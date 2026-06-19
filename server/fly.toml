@@ -5,6 +5,12 @@ primary_region = "iad"
 
 [build]
 
+# Live-tunable knobs (change here + redeploy, or `fly machine update --env KEY=VAL`).
+[env]
+  HANGOVER_S = "3.0"        # trailing-silence seconds before an utterance ends
+  GAIN = "15"               # software boost for the quiet 16-bit mic
+  WAKE_MODEL = "hey_jarvis" # openWakeWord pretrained name
+
 [http_service]
   internal_port = 8080
   force_https = true
