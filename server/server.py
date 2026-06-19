@@ -13,9 +13,9 @@ import asyncio
 import io
 import logging
 import os
-import struct
 import time
 import wave
+from collections import deque
 
 import httpx
 import numpy as np
@@ -32,10 +32,16 @@ WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # optional: where transcripts go ne
 
 SAMPLE_RATE = 16_000
 FRAME_SAMPLES = 1280          # 80 ms @ 16 kHz — openWakeWord's expected chunk
-SILENCE_RMS = 500             # int16 RMS below this counts as silence
-SILENCE_HANGOVER_S = 0.8      # end utterance after this much trailing silence
-MAX_UTTERANCE_S = 12.0        # hard cap
-PREROLL_S = 0.5               # audio kept from just before the wake hit
+# Endpointing: adaptive to the room's measured noise floor (no hardcoded level).
+# The floor is estimated from the ambient audio just before the wake word (TV
+# included); speech is whatever rises clearly above it, so it self-calibrates.
+AMBIENT_WINDOW_S = 3.0        # rolling window used to estimate the noise floor
+FLOOR_MULT = 3.0             # speech must exceed floor * this
+FLOOR_MIN_MARGIN = 150       # ...and at least this far above floor (guards floor≈0)
+SILENCE_HANGOVER_S = 0.8     # end after this much trailing below-threshold audio
+MIN_UTTERANCE_S = 0.6        # never endpoint before this (avoids instant cut)
+MAX_UTTERANCE_S = 12.0       # hard cap
+PREROLL_S = 0.5              # audio kept from just before the wake hit
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("voice")
@@ -92,8 +98,10 @@ async def connection(ws):
     pending = bytearray()           # raw bytes not yet aligned to a frame
     preroll = bytearray()           # rolling pre-wake audio
     preroll_max = int(PREROLL_S * SAMPLE_RATE) * 2
+    ambient = deque(maxlen=max(1, int(AMBIENT_WINDOW_S * SAMPLE_RATE / FRAME_SAMPLES)))
     capturing = False
     utterance = bytearray()
+    threshold = 0.0                 # adaptive speech/silence level, set at wake
     last_voice = 0.0
     started = 0.0
 
@@ -111,10 +119,14 @@ async def connection(ws):
                 preroll.extend(raw)
                 if len(preroll) > preroll_max:
                     del preroll[: len(preroll) - preroll_max]
+                ambient.append(rms(frame))      # track the room's noise floor
 
                 scores = oww.predict(frame)
                 if scores.get(WAKE_MODEL, 0.0) >= WAKE_THRESHOLD:
-                    log.info("wake word '%s' (%.2f)", WAKE_MODEL, scores[WAKE_MODEL])
+                    floor = float(np.median(ambient)) if ambient else 0.0
+                    threshold = max(floor * FLOOR_MULT, floor + FLOOR_MIN_MARGIN)
+                    log.info("wake word '%s' (%.2f)  floor=%.0f thresh=%.0f",
+                             WAKE_MODEL, scores[WAKE_MODEL], floor, threshold)
                     await ws.send("LED_BLINK")   # listening
                     capturing = True
                     utterance = bytearray(preroll)
@@ -124,17 +136,18 @@ async def connection(ws):
             else:
                 utterance.extend(raw)
                 now = time.monotonic()
-                if rms(frame) >= SILENCE_RMS:
+                if rms(frame) > threshold:
                     last_voice = now
-                done = (now - last_voice >= SILENCE_HANGOVER_S) or \
-                       (now - started >= MAX_UTTERANCE_S)
+                elapsed = now - started
+                done = (elapsed >= MIN_UTTERANCE_S and now - last_voice >= SILENCE_HANGOVER_S) \
+                       or elapsed >= MAX_UTTERANCE_S
                 if done:
                     arr = np.frombuffer(bytes(utterance), dtype=np.int16)
                     dur = arr.size / SAMPLE_RATE
                     reason = "silence" if (now - last_voice >= SILENCE_HANGOVER_S) else "maxlen"
                     peak = int(np.abs(arr).max()) if arr.size else 0
-                    log.info("utterance: %.1fs peak=%d rms=%.0f end=%s (thresh=%d)",
-                             dur, peak, rms(arr), reason, SILENCE_RMS)
+                    log.info("utterance: %.1fs peak=%d rms=%.0f end=%s (thresh=%.0f)",
+                             dur, peak, rms(arr), reason, threshold)
                     try:
                         text = await transcribe(bytes(utterance))
                         await handle_transcript(text)
