@@ -15,4 +15,4 @@
 #define I2S_SCK_PIN  14      // BCLK / SCK
 #define I2S_WS_PIN   15      // WS / LRCL
 #define I2S_SD_PIN   32      // SD / DOUT (data out of mic -> ESP32 in)
-#define I2S_MIC_CHANNEL  I2S_CHANNEL_FMT_ONLY_LEFT
+#define I2S_MIC_CHANNEL  I2S_CHANNEL_FMT_ONLY_RIGHT  // INMP441 data is on RIGHT at 32-bit

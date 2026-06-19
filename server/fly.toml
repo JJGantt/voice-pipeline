@@ -8,7 +8,7 @@ primary_region = "iad"
 # Live-tunable knobs (change here + redeploy, or `fly machine update --env KEY=VAL`).
 [env]
   HANGOVER_S = "3.0"        # trailing-silence seconds before an utterance ends
-  GAIN = "15"               # software boost for the quiet 16-bit mic
+  GAIN = "1"                # 1 = none; mic now delivers full-level 32-bit audio
   WAKE_MODEL = "hey_jarvis" # openWakeWord pretrained name
 
 [http_service]

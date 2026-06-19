@@ -161,6 +161,11 @@ async def connection(ws):
                     peak = int(np.abs(arr).max()) if arr.size else 0
                     log.info("utterance: %.1fs peak=%d rms=%.0f end=%s (thresh=%.0f)",
                              dur, peak, rms(arr), reason, threshold)
+                    try:                        # DIAG: keep last utterance for playback
+                        with open("/tmp/last_utterance.wav", "wb") as f:
+                            f.write(pcm_to_wav(bytes(utterance)))
+                    except Exception:
+                        pass
                     try:
                         text = await transcribe(bytes(utterance))
                         await handle_transcript(text)
