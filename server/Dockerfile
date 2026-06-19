@@ -1,6 +1,7 @@
 FROM python:3.11-slim
 
 WORKDIR /app
+ENV PYTHONUNBUFFERED=1
 
 # openWakeWord needs libgomp for onnxruntime
 RUN apt-get update && apt-get install -y --no-install-recommends \

@@ -129,8 +129,12 @@ async def connection(ws):
                 done = (now - last_voice >= SILENCE_HANGOVER_S) or \
                        (now - started >= MAX_UTTERANCE_S)
                 if done:
-                    dur = len(utterance) / 2 / SAMPLE_RATE
-                    log.info("utterance captured: %.1fs", dur)
+                    arr = np.frombuffer(bytes(utterance), dtype=np.int16)
+                    dur = arr.size / SAMPLE_RATE
+                    reason = "silence" if (now - last_voice >= SILENCE_HANGOVER_S) else "maxlen"
+                    peak = int(np.abs(arr).max()) if arr.size else 0
+                    log.info("utterance: %.1fs peak=%d rms=%.0f end=%s (thresh=%d)",
+                             dur, peak, rms(arr), reason, SILENCE_RMS)
                     try:
                         text = await transcribe(bytes(utterance))
                         await handle_transcript(text)
