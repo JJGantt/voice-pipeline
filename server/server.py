@@ -115,6 +115,7 @@ async def connection(ws):
                 scores = oww.predict(frame)
                 if scores.get(WAKE_MODEL, 0.0) >= WAKE_THRESHOLD:
                     log.info("wake word '%s' (%.2f)", WAKE_MODEL, scores[WAKE_MODEL])
+                    await ws.send("LED_BLINK")   # listening
                     capturing = True
                     utterance = bytearray(preroll)
                     preroll.clear()
@@ -135,6 +136,7 @@ async def connection(ws):
                         await handle_transcript(text)
                     except Exception as e:
                         log.exception("transcription failed: %s", e)
+                    await ws.send("LED_OFF")     # back to idle
                     capturing = False
                     utterance = bytearray()
                     oww.reset()

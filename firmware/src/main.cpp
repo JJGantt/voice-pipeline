@@ -12,15 +12,39 @@ static const i2s_port_t I2S_PORT = I2S_NUM_0;
 static const int SAMPLE_RATE = 16000;
 static const int FRAME_SAMPLES = 1280;          // 80 ms — matches the backend
 
+static const int LED_PIN = 2;                   // onboard blue LED (single color)
+
 WebSocketsClient ws;
 bool wsConnected = false;
 
 int16_t pcmBuf[FRAME_SAMPLES];                  // 16-bit PCM read straight from the mic
 
+TaskHandle_t blinkTask = NULL;
+
+void blinkLoop(void *_) {
+  while (true) {
+    digitalWrite(LED_PIN, HIGH); vTaskDelay(150 / portTICK_PERIOD_MS);
+    digitalWrite(LED_PIN, LOW);  vTaskDelay(150 / portTICK_PERIOD_MS);
+  }
+}
+
+void stopBlink() {
+  if (blinkTask) { vTaskDelete(blinkTask); blinkTask = NULL; }
+}
+
+// Backend feedback commands: LED_ON (listening), LED_OFF (idle), LED_BLINK (working)
+void handleCommand(const String &cmd) {
+  if (cmd == "LED_ON")        { stopBlink(); digitalWrite(LED_PIN, HIGH); }
+  else if (cmd == "LED_OFF")  { stopBlink(); digitalWrite(LED_PIN, LOW); }
+  else if (cmd == "LED_BLINK" && !blinkTask)
+    xTaskCreate(blinkLoop, "blink", 1024, NULL, 1, &blinkTask);
+}
+
 void onWsEvent(WStype_t type, uint8_t *payload, size_t len) {
   switch (type) {
     case WStype_CONNECTED:    wsConnected = true;  Serial.println("WS connected"); break;
-    case WStype_DISCONNECTED: wsConnected = false; Serial.println("WS disconnected"); break;
+    case WStype_DISCONNECTED: wsConnected = false; stopBlink(); digitalWrite(LED_PIN, LOW); Serial.println("WS disconnected"); break;
+    case WStype_TEXT:         if (payload && len) handleCommand(String((char *)payload).substring(0, len)); break;
     default: break;
   }
 }
@@ -51,6 +75,9 @@ void setupI2S() {
 void setup() {
   Serial.begin(115200);
   delay(200);
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
