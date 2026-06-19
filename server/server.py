@@ -105,8 +105,6 @@ async def connection(ws):
     threshold = 0.0                 # adaptive speech/silence level, set at wake
     last_voice = 0.0
     started = 0.0
-    idle_count = 0                  # DIAG: periodic idle level logging
-    idle_peak = 0
 
     async for msg in ws:
         if not isinstance(msg, (bytes, bytearray)):
@@ -127,19 +125,10 @@ async def connection(ws):
                     del preroll[: len(preroll) - preroll_max]
                 ambient.append(rms(frame))      # track the room's noise floor
 
-                idle_peak = max(idle_peak, int(np.abs(frame).max()))
-                idle_count += 1
-                if idle_count >= 25:            # DIAG: ~2s cadence
-                    log.info("idle: floor=%.0f peak(2s)=%d", float(np.median(ambient)), idle_peak)
-                    idle_count = 0
-                    idle_peak = 0
-
                 scores = oww.predict(frame)
                 if scores.get(WAKE_MODEL, 0.0) >= WAKE_THRESHOLD:
                     floor = float(np.median(ambient)) if ambient else 0.0
                     threshold = max(floor * FLOOR_MULT, floor + FLOOR_MIN_MARGIN)
-                    log.info("wake word '%s' (%.2f)  floor=%.0f thresh=%.0f",
-                             WAKE_MODEL, scores[WAKE_MODEL], floor, threshold)
                     await ws.send("LED_BLINK")   # listening
                     capturing = True
                     utterance = bytearray(preroll)
@@ -155,17 +144,6 @@ async def connection(ws):
                 done = (elapsed >= MIN_UTTERANCE_S and now - last_voice >= SILENCE_HANGOVER_S) \
                        or elapsed >= MAX_UTTERANCE_S
                 if done:
-                    arr = np.frombuffer(bytes(utterance), dtype=np.int16)
-                    dur = arr.size / SAMPLE_RATE
-                    reason = "silence" if (now - last_voice >= SILENCE_HANGOVER_S) else "maxlen"
-                    peak = int(np.abs(arr).max()) if arr.size else 0
-                    log.info("utterance: %.1fs peak=%d rms=%.0f end=%s (thresh=%.0f)",
-                             dur, peak, rms(arr), reason, threshold)
-                    try:                        # DIAG: keep last utterance for playback
-                        with open("/tmp/last_utterance.wav", "wb") as f:
-                            f.write(pcm_to_wav(bytes(utterance)))
-                    except Exception:
-                        pass
                     try:
                         text = await transcribe(bytes(utterance))
                         await handle_transcript(text)
