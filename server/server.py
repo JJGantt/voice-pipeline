@@ -41,7 +41,8 @@ FLOOR_MULT = 3.0             # speech must exceed floor * this
 FLOOR_MIN_MARGIN = 150       # ...and at least this far above floor (guards floor≈0)
 SILENCE_HANGOVER_S = float(os.environ.get("HANGOVER_S", "3.0"))  # trailing silence to end (env-tunable)
 MIN_UTTERANCE_S = 0.6        # never endpoint before this (avoids instant cut)
-MAX_UTTERANCE_S = 12.0       # hard cap
+MAX_UTTERANCE_S = float(os.environ.get("MAX_UTTERANCE_S", "600"))  # absolute safety cap (10 min)
+LONG_UTTERANCE_WARN_S = 300.0  # warn if a single capture runs this long
 PREROLL_S = 0.5              # audio kept from just before the wake hit
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -80,13 +81,22 @@ async def transcribe(pcm: bytes) -> str:
     return (result if isinstance(result, str) else getattr(result, "text", "")).strip()
 
 
-async def handle_transcript(text: str):
-    """HANDOFF SEAM — the rest of the system hooks in here."""
-    log.info("TRANSCRIPT: %r", text)
+async def handle_transcript(text: str, duration_s: float, truncated: bool):
+    """HANDOFF SEAM — the rest of the system hooks in here.
+
+    `duration_s` is the captured length; `truncated` is True if the capture ended
+    by hitting MAX_UTTERANCE_S while speech was still active (the hub surfaces this).
+    """
+    log.info("TRANSCRIPT (%.0fs%s): %r", duration_s, ", TRUNCATED" if truncated else "", text)
     if WEBHOOK_URL and text:
         try:
             async with httpx.AsyncClient(timeout=10) as c:
-                await c.post(WEBHOOK_URL, json={"transcript": text, "ts": time.time()})
+                await c.post(WEBHOOK_URL, json={
+                    "transcript": text,
+                    "ts": time.time(),
+                    "duration_s": round(duration_s, 1),
+                    "truncated": truncated,
+                })
         except Exception as e:
             log.warning("webhook POST failed: %s", e)
 
@@ -144,9 +154,15 @@ async def connection(ws):
                 done = (elapsed >= MIN_UTTERANCE_S and now - last_voice >= SILENCE_HANGOVER_S) \
                        or elapsed >= MAX_UTTERANCE_S
                 if done:
+                    dur = len(utterance) / 2 / SAMPLE_RATE
+                    truncated = elapsed >= MAX_UTTERANCE_S and (now - last_voice) < SILENCE_HANGOVER_S
+                    if truncated:
+                        log.warning("utterance hit %ds cap while still active — truncated", int(MAX_UTTERANCE_S))
+                    elif dur >= LONG_UTTERANCE_WARN_S:
+                        log.warning("long utterance: %.0fs", dur)
                     try:
                         text = await transcribe(bytes(utterance))
-                        await handle_transcript(text)
+                        await handle_transcript(text, dur, truncated)
                     except Exception as e:
                         log.exception("transcription failed: %s", e)
                     await ws.send("LED_OFF")     # back to idle

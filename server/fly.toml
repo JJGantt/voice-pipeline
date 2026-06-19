@@ -10,6 +10,7 @@ primary_region = "iad"
   HANGOVER_S = "3.0"        # trailing-silence seconds before an utterance ends
   GAIN = "1"                # 1 = none; mic now delivers full-level 32-bit audio
   WAKE_MODEL = "hey_jarvis" # openWakeWord pretrained name
+  MAX_UTTERANCE_S = "600"   # absolute safety cap in seconds (10 min)
 
 [http_service]
   internal_port = 8080
