@@ -27,6 +27,7 @@ from openwakeword.model import Model
 PORT = int(os.environ.get("PORT", "8080"))
 WAKE_MODEL = os.environ.get("WAKE_MODEL", "hey_jarvis")  # openWakeWord pretrained name
 WAKE_THRESHOLD = float(os.environ.get("WAKE_THRESHOLD", "0.5"))
+GAIN = float(os.environ.get("GAIN", "15"))   # software boost for the quiet 16-bit mic
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "whisper-large-v3-turbo")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # optional: where transcripts go next
 
@@ -104,6 +105,8 @@ async def connection(ws):
     threshold = 0.0                 # adaptive speech/silence level, set at wake
     last_voice = 0.0
     started = 0.0
+    idle_count = 0                  # DIAG: periodic idle level logging
+    idle_peak = 0
 
     async for msg in ws:
         if not isinstance(msg, (bytes, bytearray)):
@@ -114,12 +117,22 @@ async def connection(ws):
             raw = bytes(pending[: FRAME_SAMPLES * 2])
             del pending[: FRAME_SAMPLES * 2]
             frame = np.frombuffer(raw, dtype=np.int16)
+            if GAIN != 1.0:                 # boost the quiet mic, then re-pack
+                frame = np.clip(frame.astype(np.float32) * GAIN, -32768, 32767).astype(np.int16)
+                raw = frame.tobytes()
 
             if not capturing:
                 preroll.extend(raw)
                 if len(preroll) > preroll_max:
                     del preroll[: len(preroll) - preroll_max]
                 ambient.append(rms(frame))      # track the room's noise floor
+
+                idle_peak = max(idle_peak, int(np.abs(frame).max()))
+                idle_count += 1
+                if idle_count >= 25:            # DIAG: ~2s cadence
+                    log.info("idle: floor=%.0f peak(2s)=%d", float(np.median(ambient)), idle_peak)
+                    idle_count = 0
+                    idle_peak = 0
 
                 scores = oww.predict(frame)
                 if scores.get(WAKE_MODEL, 0.0) >= WAKE_THRESHOLD:

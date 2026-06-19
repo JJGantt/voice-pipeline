@@ -17,8 +17,8 @@ static const int LED_PIN = 2;                   // onboard blue LED (single colo
 WebSocketsClient ws;
 bool wsConnected = false;
 
-int32_t i2sBuf[FRAME_SAMPLES];                  // raw 32-bit slots from the INMP441
-int16_t pcmBuf[FRAME_SAMPLES];                  // gained 16-bit PCM
+int16_t pcmBuf[FRAME_SAMPLES];                  // 16-bit PCM read straight from the mic
+                                                // (gain is applied server-side)
 
 TaskHandle_t blinkTask = NULL;
 
@@ -54,7 +54,7 @@ void setupI2S() {
   i2s_config_t cfg = {
       .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
       .sample_rate = SAMPLE_RATE,
-      .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,   // INMP441 = 24-bit in 32-bit slot
+      .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,   // working direct read
       .channel_format = I2S_MIC_CHANNEL,
       .communication_format = I2S_COMM_FORMAT_STAND_I2S,
       .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
@@ -98,20 +98,9 @@ void loop() {
   ws.loop();
 
   size_t bytesRead = 0;
-  i2s_read(I2S_PORT, i2sBuf, sizeof(i2sBuf), &bytesRead, portMAX_DELAY);
-  int samples = bytesRead / sizeof(int32_t);
+  i2s_read(I2S_PORT, pcmBuf, sizeof(pcmBuf), &bytesRead, portMAX_DELAY);
 
-  // INMP441 puts 24-bit data left-justified in the 32-bit slot. Shift down by 11
-  // (instead of 16) to drop into 16-bit *with ~32x gain*, then clamp. Fixes the
-  // too-quiet capture that left speech below the endpoint threshold.
-  for (int i = 0; i < samples; i++) {
-    int32_t v = i2sBuf[i] >> 11;
-    if (v > 32767) v = 32767;
-    else if (v < -32768) v = -32768;
-    pcmBuf[i] = (int16_t)v;
-  }
-
-  if (wsConnected && samples > 0) {
-    ws.sendBIN((uint8_t *)pcmBuf, samples * sizeof(int16_t));
+  if (wsConnected && bytesRead > 0) {
+    ws.sendBIN((uint8_t *)pcmBuf, bytesRead);
   }
 }
