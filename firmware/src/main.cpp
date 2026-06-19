@@ -15,8 +15,7 @@ static const int FRAME_SAMPLES = 1280;          // 80 ms — matches the backend
 WebSocketsClient ws;
 bool wsConnected = false;
 
-int32_t i2sBuf[FRAME_SAMPLES];                  // raw 32-bit slots from the mic
-int16_t pcmBuf[FRAME_SAMPLES];                  // converted 16-bit PCM
+int16_t pcmBuf[FRAME_SAMPLES];                  // 16-bit PCM read straight from the mic
 
 void onWsEvent(WStype_t type, uint8_t *payload, size_t len) {
   switch (type) {
@@ -30,7 +29,7 @@ void setupI2S() {
   i2s_config_t cfg = {
       .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
       .sample_rate = SAMPLE_RATE,
-      .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,   // INMP441 = 24-bit in 32-bit slot
+      .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,   // proven 16-bit direct read
       .channel_format = I2S_MIC_CHANNEL,
       .communication_format = I2S_COMM_FORMAT_STAND_I2S,
       .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
@@ -71,15 +70,9 @@ void loop() {
   ws.loop();
 
   size_t bytesRead = 0;
-  i2s_read(I2S_PORT, i2sBuf, sizeof(i2sBuf), &bytesRead, portMAX_DELAY);
-  int samples = bytesRead / sizeof(int32_t);
+  i2s_read(I2S_PORT, pcmBuf, sizeof(pcmBuf), &bytesRead, portMAX_DELAY);
 
-  // INMP441 puts 24-bit data left-justified in a 32-bit slot; shift down to 16-bit.
-  for (int i = 0; i < samples; i++) {
-    pcmBuf[i] = (int16_t)(i2sBuf[i] >> 14);
-  }
-
-  if (wsConnected) {
-    ws.sendBIN((uint8_t *)pcmBuf, samples * sizeof(int16_t));
+  if (wsConnected && bytesRead > 0) {
+    ws.sendBIN((uint8_t *)pcmBuf, bytesRead);
   }
 }
