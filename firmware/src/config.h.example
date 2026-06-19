@@ -1,0 +1,20 @@
+#pragma once
+// Copy to config.h and fill in. config.h is gitignored.
+
+// --- WiFi ---
+#define WIFI_SSID      "your-ssid"
+#define WIFI_PASSWORD  "your-password"
+
+// --- Server (Fly voice backend) ---
+#define WS_HOST  "jared-voice.fly.dev"
+#define WS_PORT  443
+#define WS_PATH  "/ws/audio"
+#define WS_TLS   true        // wss://
+
+// --- I2S mic wiring (INMP441 / SPH0645 class) ---
+// Set these to the GPIOs you actually soldered the mic to.
+#define I2S_SCK_PIN  26      // BCLK / SCK
+#define I2S_WS_PIN   25      // WS / LRCL
+#define I2S_SD_PIN   33      // SD / DOUT (data out of mic -> ESP32 in)
+// INMP441 channel: mic L/R pin tied to GND = LEFT, to VDD = RIGHT
+#define I2S_MIC_CHANNEL  I2S_CHANNEL_FMT_ONLY_LEFT

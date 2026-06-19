@@ -1,0 +1,8 @@
+# firmware secrets / build
+firmware/src/config.h
+firmware/.pio/
+
+# python
+server/__pycache__/
+server/.venv/
+*.pyc
