@@ -11,9 +11,9 @@ const RECENT_WORDS = ['most recent', 'latest', 'last', 'newest', 'current'];
 function norm(s) {
   return (s || '').toLowerCase().trim();
 }
-// "the hub", "switch to the hub", "go to hub" → "hub". Strips leading filler so a bare
-// hub word resolves to the default view even if a SESSION happens to be named e.g. "Hub UI"
-// (that fuller name still routes to the session via keyword matching below).
+// Strip leading filler ("switch to", "go to", "the", …) so phrasing like "switch to the hub"
+// resolves to a bare hub word. hub/default/main/dashboard/etc. are RESERVED for the default
+// view; any other phrase routes to a session via keyword matching below.
 function stripFiller(q) {
   return q.replace(/^(switch to |go to |show |open |focus on |focus |bring up |the )+/g, '').trim();
 }
@@ -24,33 +24,41 @@ export async function resolveTarget(target) {
   const q = norm(target);
   if (!q) return { kind: 'none', message: 'Empty target.' };
 
-  // Bare "hub"/"default"/"the hub"/... → the default dashboard view (not a session).
-  const bare = stripFiller(q);
-  if (HUB_WORDS.includes(q) || HUB_WORDS.includes(bare)) {
+  // Explicit session framing — "the session named X", "switch to the session X",
+  // "session called/labeled X" — means a SESSION even if X is a reserved hub word.
+  // Strip the framing and match the remaining name against sessions (skip the hub default).
+  const sessionFramed = /\bsessions?\b/.test(q);
+  const mq = sessionFramed
+    ? (q.replace(/^.*?\bsessions?\b\s*(named|called|labelled|labeled|titled|that('?s)? named)?\s*/i, '').trim() || q)
+    : (stripFiller(q) || q);
+
+  // Bare "hub"/"default"/"the hub"/... → the default dashboard view (not a session) —
+  // but only when the user wasn't explicitly asking for a session.
+  if (!sessionFramed && (HUB_WORDS.includes(q) || HUB_WORDS.includes(mq))) {
     return { kind: 'hub' };
   }
 
   const sessions = await listRecentSessions(5);
   if (!sessions.length) {
-    if (q === 'hub') return { kind: 'hub' };
+    if (!sessionFramed && q === 'hub') return { kind: 'hub' };
     return { kind: 'none', message: 'No recent sessions found to focus.' };
   }
 
   // "most recent" / "latest" / "last" → newest session (already sorted newest-first).
-  if (RECENT_WORDS.some((w) => q === w || q.includes(w))) {
+  if (RECENT_WORDS.some((w) => mq === w || mq.includes(w))) {
     return { kind: 'session', session: sessions[0], note: 'most recent session' };
   }
 
   // Exact session id match.
-  const byId = sessions.find((s) => norm(s.id) === q || norm(s.id).startsWith(q));
+  const byId = sessions.find((s) => norm(s.id) === mq || norm(s.id).startsWith(mq));
   if (byId) return { kind: 'session', session: byId };
 
   // Keyword scoring against title and project.
-  const terms = q.split(/\s+/).filter(Boolean);
+  const terms = mq.split(/\s+/).filter(Boolean);
   const scored = sessions.map((s) => {
     const hay = `${norm(s.title)} ${norm(s.project)}`;
     let score = 0;
-    if (hay.includes(q)) score += 10; // full-phrase substring
+    if (hay.includes(mq)) score += 10; // full-phrase substring
     for (const t of terms) if (hay.includes(t)) score += 1;
     return { s, score };
   });
