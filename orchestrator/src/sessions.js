@@ -14,7 +14,8 @@ import { config } from './config.js';
 // different lines, so we keep scanning until both are found (or lines run out).
 export function extractMeta(text) {
   const lines = text.split('\n');
-  let title = null;
+  let aiTitle = null;
+  let customTitle = null; // a user `/rename` — overrides the auto aiTitle
   let cwd = null;
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i].trim();
@@ -25,11 +26,12 @@ export function extractMeta(text) {
     } catch {
       continue;
     }
-    if (title == null && typeof obj.aiTitle === 'string') title = obj.aiTitle;
+    if (customTitle == null && obj.type === 'custom-title' && typeof obj.customTitle === 'string') customTitle = obj.customTitle;
+    if (aiTitle == null && typeof obj.aiTitle === 'string') aiTitle = obj.aiTitle;
     if (cwd == null && typeof obj.cwd === 'string') cwd = obj.cwd;
-    if (title != null && cwd != null) break;
+    if (customTitle != null && cwd != null) break;
   }
-  return { title, cwd };
+  return { title: customTitle || aiTitle, cwd };
 }
 
 // Derive the on-disk project dir name Claude uses from an absolute cwd.

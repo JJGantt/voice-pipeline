@@ -20,6 +20,7 @@ const HEAD_BYTES = 128 * 1024; // bounded fallback read from the start
 // latest cwd, and the first user-message text seen (for title fallback).
 function scanChunk(chunk) {
   let aiTitle = null;
+  let customTitle = null;
   let cwd = null;
   let firstUserText = null;
   const lines = chunk.split('\n');
@@ -34,6 +35,10 @@ function scanChunk(chunk) {
     }
     if (rec.type === 'ai-title' && typeof rec.aiTitle === 'string') {
       aiTitle = rec.aiTitle; // keep overwriting → ends as the latest
+    }
+    // A user `/rename` writes a `custom-title` record; it overrides the auto aiTitle.
+    if (rec.type === 'custom-title' && typeof rec.customTitle === 'string') {
+      customTitle = rec.customTitle;
     }
     if (typeof rec.cwd === 'string' && rec.cwd) {
       cwd = rec.cwd; // keep overwriting → ends as the latest seen in this chunk
@@ -52,7 +57,7 @@ function scanChunk(chunk) {
       }
     }
   }
-  return { aiTitle, cwd, firstUserText };
+  return { aiTitle, customTitle, cwd, firstUserText };
 }
 
 async function readTail(filePath, fh, size) {
@@ -78,19 +83,21 @@ async function readSession(filePath, project, mtimeMs) {
     const { size } = await fh.stat();
 
     const tail = await readTail(filePath, fh, size);
-    let { aiTitle, cwd, firstUserText } = scanChunk(tail);
+    let { aiTitle, customTitle, cwd, firstUserText } = scanChunk(tail);
 
     // If the title (or anything useful) wasn't in the tail and the file is larger
     // than what we read, scan a bounded head as a fallback.
-    if ((!aiTitle || !cwd || !firstUserText) && size > TAIL_BYTES) {
+    if ((!aiTitle || !customTitle || !cwd || !firstUserText) && size > TAIL_BYTES) {
       const head = await readHead(fh, size);
       const h = scanChunk(head);
       if (!aiTitle) aiTitle = h.aiTitle;
+      if (!customTitle) customTitle = h.customTitle;
       if (!cwd) cwd = h.cwd; // head cwd only used if tail had none
       if (!firstUserText) firstUserText = h.firstUserText;
     }
 
-    const title = aiTitle || firstUserText || id;
+    // A user rename (customTitle) wins over the auto aiTitle.
+    const title = customTitle || aiTitle || firstUserText || id;
     return {
       id,
       title,

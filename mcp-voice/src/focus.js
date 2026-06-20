@@ -5,11 +5,17 @@ import { listRecentSessions } from './sessions.js';
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 
-const HUB_WORDS = ['hub', 'wall', 'home', 'dashboard', 'tv'];
+const HUB_WORDS = ['hub', 'wall', 'home', 'dashboard', 'tv', 'default', 'main', 'main view', 'default view', 'hub view'];
 const RECENT_WORDS = ['most recent', 'latest', 'last', 'newest', 'current'];
 
 function norm(s) {
   return (s || '').toLowerCase().trim();
+}
+// "the hub", "switch to the hub", "go to hub" → "hub". Strips leading filler so a bare
+// hub word resolves to the default view even if a SESSION happens to be named e.g. "Hub UI"
+// (that fuller name still routes to the session via keyword matching below).
+function stripFiller(q) {
+  return q.replace(/^(switch to |go to |show |open |focus on |focus |bring up |the )+/g, '').trim();
 }
 
 // Resolve `target` to either 'hub' or one of the recent sessions.
@@ -18,7 +24,9 @@ export async function resolveTarget(target) {
   const q = norm(target);
   if (!q) return { kind: 'none', message: 'Empty target.' };
 
-  if (HUB_WORDS.includes(q) || HUB_WORDS.some((w) => q === w)) {
+  // Bare "hub"/"default"/"the hub"/... → the default dashboard view (not a session).
+  const bare = stripFiller(q);
+  if (HUB_WORDS.includes(q) || HUB_WORDS.includes(bare)) {
     return { kind: 'hub' };
   }
 
