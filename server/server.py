@@ -226,7 +226,12 @@ async def connection(ws):
 
 async def main():
     log.info("voice backend up on :%d  wake=%s  stt=%s", PORT, WAKE_MODEL, GROQ_MODEL)
-    async with websockets.serve(connection, "0.0.0.0", PORT, max_size=None):
+    # ping_interval=None: the ESP32 is a continuous PCM pump and doesn't reliably answer
+    # WebSocket keepalive pings, so server-initiated pings were closing the connection mid-
+    # utterance ("keepalive ping timeout"). The constant audio stream keeps the socket live;
+    # if the ESP drops, the recv loop ends on its own.
+    async with websockets.serve(connection, "0.0.0.0", PORT, max_size=None,
+                                ping_interval=None, close_timeout=5):
         await asyncio.Future()
 
 

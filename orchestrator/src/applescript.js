@@ -26,26 +26,53 @@ function osascript(script) {
 // Note: Claude Code appends-and-closes its transcript, so a holder may not
 // always exist at the instant we look. Callers must treat null as "no live
 // desk tab found -> skip closing" (the documented safe fallback).
-export async function ttyForSession(id) {
-  const file = findSessionFile(id);
-  if (!file) return null;
-  let pids;
+async function ttyOf(pid) {
   try {
-    const { stdout } = await execFileP('lsof', ['-t', '--', file]);
-    pids = stdout.split('\n').map((s) => s.trim()).filter(Boolean);
-  } catch {
-    return null; // lsof exits non-zero when nothing holds the file open
-  }
-  for (const pid of pids) {
+    const { stdout } = await execFileP('ps', ['-o', 'tty=', '-p', pid]);
+    const t = stdout.trim();
+    return t && t !== '??' && t !== '?' ? `/dev/${t}` : null;
+  } catch { return null; }
+}
+async function cwdOf(pid) {
+  try {
+    const { stdout } = await execFileP('lsof', ['-a', '-p', pid, '-d', 'cwd', '-Fn']);
+    const line = stdout.split('\n').find((l) => l.startsWith('n'));
+    return line ? line.slice(1) : null;
+  } catch { return null; }
+}
+
+export async function ttyForSession(id, cwd) {
+  // 1) Definitive but rare: a process actually holding <id>.jsonl open. Claude appends-and-closes
+  //    the transcript, so this usually finds nothing — hence the fallbacks below.
+  const file = findSessionFile(id);
+  if (file) {
     try {
-      const { stdout } = await execFileP('ps', ['-o', 'tty=', '-p', pid]);
-      const t = stdout.trim();
-      if (t && t !== '??' && t !== '?') return `/dev/${t}`;
-    } catch {
-      // try next pid
-    }
+      const { stdout } = await execFileP('lsof', ['-t', '--', file]);
+      for (const pid of stdout.split('\n').map((s) => s.trim()).filter(Boolean)) {
+        const t = await ttyOf(pid); if (t) return t;
+      }
+    } catch { /* no live holder */ }
   }
-  return null;
+  // 2) Find the live `claude` desk process for this session. argv match (a tab started via
+  //    `claude --resume <id>`) is definitive; otherwise match the session's cwd. Headless claude
+  //    (the worker's `claude -p`, our own pty) has no controlling tty, so it's filtered out.
+  let pids = [];
+  try {
+    const { stdout } = await execFileP('pgrep', ['-f', 'claude']);
+    pids = stdout.split('\n').map((s) => s.trim()).filter(Boolean);
+  } catch { return null; }
+  const cwdMatches = [];
+  for (const pid of pids) {
+    const t = await ttyOf(pid);
+    if (!t) continue; // no Terminal tab
+    try {
+      const { stdout: args } = await execFileP('ps', ['-p', pid, '-o', 'args=']);
+      if (args.includes(id)) return t; // resumed with this id → definitive
+    } catch { /* */ }
+    if (cwd) { const c = await cwdOf(pid); if (c && c === cwd) cwdMatches.push(t); }
+  }
+  // Trust a cwd match only when unambiguous (exactly one claude in that directory).
+  return cwdMatches.length === 1 ? cwdMatches[0] : null;
 }
 
 // Enumerate the ttys of every open Terminal tab. Returns [] if Terminal isn't

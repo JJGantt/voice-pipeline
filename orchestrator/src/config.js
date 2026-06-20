@@ -13,6 +13,10 @@ export const config = {
 
   PORT: parseInt(process.env.PORT || '7682', 10),
   MAC_HOST: process.env.MAC_HOST || 'Jareds-MacBook-Air.local',
+  // Public base the TV/Pi uses to reach the terminal ws. MUST be wss:// — the /tv page is
+  // HTTPS, so an insecure ws:// is blocked as mixed content. Tailscale Serve fronts the local
+  // orchestrator (127.0.0.1:PORT) with a valid TLS cert on the tailnet FQDN at :443.
+  TERM_BASE: process.env.TERM_BASE || 'wss://<the Mac>.<tailnet>.ts.net',
   ORCH_TOKEN: process.env.ORCH_TOKEN || 'REDACTED',
   CLAUDE_BIN: process.env.CLAUDE_BIN || path.join(HOME, '.local/bin/claude'),
 
@@ -31,7 +35,8 @@ export const config = {
   REGISTRY_LIMIT: parseInt(process.env.REGISTRY_LIMIT || '5', 10),
 };
 
-// terminal_url advertised to the TV/Pi when a real session is active.
+// terminal_url advertised to the TV/Pi when a real session is active. wss via Tailscale Serve
+// (TLS-terminated at the tailnet FQDN) so the HTTPS /tv page can open it without mixed-content.
 export function terminalUrl() {
-  return `ws://${config.MAC_HOST}:${config.PORT}/term?token=${config.ORCH_TOKEN}`;
+  return `${config.TERM_BASE}/term?token=${config.ORCH_TOKEN}`;
 }

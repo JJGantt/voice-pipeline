@@ -70,6 +70,10 @@ VOICE_MCP_JS = os.environ.get(
     "VOICE_MCP_JS", "/Users/jaredgantt/repos/voice-pipeline/mcp-voice/src/index.js"
 )
 
+# Govee lights MCP so voice can control the lights ("turn the lights blue").
+GOVEE_PY = os.environ.get("GOVEE_PY", "/opt/homebrew/bin/python3.11")
+GOVEE_MCP_PY = os.environ.get("GOVEE_MCP_PY", "/Users/jaredgantt/repos/govee-mcp/govee_mcp.py")
+
 # Orchestrator (Mac) — when focus is a specific Mac session, the transcript is
 # injected into that session's wall terminal via the orchestrator instead of
 # running a fresh `claude -p`.
@@ -276,6 +280,7 @@ def write_mcp_config() -> str:
         "mcpServers": {
             "data": {"command": "node", "args": [DATA_MCP_JS], "env": env},
             "voice": {"command": "node", "args": [VOICE_MCP_JS], "env": env},
+            "govee-lights": {"command": GOVEE_PY, "args": [GOVEE_MCP_PY]},
         }
     }
     fd, path = tempfile.mkstemp(prefix="voice-mcp-", suffix=".json")
@@ -303,7 +308,7 @@ def run_claude(transcript: str, resume_session_id: str | None) -> dict:
         "--strict-mcp-config",
         "--output-format", "stream-json",
         "--verbose",
-        "--allowedTools", "mcp__data", "mcp__voice",
+        "--allowedTools", "mcp__data", "mcp__voice", "mcp__govee-lights",
     ]
 
     session_id = None

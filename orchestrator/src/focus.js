@@ -57,7 +57,7 @@ async function reconcile(targetFocus) {
 
   // 1. Close the desk tab holding this session, if we can find a live one.
   try {
-    const tty = await ttyForSession(id);
+    const tty = await ttyForSession(id, cwd);
     if (tty) {
       const closed = await closeTabForTty(tty);
       console.log(`[focus] desk tab for ${id} tty=${tty} closed=${closed}`);
