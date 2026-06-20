@@ -19,6 +19,7 @@ import asyncio
 import io
 import logging
 import os
+import re
 import time
 import wave
 from collections import deque
@@ -98,6 +99,10 @@ async def handle_transcript(text: str, duration_s: float, truncated: bool):
     by hitting MAX_UTTERANCE_S while speech was still active (the hub surfaces this).
     """
     log.info("TRANSCRIPT (%.0fs%s): %r", duration_s, ", TRUNCATED" if truncated else "", text)
+    # Strip a leading wake phrase the STT often captures ("Hey Jarvis, ...") — it's the
+    # trigger word, not part of the command. Tolerant of Whisper mishears (jervis/jarvis/etc.).
+    text = re.sub(r"^\W*(hey|hi|ok|okay)?\W*(jarvis|jervis|jarvi|jaravis|travis)\b[\s,.!:;-]*",
+                  "", text or "", count=1, flags=re.IGNORECASE).strip()
     if SUPABASE_URL and SUPABASE_ANON_KEY and text:
         # Best-effort enqueue into the Supabase voice_requests table. The anon key
         # is INSERT-only by RLS, so we send only the two fields and ask for no
