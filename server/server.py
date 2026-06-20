@@ -5,8 +5,14 @@ a WebSocket, runs openWakeWord on it, and on a wake-word hit captures the follow
 utterance (ending on trailing silence) and transcribes it with Groq's whisper.
 
 The pipeline STOPS at the transcript. `handle_transcript()` is the handoff seam:
-it logs the text and, if WEBHOOK_URL is set, POSTs it onward. Wire the rest of the
-system in there.
+it logs the text and, if SUPABASE_URL/SUPABASE_ANON_KEY are set, enqueues it into the
+Supabase `voice_requests` table (INSERT-only via the anon key + RLS) for downstream
+consumers to pick up. Wire the rest of the system off that queue.
+
+The WebSocket optionally requires a device token: if VOICE_DEVICE_TOKEN is set,
+clients must present it (via `?token=` on the ws path or an X-Device-Token /
+Authorization header) or the connection is rejected. If it's unset, all
+connections are accepted (so existing firmware keeps working).
 """
 
 import asyncio
@@ -29,7 +35,11 @@ WAKE_MODEL = os.environ.get("WAKE_MODEL", "hey_jarvis")  # openWakeWord pretrain
 WAKE_THRESHOLD = float(os.environ.get("WAKE_THRESHOLD", "0.5"))
 GAIN = float(os.environ.get("GAIN", "15"))   # software boost for the quiet 16-bit mic
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "whisper-large-v3-turbo")
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # optional: where transcripts go next
+# Supabase enqueue target for transcripts (INSERT-only via anon key + RLS).
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
+# Optional device-token auth on the ws handshake; enforced only when set.
+VOICE_DEVICE_TOKEN = os.environ.get("VOICE_DEVICE_TOKEN")
 
 SAMPLE_RATE = 16_000
 FRAME_SAMPLES = 1280          # 80 ms @ 16 kHz — openWakeWord's expected chunk
@@ -88,21 +98,62 @@ async def handle_transcript(text: str, duration_s: float, truncated: bool):
     by hitting MAX_UTTERANCE_S while speech was still active (the hub surfaces this).
     """
     log.info("TRANSCRIPT (%.0fs%s): %r", duration_s, ", TRUNCATED" if truncated else "", text)
-    if WEBHOOK_URL and text:
+    if SUPABASE_URL and SUPABASE_ANON_KEY and text:
+        # Best-effort enqueue into the Supabase voice_requests table. The anon key
+        # is INSERT-only by RLS, so we send only the two fields and ask for no
+        # representation back (Prefer: return=minimal). Never raise on failure.
         try:
             async with httpx.AsyncClient(timeout=10) as c:
-                await c.post(WEBHOOK_URL, json={
-                    "transcript": text,
-                    "ts": time.time(),
-                    "duration_s": round(duration_s, 1),
-                    "truncated": truncated,
-                })
+                await c.post(
+                    f"{SUPABASE_URL}/rest/v1/voice_requests",
+                    headers={
+                        "apikey": SUPABASE_ANON_KEY,
+                        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+                        "Content-Type": "application/json",
+                        "Prefer": "return=minimal",
+                    },
+                    json={"transcript": text, "source": "fly"},
+                )
         except Exception as e:
-            log.warning("webhook POST failed: %s", e)
+            log.warning("supabase enqueue failed: %s", e)
+
+
+def _client_token(ws) -> str | None:
+    """Pull the device token off the handshake (websockets 12 API).
+
+    Checks, in order: the `?token=` query param on the ws path, then the
+    `X-Device-Token` header, then a `Bearer ...` Authorization header. In
+    websockets 12 the server handler gets a WebSocketServerProtocol whose
+    `.path` carries the full request target (path + query) and whose
+    `.request_headers` is the handshake Headers mapping.
+    """
+    path = getattr(ws, "path", "") or ""
+    if "?" in path:
+        from urllib.parse import parse_qs
+        qs = parse_qs(path.split("?", 1)[1])
+        tok = qs.get("token", [None])[0]
+        if tok:
+            return tok
+    headers = getattr(ws, "request_headers", None)
+    if headers is not None:
+        tok = headers.get("X-Device-Token")
+        if tok:
+            return tok
+        auth = headers.get("Authorization") or ""
+        if auth.startswith("Bearer "):
+            return auth[len("Bearer "):]
+    return None
 
 
 async def connection(ws):
     peer = getattr(ws, "remote_address", "?")
+    # Device-token gate: enforced only when VOICE_DEVICE_TOKEN is set, so existing
+    # firmware that doesn't send a token keeps working until it's updated.
+    if VOICE_DEVICE_TOKEN:
+        if _client_token(ws) != VOICE_DEVICE_TOKEN:
+            log.warning("rejected unauthenticated/invalid connection: %s", peer)
+            await ws.close(code=1008, reason="invalid device token")
+            return
     log.info("ESP32 connected: %s", peer)
     oww.reset()
 

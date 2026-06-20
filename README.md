@@ -15,13 +15,22 @@ ESP32 (I2S mic) ──wss://jared-voice.fly.dev/ws/audio──▶  Fly: jared-vo
 ## server/ (Fly app `jared-voice`)
 - WebSocket server, openWakeWord, Groq STT. Always-on 1GB machine.
 - Config via env: `GROQ_API_KEY` (secret), `WAKE_MODEL` (default `hey_jarvis`),
-  `WAKE_THRESHOLD`, `GROQ_MODEL`, `WEBHOOK_URL` (optional, where transcripts POST next).
+  `WAKE_THRESHOLD`, `GROQ_MODEL`, `SUPABASE_URL` + `SUPABASE_ANON_KEY` (where
+  transcripts enqueue), `VOICE_DEVICE_TOKEN` (optional ws auth — see below).
 - Deploy: `fly deploy` from `server/`. Set the key: `fly secrets set GROQ_API_KEY=...`.
 
 ### The handoff seam
-`handle_transcript(text)` currently logs the transcript and, if `WEBHOOK_URL` is set,
-POSTs `{"transcript": ..., "ts": ...}` to it. Replace/extend this to connect the voice
-output to the status hub / Claude / actions.
+`handle_transcript(text)` logs the transcript and, if `SUPABASE_URL` and
+`SUPABASE_ANON_KEY` are set, enqueues it into the Supabase `voice_requests` table
+(`INSERT` of `{"transcript": ..., "source": "fly"}` via the anon key — INSERT-only
+by RLS; the table fills the rest with defaults). Downstream consumers read off that
+queue. It's best-effort and never raises.
+
+### WebSocket auth
+If `VOICE_DEVICE_TOKEN` is set, the ws handshake must present that token — via
+`?token=...` on the ws path, an `X-Device-Token` header, or `Authorization: Bearer
+...` — or the connection is closed (1008). If it's unset, all connections are
+accepted, so existing firmware keeps working until it's updated to send the token.
 
 ## firmware/ (ESP32, PlatformIO)
 - Copy `src/config.h.example` → `src/config.h`, fill WiFi + server + I2S mic pins.

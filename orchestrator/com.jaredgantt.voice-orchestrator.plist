@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Sample launchd agent for the voice orchestrator.
+  Install (parent does this, NOT the build step):
+    cp com.jaredgantt.voice-orchestrator.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.jaredgantt.voice-orchestrator.plist
+  Edit SUPABASE_KEY below to the service_role key before loading.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.jaredgantt.voice-orchestrator</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/node</string>
+    <string>/Users/jaredgantt/repos/voice-pipeline/orchestrator/src/server.js</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/jaredgantt/repos/voice-pipeline/orchestrator</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>SUPABASE_URL</key>
+    <string>https://felyggqjjhltwokdfhop.supabase.co</string>
+    <!-- service_role key: fill this in before loading -->
+    <key>SUPABASE_KEY</key>
+    <string>REPLACE_WITH_SERVICE_ROLE_KEY</string>
+    <key>PORT</key>
+    <string>7682</string>
+    <key>MAC_HOST</key>
+    <string>Jareds-MacBook-Air.local</string>
+    <key>ORCH_TOKEN</key>
+    <string>REDACTED</string>
+    <key>CLAUDE_BIN</key>
+    <string>/Users/jaredgantt/.local/bin/claude</string>
+    <!-- PATH so node-pty's spawned shells/claude resolve normally -->
+    <key>PATH</key>
+    <string>/Users/jaredgantt/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/Users/jaredgantt/Library/Logs/voice-orchestrator.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/jaredgantt/Library/Logs/voice-orchestrator.err.log</string>
+</dict>
+</plist>

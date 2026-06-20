@@ -1,0 +1,90 @@
+# mcp-voice
+
+A small stdio MCP server, **`voice`**, that lets any Claude session see the
+focusable Claude Code sessions on this Mac and switch what the Pi/TV wall is
+focused on. It is modeled on the `data` MCP in `data-layer` (same
+`@modelcontextprotocol/sdk` stdio pattern), but runs directly with `node` — no
+build step.
+
+## Tools
+
+### `list_sessions` (no args)
+Scans `~/.claude/projects/*/*.jsonl` and returns the **5 most recently active**
+sessions (by file mtime), newest first:
+
+```json
+[{ "id": "...", "title": "...", "cwd": "...", "project": "...", "last_active": "ISO" }]
+```
+
+- `title` = the latest `ai-title` record's `aiTitle` in the file. Fallback: the
+  first user-message snippet, else the session id.
+- `cwd` = the last `cwd` field seen in the file.
+- `project` = the project directory name under `~/.claude/projects/`.
+
+Files are read via a bounded tail (256 KB) with a bounded head fallback, so it
+stays fast even on multi-thousand-line transcripts.
+
+### `set_focus` (`{ target: string }`)
+`target` is either the literal `"hub"` or a fuzzy reference to one of the 5
+recent sessions:
+
+- `"hub"` (also matches "wall"/"home"/"dashboard"/"tv") → focus `'hub'`.
+- `"most recent"` / `"latest"` / `"last"` → the newest session.
+- otherwise → keyword/substring match against each session's title and project;
+  best single match wins (it tells you when it picked among ties).
+
+It then `PATCH`es the `voice_focus` singleton (`id=eq.1`) over Supabase REST:
+
+```json
+{ "focus": "hub | <session-id>", "label": "<title or 'Hub'>",
+  "session_cwd": "<cwd or null>", "updated_by": "mcp", "updated_at": "<now>" }
+```
+
+`terminal_url` is intentionally left untouched — the orchestrator sets/clears it.
+Returns a human-readable confirmation describing what got focused.
+
+## Environment
+
+Both come from the process env at runtime (no secrets committed):
+
+- `SUPABASE_URL` — `https://felyggqjjhltwokdfhop.supabase.co`
+- `SUPABASE_KEY` — the `life-data` project **service_role** key
+
+## Running
+
+```bash
+npm install
+SUPABASE_URL=... SUPABASE_KEY=... node src/index.js   # stdio MCP server
+npm run test:list                                     # prints the 5 recent sessions
+```
+
+## Registration
+
+Already registered for interactive Claude sessions in `~/.claude.json` under
+`mcpServers.voice` (stdio, `command: node`, args pointing at
+`src/index.js`, env `{SUPABASE_URL, SUPABASE_KEY}`), alongside the existing
+`data` server.
+
+**Worker note:** the voice-pipeline worker that spawns Claude with
+`--mcp-config` should include this server too, so worker-spawned sessions can
+list/switch focus. Add an entry like:
+
+```json
+{
+  "mcpServers": {
+    "voice": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["/Users/jaredgantt/repos/voice-pipeline/mcp-voice/src/index.js"],
+      "env": {
+        "SUPABASE_URL": "https://felyggqjjhltwokdfhop.supabase.co",
+        "SUPABASE_KEY": "<service_role key>"
+      }
+    }
+  }
+}
+```
+
+The parent/orchestrator wires the worker's `--mcp-config`; this repo is not
+deployed automatically.
+```
