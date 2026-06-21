@@ -1,0 +1,5 @@
+openwakeword
+sounddevice
+numpy
+scipy
+httpx
