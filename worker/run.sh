@@ -12,6 +12,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# Local secrets (ANTHROPIC_API_KEY for the SDK routing path, etc.) — gitignored.
+[ -f .env ] && { set -a; . ./.env; set +a; }
+
 export SUPABASE_URL="${SUPABASE_URL:-https://felyggqjjhltwokdfhop.supabase.co}"
 export WORKER_ID="${WORKER_ID:-mac}"
 export WORKER_PRIORITY="${WORKER_PRIORITY:-mac,pi}"

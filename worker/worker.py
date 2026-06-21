@@ -23,6 +23,7 @@ Design notes:
   a calendar-day rollover (see should_reset_session()).
 """
 
+import asyncio
 import difflib
 import json
 import os
@@ -512,6 +513,121 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
 # --------------------------------------------------------------------------- #
 
 
+# --------------------------------------------------------------------------- #
+# Warm Agent SDK path (routing_mode='sdk', and always on Fly). A persistent ClaudeSDKClient lives in a
+# dedicated background event loop so the MCP servers connect ONCE and stay hot across requests — no
+# per-command CLI/MCP cold start. Uses the Anthropic API (ANTHROPIC_API_KEY) → billed to the SDK
+# credit, unlike the subscription `claude -p` path above.
+# --------------------------------------------------------------------------- #
+
+
+class SdkRunner:
+    def __init__(self):
+        self._loop = None
+        self._client = None
+        self._last = 0.0
+        self._day = None
+
+    def _start_loop(self):
+        if self._loop is None:
+            self._loop = asyncio.new_event_loop()
+            threading.Thread(target=self._loop.run_forever, name="sdk-loop", daemon=True).start()
+
+    async def _disconnect(self):
+        try:
+            if self._client:
+                await self._client.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def reset(self):
+        """Drop the warm client so the next request starts a fresh conversation."""
+        if self._client is not None and self._loop is not None:
+            try:
+                asyncio.run_coroutine_threadsafe(self._disconnect(), self._loop).result(timeout=10)
+            except Exception:  # noqa: BLE001
+                pass
+        self._client = None
+
+    async def _ensure_client(self, system_append):
+        if self._client is not None:
+            return
+        from claude_agent_sdk import (ClaudeSDKClient, ClaudeAgentOptions,
+                                      PermissionResultAllow, PermissionResultDeny)
+        mcp_env = {"SUPABASE_URL": SUPABASE_URL, "SUPABASE_KEY": SUPABASE_KEY}
+
+        async def _can_use_tool(tool_name, tool_input, context):  # allowlist: MCP tools only, no prompts
+            if str(tool_name).startswith("mcp__"):
+                return PermissionResultAllow()
+            return PermissionResultDeny(message="only MCP tools are permitted")
+
+        sysprompt = {"type": "preset", "preset": "claude_code"}
+        if system_append:
+            sysprompt["append"] = system_append
+        opts = ClaudeAgentOptions(
+            mcp_servers={
+                "data": {"type": "stdio", "command": "node", "args": [DATA_MCP_JS], "env": mcp_env},
+                "voice": {"type": "stdio", "command": "node", "args": [VOICE_MCP_JS], "env": mcp_env},
+                "govee-lights": {"type": "stdio", "command": GOVEE_PY, "args": [GOVEE_MCP_PY]},
+            },
+            allowed_tools=["mcp__data", "mcp__voice", "mcp__govee-lights"],
+            can_use_tool=_can_use_tool,
+            system_prompt=sysprompt,
+        )
+        self._client = ClaudeSDKClient(opts)
+        await self._client.connect()
+
+    async def _run(self, transcript, system_append, on_event):
+        from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
+        await self._ensure_client(system_append)
+        await self._client.query(transcript)
+        parts, raw_error = [], None
+        async for msg in self._client.receive_response():
+            if isinstance(msg, AssistantMessage):
+                for b in msg.content:
+                    if isinstance(b, TextBlock):
+                        parts.append(b.text)
+                    elif isinstance(b, ToolUseBlock) and on_event:
+                        try:
+                            on_event("tool", {"name": b.name, "input": b.input})
+                        except Exception:  # noqa: BLE001
+                            pass
+            elif isinstance(msg, ResultMessage):
+                if getattr(msg, "is_error", False):
+                    raw_error = getattr(msg, "result", None) or "sdk reported error"
+        text = "".join(parts).strip()
+        return {"session_id": None, "text": text, "result": text,
+                "ok": raw_error is None and bool(text), "raw_error": raw_error}
+
+    def run(self, transcript, system_append="", on_event=None) -> dict:
+        self._start_loop()
+        now = time.monotonic()
+        today = datetime.now().astimezone().date()
+        if self._client is not None and (now - self._last > SESSION_IDLE_RESET_S or self._day != today):
+            self.reset()   # fresh conversation on idle / day rollover, matching the subscription path
+        self._last, self._day = now, today
+        try:
+            fut = asyncio.run_coroutine_threadsafe(self._run(transcript, system_append, on_event), self._loop)
+            return fut.result(timeout=CLAUDE_TIMEOUT_S + 30)
+        except Exception as e:  # noqa: BLE001 — a dead warm client shouldn't wedge the worker
+            self.reset()
+            return {"session_id": None, "text": "", "result": "",
+                    "ok": False, "raw_error": f"sdk run failed: {e}"}
+
+
+SDK = SdkRunner()
+
+
+def get_routing_mode(db: Supabase) -> str:
+    """'sdk' (warm Agent SDK, API/credit) or 'subscription' (claude -p). Fly is always sdk (API-only)."""
+    if WORKER_ID == "fly":
+        return "sdk"
+    rows = db.get("app_settings", "key=eq.routing_mode&select=value")
+    if rows and rows[0].get("value") in ("sdk", "subscription"):
+        return rows[0]["value"]
+    return "subscription"
+
+
 def get_focus(db: Supabase) -> str:
     rows = db.get("voice_focus", "id=eq.1&select=focus")
     if rows and isinstance(rows, list) and rows[0].get("focus"):
@@ -605,6 +721,7 @@ def process_request(db: Supabase, req: dict) -> None:
             HUB_SESSION_FILE.unlink(missing_ok=True)
         except Exception as e:
             log(f"reset: unlink hub_session failed: {e}")
+        SDK.reset()   # also drop the warm SDK conversation, if any
         db.patch("voice_requests", f"id=eq.{rid}",
                  {"status": "done", "result": "(context reset)", "updated_at": now_iso()})
         log("hub context reset — session dropped")
@@ -677,7 +794,11 @@ def process_request(db: Supabase, req: dict) -> None:
     if quick:
         prompt += QUICK_REPLY_DIRECTIVE
 
-    result = run_claude(prompt, resume_id, on_event=_emit, system_append=govee_context())
+    sys_ctx = govee_context()
+    if get_routing_mode(db) == "sdk":
+        result = SDK.run(prompt, system_append=sys_ctx, on_event=_emit)      # warm Agent SDK (API/credit)
+    else:
+        result = run_claude(prompt, resume_id, on_event=_emit, system_append=sys_ctx)  # claude -p (subscription)
 
     if result.get("session_id"):
         write_hub_session(result["session_id"])
