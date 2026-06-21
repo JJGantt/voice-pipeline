@@ -23,6 +23,7 @@ import re
 import time
 import wave
 from collections import deque
+from http import HTTPStatus
 
 import httpx
 import numpy as np
@@ -41,6 +42,10 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
 # Optional device-token auth on the ws handshake; enforced only when set.
 VOICE_DEVICE_TOKEN = os.environ.get("VOICE_DEVICE_TOKEN")
+# Shared secret the worker uses to ping POST /led-off when the model finishes (turns the ESP LED off).
+LED_TOKEN = os.environ.get("LED_TOKEN", "")
+# The currently-connected ESP, so the /led-off HTTP handler can reach it. One device → one global ref.
+_active_esp = None
 
 SAMPLE_RATE = 16_000
 FRAME_SAMPLES = 1280          # 80 ms @ 16 kHz — openWakeWord's expected chunk
@@ -92,7 +97,7 @@ async def transcribe(pcm: bytes) -> str:
     return (result if isinstance(result, str) else getattr(result, "text", "")).strip()
 
 
-async def handle_transcript(text: str, duration_s: float, truncated: bool):
+async def handle_transcript(text: str, duration_s: float, truncated: bool) -> bool:
     """HANDOFF SEAM — the rest of the system hooks in here.
 
     `duration_s` is the captured length; `truncated` is True if the capture ended
@@ -103,24 +108,27 @@ async def handle_transcript(text: str, duration_s: float, truncated: bool):
     # trigger word, not part of the command. Tolerant of Whisper mishears (raspy/rhaspy/raspberry/etc.).
     text = re.sub(r"^\W*(hey|hi|ok|okay)?\W*(rhasspy|rhaspy|raspy|rasbee|rasby|raspberry|rasp)\b[\s,.!:;-]*",
                   "", text or "", count=1, flags=re.IGNORECASE).strip()
-    if SUPABASE_URL and SUPABASE_ANON_KEY and text:
-        # Best-effort enqueue into the Supabase voice_requests table. The anon key
-        # is INSERT-only by RLS, so we send only the two fields and ask for no
-        # representation back (Prefer: return=minimal). Never raise on failure.
-        try:
-            async with httpx.AsyncClient(timeout=10) as c:
-                await c.post(
-                    f"{SUPABASE_URL}/rest/v1/voice_requests",
-                    headers={
-                        "apikey": SUPABASE_ANON_KEY,
-                        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-                        "Content-Type": "application/json",
-                        "Prefer": "return=minimal",
-                    },
-                    json={"transcript": text, "source": "fly"},
-                )
-        except Exception as e:
-            log.warning("supabase enqueue failed: %s", e)
+    if not (SUPABASE_URL and SUPABASE_ANON_KEY and text):
+        return False
+    # Best-effort enqueue into the Supabase voice_requests table. The anon key is INSERT-only by RLS,
+    # so we send only the two fields and ask for no representation back. Returns whether it enqueued
+    # (the caller drives the LED: blink while the worker is working, off otherwise).
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            await c.post(
+                f"{SUPABASE_URL}/rest/v1/voice_requests",
+                headers={
+                    "apikey": SUPABASE_ANON_KEY,
+                    "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+                    "Content-Type": "application/json",
+                    "Prefer": "return=minimal",
+                },
+                json={"transcript": text, "source": "fly"},
+            )
+        return True
+    except Exception as e:
+        log.warning("supabase enqueue failed: %s", e)
+        return False
 
 
 def _client_token(ws) -> str | None:
@@ -151,6 +159,7 @@ def _client_token(ws) -> str | None:
 
 
 async def connection(ws):
+    global _active_esp
     peer = getattr(ws, "remote_address", "?")
     # Device-token gate: enforced only when VOICE_DEVICE_TOKEN is set, so existing
     # firmware that doesn't send a token keeps working until it's updated.
@@ -160,6 +169,7 @@ async def connection(ws):
             await ws.close(code=1008, reason="invalid device token")
             return
     log.info("ESP32 connected: %s", peer)
+    _active_esp = ws
     oww.reset()
 
     pending = bytearray()           # raw bytes not yet aligned to a frame
@@ -199,7 +209,7 @@ async def connection(ws):
                 if scores.get(WAKE_MODEL, 0.0) >= WAKE_THRESHOLD:
                     floor = float(np.median(ambient)) if ambient else 0.0
                     threshold = max(floor * FLOOR_MULT, floor + FLOOR_MIN_MARGIN)
-                    await ws.send("LED_BLINK")   # listening
+                    await ws.send("LED_ON")   # solid while recording you
                     capturing = True
                     utterance = bytearray(preroll)
                     preroll.clear()
@@ -220,17 +230,55 @@ async def connection(ws):
                         log.warning("utterance hit %ds cap while still active — truncated", int(MAX_UTTERANCE_S))
                     elif dur >= LONG_UTTERANCE_WARN_S:
                         log.warning("long utterance: %.0fs", dur)
+                    enqueued = False
                     try:
                         text = await transcribe(bytes(utterance))
-                        await handle_transcript(text, dur, truncated)
+                        enqueued = await handle_transcript(text, dur, truncated)
                     except Exception as e:
                         log.exception("transcription failed: %s", e)
-                    await ws.send("LED_OFF")     # back to idle
+                    if enqueued:
+                        await ws.send("LED_BLINK")            # working — the worker LED_OFFs when the model finishes
+                        asyncio.create_task(_led_safety(ws))  # backstop in case no done-ping arrives
+                    else:
+                        await ws.send("LED_OFF")              # nothing to do → idle
                     capturing = False
                     utterance = bytearray()
                     oww.reset()
 
+    if _active_esp is ws:
+        _active_esp = None
     log.info("ESP32 disconnected: %s", peer)
+
+
+LED_SAFETY_S = 60.0  # clear the 'working' blink after this long even if the worker never pings
+
+
+async def _led_safety(ws):
+    """Backstop: clear the working blink after a while even if the worker's done-ping never arrives."""
+    try:
+        await asyncio.sleep(LED_SAFETY_S)
+        await ws.send("LED_OFF")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def process_request(path, request_headers):
+    """Plain HTTP on the same port. The worker POSTs /led-off?token=... when the model finishes, so the
+    ESP light goes blink (working) → off. Non-matching paths return None → the WS handshake proceeds."""
+    if path.startswith("/led-off"):
+        from urllib.parse import urlparse, parse_qs
+        tok = parse_qs(urlparse(path).query).get("token", [None])[0]
+        if LED_TOKEN and tok != LED_TOKEN:
+            return (HTTPStatus.FORBIDDEN, [], b"forbidden\n")
+        if _active_esp is not None:
+            try:
+                await _active_esp.send("LED_OFF")
+            except Exception:  # noqa: BLE001
+                pass
+        return (HTTPStatus.OK, [], b"ok\n")
+    if path in ("/health", "/"):
+        return (HTTPStatus.OK, [], b"ok\n")
+    return None
 
 
 async def main():
@@ -240,7 +288,8 @@ async def main():
     # utterance ("keepalive ping timeout"). The constant audio stream keeps the socket live;
     # if the ESP drops, the recv loop ends on its own.
     async with websockets.serve(connection, "0.0.0.0", PORT, max_size=None,
-                                ping_interval=None, close_timeout=5):
+                                ping_interval=None, close_timeout=5,
+                                process_request=process_request):
         await asyncio.Future()
 
 

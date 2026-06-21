@@ -95,6 +95,21 @@ def push_activity(text: str, state: str = "tool") -> None:
     except Exception:  # noqa: BLE001
         pass
 
+
+# After an ESP-sourced ('fly') request finishes, tell the voice server so the ESP light goes from
+# 'working' (blink) → off. The server holds the ESP socket; we just hit its /led-off HTTP route.
+LED_TOKEN = os.environ.get("LED_TOKEN", "")
+LED_PING_URL = os.environ.get("LED_PING_URL", "https://jared-voice.fly.dev/led-off")
+
+
+def ping_esp_led_off() -> None:
+    if not LED_PING_URL:
+        return
+    try:
+        httpx.get(LED_PING_URL, params={"token": LED_TOKEN} if LED_TOKEN else None, timeout=3.0)
+    except Exception:  # noqa: BLE001
+        pass
+
 # Orchestrator (Mac) — when focus is a specific Mac session, the transcript is
 # injected into that session's wall terminal via the orchestrator instead of
 # running a fresh `claude -p`.
@@ -879,6 +894,9 @@ def one_iteration(db: Supabase) -> bool:
             )
         except Exception:  # noqa: BLE001
             pass
+    finally:
+        if (req.get("source") or "").strip() == "fly":
+            ping_esp_led_off()   # model done (or dropped/errored) → clear the ESP working-light
     return True
 
 
