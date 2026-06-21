@@ -124,6 +124,24 @@ QUICK_REPLY_DIRECTIVE = (
     "in under 7 words.]"
 )
 
+# Sentinel the model emits to silently drop a turn (wake-word false positive). Matched loosely below.
+IGNORE_SENTINEL = "__IGNORE__"
+
+# Always-on voice listeners (ESP, Mac) occasionally false-trigger on noise/silence, so the transcript
+# can be a mishear, not a real request (a stray word, or a Whisper artifact like "thank you" from
+# silence). Appended to transcribed turns so the model can drop obvious noise instead of earnestly
+# answering it. Transcribed sources only — typed input is intentional and never gets this.
+WAKE_NOISE_DIRECTIVE = (
+    "\n\n[This text came from an always-on voice wake-word listener that frequently FALSE-TRIGGERS on "
+    "background noise or silence, so it is often a mis-transcription rather than a real instruction. This "
+    "system ONLY handles actual commands, requests, or questions you can act on. If the text is NOT a "
+    "genuine actionable request — that includes bare pleasantries or acknowledgements ('thank you', "
+    "'thanks', 'okay', 'you', 'bye', 'cool'), lone stray words ('speed'), filler, or anything nonsensical "
+    "or blatantly unrelated — then it is almost certainly a false trigger: do NOT respond, do NOT thank "
+    "them back, do NOT ask for clarification. Reply with EXACTLY "
+    f"'{IGNORE_SENTINEL}' and nothing else. Only respond normally when there is a real task or question.]"
+)
+
 # --------------------------------------------------------------------------- #
 # Small helpers
 # --------------------------------------------------------------------------- #
@@ -554,12 +572,8 @@ def process_request(db: Supabase, req: dict) -> None:
         )
         return
 
-    # Write the user turn.
-    db.post(
-        "voice_messages",
-        {"request_id": rid, "focus": "hub", "role": "user",
-         "text": transcript, "done": True},
-    )
+    # (The user turn is written AFTER the model runs — deferred so a wake-word false positive that the
+    # model drops never appears in the conversation. See below.)
 
     # Hub session management.
     state = read_hub_session()
@@ -587,20 +601,41 @@ def process_request(db: Supabase, req: dict) -> None:
         text = (short + (" " + argstr if argstr else "")).strip()
         push_activity(text, "tool")  # direct push → instant activity bar (transient, not stored)
 
-    # Quick-add FAB turns ask for a terse, fits-in-the-chip confirmation; the user bubble above stays
-    # clean (the directive rides only on the prompt handed to Claude, never shown in the thread).
-    quick = (req.get("source") or "").strip() == "web-quick"
-    prompt = transcript + QUICK_REPLY_DIRECTIVE if quick else transcript
+    # Per-source prompt directives (ride only on the prompt handed to Claude, never shown in the thread):
+    #  · transcribed sources (ESP/Mac/quick-FAB) get false-positive awareness so noise mis-hears drop,
+    #  · the quick-add FAB additionally gets the terse fits-in-the-chip reply format.
+    source = (req.get("source") or "").strip()
+    quick = source == "web-quick"
+    audio = source in ("fly", "mac", "web-quick")   # transcribed (mishear-prone); typed text is excluded
+    prompt = transcript
+    if audio:
+        prompt += WAKE_NOISE_DIRECTIVE
+    if quick:
+        prompt += QUICK_REPLY_DIRECTIVE
 
     result = run_claude(prompt, resume_id, on_event=_emit)
-    push_activity((result.get("text") or "").strip()[:120], "done")  # close out the activity bar w/ the result
 
     if result.get("session_id"):
         write_hub_session(result["session_id"])
         log(f"captured session_id {result['session_id']}")
 
+    text = (result.get("text") or "").strip()
+
+    # Wake-word false positive: the model flagged the transcript as noise/mishear → drop it silently.
+    # No user OR assistant turn is written, so the conversation stays clean; just clear the activity bar.
+    if audio and re.sub(r"[^a-z]", "", text.lower()) == "ignore":
+        push_activity("(ignored — likely noise)", "done")
+        db.patch("voice_requests", f"id=eq.{rid}",
+                 {"status": "done", "result": "(ignored: wake-word false positive)", "updated_at": now_iso()})
+        log(f"ignored likely false-positive: {transcript[:60]!r}")
+        return
+
+    # Real turn → now write the user bubble (deferred past the noise check), then close the activity bar.
+    db.post("voice_messages",
+            {"request_id": rid, "focus": "hub", "role": "user", "text": transcript, "done": True})
+    push_activity(text[:120], "done")  # close out the activity bar w/ the result
+
     if result["ok"]:
-        text = result["text"]
         db.post(
             "voice_messages",
             {"request_id": rid, "focus": "hub", "role": "assistant",
