@@ -23,6 +23,7 @@ Design notes:
   a calendar-day rollover (see should_reset_session()).
 """
 
+import difflib
 import json
 import os
 import re
@@ -537,6 +538,30 @@ def claim_one(db: Supabase) -> dict | None:
     return claimed[0]
 
 
+def _norm_text(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+
+
+def _duplicate_of_recent(db: Supabase, req: dict) -> bool:
+    """True if another request within ~8s has a near-identical transcript and was already claimed/done —
+    i.e. a second always-on listener (ESP + Mac) heard the same utterance. Keeps the EARLIER request."""
+    rid = req.get("id")
+    tx = _norm_text(req.get("transcript") or "")
+    ts = _parse_ts(req.get("created_at") or "")
+    if not tx or ts is None:
+        return False
+    rows = db.get("voice_requests", "select=id,transcript,created_at,status&order=created_at.desc&limit=12")
+    for r in rows:
+        if r.get("id") == rid or r.get("status") not in ("claimed", "done"):
+            continue
+        ots = _parse_ts(r.get("created_at") or "")
+        if ots is None or abs((ts - ots).total_seconds()) > 8:
+            continue
+        if ots <= ts and difflib.SequenceMatcher(None, tx, _norm_text(r.get("transcript") or "")).ratio() >= 0.75:
+            return True
+    return False
+
+
 def process_request(db: Supabase, req: dict) -> None:
     rid = req["id"]
     transcript = req.get("transcript") or ""
@@ -570,6 +595,15 @@ def process_request(db: Supabase, req: dict) -> None:
              if ok else
              {"status": "error", "error": err or "inject failed", "updated_at": now_iso()}),
         )
+        return
+
+    # Dedup: multiple always-on listeners (ESP + Mac) hear one utterance, so it lands as several requests
+    # a few seconds apart. If a near-simultaneous, near-identical transcript was already handled, drop this
+    # one so the command never runs twice. v1 keeps the earlier request; quality-ranked pick comes later.
+    if _duplicate_of_recent(db, req):
+        db.patch("voice_requests", f"id=eq.{rid}",
+                 {"status": "done", "result": "(duplicate — dropped)", "updated_at": now_iso()})
+        log(f"dropped duplicate request {rid}: {transcript[:60]!r}")
         return
 
     # (The user turn is written AFTER the model runs — deferred so a wake-word false positive that the
