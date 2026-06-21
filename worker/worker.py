@@ -118,11 +118,10 @@ RESET_SENTINEL = "__RESET_CONTEXT__"
 # is shown as the user's bubble; this text is invisible to the conversation.
 QUICK_REPLY_DIRECTIVE = (
     "\n\n[Reply format for THIS turn only: this came from the quick-add voice button, whose reply shows "
-    "in a tiny status chip for a couple seconds. After doing the task, reply with ONE phrase of 3–7 words "
-    "that simply CONFIRMS THE ACTION you performed — e.g. \"Lunch bagel logged\", \"Weight logged\", "
-    "\"Lights set to blue\", \"Milk added to the list\", \"Workout set added\". Do NOT report numbers, "
-    "totals, calories, weights, or any stats — the dashboard already shows those, so echoing them is noise. "
-    "No greeting, no explanation, no question. If nothing could be done, say so in under 7 words.]"
+    "in a tiny status chip for a couple seconds. Do the task, then confirm in ONE phrase of 3–7 words "
+    "naming what was done — e.g. \"Lunch bagel logged\", \"Weight logged: 178\", \"Lights set to blue\", "
+    "\"Added milk to the list\". No greeting, no explanation, no follow-up question. If it failed, say so "
+    "in under 7 words.]"
 )
 
 # --------------------------------------------------------------------------- #
