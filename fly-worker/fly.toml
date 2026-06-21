@@ -1,0 +1,14 @@
+# Fly fallback voice worker (no inbound service — it polls Supabase). Always-on, single machine.
+app = "jared-voice-worker"
+primary_region = "iad"
+
+[build]
+
+[env]
+  WORKER_ID = "fly"
+  WORKER_PRIORITY = "mac,pi,fly"
+  SUPABASE_URL = "https://felyggqjjhltwokdfhop.supabase.co"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1gb"

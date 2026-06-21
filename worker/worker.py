@@ -588,12 +588,17 @@ class SdkRunner:
         sysprompt = {"type": "preset", "preset": "claude_code"}
         if system_append:
             sysprompt["append"] = system_append
+        # Only wire MCP servers whose files exist — the Fly fallback image has no Govee LAN MCP, and
+        # the LAN lights aren't reachable from the cloud anyway, so it degrades gracefully.
+        servers = {}
+        if os.path.exists(DATA_MCP_JS):
+            servers["data"] = {"type": "stdio", "command": "node", "args": [DATA_MCP_JS], "env": mcp_env}
+        if os.path.exists(VOICE_MCP_JS):
+            servers["voice"] = {"type": "stdio", "command": "node", "args": [VOICE_MCP_JS], "env": mcp_env}
+        if os.path.exists(GOVEE_MCP_PY):
+            servers["govee-lights"] = {"type": "stdio", "command": GOVEE_PY, "args": [GOVEE_MCP_PY]}
         opts = ClaudeAgentOptions(
-            mcp_servers={
-                "data": {"type": "stdio", "command": "node", "args": [DATA_MCP_JS], "env": mcp_env},
-                "voice": {"type": "stdio", "command": "node", "args": [VOICE_MCP_JS], "env": mcp_env},
-                "govee-lights": {"type": "stdio", "command": GOVEE_PY, "args": [GOVEE_MCP_PY]},
-            },
+            mcp_servers=servers,
             allowed_tools=["mcp__data", "mcp__voice", "mcp__govee-lights"],
             can_use_tool=_can_use_tool,
             system_prompt=sysprompt,
