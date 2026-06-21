@@ -9,11 +9,13 @@ feeds. The Mac worker then drains it into the shared 'hub' conversation, identic
 front-end. The Mac is just another set of ears.
 """
 
+import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import wave
 from datetime import datetime, timezone
@@ -45,6 +47,53 @@ MIN_UTTER_S = 0.4      # ignore sub-0.4s "utterances" (just the wake tail)
 
 def log(msg: str) -> None:
     print(f"{datetime.now(timezone.utc).isoformat()} [mac-listener] {msg}", flush=True)
+
+
+# ---- local feedback: a visual wake notification + Raspy's reply spoken aloud --------------------
+SPEAK_SH = os.path.expanduser("~/scripts/speak.sh")
+
+
+def notify(msg: str) -> None:
+    """Visual 'I heard you' cue (macOS notification) — no audio chime before the command."""
+    try:
+        subprocess.run(["osascript", "-e", f'display notification {json.dumps(msg)} with title "Raspy"'],
+                       capture_output=True, timeout=5)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _latest_assistant_id():
+    try:
+        r = httpx.get(f"{SUPABASE_URL}/rest/v1/voice_messages",
+                      params={"focus": "eq.hub", "role": "eq.assistant", "order": "created_at.desc",
+                              "limit": "1", "select": "id"},
+                      headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=8)
+        rows = r.json()
+        return rows[0]["id"] if rows else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def speak_reply(baseline) -> None:
+    """Wait for Raspy's reply to land in the shared thread (whichever listener's request produced it —
+    robust to dedup), then speak it aloud. Background thread → never blocks the wake loop."""
+    deadline = time.time() + 45
+    while time.time() < deadline:
+        time.sleep(1.5)
+        try:
+            r = httpx.get(f"{SUPABASE_URL}/rest/v1/voice_messages",
+                          params={"focus": "eq.hub", "role": "eq.assistant", "order": "created_at.desc",
+                                  "limit": "1", "select": "id,text"},
+                          headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=8)
+            rows = r.json()
+            if rows and rows[0]["id"] != baseline and (rows[0].get("text") or "").strip():
+                try:
+                    subprocess.run([SPEAK_SH], input=rows[0]["text"], text=True, capture_output=True, timeout=90)
+                except Exception as e:  # noqa: BLE001
+                    log(f"speak failed: {e}")
+                return
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def strip_wake(text: str) -> str:
@@ -184,11 +233,14 @@ def main() -> int:
             score = oww.predict(audio).get(WAKE_MODEL, 0.0)
             if score >= WAKE_THRESHOLD:
                 log(f"wake! (score {score:.2f}) — capturing…")
+                notify("🎙 Listening…")
+                baseline = _latest_assistant_id()   # snapshot before this command's reply lands
                 pcm = capture_utterance(stream)
                 text = strip_wake(transcribe(pcm))
                 if text:
                     log(f"transcript: {text!r}")
                     enqueue(text)
+                    threading.Thread(target=speak_reply, args=(baseline,), daemon=True).start()
                 else:
                     log("…nothing intelligible, ignoring")
                 oww.reset()  # clear the activation so the next wake is fresh

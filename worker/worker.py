@@ -159,6 +159,15 @@ WAKE_NOISE_DIRECTIVE = (
     f"'{IGNORE_SENTINEL}' and nothing else. Only respond normally when there is a real task or question.]"
 )
 
+# Always-on voice (ESP/Mac) replies are spoken aloud, so they must be very short. Appended to fly/mac
+# turns. (The quick-add FAB has its own terser directive; typed web turns get neither.)
+VOICE_REPLY_DIRECTIVE = (
+    "\n\n[This came in by voice and the reply is spoken aloud — be VERY succinct: confirm the result in "
+    "ONE short phrase (e.g. 'Floor lamp blue at 10%', 'Logged the bagel', 'About 1,800 calories'). No "
+    "preamble, no 'I'll do X' narration, no follow-up question — just the essential result.]"
+)
+
+
 # Govee lights the model can control. We read their display names from the govee MCP's env file and
 # inject them into the system prompt every turn, so the model acts on "the floor lamp" immediately
 # instead of burning a round-trip on a list/lookup tool first.
@@ -808,6 +817,8 @@ def process_request(db: Supabase, req: dict) -> None:
         prompt += WAKE_NOISE_DIRECTIVE
     if quick:
         prompt += QUICK_REPLY_DIRECTIVE
+    if source in ("fly", "mac"):
+        prompt += VOICE_REPLY_DIRECTIVE   # spoken aloud → keep it short
 
     sys_ctx = govee_context()
     if get_routing_mode(db) == "sdk":

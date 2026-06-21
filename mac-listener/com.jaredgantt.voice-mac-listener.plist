@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Always-on Mac voice listener. Install with:
+       cp com.jaredgantt.voice-mac-listener.plist ~/Library/LaunchAgents/
+       launchctl load ~/Library/LaunchAgents/com.jaredgantt.voice-mac-listener.plist
+     First run will need Microphone permission granted (System Settings → Privacy → Microphone). -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.jaredgantt.voice-mac-listener</string>
+  <key>ProgramArguments</key>
+  <array><string>/Users/jaredgantt/repos/voice-pipeline/mac-listener/run.sh</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/Users/jaredgantt/repos/voice-pipeline/mac-listener/listener.out.log</string>
+  <key>StandardErrorPath</key><string>/Users/jaredgantt/repos/voice-pipeline/mac-listener/listener.err.log</string>
+</dict>
+</plist>
