@@ -32,7 +32,7 @@ from openwakeword.model import Model
 
 # ---- config (env) ----------------------------------------------------------
 PORT = int(os.environ.get("PORT", "8080"))
-WAKE_MODEL = os.environ.get("WAKE_MODEL", "hey_jarvis")  # openWakeWord pretrained name
+WAKE_MODEL = os.environ.get("WAKE_MODEL", "hey_rhasspy")  # openWakeWord pretrained name ("Hey Rhasspy")
 WAKE_THRESHOLD = float(os.environ.get("WAKE_THRESHOLD", "0.5"))
 GAIN = float(os.environ.get("GAIN", "15"))   # software boost for the quiet 16-bit mic
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "whisper-large-v3-turbo")
@@ -99,9 +99,9 @@ async def handle_transcript(text: str, duration_s: float, truncated: bool):
     by hitting MAX_UTTERANCE_S while speech was still active (the hub surfaces this).
     """
     log.info("TRANSCRIPT (%.0fs%s): %r", duration_s, ", TRUNCATED" if truncated else "", text)
-    # Strip a leading wake phrase the STT often captures ("Hey Jarvis, ...") — it's the
-    # trigger word, not part of the command. Tolerant of Whisper mishears (jervis/jarvis/etc.).
-    text = re.sub(r"^\W*(hey|hi|ok|okay)?\W*(jarvis|jervis|jarvi|jaravis|travis)\b[\s,.!:;-]*",
+    # Strip a leading wake phrase the STT often captures ("Hey Rhasspy, ...") — it's the
+    # trigger word, not part of the command. Tolerant of Whisper mishears (raspy/rhaspy/raspberry/etc.).
+    text = re.sub(r"^\W*(hey|hi|ok|okay)?\W*(rhasspy|rhaspy|raspy|rasbee|rasby|raspberry|rasp)\b[\s,.!:;-]*",
                   "", text or "", count=1, flags=re.IGNORECASE).strip()
     if SUPABASE_URL and SUPABASE_ANON_KEY and text:
         # Best-effort enqueue into the Supabase voice_requests table. The anon key
