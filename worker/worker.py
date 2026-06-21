@@ -143,6 +143,34 @@ WAKE_NOISE_DIRECTIVE = (
     f"'{IGNORE_SENTINEL}' and nothing else. Only respond normally when there is a real task or question.]"
 )
 
+# Govee lights the model can control. We read their display names from the govee MCP's env file and
+# inject them into the system prompt every turn, so the model acts on "the floor lamp" immediately
+# instead of burning a round-trip on a list/lookup tool first.
+GOVEE_ENV = os.environ.get("GOVEE_ENV", "/Users/jaredgantt/repos/govee-mcp/.env-govee")
+
+
+def _govee_light_names() -> list:
+    names = []
+    try:
+        with open(GOVEE_ENV) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("GOVEE_LIGHT_") and "=" in line:
+                    parts = line.split("=", 1)[1].split(",", 2)
+                    if len(parts) == 3:
+                        names.append(parts[2].strip().strip('"').strip("'"))
+    except Exception:  # noqa: BLE001
+        pass
+    return names
+
+
+def govee_context() -> str:
+    names = _govee_light_names()
+    if not names:
+        return ""
+    return ("Govee smart lights you can control RIGHT NOW, by name, via the govee-lights tools — do NOT "
+            "call any list/lookup tool first, these ARE the available lights: " + ", ".join(names) + ".")
+
 # --------------------------------------------------------------------------- #
 # Small helpers
 # --------------------------------------------------------------------------- #
@@ -342,7 +370,7 @@ def write_mcp_config() -> str:
     return path
 
 
-def run_claude(transcript: str, resume_session_id: str | None, on_event=None) -> dict:
+def run_claude(transcript: str, resume_session_id: str | None, on_event=None, system_append: str = "") -> dict:
     """Run `claude -p` headless and STREAM the stream-json output, parsing events as they arrive.
 
     on_event(kind, payload) fires live during the run so progress can be surfaced — currently
@@ -363,6 +391,8 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None) ->
         "--verbose",
         "--allowedTools", "mcp__data", "mcp__voice", "mcp__govee-lights",
     ]
+    if system_append:
+        cmd += ["--append-system-prompt", system_append]
 
     session_id = None
     assistant_chunks: list[str] = []
@@ -647,7 +677,7 @@ def process_request(db: Supabase, req: dict) -> None:
     if quick:
         prompt += QUICK_REPLY_DIRECTIVE
 
-    result = run_claude(prompt, resume_id, on_event=_emit)
+    result = run_claude(prompt, resume_id, on_event=_emit, system_append=govee_context())
 
     if result.get("session_id"):
         write_hub_session(result["session_id"])
