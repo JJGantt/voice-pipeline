@@ -30,6 +30,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone, date
 from pathlib import Path
@@ -74,6 +75,24 @@ VOICE_MCP_JS = os.environ.get(
 GOVEE_PY = os.environ.get("GOVEE_PY", "/opt/homebrew/bin/python3.11")
 GOVEE_MCP_PY = os.environ.get("GOVEE_MCP_PY", "/Users/jaredgantt/repos/govee-mcp/govee_mcp.py")
 
+# Low-latency activity push to the status-hub server: transient "what Jarvis is doing" events go
+# straight to the SSE clients (bypassing Supabase realtime) so the on-screen activity bar tracks
+# tool calls in real time. Authenticated by the hub's kiosk token in the URL.
+HUB_PUSH_URL = os.environ.get(
+    "HUB_PUSH_URL",
+    "https://jared-status-hub.fly.dev/api/voice-activity?token=REDACTED",
+)
+
+
+def push_activity(text: str, state: str = "tool") -> None:
+    """Fire a transient activity event to the hub (best-effort; never raises)."""
+    if not HUB_PUSH_URL:
+        return
+    try:
+        httpx.post(HUB_PUSH_URL, json={"text": text, "state": state, "focus": "hub"}, timeout=2.0)
+    except Exception:  # noqa: BLE001
+        pass
+
 # Orchestrator (Mac) — when focus is a specific Mac session, the transcript is
 # injected into that session's wall terminal via the orchestrator instead of
 # running a fresh `claude -p`.
@@ -89,6 +108,21 @@ HTTP_TIMEOUT_S = 30.0
 CLAUDE_TIMEOUT_S = float(os.environ.get("CLAUDE_TIMEOUT_S", "300"))
 
 HUB_SESSION_FILE = STATE_DIR / "hub_session.json"
+# Sentinel the hub UI enqueues to force a fresh Claude session (manual "Reset context").
+# Must match VOICE_RESET_SENTINEL in the status-hub server.
+RESET_SENTINEL = "__RESET_CONTEXT__"
+
+# Quick-add requests (source 'web-quick', from the hub's bottom-right mic FAB) show their reply in a
+# tiny status chip that holds only a few words before it fades. Append this directive to the turn so
+# Jarvis still does the work but confirms it in one short phrase. Only the directive-free transcript
+# is shown as the user's bubble; this text is invisible to the conversation.
+QUICK_REPLY_DIRECTIVE = (
+    "\n\n[Reply format for THIS turn only: this came from a quick-add voice button whose reply shows "
+    "in a tiny chip that fits only a few words. Do the task, then confirm in ONE phrase of 3–7 words "
+    "naming what was done — e.g. \"Lunch bagel logged\", \"Weight logged: 178\", \"Lights set to blue\", "
+    "\"Added milk to the list\". No greeting, no explanation, no follow-up question. If it failed, say so "
+    "in under 7 words.]"
+)
 
 # --------------------------------------------------------------------------- #
 # Small helpers
@@ -289,15 +323,15 @@ def write_mcp_config() -> str:
     return path
 
 
-def run_claude(transcript: str, resume_session_id: str | None) -> dict:
-    """Run `claude -p` headless and parse the stream-json output.
+def run_claude(transcript: str, resume_session_id: str | None, on_event=None) -> dict:
+    """Run `claude -p` headless and STREAM the stream-json output, parsing events as they arrive.
 
-    Returns {"session_id": str|None, "text": str, "result": str, "ok": bool,
-             "raw_error": str|None}.
+    on_event(kind, payload) fires live during the run so progress can be surfaced — currently
+    on_event("tool", {"name", "input"}) for each tool call. Returns {"session_id", "text",
+    "result", "ok", "raw_error"}.
 
-    Tool allowlist is restricted to `mcp__data` only: no Bash/Edit/Read. In
-    headless `-p` mode a tool that is not in --allowedTools is DENIED (not
-    prompted), so the run never hangs waiting on a permission prompt.
+    Tool allowlist is restricted to the MCP servers: no Bash/Edit/Read. In headless `-p` mode a
+    tool that is not in --allowedTools is DENIED (not prompted), so the run never hangs.
     """
     mcp_path = write_mcp_config()
     cmd = [CLAUDE_BIN, "-p", transcript]
@@ -315,20 +349,41 @@ def run_claude(transcript: str, resume_session_id: str | None) -> dict:
     assistant_chunks: list[str] = []
     result_text = ""
     raw_error = None
+    proc = None
+    timed_out = {"v": False}
 
     try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=CLAUDE_TIMEOUT_S,
-            # Use a clean env but keep PATH/HOME so the subscription auth is found.
-            env=os.environ.copy(),
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1, env=os.environ.copy(),  # line-buffered so events arrive promptly
         )
-        stdout = proc.stdout or ""
-        stderr = proc.stderr or ""
+        # Watchdog: kill the run if it exceeds the timeout, which ends the streaming loop at EOF.
+        done = threading.Event()
 
-        for line in stdout.splitlines():
+        def _watchdog():
+            if not done.wait(CLAUDE_TIMEOUT_S):
+                timed_out["v"] = True
+                try:
+                    proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        threading.Thread(target=_watchdog, daemon=True).start()
+
+        # Drain stderr concurrently so it can't fill its pipe and deadlock the stdout reader below.
+        err_buf: list[str] = []
+
+        def _drain_err():
+            try:
+                for el in proc.stderr:
+                    err_buf.append(el)
+            except Exception:  # noqa: BLE001
+                pass
+
+        threading.Thread(target=_drain_err, daemon=True).start()
+
+        # Stream events as claude emits them (one JSON object per line).
+        for line in proc.stdout:
             line = line.strip()
             if not line:
                 continue
@@ -338,22 +393,26 @@ def run_claude(transcript: str, resume_session_id: str | None) -> dict:
                 continue
             etype = ev.get("type")
 
-            # init/system event carries the session id
-            if etype == "system":
+            if etype == "system":  # init event carries the session id
                 if ev.get("session_id"):
                     session_id = ev["session_id"]
 
-            # assistant message events: text lives in message.content[*].text
-            elif etype == "assistant":
+            elif etype == "assistant":  # text lives in content[*].text; tool calls in content[*].tool_use
                 msg = ev.get("message", {})
                 for block in msg.get("content", []) or []:
-                    if isinstance(block, dict) and block.get("type") == "text":
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "text":
                         assistant_chunks.append(block.get("text", ""))
+                    elif block.get("type") == "tool_use" and on_event:
+                        try:
+                            on_event("tool", {"name": block.get("name", ""), "input": block.get("input")})
+                        except Exception:  # noqa: BLE001
+                            pass
                 if ev.get("session_id"):
                     session_id = ev["session_id"]
 
-            # final result event
-            elif etype == "result":
+            elif etype == "result":  # final event
                 if ev.get("session_id"):
                     session_id = ev["session_id"]
                 if isinstance(ev.get("result"), str):
@@ -361,7 +420,14 @@ def run_claude(transcript: str, resume_session_id: str | None) -> dict:
                 if ev.get("is_error"):
                     raw_error = ev.get("result") or "claude reported is_error"
 
-        if proc.returncode != 0 and not result_text and not assistant_chunks:
+        done.set()
+        proc.wait(timeout=5)
+        stderr = "".join(err_buf)
+
+        if timed_out["v"]:
+            return {"session_id": session_id, "text": "", "result": "",
+                    "ok": False, "raw_error": f"claude timed out after {CLAUDE_TIMEOUT_S}s"}
+        if proc.returncode not in (0, None) and not result_text and not assistant_chunks:
             raw_error = raw_error or f"claude exited {proc.returncode}: {stderr[:500]}"
 
         text = result_text or "\n".join(c for c in assistant_chunks if c).strip()
@@ -372,15 +438,12 @@ def run_claude(transcript: str, resume_session_id: str | None) -> dict:
             "ok": raw_error is None and bool(text),
             "raw_error": raw_error,
         }
-    except subprocess.TimeoutExpired:
-        return {
-            "session_id": session_id,
-            "text": "",
-            "result": "",
-            "ok": False,
-            "raw_error": f"claude timed out after {CLAUDE_TIMEOUT_S}s",
-        }
     except Exception as e:  # noqa: BLE001
+        if proc is not None:
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
         return {
             "session_id": session_id,
             "text": "",
@@ -461,6 +524,19 @@ def process_request(db: Supabase, req: dict) -> None:
     transcript = req.get("transcript") or ""
     log(f"claimed request {rid}: {transcript[:80]!r}")
 
+    # Manual context reset from the hub UI: drop the resumed hub session so the next command starts
+    # fresh. The status-hub server already cleared the visible thread and pushed a live reset to
+    # every surface — here we just forget the Claude session and ack (no Claude run, no turns).
+    if transcript.strip() == RESET_SENTINEL:
+        try:
+            HUB_SESSION_FILE.unlink(missing_ok=True)
+        except Exception as e:
+            log(f"reset: unlink hub_session failed: {e}")
+        db.patch("voice_requests", f"id=eq.{rid}",
+                 {"status": "done", "result": "(context reset)", "updated_at": now_iso()})
+        log("hub context reset — session dropped")
+        return
+
     focus = get_focus(db)
 
     # Focus is a specific Mac session → inject the transcript into that session's
@@ -494,7 +570,30 @@ def process_request(db: Supabase, req: dict) -> None:
         resume_id = state["session_id"]
         log(f"hub session: resuming {resume_id}")
 
-    result = run_claude(transcript, resume_id)
+    # Surface tool calls live by pushing them straight to the hub's activity bar (transient — not
+    # stored in voice_messages, so they never appear in the conversation thread).
+    def _emit(kind, payload):
+        if kind != "tool":
+            return
+        name = str(payload.get("name") or "")
+        short = name.rsplit("__", 1)[-1] if "__" in name else name
+        try:
+            args = payload.get("input")
+            argstr = json.dumps(args, ensure_ascii=False, separators=(",", ":")) if args else ""
+        except Exception:  # noqa: BLE001
+            argstr = str(payload.get("input") or "")
+        if len(argstr) > 200:
+            argstr = argstr[:199] + "…"
+        text = (short + (" " + argstr if argstr else "")).strip()
+        push_activity(text, "tool")  # direct push → instant activity bar (transient, not stored)
+
+    # Quick-add FAB turns ask for a terse, fits-in-the-chip confirmation; the user bubble above stays
+    # clean (the directive rides only on the prompt handed to Claude, never shown in the thread).
+    quick = (req.get("source") or "").strip() == "web-quick"
+    prompt = transcript + QUICK_REPLY_DIRECTIVE if quick else transcript
+
+    result = run_claude(prompt, resume_id, on_event=_emit)
+    push_activity((result.get("text") or "").strip()[:120], "done")  # close out the activity bar w/ the result
 
     if result.get("session_id"):
         write_hub_session(result["session_id"])

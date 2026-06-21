@@ -174,6 +174,10 @@ async def connection(ws):
 
     async for msg in ws:
         if not isinstance(msg, (bytes, bytearray)):
+            # Non-audio control text from the device (e.g. "RSSI -67" signal telemetry). Log it so
+            # WiFi signal strength is visible in `fly logs`, then keep going — it isn't audio.
+            if isinstance(msg, str) and msg.startswith("RSSI"):
+                log.info("device %s %s dBm", peer, msg)
             continue
         pending.extend(msg)
 

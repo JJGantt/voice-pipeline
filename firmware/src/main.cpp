@@ -81,10 +81,12 @@ void setup() {
   digitalWrite(LED_PIN, LOW);
 
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);          // disable modem power-save — the #1 cause of periodic streaming drops
+  WiFi.setAutoReconnect(true);   // rejoin the AP automatically if the link drops
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) { delay(300); Serial.print("."); }
-  Serial.printf("\nConnected to WiFi  %s\n", WiFi.localIP().toString().c_str());
+  Serial.printf("\nConnected to WiFi  %s  (RSSI %d dBm)\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
 
   setupI2S();
 
@@ -92,10 +94,30 @@ void setup() {
   else        ws.begin(WS_HOST, WS_PORT, WS_PATH);
   ws.onEvent(onWsEvent);
   ws.setReconnectInterval(2000);
+  // Client-side keepalive: ping every 10s, expect a pong within 3s, give up after 2 misses (~16s).
+  // A weak-WiFi blip leaves the TCP socket half-open; without this the ESP keeps pumping audio into
+  // a dead socket and only notices after the multi-minute OS TCP timeout. The heartbeat catches it
+  // in seconds so the fast (2s) auto-reconnect can kick in. The server auto-pongs these pings.
+  ws.enableHeartbeat(10000, 3000, 2);
 }
 
 void loop() {
   ws.loop();
+
+  // WiFi watchdog + signal telemetry. i2s_read below blocks ~80ms, so this runs roughly that often.
+  static uint32_t lastWifiTry = 0, lastRssi = 0;
+  uint32_t now = millis();
+  if (WiFi.status() != WL_CONNECTED) {
+    if (now - lastWifiTry > 5000) {        // throttle reconnect attempts while the AP is unreachable
+      lastWifiTry = now;
+      Serial.println("WiFi dropped — reconnecting");
+      WiFi.reconnect();
+    }
+  } else if (now - lastRssi > 30000) {     // report signal strength so it's visible in `fly logs`
+    lastRssi = now;
+    Serial.printf("WiFi RSSI %d dBm  ws=%s\n", WiFi.RSSI(), wsConnected ? "up" : "down");
+    if (wsConnected) ws.sendTXT(String("RSSI ") + WiFi.RSSI());
+  }
 
   size_t bytesRead = 0;
   i2s_read(I2S_PORT, i2sBuf, sizeof(i2sBuf), &bytesRead, portMAX_DELAY);
