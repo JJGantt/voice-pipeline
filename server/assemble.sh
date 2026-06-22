@@ -2,12 +2,14 @@
 # Assemble the combined jared-voice build context (transcriber + fallback worker), then `flyctl deploy`.
 set -euo pipefail
 cd "$(dirname "$0")"
-rm -rf data-layer mcp-voice worker.py
+rm -rf data-layer mcp-voice govee-mcp worker.py
 mkdir -p data-layer
 cp ~/repos/data-layer/package.json ~/repos/data-layer/tsconfig.json data-layer/
 cp -R ~/repos/data-layer/src data-layer/src
 mkdir -p mcp-voice
 cp ~/repos/voice-pipeline/mcp-voice/package.json ~/repos/voice-pipeline/mcp-voice/package-lock.json mcp-voice/ 2>/dev/null || true
 cp -R ~/repos/voice-pipeline/mcp-voice/src mcp-voice/src
+mkdir -p govee-mcp
+cp ~/repos/govee-mcp/govee_mcp.py ~/repos/govee-mcp/sync_devices.py govee-mcp/
 cp ~/repos/voice-pipeline/worker/worker.py worker.py
 echo "assembled — now: flyctl deploy --now -a jared-voice"

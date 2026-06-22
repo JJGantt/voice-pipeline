@@ -168,28 +168,26 @@ VOICE_REPLY_DIRECTIVE = (
 )
 
 
-# Govee lights the model can control. We read their display names from the govee MCP's env file and
-# inject them into the system prompt every turn, so the model acts on "the floor lamp" immediately
-# instead of burning a round-trip on a list/lookup tool first.
-GOVEE_ENV = os.environ.get("GOVEE_ENV", "/Users/jaredgantt/repos/govee-mcp/.env-govee")
+# Govee lights the model can control — pulled from the auto-synced Supabase govee_devices table and
+# injected into the system prompt every turn, so the model acts on "the floor lamp" immediately
+# instead of burning a round-trip on a list tool. Cached in-process (30 min) to avoid a per-command DB hit.
+_govee_cache = {"at": -1e9, "lights": []}
+GOVEE_CACHE_TTL = 1800
 
 
 def _govee_lights() -> list:
-    """[(key, display), …] from the govee MCP env file. The tools take the KEY as the `light` arg;
-    the display name is what the user's speech matches."""
-    out = []
+    """[(key, display), …] from Supabase govee_devices (hidden=false). key is the tool arg; display matches speech."""
+    now = time.monotonic()
+    if _govee_cache["lights"] and now - _govee_cache["at"] < GOVEE_CACHE_TTL:
+        return _govee_cache["lights"]
     try:
-        with open(GOVEE_ENV) as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("GOVEE_LIGHT_") and "=" in line:
-                    name, val = line.split("=", 1)
-                    key = name[len("GOVEE_LIGHT_"):].lower()
-                    parts = val.split(",", 2)
-                    if len(parts) == 3:
-                        out.append((key, parts[2].strip().strip('"').strip("'")))
-    except Exception:  # noqa: BLE001
-        pass
+        r = httpx.get(f"{SUPABASE_URL}/rest/v1/govee_devices",
+                      params={"select": "key,display_name", "hidden": "eq.false", "order": "key"},
+                      headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=8)
+        out = [(row["key"], row["display_name"]) for row in r.json()]
+        _govee_cache["at"], _govee_cache["lights"] = now, out
+    except Exception:  # noqa: BLE001 — keep last-known list on a transient failure
+        out = _govee_cache["lights"]
     return out
 
 
@@ -393,7 +391,7 @@ def write_mcp_config() -> str:
         "mcpServers": {
             "data": {"command": "node", "args": [DATA_MCP_JS], "env": env},
             "voice": {"command": "node", "args": [VOICE_MCP_JS], "env": env},
-            "govee-lights": {"command": GOVEE_PY, "args": [GOVEE_MCP_PY]},
+            "govee-lights": {"command": GOVEE_PY, "args": [GOVEE_MCP_PY], "env": env},
         }
     }
     fd, path = tempfile.mkstemp(prefix="voice-mcp-", suffix=".json")
@@ -603,7 +601,7 @@ class SdkRunner:
         if os.path.exists(VOICE_MCP_JS):
             servers["voice"] = {"type": "stdio", "command": "node", "args": [VOICE_MCP_JS], "env": mcp_env}
         if os.path.exists(GOVEE_MCP_PY):
-            servers["govee-lights"] = {"type": "stdio", "command": GOVEE_PY, "args": [GOVEE_MCP_PY]}
+            servers["govee-lights"] = {"type": "stdio", "command": GOVEE_PY, "args": [GOVEE_MCP_PY], "env": mcp_env}
         opts = ClaudeAgentOptions(
             mcp_servers=servers,
             allowed_tools=["mcp__data", "mcp__voice", "mcp__govee-lights"],

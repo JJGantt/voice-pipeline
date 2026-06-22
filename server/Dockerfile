@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Claude CLI (the Agent SDK drives it for the fallback path) + python deps for both processes
 RUN npm install -g @anthropic-ai/claude-code
 COPY requirements.txt .
-RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt claude-agent-sdk
+RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt claude-agent-sdk mcp python-dotenv
 # pre-download the wake-word models so the container starts instantly / offline
 RUN python3 -c "import openwakeword.utils as u; u.download_models()"
 
@@ -29,12 +29,17 @@ COPY mcp-voice/package.json mcp-voice/package-lock.json* ./
 RUN npm install --no-audit --no-fund
 COPY mcp-voice/src ./src
 
+# govee MCP (cloud light control for the fallback) + the inventory sync job
+COPY govee-mcp /app/govee-mcp
+
 # app code
 WORKDIR /app
 COPY server.py worker.py entrypoint.sh ./
 
 ENV DATA_MCP_JS=/app/data-layer/dist/mcp.js \
     VOICE_MCP_JS=/app/mcp-voice/src/index.js \
+    GOVEE_PY=python3 \
+    GOVEE_MCP_PY=/app/govee-mcp/govee_mcp.py \
     WORKER_ID=fly \
     WORKER_PRIORITY=mac,pi,fly
 
