@@ -145,6 +145,17 @@ QUICK_REPLY_DIRECTIVE = (
     "in under 7 words.]"
 )
 
+# Power tier (the hub's "brain" button): maximum-precision path for hard estimates — typically a
+# restaurant dish whose ingredients/macros are unknown. Routed to Opus, and this directive both asks
+# for careful decomposition AND contains the "ultrathink" keyword, which is how `claude -p` unlocks
+# its largest extended-thinking budget (there is no CLI flag for it).
+POWER_DIRECTIVE = (
+    "\n\n[Precision mode — ultrathink. Take your time and reason carefully before acting. If this "
+    "involves estimating nutrition for a dish whose exact contents aren't given, decompose it into its "
+    "likely ingredients with realistic restaurant portions, estimate each component's macros, and sum "
+    "them — don't lowball. Prefer the structured per-ingredient breakdown the log tool supports.]"
+)
+
 # Sentinel the model emits to silently drop a turn (wake-word false positive). Matched loosely below.
 IGNORE_SENTINEL = "__IGNORE__"
 
@@ -417,7 +428,7 @@ def write_mcp_config() -> str:
     return path
 
 
-def run_claude(transcript: str, resume_session_id: str | None, on_event=None, system_append: str = "") -> dict:
+def run_claude(transcript: str, resume_session_id: str | None, on_event=None, system_append: str = "", model: str = HUB_MODEL) -> dict:
     """Run `claude -p` headless and STREAM the stream-json output, parsing events as they arrive.
 
     on_event(kind, payload) fires live during the run so progress can be surfaced — currently
@@ -432,7 +443,7 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
     if resume_session_id:
         cmd += ["--resume", resume_session_id]
     cmd += [
-        "--model", HUB_MODEL,
+        "--model", model,
         "--mcp-config", mcp_path,
         "--strict-mcp-config",
         "--output-format", "stream-json",
@@ -602,7 +613,7 @@ class SdkRunner:
                 pass
         self._client = None
 
-    async def _ensure_client(self, system_append):
+    async def _ensure_client(self, system_append, model):
         if self._client is not None:
             return
         from claude_agent_sdk import (ClaudeSDKClient, ClaudeAgentOptions,
@@ -627,18 +638,19 @@ class SdkRunner:
         if os.path.exists(GOVEE_MCP_PY):
             servers["govee-lights"] = {"type": "stdio", "command": GOVEE_PY, "args": [GOVEE_MCP_PY], "env": mcp_env}
         opts = ClaudeAgentOptions(
-            model=HUB_MODEL,
+            model=model,
             mcp_servers=servers,
             allowed_tools=["mcp__data", "mcp__voice", "mcp__govee-lights"],
             can_use_tool=_can_use_tool,
             system_prompt=sysprompt,
         )
+        self._model = model
         self._client = ClaudeSDKClient(opts)
         await self._client.connect()
 
-    async def _run(self, transcript, system_append, on_event):
+    async def _run(self, transcript, system_append, on_event, model):
         from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
-        await self._ensure_client(system_append)
+        await self._ensure_client(system_append, model)
         await self._client.query(transcript)
         parts, raw_error = [], None
         async for msg in self._client.receive_response():
@@ -658,15 +670,17 @@ class SdkRunner:
         return {"session_id": None, "text": text, "result": text,
                 "ok": raw_error is None and bool(text), "raw_error": raw_error}
 
-    def run(self, transcript, system_append="", on_event=None) -> dict:
+    def run(self, transcript, system_append="", on_event=None, model=HUB_MODEL) -> dict:
         self._start_loop()
         now = time.monotonic()
         today = datetime.now().astimezone().date()
-        if self._client is not None and (now - self._last > SESSION_IDLE_RESET_S or self._day != today):
-            self.reset()   # fresh conversation on idle / day rollover, matching the subscription path
+        # Recreate the warm client on idle / day rollover / a model switch (tier change).
+        if self._client is not None and (now - self._last > SESSION_IDLE_RESET_S or self._day != today
+                                         or getattr(self, "_model", None) != model):
+            self.reset()
         self._last, self._day = now, today
         try:
-            fut = asyncio.run_coroutine_threadsafe(self._run(transcript, system_append, on_event), self._loop)
+            fut = asyncio.run_coroutine_threadsafe(self._run(transcript, system_append, on_event, model), self._loop)
             result = fut.result(timeout=CLAUDE_TIMEOUT_S + 30)
             if SDK_EPHEMERAL:
                 self.reset()   # fallback (fly) runs rarely → don't hold the warm CLI/MCPs in RAM between uses
@@ -724,7 +738,7 @@ def claim_one(db: Supabase) -> dict | None:
 
     pending = db.get(
         "voice_requests",
-        "status=eq.pending&order=created_at.asc&limit=1&select=id,transcript,source",
+        "status=eq.pending&order=created_at.asc&limit=1&select=id,transcript,source,tier",
     )
     if not pending:
         return None
@@ -861,15 +875,28 @@ def process_request(db: Supabase, req: dict) -> None:
     if source in ("fly", "mac"):
         prompt += VOICE_REPLY_DIRECTIVE   # spoken aloud → keep it short
 
+    # Tier (set by the hub's two FAB buttons): 'fast' = the sparkle button (simple, unambiguous
+    # tool routing → Haiku, no thinking); 'power' = the brain button (precision macro estimates →
+    # Opus + max thinking via POWER_DIRECTIVE). Anything else (typed card, ESP voice) → HUB_MODEL.
+    tier = (req.get("tier") or "").strip()
+    if tier == "power":
+        model = "opus"
+        prompt += POWER_DIRECTIVE
+    elif tier == "fast":
+        model = "haiku"
+    else:
+        model = HUB_MODEL
+    log(f"tier={tier or 'default'} → model={model}")
+
     # Role framing first, then the live govee device list (when there are lights).
     sys_ctx = HUB_SYSTEM
     govee = govee_context()
     if govee:
         sys_ctx += "\n\n" + govee
     if get_routing_mode(db) == "sdk":
-        result = SDK.run(prompt, system_append=sys_ctx, on_event=_emit)      # warm Agent SDK (API/credit)
+        result = SDK.run(prompt, system_append=sys_ctx, on_event=_emit, model=model)      # warm Agent SDK (API/credit)
     else:
-        result = run_claude(prompt, resume_id, on_event=_emit, system_append=sys_ctx)  # claude -p (subscription)
+        result = run_claude(prompt, resume_id, on_event=_emit, system_append=sys_ctx, model=model)  # claude -p (subscription)
 
     if result.get("session_id"):
         write_hub_session(result["session_id"])
