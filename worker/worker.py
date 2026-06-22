@@ -449,10 +449,16 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
     proc = None
     timed_out = {"v": False}
 
+    # Subscription path: `claude -p` must use the logged-in Claude subscription, not an API key. If
+    # ANTHROPIC_API_KEY is in the env (it is, so the SDK path can use it), the CLI silently bills the
+    # Anthropic API instead — so strip it for this subprocess only. The SDK runner still sees it.
+    sub_env = os.environ.copy()
+    sub_env.pop("ANTHROPIC_API_KEY", None)
+
     try:
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, bufsize=1, env=os.environ.copy(),  # line-buffered so events arrive promptly
+            text=True, bufsize=1, env=sub_env,  # line-buffered so events arrive promptly
         )
         # Watchdog: kill the run if it exceeds the timeout, which ends the streaming loop at EOF.
         done = threading.Event()
