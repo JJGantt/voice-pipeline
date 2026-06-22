@@ -1,0 +1,5 @@
+data-layer/
+mcp-voice/
+worker.py
+entrypoint logs
+*.log

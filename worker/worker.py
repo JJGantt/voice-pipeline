@@ -637,13 +637,19 @@ class SdkRunner:
         self._last, self._day = now, today
         try:
             fut = asyncio.run_coroutine_threadsafe(self._run(transcript, system_append, on_event), self._loop)
-            return fut.result(timeout=CLAUDE_TIMEOUT_S + 30)
+            result = fut.result(timeout=CLAUDE_TIMEOUT_S + 30)
+            if SDK_EPHEMERAL:
+                self.reset()   # fallback (fly) runs rarely → don't hold the warm CLI/MCPs in RAM between uses
+            return result
         except Exception as e:  # noqa: BLE001 — a dead warm client shouldn't wedge the worker
             self.reset()
             return {"session_id": None, "text": "", "result": "",
                     "ok": False, "raw_error": f"sdk run failed: {e}"}
 
 
+# The fly fallback shares the always-on voice machine and runs rarely, so it resets its SDK client
+# after each request rather than holding the warm CLI/MCPs resident (keeps memory low on that box).
+SDK_EPHEMERAL = WORKER_ID == "fly"
 SDK = SdkRunner()
 
 
