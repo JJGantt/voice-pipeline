@@ -132,22 +132,23 @@ async def handle_transcript(text: str, duration_s: float, truncated: bool) -> bo
 
 
 def _client_token(ws) -> str | None:
-    """Pull the device token off the handshake (websockets 12 API).
+    """Pull the device token off the handshake (websockets 15 asyncio API).
 
     Checks, in order: the `?token=` query param on the ws path, then the
     `X-Device-Token` header, then a `Bearer ...` Authorization header. In
-    websockets 12 the server handler gets a WebSocketServerProtocol whose
-    `.path` carries the full request target (path + query) and whose
-    `.request_headers` is the handshake Headers mapping.
+    websockets 15 the server handler gets a ServerConnection whose `.request`
+    is the handshake Request — `.path` carries the full request target
+    (path + query) and `.headers` is the Headers mapping.
     """
-    path = getattr(ws, "path", "") or ""
+    request = getattr(ws, "request", None)
+    path = getattr(request, "path", "") or ""
     if "?" in path:
         from urllib.parse import parse_qs
         qs = parse_qs(path.split("?", 1)[1])
         tok = qs.get("token", [None])[0]
         if tok:
             return tok
-    headers = getattr(ws, "request_headers", None)
+    headers = getattr(request, "headers", None)
     if headers is not None:
         tok = headers.get("X-Device-Token")
         if tok:
@@ -262,22 +263,24 @@ async def _led_safety(ws):
         pass
 
 
-async def process_request(path, request_headers):
-    """Plain HTTP on the same port. The worker POSTs /led-off?token=... when the model finishes, so the
-    ESP light goes blink (working) → off. Non-matching paths return None → the WS handshake proceeds."""
+async def process_request(connection, request):
+    """Plain HTTP on the same port (websockets 15 asyncio API). The worker POSTs /led-off?token=... when
+    the model finishes, so the ESP light goes blink (working) → off. Returning a Response short-circuits
+    the handshake; returning None lets the WS upgrade proceed."""
+    path = request.path
     if path.startswith("/led-off"):
         from urllib.parse import urlparse, parse_qs
         tok = parse_qs(urlparse(path).query).get("token", [None])[0]
         if LED_TOKEN and tok != LED_TOKEN:
-            return (HTTPStatus.FORBIDDEN, [], b"forbidden\n")
+            return connection.respond(HTTPStatus.FORBIDDEN, "forbidden\n")
         if _active_esp is not None:
             try:
                 await _active_esp.send("LED_OFF")
             except Exception:  # noqa: BLE001
                 pass
-        return (HTTPStatus.OK, [], b"ok\n")
+        return connection.respond(HTTPStatus.OK, "ok\n")
     if path in ("/health", "/"):
-        return (HTTPStatus.OK, [], b"ok\n")
+        return connection.respond(HTTPStatus.OK, "ok\n")
     return None
 
 
