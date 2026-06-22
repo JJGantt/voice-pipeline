@@ -61,6 +61,9 @@ WORKER_PRIORITY = [
 
 STATE_DIR = Path(os.path.expanduser(os.environ.get("STATE_DIR", "~/.voice-worker")))
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
+# Hub turns are short tool-use, not deep reasoning — default to Haiku for low latency.
+# Override with HUB_MODEL (e.g. 'sonnet') if macro estimates / messy transcripts need more muscle.
+HUB_MODEL = os.environ.get("HUB_MODEL", "haiku")
 
 # Path to the built data MCP server (node entrypoint).
 DATA_MCP_JS = os.environ.get(
@@ -428,6 +431,7 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
     if resume_session_id:
         cmd += ["--resume", resume_session_id]
     cmd += [
+        "--model", HUB_MODEL,
         "--mcp-config", mcp_path,
         "--strict-mcp-config",
         "--output-format", "stream-json",
@@ -616,6 +620,7 @@ class SdkRunner:
         if os.path.exists(GOVEE_MCP_PY):
             servers["govee-lights"] = {"type": "stdio", "command": GOVEE_PY, "args": [GOVEE_MCP_PY], "env": mcp_env}
         opts = ClaudeAgentOptions(
+            model=HUB_MODEL,
             mcp_servers=servers,
             allowed_tools=["mcp__data", "mcp__voice", "mcp__govee-lights"],
             can_use_tool=_can_use_tool,
