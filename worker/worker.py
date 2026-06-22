@@ -174,27 +174,34 @@ VOICE_REPLY_DIRECTIVE = (
 GOVEE_ENV = os.environ.get("GOVEE_ENV", "/Users/jaredgantt/repos/govee-mcp/.env-govee")
 
 
-def _govee_light_names() -> list:
-    names = []
+def _govee_lights() -> list:
+    """[(key, display), …] from the govee MCP env file. The tools take the KEY as the `light` arg;
+    the display name is what the user's speech matches."""
+    out = []
     try:
         with open(GOVEE_ENV) as f:
             for line in f:
                 line = line.strip()
                 if line.startswith("GOVEE_LIGHT_") and "=" in line:
-                    parts = line.split("=", 1)[1].split(",", 2)
+                    name, val = line.split("=", 1)
+                    key = name[len("GOVEE_LIGHT_"):].lower()
+                    parts = val.split(",", 2)
                     if len(parts) == 3:
-                        names.append(parts[2].strip().strip('"').strip("'"))
+                        out.append((key, parts[2].strip().strip('"').strip("'")))
     except Exception:  # noqa: BLE001
         pass
-    return names
+    return out
 
 
 def govee_context() -> str:
-    names = _govee_light_names()
-    if not names:
+    lights = _govee_lights()
+    if not lights:
         return ""
-    return ("Govee smart lights you can control RIGHT NOW, by name, via the govee-lights tools — do NOT "
-            "call any list/lookup tool first, these ARE the available lights: " + ", ".join(names) + ".")
+    listing = ", ".join(f"{k} ({d})" for k, d in lights)
+    return ("Govee lights you can control RIGHT NOW via the govee-lights tools — pass the KEY (the part "
+            "before the parentheses) as the `light` arg; do NOT call a list/lookup tool first. Available: "
+            + listing + ". If a request matches multiple lights by name (e.g. two 'Bedroom Ceiling'), "
+            "control ALL of them.")
 
 # --------------------------------------------------------------------------- #
 # Small helpers
