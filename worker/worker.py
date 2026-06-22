@@ -61,9 +61,10 @@ WORKER_PRIORITY = [
 
 STATE_DIR = Path(os.path.expanduser(os.environ.get("STATE_DIR", "~/.voice-worker")))
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
-# Hub turns are short tool-use, not deep reasoning — default to Haiku for low latency.
-# Override with HUB_MODEL (e.g. 'sonnet') if macro estimates / messy transcripts need more muscle.
-HUB_MODEL = os.environ.get("HUB_MODEL", "haiku")
+# Most hub turns are tool use, but nutrition macro estimation leans on the model's internal
+# food knowledge — so default to Sonnet (strong priors, still fast). Override with HUB_MODEL
+# ('haiku' for max speed on trivial turns, 'opus' for the best macro/disambiguation quality).
+HUB_MODEL = os.environ.get("HUB_MODEL", "sonnet")
 
 # Path to the built data MCP server (node entrypoint).
 DATA_MCP_JS = os.environ.get(
