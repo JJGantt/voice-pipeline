@@ -167,6 +167,19 @@ VOICE_REPLY_DIRECTIVE = (
     "preamble, no 'I'll do X' narration, no follow-up question — just the essential result.]"
 )
 
+# Role framing for every hub turn. The base preset is claude_code (a coding agent), so without this
+# the model treats requests like a dev session and reaches for Bash/curl. This establishes what it
+# actually is. It deliberately gives NO per-tool guidance — each tool's schema documents its own use.
+HUB_SYSTEM = (
+    "You are the assistant behind Jared's personal life-data hub. This is NOT a coding session and you "
+    "are NOT exploring a codebase. Your sole job is to fulfill each request by calling the MCP tools you "
+    "have been given to read and update his life data (nutrition, workouts, weight, lists, reminders, "
+    "notes, recipes, smart lights, and the like). The tools are the only way to act, and each tool's own "
+    "description tells you how to use it — follow those. Bash, curl, a shell, the filesystem, and file "
+    "editing are NOT available to you; never attempt them. If no available tool can satisfy a request, "
+    "say so briefly rather than improvising another way."
+)
+
 
 # Govee lights the model can control — pulled from the auto-synced Supabase govee_devices table and
 # injected into the system prompt every turn, so the model acts on "the floor lamp" immediately
@@ -836,7 +849,11 @@ def process_request(db: Supabase, req: dict) -> None:
     if source in ("fly", "mac"):
         prompt += VOICE_REPLY_DIRECTIVE   # spoken aloud → keep it short
 
-    sys_ctx = govee_context()
+    # Role framing first, then the live govee device list (when there are lights).
+    sys_ctx = HUB_SYSTEM
+    govee = govee_context()
+    if govee:
+        sys_ctx += "\n\n" + govee
     if get_routing_mode(db) == "sdk":
         result = SDK.run(prompt, system_append=sys_ctx, on_event=_emit)      # warm Agent SDK (API/credit)
     else:
@@ -889,6 +906,88 @@ def process_request(db: Supabase, req: dict) -> None:
             {"status": "error", "error": err, "updated_at": now_iso()},
         )
         log(f"ERROR request {rid}: {err}")
+
+
+# --------------------------------------------------------------------------- #
+# Realtime waker — event-driven claim. A background asyncio loop holds a Supabase
+# realtime subscription to voice_requests INSERTs and sets a threading.Event the
+# instant a command is enqueued, so the main loop claims it immediately instead of
+# waiting out the idle poll (removing up to IDLE_POLL_S of latency on every command).
+# The poll stays as a fallback: when the websocket is healthy the event fires first
+# and we never hit the timeout; if it drops, wait() just times out and we degrade to
+# exactly the old polling cadence. Subscribing requires voice_requests to be in the
+# supabase_realtime publication (migration 00021).
+# --------------------------------------------------------------------------- #
+
+REALTIME_ENABLED = os.environ.get("REALTIME", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+class RealtimeWaker:
+    def __init__(self):
+        self.event = threading.Event()
+        self._loop = None
+        self._sock = None
+        self._started = False
+
+    def start(self) -> None:
+        if self._started or not REALTIME_ENABLED:
+            if not REALTIME_ENABLED:
+                log("realtime listener disabled by env (REALTIME=0); polling only")
+            return
+        try:
+            import realtime  # noqa: F401 — probe availability before spawning the thread
+        except Exception as e:  # noqa: BLE001 — missing lib must not break the worker; just poll
+            log(f"realtime listener unavailable ({e}); falling back to {IDLE_POLL_S}s polling")
+            return
+        self._started = True
+        self._loop = asyncio.new_event_loop()
+        threading.Thread(target=self._run, name="rt-waker", daemon=True).start()
+        log("realtime listener starting (event-driven claim on voice_requests INSERT)")
+
+    def _run(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop.run_until_complete(self._serve())
+        except Exception as e:  # noqa: BLE001
+            log(f"realtime listener loop exited: {e}")
+
+    async def _serve(self) -> None:
+        from realtime import AsyncRealtimeClient
+        # Outer loop rebuilds the client if connect()/subscribe() itself fails (e.g. no network at
+        # boot); auto_reconnect handles transient drops once connected. Never raises out — the worker
+        # keeps polling regardless.
+        while _running:
+            try:
+                self._sock = AsyncRealtimeClient(f"{SUPABASE_URL}/realtime/v1", SUPABASE_KEY,
+                                                 auto_reconnect=True)
+                await self._sock.connect()
+                ch = self._sock.channel("voice-worker")
+                ch.on_postgres_changes("INSERT", callback=self._on_insert,
+                                       schema="public", table="voice_requests")
+                await ch.subscribe(self._on_sub)
+                while _running and self._sock.is_connected:
+                    await asyncio.sleep(1.0)
+            except Exception as e:  # noqa: BLE001
+                log(f"realtime listener error: {e}; retrying in 5s (poll fallback active)")
+            try:
+                if self._sock:
+                    await self._sock.close()
+            except Exception:  # noqa: BLE001
+                pass
+            if _running:
+                await asyncio.sleep(5.0)
+
+    def _on_insert(self, _payload) -> None:
+        self.event.set()  # a command was enqueued → wake the main loop now
+
+    def _on_sub(self, state, err=None) -> None:
+        log(f"realtime subscription: {state}{(' err=' + str(err)) if err else ''}")
+
+    def wait(self, timeout: float) -> bool:
+        """Block until an INSERT wakes us (instant) or `timeout` elapses (poll fallback)."""
+        fired = self.event.wait(timeout)
+        self.event.clear()
+        return fired
 
 
 # --------------------------------------------------------------------------- #
@@ -949,6 +1048,9 @@ def main() -> int:
             log(f"--once complete (processed={processed})")
             return 0
 
+        waker = RealtimeWaker()
+        waker.start()   # event-driven claim; no-op fallback to polling if realtime is unavailable
+
         last_heartbeat = 0.0
         while _running:
             now = time.monotonic()
@@ -957,9 +1059,11 @@ def main() -> int:
                 last_heartbeat = now
 
             processed = one_iteration(db)
-            # Loop quickly if we just worked (drain the queue); else idle-poll.
+            # Loop quickly if we just worked (drain the queue); else wait for the next INSERT.
+            # waker.wait wakes instantly on a realtime INSERT, else times out after IDLE_POLL_S so
+            # heartbeats keep cadence and a dropped socket degrades to the old polling behavior.
             if not processed:
-                time.sleep(IDLE_POLL_S)
+                waker.wait(IDLE_POLL_S)
 
     log("stopped")
     return 0
