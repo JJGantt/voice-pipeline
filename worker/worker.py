@@ -893,7 +893,8 @@ def process_request(db: Supabase, req: dict) -> None:
     govee = govee_context()
     if govee:
         sys_ctx += "\n\n" + govee
-    if get_routing_mode(db) == "sdk":
+    # fast/power tiers always use the warm SDK path (API key) regardless of routing_mode — no cold starts.
+    if tier in ("fast", "power") or get_routing_mode(db) == "sdk":
         result = SDK.run(prompt, system_append=sys_ctx, on_event=_emit, model=model)      # warm Agent SDK (API/credit)
     else:
         result = run_claude(prompt, resume_id, on_event=_emit, system_append=sys_ctx, model=model)  # claude -p (subscription)

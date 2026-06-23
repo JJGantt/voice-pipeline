@@ -28,7 +28,8 @@ from openwakeword.model import Model
 # ---- config (env, with sane defaults) -------------------------------------
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://felyggqjjhltwokdfhop.supabase.co").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")   # service_role or anon — only needs INSERT on voice_requests
-WAKE_MODEL = os.environ.get("WAKE_MODEL", "hey_rhasspy")
+WAKE_MODEL = os.environ.get("WAKE_MODEL", "hey_rhasspy")          # fast tier → Haiku
+WAKE_MODEL_POWER = os.environ.get("WAKE_MODEL_POWER", "hey_jarvis") # power tier → Opus + ultrathink
 WAKE_THRESHOLD = float(os.environ.get("WAKE_THRESHOLD", "0.5"))
 WHISPER_BIN = os.path.expanduser(os.environ.get("WHISPER_BIN", "~/whisper.cpp/build/bin/whisper-cli"))
 WHISPER_MODEL = os.path.expanduser(os.environ.get("WHISPER_MODEL", "~/whisper.cpp/models/ggml-medium.en.bin"))
@@ -97,10 +98,14 @@ def speak_reply(baseline) -> None:
 
 
 def strip_wake(text: str) -> str:
-    """Drop a leading 'Hey Rhasspy,' the STT often captures (tolerant of mishears)."""
-    return re.sub(
+    """Drop a leading wake phrase the STT often captures (tolerant of mishears)."""
+    text = re.sub(
         r"^\W*(hey|hi|ok|okay)?\W*(rhasspy|rhaspy|raspy|rasbee|rasby|raspberry|rasp)\b[\s,.!:;-]*",
         "", text or "", count=1, flags=re.IGNORECASE,
+    ).strip()
+    return re.sub(
+        r"^\W*(hey|hi|ok|okay)?\W*(jarvis|jarvas|jervis)\b[\s,.!:;-]*",
+        "", text, count=1, flags=re.IGNORECASE,
     ).strip()
 
 
@@ -159,11 +164,14 @@ def transcribe(pcm: np.ndarray) -> str:
             pass
 
 
-def enqueue(text: str) -> None:
+def enqueue(text: str, tier: str = "") -> None:
     """Insert the transcript into voice_requests (source='mac', focus='hub'). Best-effort."""
     if not (SUPABASE_KEY and text):
         return
     try:
+        payload: dict = {"transcript": text, "source": "mac", "focus": "hub"}
+        if tier:
+            payload["tier"] = tier
         httpx.post(
             f"{SUPABASE_URL}/rest/v1/voice_requests",
             headers={
@@ -172,10 +180,10 @@ def enqueue(text: str) -> None:
                 "Content-Type": "application/json",
                 "Prefer": "return=minimal",
             },
-            json={"transcript": text, "source": "mac", "focus": "hub"},
+            json=payload,
             timeout=10.0,
         )
-        log(f"enqueued: {text[:80]!r}")
+        log(f"enqueued (tier={tier or 'default'}): {text[:80]!r}")
     except Exception as e:  # noqa: BLE001
         log(f"enqueue failed: {e}")
 
@@ -222,24 +230,31 @@ def main() -> int:
         print(f"FATAL: no GROQ_API_KEY and whisper.cpp not found ({WHISPER_BIN}).", file=sys.stderr)
         return 2
 
-    log(f"loading wake model {WAKE_MODEL!r} (threshold {WAKE_THRESHOLD})…")
-    oww = Model(wakeword_models=[WAKE_MODEL], inference_framework="onnx")
-    log(f"listening on the default mic — say 'Hey Rhasspy'  (stt={stt}, hangover={HANGOVER_S}s)")
+    log(f"loading wake models: fast={WAKE_MODEL!r} power={WAKE_MODEL_POWER!r} (threshold {WAKE_THRESHOLD})…")
+    oww = Model(wakeword_models=[WAKE_MODEL, WAKE_MODEL_POWER], inference_framework="onnx")
+    log(f"listening — 'Hey Rhasspy' (fast/Haiku) or 'Hey Jarvis' (power/Opus)  (stt={stt}, hangover={HANGOVER_S}s)")
 
     with sd.RawInputStream(samplerate=SAMPLE_RATE, blocksize=FRAME, dtype="int16", channels=1) as stream:
         while True:
             buf, _ = stream.read(FRAME)
             audio = np.frombuffer(bytes(buf), dtype=np.int16)
-            score = oww.predict(audio).get(WAKE_MODEL, 0.0)
-            if score >= WAKE_THRESHOLD:
-                log(f"wake! (score {score:.2f}) — capturing…")
+            scores = oww.predict(audio)
+            fast_score = scores.get(WAKE_MODEL, 0.0)
+            power_score = scores.get(WAKE_MODEL_POWER, 0.0)
+            fired_tier = None
+            if power_score >= WAKE_THRESHOLD:
+                fired_tier = "power"   # power checked first — higher specificity wins ties
+            elif fast_score >= WAKE_THRESHOLD:
+                fired_tier = "fast"
+            if fired_tier:
+                log(f"wake! tier={fired_tier} (fast={fast_score:.2f} power={power_score:.2f}) — capturing…")
                 notify("🎙 Listening…")
                 baseline = _latest_assistant_id()   # snapshot before this command's reply lands
                 pcm = capture_utterance(stream)
                 text = strip_wake(transcribe(pcm))
                 if text:
-                    log(f"transcript: {text!r}")
-                    enqueue(text)
+                    log(f"transcript (tier={fired_tier}): {text!r}")
+                    enqueue(text, tier=fired_tier)
                     threading.Thread(target=speak_reply, args=(baseline,), daemon=True).start()
                 else:
                     log("…nothing intelligible, ignoring")
