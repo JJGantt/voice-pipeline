@@ -697,6 +697,143 @@ SDK_EPHEMERAL = WORKER_ID == "fly"
 SDK = SdkRunner()
 
 
+# --------------------------------------------------------------------------- #
+# Stripped-down API agent — ONLY the MCP tools, nothing else.
+#
+# `claude -p` (and the warm Agent SDK on the claude_code preset) hand the model the whole Claude Code
+# toolset — Bash, WebSearch, WebFetch, ToolSearch, Write, Cron, ~30 tools — and only DENY the
+# non-allowlisted ones at execution time. The model still SEES them and reaches for ToolSearch/Bash,
+# which is noise (and invites a tiny model like Haiku to hallucinate). This runner instead calls the
+# Anthropic Messages API directly with exactly the data/voice/govee MCP tools as `tools=`, and nothing
+# else: no built-ins, no tool discovery, no coding-agent system prompt.
+#
+# It's a real agentic loop, not one-shot — the model can chain sequential tool calls and always ends
+# with a user-facing text reply. MCP servers are started ONCE (warm stdio sessions) and their schemas
+# are inlined with the prompt, so a turn is one round-trip (+ tool round-trips), no spin-up per request.
+API_MODEL_IDS = {"haiku": "claude-haiku-4-5", "sonnet": "claude-sonnet-4-6", "opus": "claude-opus-4-8"}
+
+
+class ApiRunner:
+    def __init__(self):
+        self._loop = None
+        self._client = None
+        self._stack = None        # AsyncExitStack holding the warm MCP stdio sessions
+        self._sessions = {}       # server name -> mcp ClientSession
+        self._tools = []          # Anthropic tool schemas (only the MCP tools)
+        self._dispatch = {}       # anthropic tool name -> (server, real MCP tool name)
+        self._messages = []       # conversation history (reset on idle / day rollover)
+        self._last = 0.0
+        self._day = None
+
+    def _start_loop(self):
+        if self._loop is None:
+            self._loop = asyncio.new_event_loop()
+            threading.Thread(target=self._loop.run_forever, name="api-loop", daemon=True).start()
+
+    async def _ensure(self):
+        if self._client is None:
+            from anthropic import AsyncAnthropic
+            self._client = AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        if self._sessions:
+            return
+        from contextlib import AsyncExitStack
+        from mcp import ClientSession, StdioServerParameters
+        from mcp.client.stdio import stdio_client
+        env = {**os.environ, "SUPABASE_URL": SUPABASE_URL, "SUPABASE_KEY": SUPABASE_KEY}
+        specs = []
+        if os.path.exists(DATA_MCP_JS):  specs.append(("data", "node", [DATA_MCP_JS]))
+        if os.path.exists(VOICE_MCP_JS): specs.append(("voice", "node", [VOICE_MCP_JS]))
+        if os.path.exists(GOVEE_MCP_PY): specs.append(("govee", GOVEE_PY, [GOVEE_MCP_PY]))
+        self._stack = AsyncExitStack()
+        for name, cmd, args in specs:
+            params = StdioServerParameters(command=cmd, args=args, env=env)
+            read, write = await self._stack.enter_async_context(stdio_client(params))
+            session = await self._stack.enter_async_context(ClientSession(read, write))
+            await session.initialize()
+            self._sessions[name] = session
+            for t in (await session.list_tools()).tools:
+                aname = (name + "__" + t.name)[:64]
+                self._tools.append({
+                    "name": aname,
+                    "description": (t.description or "")[:2048],
+                    "input_schema": t.inputSchema or {"type": "object", "properties": {}},
+                })
+                self._dispatch[aname] = (name, t.name)
+        log(f"api agent: {len(self._tools)} MCP tools warm ({', '.join(self._sessions)})")
+
+    async def _close(self):
+        if self._stack is not None:
+            try:
+                await self._stack.aclose()
+            except Exception:  # noqa: BLE001
+                pass
+        self._stack = None
+        self._sessions, self._tools, self._dispatch = {}, [], {}
+
+    def reset(self):
+        self._messages = []   # keep MCP warm; just forget the conversation
+
+    async def _call_tool(self, server, real, args):
+        try:
+            r = await self._sessions[server].call_tool(real, args or {})
+            parts = [getattr(c, "text", None) or str(c) for c in (r.content or [])]
+            return "\n".join(p for p in parts if p) or "(no output)"
+        except Exception as e:  # noqa: BLE001
+            return f"tool error: {e}"
+
+    async def _run(self, prompt, system, model, think, on_event):
+        await self._ensure()
+        self._messages.append({"role": "user", "content": prompt})
+        kwargs = dict(model=API_MODEL_IDS.get(model, model), system=system,
+                      tools=self._tools, messages=self._messages,
+                      max_tokens=8000 if think else 1024)
+        if think:  # power tier: Opus adaptive thinking (budget_tokens is rejected on 4.8)
+            kwargs["thinking"] = {"type": "adaptive"}
+            kwargs["output_config"] = {"effort": "high"}
+        final_text = ""
+        for _ in range(8):  # agentic loop: chain tool calls until a final text reply
+            resp = await self._client.messages.create(**kwargs)
+            self._messages.append({"role": "assistant", "content": resp.content})  # preserves thinking/tool blocks
+            tool_results = []
+            for b in resp.content:
+                if b.type == "text":
+                    final_text = b.text
+                elif b.type == "tool_use":
+                    if on_event:
+                        try:
+                            on_event("tool", {"name": b.name, "input": b.input})
+                        except Exception:  # noqa: BLE001
+                            pass
+                    server, real = self._dispatch.get(b.name, (None, None))
+                    out = await self._call_tool(server, real, b.input) if server else "tool not found"
+                    tool_results.append({"type": "tool_result", "tool_use_id": b.id, "content": out})
+            if resp.stop_reason == "tool_use" and tool_results:
+                self._messages.append({"role": "user", "content": tool_results})
+                kwargs["messages"] = self._messages
+                continue
+            break
+        return {"session_id": None, "text": final_text.strip(), "result": final_text.strip(),
+                "ok": bool(final_text.strip()), "raw_error": None}
+
+    def run(self, transcript, system_append="", on_event=None, model="haiku", think=False) -> dict:
+        self._start_loop()
+        now = time.monotonic()
+        today = datetime.now().astimezone().date()
+        if self._messages and (now - self._last > SESSION_IDLE_RESET_S or self._day != today):
+            self.reset()
+        self._last, self._day = now, today
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                self._run(transcript, system_append, model, think, on_event), self._loop)
+            return fut.result(timeout=CLAUDE_TIMEOUT_S + 30)
+        except Exception as e:  # noqa: BLE001 — never wedge the worker
+            self.reset()
+            return {"session_id": None, "text": "", "result": "", "ok": False, "raw_error": f"api run failed: {e}"}
+
+
+API = ApiRunner()
+
+
 def get_routing_mode(db: Supabase) -> str:
     """'sdk' (warm Agent SDK, API/credit) or 'subscription' (claude -p). Fly is always sdk (API-only)."""
     if WORKER_ID == "fly":
@@ -798,6 +935,7 @@ def process_request(db: Supabase, req: dict) -> None:
         except Exception as e:
             log(f"reset: unlink hub_session failed: {e}")
         SDK.reset()   # also drop the warm SDK conversation, if any
+        API.reset()   # and the API agent's conversation
         db.patch("voice_requests", f"id=eq.{rid}",
                  {"status": "done", "result": "(context reset)", "updated_at": now_iso()})
         log("hub context reset — session dropped")
@@ -891,19 +1029,19 @@ def process_request(db: Supabase, req: dict) -> None:
     if govee:
         sys_ctx += "\n\n" + govee
     # Billing/routing:
-    #  · 'fast' (Raspy quick) → warm Agent SDK on the API key — no cold start, crazy quick (cheap Haiku).
-    #  · EVERYTHING ELSE — including 'power' (Jarvis, the smart one) and the default — runs on the
-    #    SUBSCRIPTION via `claude -p` (free; run_claude strips ANTHROPIC_API_KEY so it never bills the API).
-    #  · On the Fly fallback, get_routing_mode() is forced to 'sdk' (no subscription login there), so Fly
-    #    uses the API — but only when Mac AND Pi are down.
-    # If the fast path's API errors (e.g. no API credit), fall back to the free subscription so Raspy
-    # never breaks and never silently drains anything.
-    use_sdk = tier == "fast" or get_routing_mode(db) == "sdk"
-    if use_sdk:
-        result = SDK.run(prompt, system_append=sys_ctx, on_event=_emit, model=model)      # warm Agent SDK (API)
-        if tier == "fast" and not result.get("ok"):
-            log(f"fast tier API failed ({result.get('raw_error')}); falling back to subscription")
+    #  · The two FAB tiers — 'fast' (Raspy quick → Haiku) and 'power' (Jarvis → Opus + thinking) — run on
+    #    the stripped-down API agent: ONLY the data/voice/govee MCP tools, no Claude Code bloat. Costs API
+    #    credits (pennies/turn) but it's clean and can't hallucinate built-in tools. On API error it falls
+    #    back to the free subscription so Raspy never breaks.
+    #  · EVERYTHING ELSE (typed card, ESP voice, default) stays on the SUBSCRIPTION via `claude -p` (free).
+    #  · On the Fly fallback, get_routing_mode() is forced to 'sdk' (no subscription login there).
+    if tier in ("fast", "power"):
+        result = API.run(prompt, system_append=sys_ctx, on_event=_emit, model=model, think=(tier == "power"))
+        if not result.get("ok"):
+            log(f"{tier} tier API failed ({result.get('raw_error')}); falling back to subscription")
             result = run_claude(prompt, resume_id, on_event=_emit, system_append=sys_ctx, model=model)
+    elif get_routing_mode(db) == "sdk":
+        result = SDK.run(prompt, system_append=sys_ctx, on_event=_emit, model=model)      # warm Agent SDK (Fly fallback)
     else:
         result = run_claude(prompt, resume_id, on_event=_emit, system_append=sys_ctx, model=model)  # claude -p (subscription, free)
 
