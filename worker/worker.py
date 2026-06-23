@@ -767,13 +767,35 @@ def _norm_text(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
 
 
+# Filler/wake-word tokens that carry no intent — stripped before comparing two transcripts so a
+# different mic's mis-hear (e.g. ESP keeping "very raspy") doesn't make the same utterance look distinct.
+_DEDUP_STOP = {"the", "a", "an", "to", "of", "please", "hey", "hi", "ok", "okay", "very", "and",
+               "raspy", "rhaspy", "rhasspy", "rasbee", "rasby", "raspberry", "jarvis", "um", "uh"}
+
+
+def _content_words(s: str) -> set:
+    return {w for w in _norm_text(s).split() if w not in _DEDUP_STOP}
+
+
+def _same_utterance(a: str, b: str) -> bool:
+    """Two transcripts of (probably) the same spoken command. SequenceMatcher catches near-identical
+    text; word-overlap catches the common case where two mics transcribe the same utterance differently
+    (different words/order) but share most of the content words."""
+    if difflib.SequenceMatcher(None, _norm_text(a), _norm_text(b)).ratio() >= 0.75:
+        return True
+    wa, wb = _content_words(a), _content_words(b)
+    if wa and wb and len(wa & wb) / min(len(wa), len(wb)) >= 0.6:
+        return True
+    return False
+
+
 def _duplicate_of_recent(db: Supabase, req: dict) -> bool:
-    """True if another request within ~8s has a near-identical transcript and was already claimed/done —
+    """True if another request within ~8s is the same spoken command and was already claimed/done —
     i.e. a second always-on listener (ESP + Mac) heard the same utterance. Keeps the EARLIER request."""
     rid = req.get("id")
-    tx = _norm_text(req.get("transcript") or "")
+    tx = req.get("transcript") or ""
     ts = _parse_ts(req.get("created_at") or "")
-    if not tx or ts is None:
+    if not _norm_text(tx) or ts is None:
         return False
     rows = db.get("voice_requests", "select=id,transcript,created_at,status&order=created_at.desc&limit=12")
     for r in rows:
@@ -782,7 +804,7 @@ def _duplicate_of_recent(db: Supabase, req: dict) -> bool:
         ots = _parse_ts(r.get("created_at") or "")
         if ots is None or abs((ts - ots).total_seconds()) > 8:
             continue
-        if ots <= ts and difflib.SequenceMatcher(None, tx, _norm_text(r.get("transcript") or "")).ratio() >= 0.75:
+        if ots <= ts and _same_utterance(tx, r.get("transcript") or ""):
             return True
     return False
 
