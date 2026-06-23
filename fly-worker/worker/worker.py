@@ -680,6 +680,135 @@ class SdkRunner:
 SDK = SdkRunner()
 
 
+# --------------------------------------------------------------------------- #
+# Stripped-down API agent — ONLY the MCP tools, nothing else (no Claude Code bloat).
+# Direct Anthropic Messages API with exactly the data/voice/govee MCP tools as `tools=`. MCP servers
+# start once (warm stdio sessions); schemas are inlined with the prompt. Full agentic loop (sequential
+# tool calls → final reply). See worker/worker.py for the detailed rationale.
+API_MODEL_IDS = {"haiku": "claude-haiku-4-5", "sonnet": "claude-sonnet-4-6", "opus": "claude-opus-4-8"}
+
+
+class ApiRunner:
+    def __init__(self):
+        self._loop = None
+        self._client = None
+        self._stack = None
+        self._sessions = {}
+        self._tools = []
+        self._dispatch = {}
+        self._messages = []
+        self._last = 0.0
+        self._day = None
+
+    def _start_loop(self):
+        if self._loop is None:
+            self._loop = asyncio.new_event_loop()
+            threading.Thread(target=self._loop.run_forever, name="api-loop", daemon=True).start()
+
+    async def _ensure(self):
+        if self._client is None:
+            from anthropic import AsyncAnthropic
+            self._client = AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        if self._sessions:
+            return
+        from contextlib import AsyncExitStack
+        from mcp import ClientSession, StdioServerParameters
+        from mcp.client.stdio import stdio_client
+        env = {**os.environ, "SUPABASE_URL": SUPABASE_URL, "SUPABASE_KEY": SUPABASE_KEY}
+        specs = []
+        if os.path.exists(DATA_MCP_JS):  specs.append(("data", "node", [DATA_MCP_JS]))
+        if os.path.exists(VOICE_MCP_JS): specs.append(("voice", "node", [VOICE_MCP_JS]))
+        if os.path.exists(GOVEE_MCP_PY): specs.append(("govee", GOVEE_PY, [GOVEE_MCP_PY]))
+        self._stack = AsyncExitStack()
+        for name, cmd, args in specs:
+            params = StdioServerParameters(command=cmd, args=args, env=env)
+            read, write = await self._stack.enter_async_context(stdio_client(params))
+            session = await self._stack.enter_async_context(ClientSession(read, write))
+            await session.initialize()
+            self._sessions[name] = session
+            for t in (await session.list_tools()).tools:
+                aname = (name + "__" + t.name)[:64]
+                self._tools.append({
+                    "name": aname,
+                    "description": (t.description or "")[:2048],
+                    "input_schema": t.inputSchema or {"type": "object", "properties": {}},
+                })
+                self._dispatch[aname] = (name, t.name)
+        log(f"api agent: {len(self._tools)} MCP tools warm ({', '.join(self._sessions)})")
+
+    async def _close(self):
+        if self._stack is not None:
+            try:
+                await self._stack.aclose()
+            except Exception:  # noqa: BLE001
+                pass
+        self._stack = None
+        self._sessions, self._tools, self._dispatch = {}, [], {}
+
+    def reset(self):
+        self._messages = []
+
+    async def _call_tool(self, server, real, args):
+        try:
+            r = await self._sessions[server].call_tool(real, args or {})
+            parts = [getattr(c, "text", None) or str(c) for c in (r.content or [])]
+            return "\n".join(p for p in parts if p) or "(no output)"
+        except Exception as e:  # noqa: BLE001
+            return f"tool error: {e}"
+
+    async def _run(self, prompt, system, model, think, on_event):
+        await self._ensure()
+        self._messages.append({"role": "user", "content": prompt})
+        kwargs = dict(model=API_MODEL_IDS.get(model, model), system=system,
+                      tools=self._tools, messages=self._messages,
+                      max_tokens=8000 if think else 1024)
+        if think:
+            kwargs["thinking"] = {"type": "adaptive"}
+            kwargs["output_config"] = {"effort": "high"}
+        final_text = ""
+        for _ in range(8):
+            resp = await self._client.messages.create(**kwargs)
+            self._messages.append({"role": "assistant", "content": resp.content})
+            tool_results = []
+            for b in resp.content:
+                if b.type == "text":
+                    final_text = b.text
+                elif b.type == "tool_use":
+                    if on_event:
+                        try:
+                            on_event("tool", {"name": b.name, "input": b.input})
+                        except Exception:  # noqa: BLE001
+                            pass
+                    server, real = self._dispatch.get(b.name, (None, None))
+                    out = await self._call_tool(server, real, b.input) if server else "tool not found"
+                    tool_results.append({"type": "tool_result", "tool_use_id": b.id, "content": out})
+            if resp.stop_reason == "tool_use" and tool_results:
+                self._messages.append({"role": "user", "content": tool_results})
+                kwargs["messages"] = self._messages
+                continue
+            break
+        return {"session_id": None, "text": final_text.strip(), "result": final_text.strip(),
+                "ok": bool(final_text.strip()), "raw_error": None}
+
+    def run(self, transcript, system_append="", on_event=None, model="haiku", think=False) -> dict:
+        self._start_loop()
+        now = time.monotonic()
+        today = datetime.now().astimezone().date()
+        if self._messages and (now - self._last > SESSION_IDLE_RESET_S or self._day != today):
+            self.reset()
+        self._last, self._day = now, today
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                self._run(transcript, system_append, model, think, on_event), self._loop)
+            return fut.result(timeout=CLAUDE_TIMEOUT_S + 30)
+        except Exception as e:  # noqa: BLE001
+            self.reset()
+            return {"session_id": None, "text": "", "result": "", "ok": False, "raw_error": f"api run failed: {e}"}
+
+
+API = ApiRunner()
+
+
 def get_routing_mode(db: Supabase) -> str:
     """'sdk' (warm Agent SDK, API/credit) or 'subscription' (claude -p). Fly is always sdk (API-only)."""
     if WORKER_ID == "fly":
@@ -784,6 +913,7 @@ def process_request(db: Supabase, req: dict) -> None:
         except Exception as e:
             log(f"reset: unlink hub_session failed: {e}")
         SDK.reset()   # also drop the warm SDK conversation, if any
+        API.reset()   # and the API agent's conversation
         db.patch("voice_requests", f"id=eq.{rid}",
                  {"status": "done", "result": "(context reset)", "updated_at": now_iso()})
         log("hub context reset — session dropped")
@@ -876,9 +1006,15 @@ def process_request(db: Supabase, req: dict) -> None:
     govee = govee_context()
     if govee:
         sys_ctx += "\n\n" + govee
-    # fast/power tiers always use the warm SDK path (API key) regardless of routing_mode — no cold starts.
-    if tier in ("fast", "power") or get_routing_mode(db) == "sdk":
-        result = SDK.run(prompt, system_append=sys_ctx, on_event=_emit, model=model)      # warm Agent SDK (API/credit)
+    # FAB tiers (fast→Haiku, power→Opus+thinking) run on the stripped-down API agent (MCP tools only);
+    # fall back to the free subscription on API error. Default/ESP stay on claude -p; Fly forces 'sdk'.
+    if tier in ("fast", "power"):
+        result = API.run(prompt, system_append=sys_ctx, on_event=_emit, model=model, think=(tier == "power"))
+        if not result.get("ok"):
+            log(f"{tier} tier API failed ({result.get('raw_error')}); falling back to subscription")
+            result = run_claude(prompt, resume_id, on_event=_emit, system_append=sys_ctx, model=model)
+    elif get_routing_mode(db) == "sdk":
+        result = SDK.run(prompt, system_append=sys_ctx, on_event=_emit, model=model)      # warm Agent SDK (Fly fallback)
     else:
         result = run_claude(prompt, resume_id, on_event=_emit, system_append=sys_ctx, model=model)  # claude -p (subscription)
 
