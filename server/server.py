@@ -33,7 +33,8 @@ from openwakeword.model import Model
 
 # ---- config (env) ----------------------------------------------------------
 PORT = int(os.environ.get("PORT", "8080"))
-WAKE_MODEL = os.environ.get("WAKE_MODEL", "hey_rhasspy")  # openWakeWord pretrained name ("Hey Rhasspy")
+WAKE_MODEL = os.environ.get("WAKE_MODEL", "hey_rhasspy")            # "Hey Rhasspy" → fast tier (Haiku)
+WAKE_MODEL_POWER = os.environ.get("WAKE_MODEL_POWER", "hey_jarvis") # "Hey Jarvis"  → power tier (Opus + ultrathink)
 WAKE_THRESHOLD = float(os.environ.get("WAKE_THRESHOLD", "0.5"))
 GAIN = float(os.environ.get("GAIN", "15"))   # software boost for the quiet 16-bit mic
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "whisper-large-v3-turbo")
@@ -65,7 +66,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("voice")
 
 groq = Groq(api_key=os.environ["GROQ_API_KEY"])
-oww = Model(wakeword_models=[WAKE_MODEL], inference_framework="onnx")
+oww = Model(wakeword_models=[WAKE_MODEL, WAKE_MODEL_POWER], inference_framework="onnx")
 
 
 def pcm_to_wav(pcm: bytes) -> bytes:
@@ -97,16 +98,17 @@ async def transcribe(pcm: bytes) -> str:
     return (result if isinstance(result, str) else getattr(result, "text", "")).strip()
 
 
-async def handle_transcript(text: str, duration_s: float, truncated: bool) -> bool:
+async def handle_transcript(text: str, duration_s: float, truncated: bool, tier: str = "") -> bool:
     """HANDOFF SEAM — the rest of the system hooks in here.
 
     `duration_s` is the captured length; `truncated` is True if the capture ended
     by hitting MAX_UTTERANCE_S while speech was still active (the hub surfaces this).
+    `tier` ('fast'|'power'|'') comes from which wake word fired; it rides the queue row.
     """
-    log.info("TRANSCRIPT (%.0fs%s): %r", duration_s, ", TRUNCATED" if truncated else "", text)
-    # Strip a leading wake phrase the STT often captures ("Hey Rhasspy, ...") — it's the
-    # trigger word, not part of the command. Tolerant of Whisper mishears (raspy/rhaspy/raspberry/etc.).
-    text = re.sub(r"^\W*(hey|hi|ok|okay)?\W*(rhasspy|rhaspy|raspy|rasbee|rasby|raspberry|rasp)\b[\s,.!:;-]*",
+    log.info("TRANSCRIPT (%.0fs%s, tier=%s): %r", duration_s, ", TRUNCATED" if truncated else "", tier or "-", text)
+    # Strip a leading wake phrase the STT often captures ("Hey Rhasspy, …" / "Hey Jarvis, …") — it's the
+    # trigger word, not part of the command. Tolerant of Whisper mishears (raspy/rhaspy/raspberry, jarvis/jarvas; "very").
+    text = re.sub(r"^\W*(hey|hi|ok|okay|very)?\W*(rhasspy|rhaspy|raspy|rasbee|rasby|raspberry|rasp|jarvis|jarvas|jervis)\b[\s,.!:;-]*",
                   "", text or "", count=1, flags=re.IGNORECASE).strip()
     if not (SUPABASE_URL and SUPABASE_ANON_KEY and text):
         return False
@@ -123,7 +125,7 @@ async def handle_transcript(text: str, duration_s: float, truncated: bool) -> bo
                     "Content-Type": "application/json",
                     "Prefer": "return=minimal",
                 },
-                json={"transcript": text, "source": "fly"},
+                json={"transcript": text, "source": "fly", **({"tier": tier} if tier else {})},
             )
         return True
     except Exception as e:
@@ -179,6 +181,7 @@ async def connection(ws):
     ambient = deque(maxlen=max(1, int(AMBIENT_WINDOW_S * SAMPLE_RATE / FRAME_SAMPLES)))
     capturing = False
     utterance = bytearray()
+    wake_tier = None                # which wake word fired this utterance ('fast' | 'power')
     threshold = 0.0                 # adaptive speech/silence level, set at wake
     last_voice = 0.0
     started = 0.0
@@ -207,7 +210,11 @@ async def connection(ws):
                 ambient.append(rms(frame))      # track the room's noise floor
 
                 scores = oww.predict(frame)
-                if scores.get(WAKE_MODEL, 0.0) >= WAKE_THRESHOLD:
+                power_score = scores.get(WAKE_MODEL_POWER, 0.0)
+                fast_score = scores.get(WAKE_MODEL, 0.0)
+                # "Hey Jarvis" (power) checked first so it wins ties; "Hey Rhasspy" (fast) otherwise.
+                wake_tier = "power" if power_score >= WAKE_THRESHOLD else ("fast" if fast_score >= WAKE_THRESHOLD else None)
+                if wake_tier:
                     floor = float(np.median(ambient)) if ambient else 0.0
                     threshold = max(floor * FLOOR_MULT, floor + FLOOR_MIN_MARGIN)
                     await ws.send("LED_ON")   # solid while recording you
@@ -216,6 +223,7 @@ async def connection(ws):
                     preroll.clear()
                     started = time.monotonic()
                     last_voice = started
+                    log.info("wake! tier=%s (fast=%.2f power=%.2f)", wake_tier, fast_score, power_score)
             else:
                 utterance.extend(raw)
                 now = time.monotonic()
@@ -234,7 +242,7 @@ async def connection(ws):
                     enqueued = False
                     try:
                         text = await transcribe(bytes(utterance))
-                        enqueued = await handle_transcript(text, dur, truncated)
+                        enqueued = await handle_transcript(text, dur, truncated, wake_tier or "")
                     except Exception as e:
                         log.exception("transcription failed: %s", e)
                     if enqueued:
