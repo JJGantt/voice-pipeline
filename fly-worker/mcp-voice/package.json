@@ -1,0 +1,17 @@
+{
+  "name": "mcp-voice",
+  "version": "1.0.0",
+  "description": "stdio MCP server: list focusable Mac Claude sessions and switch the Pi/TV wall focus via Supabase voice_focus.",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "mcp-voice": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test:list": "node src/test-list.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1"
+  }
+}

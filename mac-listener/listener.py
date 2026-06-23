@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Always-on Mac voice listener.
 
-openWakeWord ("hey_rhasspy") runs continuously on the built-in mic. On a wake hit it captures the
-following utterance (ending on a trailing silence — same 3s convention as the ESP), transcribes it
-LOCALLY with whisper.cpp (no Groq, no network for STT), strips the wake phrase, and enqueues the
-transcript into Supabase `voice_requests` with source='mac' — the exact same queue the ESP/Fly path
+openWakeWord runs continuously on the built-in mic with two wake words: "Hey Rhasspy" → fast tier
+(Haiku) and "Hey Jarvis" → power tier (Opus). On a wake hit it captures the following utterance
+(ending on a trailing silence), transcribes it with Groq whisper-large-v3-turbo when GROQ_API_KEY
+is set else local whisper.cpp, strips the wake phrase, and enqueues the transcript into Supabase
+`voice_requests` with source='mac' (carrying the tier) — the exact same queue the ESP/Fly path
 feeds. The Mac worker then drains it into the shared 'hub' conversation, identical to every other
-front-end. The Mac is just another set of ears.
+front-end. The Mac is just another set of ears. Live state (listening → working → done) is shown
+on screen via the Hammerspoon overlay HUD (see hud()).
 """
 
-import json
 import os
 import re
 import subprocess
@@ -42,7 +43,6 @@ SAMPLE_RATE = 16000
 FRAME = 1280            # 80 ms @ 16 kHz — openWakeWord's expected chunk
 HANGOVER_S = float(os.environ.get("HANGOVER_S", "3.0"))   # trailing silence that ends an utterance
 MAX_UTTER_S = 30.0
-CAL_S = 0.35           # learn the ambient noise floor over the first moments of capture
 MIN_UTTER_S = 0.4      # ignore sub-0.4s "utterances" (just the wake tail)
 
 
@@ -50,15 +50,19 @@ def log(msg: str) -> None:
     print(f"{datetime.now(timezone.utc).isoformat()} [mac-listener] {msg}", flush=True)
 
 
-# ---- local feedback: a visual wake notification + Raspy's reply spoken aloud --------------------
+# ---- local feedback: a screen-level state HUD + Raspy's reply spoken aloud -----------------------
 SPEAK_SH = os.path.expanduser("~/scripts/speak.sh")
+HS_BIN = os.environ.get("HS_BIN", "/opt/homebrew/bin/hs")   # Hammerspoon IPC CLI
 
 
-def notify(msg: str) -> None:
-    """Visual 'I heard you' cue (macOS notification) — no audio chime before the command."""
+def hud(state: str) -> None:
+    """Drive the Hammerspoon overlay HUD (listening/working/done/error/off). Fire-and-forget so it
+    never adds latency to the wake→capture path. The HUD is a screen-level canvas that shows over
+    full-screen apps and through Focus/DnD — unlike the old osascript banner, which macOS silently
+    suppressed (attributed to Script Editor, killed in full-screen and Do-Not-Disturb)."""
     try:
-        subprocess.run(["osascript", "-e", f'display notification {json.dumps(msg)} with title "Raspy"'],
-                       capture_output=True, timeout=5)
+        subprocess.Popen([HS_BIN, "-c", f'VoiceHUD("{state}")'],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:  # noqa: BLE001
         pass
 
@@ -88,6 +92,7 @@ def speak_reply(baseline) -> None:
                           headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=8)
             rows = r.json()
             if rows and rows[0]["id"] != baseline and (rows[0].get("text") or "").strip():
+                hud("done")   # reply landed — flip the HUD before we speak it
                 try:
                     subprocess.run([SPEAK_SH], input=rows[0]["text"], text=True, capture_output=True, timeout=90)
                 except Exception as e:  # noqa: BLE001
@@ -95,6 +100,7 @@ def speak_reply(baseline) -> None:
                 return
         except Exception:  # noqa: BLE001
             pass
+    hud("off")   # no reply within the window — don't leave the HUD stuck on "working"
 
 
 def strip_wake(text: str) -> str:
@@ -189,10 +195,19 @@ def enqueue(text: str, tier: str = "") -> None:
 
 
 def capture_utterance(stream) -> np.ndarray:
-    """Read frames until the speaker goes quiet for HANGOVER_S (or MAX_UTTER_S). Adaptive floor."""
+    """Read frames until the speaker goes quiet for HANGOVER_S (or MAX_UTTER_S).
+
+    The silence floor is tracked continuously as a running minimum of frame RMS — it snaps down to
+    any quieter frame and drifts up only slowly toward sustained noise. That means the loud tail of
+    the wake word at the very start of capture can't inflate it, and the floor keeps correcting all
+    through the utterance. (The old approach froze a floor from the first 0.35s — which usually
+    caught "…asspy" or the command's onset, set the threshold above the speaker's level so the
+    command never registered as speech, and ran the full 30s cap. That was the "took forever" bug.)
+    Speech = RMS a few × above that floor; once we've heard speech, HANGOVER_S of sub-threshold
+    frames ends the utterance.
+    """
     frames: list[np.ndarray] = []
-    floor = None
-    cal: list[float] = []
+    noise = None
     spoke = False
     silence_start = None
     t0 = time.monotonic()
@@ -202,20 +217,23 @@ def capture_utterance(stream) -> np.ndarray:
         frames.append(i16.copy())
         rms = float(np.sqrt(np.mean((i16.astype(np.float32) / 32768.0) ** 2)))
         now = time.monotonic()
-        if now - t0 < CAL_S:
-            cal.append(rms)
+
+        if noise is None:
+            noise = rms
+        elif rms < noise:
+            noise = rms                            # snap down to any quieter frame (true ambient)
         else:
-            if floor is None:
-                base = (sum(cal) / len(cal)) if cal else 0.01
-                floor = max(base * 2.5, 0.02)
-            if rms >= floor:
-                spoke = True
-                silence_start = None
-            elif spoke:
-                if silence_start is None:
-                    silence_start = now
-                elif now - silence_start >= HANGOVER_S:
-                    break
+            noise = 0.99 * noise + 0.01 * rms      # rise slowly toward sustained background noise
+
+        threshold = max(noise * 3.0, 0.015)        # speech sits well above the ambient floor
+        if rms >= threshold:
+            spoke = True
+            silence_start = None
+        elif spoke:
+            if silence_start is None:
+                silence_start = now
+            elif now - silence_start >= HANGOVER_S:
+                break
         if now - t0 >= MAX_UTTER_S:
             break
     return np.concatenate(frames) if frames else np.array([], dtype=np.int16)
@@ -248,15 +266,17 @@ def main() -> int:
                 fired_tier = "fast"
             if fired_tier:
                 log(f"wake! tier={fired_tier} (fast={fast_score:.2f} power={power_score:.2f}) — capturing…")
-                notify("🎙 Listening…")
+                hud("listening")                    # mic open, capturing the command
                 baseline = _latest_assistant_id()   # snapshot before this command's reply lands
                 pcm = capture_utterance(stream)
                 text = strip_wake(transcribe(pcm))
                 if text:
                     log(f"transcript (tier={fired_tier}): {text!r}")
+                    hud("working")                  # mic closed; worker is now thinking / running tools
                     enqueue(text, tier=fired_tier)
                     threading.Thread(target=speak_reply, args=(baseline,), daemon=True).start()
                 else:
+                    hud("off")
                     log("…nothing intelligible, ignoring")
                 oww.reset()  # clear the activation so the next wake is fresh
 
