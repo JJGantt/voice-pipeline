@@ -1072,6 +1072,14 @@ def process_request(db: Supabase, req: dict) -> None:
     quick = source == "web-quick"
     audio = source in ("fly", "mac", "web-quick")   # transcribed (mishear-prone); typed text is excluded
     prompt = transcript
+    # Give the model the real current date/time (worker-local, i.e. Jared's timezone on Mac/Pi) so any
+    # relative date resolves correctly — without it the model defaults to its training era (e.g. logging
+    # "yesterday" against 2024). Rides on the prompt, NOT the cached system block, so it can't change the
+    # per-command system prefix and break the API's prompt cache.
+    _now = datetime.now().astimezone()
+    prompt += ("\n\n[Current date and time: " + _now.strftime("%A, %B %-d, %Y, %-I:%M %p %Z") + " ("
+               + _now.strftime("%Y-%m-%d") + "). Resolve any relative date/time — 'today', 'yesterday', "
+               "'last night', 'this morning', 'last week' — against THIS, never your training data.]")
     if audio:
         prompt += WAKE_NOISE_DIRECTIVE
     if quick:
