@@ -153,6 +153,30 @@ def enqueue(text: str) -> None:
         log(f"enqueue failed: {e}")
 
 
+def inject_mode() -> bool:
+    """True when the hub's voice_inject_mode is on — route confirmed commands to the focused Mac window
+    (paste + Enter) instead of the hub. Read live per command, like route_tier()."""
+    try:
+        r = httpx.get(f"{SUPABASE_URL}/rest/v1/app_settings",
+                      params={"key": "eq.voice_inject_mode", "select": "value"},
+                      headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=5)
+        rows = r.json()
+        return bool(rows) and str(rows[0].get("value")).strip().lower() not in ("0", "false", "off", "no", "", "none")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def inject_text(text: str) -> None:
+    """Inject-mode sink: paste the command into the frontmost Mac window + Enter via Hammerspoon (reuses
+    voice.lua's injectVoiceText). No hub, no actions — just hands-free input where the cursor is."""
+    try:
+        subprocess.Popen([HS_BIN, "-c", f"injectVoiceText([==[{text}]==])"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log(f"injected: {text[:80]!r}")
+    except Exception as e:  # noqa: BLE001
+        log(f"inject failed: {e}")
+
+
 def get_setting(key: str, default: float) -> float:
     """Read a numeric setting from the hub's shared app_settings so the hub UI controls it. Falls back
     to the default if unset/unreachable."""
@@ -252,7 +276,10 @@ def main() -> int:
                                 text = transcribe(pcm)
                                 if text:
                                     log(f"Jared (sim={sim:.2f}) → {text!r}")
-                                    enqueue(text)          # worker drives working/done HUD + speech via the listener
+                                    if inject_mode():
+                                        inject_text(text)  # paste into the focused Mac window + Enter (no hub)
+                                    else:
+                                        enqueue(text)      # worker drives working/done HUD + speech via the listener
                                 else:
                                     hud("off")
                             else:

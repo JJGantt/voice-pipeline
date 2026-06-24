@@ -1118,17 +1118,20 @@ def process_request(db: Supabase, req: dict) -> None:
     #  · ACCURACY  (power)  → subscription `claude -p` (Opus + thinking) on Mac → Pi. On Fly there's no
     #    subscription login, so accuracy uses the API there with the same model + thinking.
     if tier == "custom":
-        # Custom route honors the chosen runner: 'api' = Anthropic API directly; 'local' = the free
-        # subscription (claude -p on Mac/Pi) with an API fallback so it never just fails. Fly has no
-        # subscription login, so 'local' resolves to the API there too.
-        if runner == "api" or WORKER_ID == "fly":
+        # Custom route honors the chosen runner. 'api' = Anthropic API directly. 'local' = the free
+        # subscription (claude -p on Mac/Pi) and it STAYS local — NEVER a silent API fallback (that bills
+        # money the user explicitly opted out of). On Fly there's no subscription, so a 'local' command
+        # that somehow lands there (only when both Mac AND Pi are down) is refused, not run on the API.
+        if runner == "api":
             result = API.run(prompt, system_append=sys_ctx, on_event=_emit, model=model, think=think, effort=effort)
+        elif WORKER_ID == "fly":
+            log("custom-local reached Fly (Mac+Pi down) — refusing the API; local means local")
+            result = {"ok": False, "text": "",
+                      "result": "(local route — no subscription worker up; not run on the API)",
+                      "raw_error": "no-subscription-worker", "session_id": None}
         else:
             result = run_claude(prompt, resume_id, on_event=_emit, system_append=sys_ctx, model=model,
                                 agent=use_agent, cwd=ag["cwd"])
-            if not result.get("ok"):
-                log(f"custom local failed ({result.get('raw_error')}); falling back to API")
-                result = API.run(prompt, system_append=sys_ctx, on_event=_emit, model=model, think=think, effort=effort)
     elif tier == "fast":
         result = API.run(prompt, system_append=sys_ctx, on_event=_emit, model=model, think=False)
         if not result.get("ok"):

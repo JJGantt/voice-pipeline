@@ -52,6 +52,10 @@ _active_esp = None
 # can't strand the ESP deaf.
 _suppressed = False
 _suppress_safety = None
+# Voice inject mode (hub toggle voice_inject_mode): when ON, the Mac mic is the ONLY listener — speech is
+# pasted into the focused Mac window. The ESP must go deaf for it (Mac-only listening), so the server gates
+# its own capture off here, read straight from app_settings (survives restarts / a sleeping Mac).
+_inject = False
 # Wake-free (speaker-ID) mode for the ESP, congruent with the Mac: the global wakefree_enabled toggle is
 # bridged here by the Mac listener via /wakefree-on|off. When ON, the ESP captures on speech ENERGY (no
 # wake word) and verifies the utterance is Jared's voice (ECAPA + the shared voiceprint) before
@@ -233,7 +237,7 @@ async def connection(ws):
                 frame = np.clip(frame.astype(np.float32) * GAIN, -32768, 32767).astype(np.int16)
                 raw = frame.tobytes()
 
-            if _suppressed:               # global push-to-talk mute → drop everything, abort any capture
+            if _suppressed or _inject:    # push-to-talk mute OR inject mode (Mac-only) → ESP drops everything
                 if capturing:
                     capturing = False
                     utterance = bytearray()
@@ -487,7 +491,12 @@ def _load_voiceid_bg() -> None:
 
 def _apply_setting(key, value) -> None:
     """Apply one app_settings change to the server's own state (no Mac bridge required)."""
-    global _wakefree, _suppressed, _wake_route
+    global _wakefree, _suppressed, _wake_route, _inject
+    if key == "voice_inject_mode":
+        _inject = _truthy(value)
+        log.info("voice inject mode %s (from app_settings) — ESP %s", "ON" if _inject else "off",
+                 "muted" if _inject else "live")
+        return
     if key == "wakefree_enabled":
         on = _truthy(value)
         if on and not _wakefree:
@@ -513,11 +522,11 @@ async def _settings_listener() -> None:
     if not (SUPABASE_URL and key):
         log.warning("settings listener: no supabase creds; ESP state will rely on the Mac bridge only")
         return
-    s = _get_settings(["wakefree_enabled", "voice_muted", "wakefree_route"])
-    for k in ("wakefree_route", "voice_muted", "wakefree_enabled"):
+    s = _get_settings(["wakefree_enabled", "voice_muted", "wakefree_route", "voice_inject_mode"])
+    for k in ("wakefree_route", "voice_muted", "wakefree_enabled", "voice_inject_mode"):
         if k in s:
             _apply_setting(k, s[k])
-    log.info("startup state from DB: wakefree=%s muted=%s route=%s", _wakefree, _suppressed, _wake_route)
+    log.info("startup state from DB: wakefree=%s muted=%s route=%s inject=%s", _wakefree, _suppressed, _wake_route, _inject)
     from realtime import AsyncRealtimeClient
     while True:
         sock = None

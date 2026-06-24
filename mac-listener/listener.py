@@ -139,6 +139,35 @@ def set_wakefree(on: bool) -> None:
         threading.Thread(target=_ping_esp_wakefree, args=(False,), daemon=True).start()
 
 
+# Flag the Claude Code hooks read: present → speak my replies (Kokoro) + write them spoken-word-friendly.
+# Maintained here from the hub's voice_inject_mode (this replaces the old Cmd+Opt+C conversation toggle).
+INJECT_FLAG = os.path.expanduser("~/.hammerspoon/voice-inject-mode")
+
+
+def set_inject_mode(on: bool) -> None:
+    """Voice inject mode (hub toggle `voice_inject_mode`). On → ensure always-listening (wake-free) is up
+    so the Mac mic drives it, and drop the hook flag so my replies are spoken + spoken-word-friendly. Off →
+    remove the flag and restore wake-free to its own hub setting. The ESP is gated off by the Fly server
+    itself (it reads voice_inject_mode), so the Mac stays the only listener."""
+    if on:
+        if not _wakefree.is_set():
+            set_wakefree(True)
+        try:
+            open(INJECT_FLAG, "w").close()
+        except OSError:
+            pass
+        log("inject mode ON — Mac-mic → focused window; ESP gated off by the server; replies spoken")
+    else:
+        try:
+            os.remove(INJECT_FLAG)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+        set_wakefree(_read_setting("wakefree_enabled"))   # inject forced wake-free on; restore its own toggle
+        log("inject mode OFF — wake-free restored to its hub setting")
+
+
 def _read_setting(key: str) -> bool:
     try:
         r = httpx.get(f"{SUPABASE_URL}/rest/v1/app_settings",
@@ -303,9 +332,12 @@ class RealtimeFeedback:
             set_wakefree(truthy)
         elif key == "voice_muted":      # global mute set by any explicit input (PTT / FAB)
             _apply_mute(truthy)
-        elif key == "wakefree_route":   # Efficiency/Accuracy for wake-free → bridge to the ESP (Mac reads it live)
-            tier = "power" if str(rec.get("value")) == "power" else "fast"
+        elif key == "wakefree_route":   # bridge the wake-free route to the ESP so its tier MATCHES the Mac
+            v = str(rec.get("value"))   # pass the real route through — never downgrade custom/power to fast
+            tier = v if v in ("power", "custom") else "fast"
             threading.Thread(target=_ping_esp_route, args=(tier,), daemon=True).start()
+        elif key == "voice_inject_mode":   # hands-free: Mac-mic speech → focused window (ESP off, replies spoken)
+            set_inject_mode(truthy)
 
     def _on_request(self, payload) -> None:
         """A command's status changed (any source) → reflect it on the HUD, and pre-warm TTS on claim.
@@ -495,6 +527,7 @@ def main() -> int:
     signal.signal(signal.SIGUSR2, _on_ptt_stop)
     if _read_setting("wakefree_enabled"):  # apply persisted hub toggle at boot; live flips via RealtimeFeedback
         set_wakefree(True)
+    set_inject_mode(_read_setting("voice_inject_mode"))  # apply persisted inject toggle (forces wake-free on if set)
     # Clear any stale global mute on boot: push-to-talk mutes are Mac-local, so a fresh listener means
     # nothing is dictating. This un-sticks a voice_muted left set by a crash mid-dictation — the only
     # safety we need now that the server's arbitrary 90s auto-clear is gone.
