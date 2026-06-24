@@ -375,7 +375,7 @@ def _load_voiceid():
     _bank = np.load(io.BytesIO(base64.b64decode(s["voiceprint"]))) if s.get("voiceprint") else None
     _vthresh = float(s.get("voiceid_threshold") or 0.30)
     _vpause = float(s.get("wakefree_pause_s") or 2.0)
-    _wake_route = "power" if s.get("wakefree_route") == "power" else "fast"
+    _wake_route = s.get("wakefree_route") if s.get("wakefree_route") in ("power", "custom") else "fast"
     log.info("wake-free loaded: voiceprint=%s thresh=%.2f pause=%.1fs route=%s",
              None if _bank is None else _bank.shape, _vthresh, _vpause, _wake_route)
 
@@ -459,7 +459,7 @@ async def process_request(connection, request):
         from urllib.parse import urlparse, parse_qs
         global _wake_route
         v = parse_qs(urlparse(path).query).get("v", [None])[0]
-        _wake_route = "power" if v == "power" else "fast"
+        _wake_route = v if v in ("power", "custom") else "fast"
         log.info("wake-free route → %s", _wake_route)
         return connection.respond(HTTPStatus.OK, "ok\n")
     if path in ("/health", "/"):
@@ -500,7 +500,7 @@ def _apply_setting(key, value) -> None:
         _suppressed = _truthy(value)
         log.info("global mute %s (from app_settings)", "ON" if _suppressed else "off")
     elif key == "wakefree_route":
-        _wake_route = "power" if str(value) == "power" else "fast"
+        _wake_route = str(value) if str(value) in ("power", "custom") else "fast"
         log.info("wake-free route → %s (from app_settings)", _wake_route)
     elif key in ("voiceid_threshold", "wakefree_pause_s", "voiceprint") and _wakefree:
         _load_voiceid_bg()   # refresh thresholds / voiceprint live

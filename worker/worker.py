@@ -801,12 +801,23 @@ API = ApiRunner()
 
 
 def chatbox_route(db: Supabase) -> str:
-    """Route for the typed chat box ONLY: 'fast' (efficiency) or 'power' (accuracy). Default accuracy.
-    The two FAB buttons and the two wake words carry their own tier and ignore this."""
+    """Route for the typed chat box ONLY: 'fast' (efficiency), 'power' (accuracy), or 'custom'. Default
+    accuracy. The two FAB buttons and the two wake words carry their own tier and ignore this."""
     rows = db.get("app_settings", "key=eq.chatbox_route&select=value")
-    if rows and rows[0].get("value") in ("fast", "power"):
+    if rows and rows[0].get("value") in ("fast", "power", "custom"):
         return rows[0]["value"]
     return "power"
+
+
+def custom_config(db: Supabase) -> dict:
+    """The 'custom' route's knobs (hub Settings → Custom): model (haiku|sonnet|opus), thinking effort
+    (none|low|high), and runner (local subscription | api). Sane fallbacks if unset."""
+    rows = db.get("app_settings", "key=in.(custom_model,custom_think,custom_runner)&select=key,value")
+    s = {r["key"]: r["value"] for r in rows} if isinstance(rows, list) else {}
+    model = s.get("custom_model") if s.get("custom_model") in ("haiku", "sonnet", "opus") else "sonnet"
+    think = s.get("custom_think") if s.get("custom_think") in ("none", "low", "high") else "low"
+    runner = s.get("custom_runner") if s.get("custom_runner") in ("local", "api") else "local"
+    return {"model": model, "think": think, "runner": runner}
 
 
 def get_focus(db: Supabase) -> str:
@@ -980,14 +991,23 @@ def process_request(db: Supabase, req: dict) -> None:
     # Resolve the route. Buttons + wake words set the tier directly; the typed chat box has none, so it
     # follows the chat-box route setting. TWO routes only: fast (efficiency) | power (accuracy).
     tier = (req.get("tier") or "").strip()
-    if tier not in ("fast", "power"):
+    if tier not in ("fast", "power", "custom"):
         tier = chatbox_route(db)
-    if tier == "power":
-        model = "opus"
+    think = False        # API extended-thinking on/off
+    runner = ""          # "" = the tier's default device; "local"|"api" only when custom forces it
+    if tier == "custom":
+        cfg = custom_config(db)
+        model, runner = cfg["model"], cfg["runner"]
+        if cfg["think"] != "none":
+            think = True
+            if cfg["think"] == "high":
+                prompt += POWER_DIRECTIVE   # high effort → ultrathink (matters most on the subscription path)
+    elif tier == "power":
+        model = "opus"; think = True
         prompt += POWER_DIRECTIVE
     else:
         model = "haiku"
-    log(f"route={tier} → model={model}")
+    log(f"route={tier} → model={model} think={think}{(' runner=' + runner) if runner else ''}")
     ping_esp_led("blink")   # working — the ESP light blinks for EVERY command, not just ESP-sourced ones
 
     # Role framing first, then the live govee device list (when there are lights).
@@ -1000,7 +1020,18 @@ def process_request(db: Supabase, req: dict) -> None:
     #    to the free subscription so Raspy never breaks.
     #  · ACCURACY  (power)  → subscription `claude -p` (Opus + thinking) on Mac → Pi. On Fly there's no
     #    subscription login, so accuracy uses the API there with the same model + thinking.
-    if tier == "fast":
+    if tier == "custom":
+        # Custom route honors the chosen runner: 'api' = Anthropic API directly; 'local' = the free
+        # subscription (claude -p on Mac/Pi) with an API fallback so it never just fails. Fly has no
+        # subscription login, so 'local' resolves to the API there too.
+        if runner == "api" or WORKER_ID == "fly":
+            result = API.run(prompt, system_append=sys_ctx, on_event=_emit, model=model, think=think)
+        else:
+            result = run_claude(prompt, resume_id, on_event=_emit, system_append=sys_ctx, model=model)
+            if not result.get("ok"):
+                log(f"custom local failed ({result.get('raw_error')}); falling back to API")
+                result = API.run(prompt, system_append=sys_ctx, on_event=_emit, model=model, think=think)
+    elif tier == "fast":
         result = API.run(prompt, system_append=sys_ctx, on_event=_emit, model=model, think=False)
         if not result.get("ok"):
             log(f"fast API failed ({result.get('raw_error')}); falling back to subscription")

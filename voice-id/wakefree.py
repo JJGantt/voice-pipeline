@@ -121,8 +121,9 @@ def route_tier() -> str:
                       params={"key": "eq.wakefree_route", "select": "value"},
                       headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=8)
         rows = r.json()
-        if rows and rows[0].get("value") == "power":
-            return "power"
+        v = rows[0].get("value") if rows else None
+        if v in ("power", "custom"):
+            return v
     except Exception:  # noqa: BLE001
         pass
     return "fast"
