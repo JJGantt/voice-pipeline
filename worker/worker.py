@@ -496,6 +496,33 @@ def agent_settings() -> dict:
     return {"mode": _agent_cache["mode"], "cwd": _agent_cache["cwd"]}
 
 
+def publish_repo_dirs() -> None:
+    """Mac-only: scan the home tree for git repos and publish the list to app_settings.agent_cwd_options
+    (JSON array) so the hub's full-agent working-directory picker offers the actual repos. The agent runs on
+    whichever worker claims a request, but the Mac is primary, so its paths drive the dropdown; run_claude
+    falls back to $HOME if a published path doesn't exist on the worker that ends up running it."""
+    if WORKER_ID != "mac":
+        return
+    home = os.path.expanduser("~")
+    found = set()
+    for root in (home, os.path.join(home, "repos")):
+        try:
+            for entry in os.scandir(root):
+                if entry.is_dir() and os.path.isdir(os.path.join(entry.path, ".git")):
+                    found.add(entry.path)
+        except OSError:
+            pass
+    opts = sorted(found)
+    try:
+        httpx.post(f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
+                   headers={**headers(), "Prefer": "resolution=merge-duplicates"},
+                   json={"key": "agent_cwd_options", "value": json.dumps(opts), "updated_at": now_iso()},
+                   timeout=10)
+        log(f"published {len(opts)} repo dirs for the agent cwd picker")
+    except Exception as e:  # noqa: BLE001
+        log(f"publish_repo_dirs failed: {e}")
+
+
 def should_reset_session(state: dict | None, agent: bool = False) -> bool:
     """Reset (start fresh) if: no state, idle > the reset budget, or it's a new calendar day. In full-agent
     mode the conversation resets MANUALLY only — a long coding session shouldn't be wiped by an idle gap or a
@@ -569,6 +596,9 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
     if system_append:
         cmd += ["--append-system-prompt", system_append]
     timeout_s = AGENT_TIMEOUT_S if agent else CLAUDE_TIMEOUT_S
+    if cwd and not os.path.isdir(cwd):   # a published path may not exist on the worker that runs it
+        log(f"agent cwd {cwd!r} not present here; falling back to $HOME")
+        cwd = os.path.expanduser("~")
 
     session_id = None
     assistant_chunks: list[str] = []
@@ -1289,6 +1319,7 @@ def main() -> int:
 
     with httpx.Client(timeout=HTTP_TIMEOUT_S) as client:
         db = Supabase(client)
+        publish_repo_dirs()   # Mac-only: refresh the agent cwd picker's repo list
 
         if once:
             heartbeat(db)
