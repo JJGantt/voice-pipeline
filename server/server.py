@@ -429,6 +429,8 @@ async def process_request(connection, request):
         global _led_working, _led_capturing
         if u.path == "/led-blink":
             _led_working = True
+            if _active_esp is not None:
+                asyncio.create_task(_led_safety(_active_esp))  # backstop: self-clear if no /led-off ever arrives
         elif u.path == "/led-off":           # done → full reset (clears any lingering capture too)
             _led_working = False
             _led_capturing = False

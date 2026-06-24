@@ -1173,8 +1173,11 @@ def one_iteration(db: Supabase) -> bool:
         except Exception:  # noqa: BLE001
             pass
     finally:
-        if (req.get("source") or "").strip() == "fly":
-            ping_esp_led("off")   # model done (or dropped/errored) → clear the ESP working-light
+        # /led-off must fire for EVERY command — the blink (ping_esp_led "blink") is universal, so the
+        # off has to be too. Gating this to source=='fly' meant a Mac/web command blinked the ESP and
+        # NEVER cleared it (e.g. a wake-word false positive: claimed → blink → dropped as noise →
+        # stuck blinking forever). The ESP just ignores the ping when there's no light to clear.
+        ping_esp_led("off")   # model done (or dropped/errored) → clear the ESP working-light
     return True
 
 
