@@ -74,13 +74,13 @@ export async function getRouting() {
   const model = MODELS.includes(s.custom_model) ? s.custom_model : 'sonnet';
   const thinking = THINK.includes(s.custom_think) ? s.custom_think : 'medium';
   const runner = s.custom_runner === 'api' ? 'api' : 'local';
-  const wake = truthy(s.wakefree_enabled ?? '0');
+  const alwaysOn = truthy(s.wakefree_enabled ?? '0');
   const active = s.chatbox_route === 'custom' || s.wakefree_route === 'custom';
   return {
     model, model_label: MODEL_LABEL[model],
     thinking, thinking_label: THINK_LABEL[thinking],
     runner, runner_label: RUNNER_LABEL[runner],
-    wake_word: wake,
+    always_on: alwaysOn,   // hands-free, no-wake-word voice (aka 'AO' / 'wake-free')
     custom_route_active: active,
     note: active
       ? 'Custom route is active, so these are what the conversational agent uses now.'
@@ -110,8 +110,9 @@ export async function setRunner(v) {
   return `Runner set to ${RUNNER_LABEL[r]} (Custom route now active).`;
 }
 
-export async function setWakeWord(on) {
+// Always-on voice (aka 'AO' / 'wake-free' / hands-free) — toggles wakefree_enabled.
+export async function setAlwaysOn(on) {
   const v = truthy(on);
   await writeSettings({ wakefree_enabled: v ? '1' : '0' });
-  return `Wake-free voice ${v ? 'enabled' : 'disabled'}.`;
+  return `Always-on (wake-free) voice ${v ? 'enabled' : 'disabled'}.`;
 }

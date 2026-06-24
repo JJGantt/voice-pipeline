@@ -9,7 +9,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import { listRecentSessions } from './sessions.js';
 import { setFocus } from './focus.js';
 import { say } from './say.js';
-import { getRouting, setModel, setThinking, setRunner, setWakeWord } from './routing.js';
+import { getRouting, setModel, setThinking, setRunner, setAlwaysOn } from './routing.js';
 
 const server = new Server({ name: 'voice', version: '1.0.0' }, { capabilities: { tools: {} } });
 
@@ -54,7 +54,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'get_routing',
       description:
-        "Report how the conversational agent is currently routed: the model (haiku/sonnet/opus), thinking level (none/medium/maximum), runner (local subscription vs Anthropic API), and whether wake-free voice is on. Use this when Jared asks what model/thinking/routing is in effect.",
+        "Report how the conversational agent is currently routed: the model (haiku/sonnet/opus), thinking level (none/medium/maximum), runner (local subscription vs Anthropic API), and whether ALWAYS-ON voice is on (the hands-free, no-wake-word mode — also called 'always on', 'AO', or 'wake-free'; all the same thing). Use this when Jared asks what model/thinking/routing is in effect or whether always-on is enabled.",
       inputSchema: { type: 'object', properties: {} },
     },
     {
@@ -88,12 +88,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
-      name: 'set_wake_word',
+      name: 'set_always_on',
       description:
-        "Turn the wake-free voice system on or off. Pass `on: true` to enable hands-free listening, `on: false` to disable it.",
+        "Turn the ALWAYS-ON voice system on or off. This is the hands-free, no-wake-word listening mode — Jared calls it 'always on', 'AO', or 'wake-free', and they all mean THIS one toggle. So 'turn on always-on', 'turn always on on', 'enable AO', 'turn off always on', 'disable wake-free', etc. all map here. Pass `on: true` to enable, `on: false` to disable.",
       inputSchema: {
         type: 'object',
-        properties: { on: { type: 'boolean', description: 'true = enable wake-free voice, false = disable' } },
+        properties: { on: { type: 'boolean', description: 'true = enable always-on (wake-free) voice, false = disable' } },
         required: ['on'],
       },
     },
@@ -137,8 +137,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (name === 'set_runner') {
       return text(await setRunner(a.runner));
     }
-    if (name === 'set_wake_word') {
-      return text(await setWakeWord(a.on));
+    if (name === 'set_always_on') {
+      return text(await setAlwaysOn(a.on));
     }
     return text(`Unknown tool: ${name}`);
   } catch (err) {
