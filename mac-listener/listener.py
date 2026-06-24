@@ -123,11 +123,15 @@ def set_wakefree(on: bool) -> None:
             subprocess.Popen([WAKEFREE_RUN], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception as e:  # noqa: BLE001
             log(f"failed to start wakefree: {e}")
+        # Pin the TTS engine warm for the whole session (don't let it idle-exit between commands and
+        # cold-reload), and warm it now so the first command isn't delayed.
+        _pin_tts(True); warm_tts()
         threading.Thread(target=_ping_esp_wakefree, args=(True,), daemon=True).start()
     elif not on and _wakefree.is_set():
         log("wake-free OFF — stopping wakefree.py, reclaiming mic (+ ESP)")
         subprocess.Popen(["pkill", "-f", "wakefree.py"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         _wakefree.clear(); _recompute_capture()
+        _pin_tts(False)   # session over → let the daemon idle-exit and give the ~1 GB back
         threading.Thread(target=_ping_esp_wakefree, args=(False,), daemon=True).start()
 
 
@@ -171,6 +175,21 @@ def warm_tts() -> None:
     permanently. Idempotent + fire-and-forget (voice_daemon.sh no-ops if it's already running)."""
     try:
         subprocess.Popen([VOICE_DAEMON, "start"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+KOKORO_PIN = "/tmp/kokoro.pin"   # present = keep the TTS daemon warm (don't idle-exit); see kokoro_daemon.py
+
+
+def _pin_tts(on: bool) -> None:
+    """Pin/unpin the TTS daemon warm. While wake-free is ON we keep the engine resident for the whole
+    session so spaced-out commands never hit a cold ~7s reload; OFF lets it idle-exit and free the RAM."""
+    try:
+        if on:
+            open(KOKORO_PIN, "w").close()
+        else:
+            os.path.exists(KOKORO_PIN) and os.remove(KOKORO_PIN)
     except Exception:  # noqa: BLE001
         pass
 

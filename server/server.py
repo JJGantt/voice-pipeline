@@ -67,6 +67,15 @@ _bank = None         # voiceprint: (N, 192) exemplar embeddings from app_setting
 _vthresh = 0.30
 _vpause = 2.0
 
+# ---- Single-owner LED state ---------------------------------------------------------------------
+# The ESP has one LED and it must reflect ONE coherent state, never a race between code paths. Two
+# flags drive it with strict precedence: working (the worker is processing a command) > capturing (a
+# mic is actively recording) > idle. EVERY LED change goes through _render_led() — nothing calls
+# ws.send("LED_*") directly — so the old "solid → off → blink" flicker (the local capture machine and
+# the worker's universal pings stomping each other last-writer-wins) cannot happen.
+_led_working = False     # set by the worker's /led-blink, cleared by /led-off (universal, any source)
+_led_capturing = False   # set while this ESP is recording an utterance
+
 SAMPLE_RATE = 16_000
 FRAME_SAMPLES = 1280          # 80 ms @ 16 kHz — openWakeWord's expected chunk
 # Endpointing: adaptive to the room's measured noise floor (no hardcoded level).
@@ -181,7 +190,7 @@ def _client_token(ws) -> str | None:
 
 
 async def connection(ws):
-    global _active_esp
+    global _active_esp, _led_working, _led_capturing
     peer = getattr(ws, "remote_address", "?")
     # Device-token gate: enforced only when VOICE_DEVICE_TOKEN is set, so existing
     # firmware that doesn't send a token keeps working until it's updated.
@@ -192,6 +201,8 @@ async def connection(ws):
             return
     log.info("ESP32 connected: %s", peer)
     _active_esp = ws
+    _led_working = False
+    _led_capturing = False
     oww.reset()
 
     pending = bytearray()           # raw bytes not yet aligned to a frame
@@ -227,7 +238,8 @@ async def connection(ws):
                     capturing = False
                     utterance = bytearray()
                     oww.reset()
-                    await ws.send("LED_OFF")
+                    _led_capturing = False
+                    await _render_led(ws)
                 continue
 
             if not capturing:
@@ -251,7 +263,8 @@ async def connection(ws):
                     wake_tier = "power" if power_score >= WAKE_THRESHOLD else ("fast" if fast_score >= WAKE_THRESHOLD else None)
                 if wake_tier:
                     threshold = speech_level
-                    await ws.send("LED_ON")   # solid while recording you
+                    _led_capturing = True     # solid while recording you (precedence: working > this > idle)
+                    await _render_led(ws)
                     capturing = True
                     utterance = bytearray(preroll)
                     preroll.clear()
@@ -280,7 +293,8 @@ async def connection(ws):
                         sim = _verify_jared(np.frombuffer(bytes(utterance), dtype=np.int16))
                         if sim < _vthresh:
                             log.info("wake-free: not Jared (sim=%.2f) — dropped", sim)
-                            await ws.send("LED_OFF")
+                            _led_capturing = False
+                            await _render_led(ws)
                             capturing = False
                             utterance = bytearray()
                             continue
@@ -292,10 +306,12 @@ async def connection(ws):
                     except Exception as e:
                         log.exception("transcription failed: %s", e)
                     if enqueued:
-                        await ws.send("LED_BLINK")            # working — the worker LED_OFFs when the model finishes
+                        # Stay solid (capturing) until the worker's /led-blink takes over (working) and
+                        # its /led-off (done) clears everything — so the bulb never dips to off between.
                         asyncio.create_task(_led_safety(ws))  # backstop in case no done-ping arrives
                     else:
-                        await ws.send("LED_OFF")              # nothing to do → idle
+                        _led_capturing = False                # nothing to do → idle
+                        await _render_led(ws)
                     capturing = False
                     utterance = bytearray()
                     oww.reset()
@@ -308,11 +324,27 @@ async def connection(ws):
 LED_SAFETY_S = 60.0  # clear the 'working' blink after this long even if the worker never pings
 
 
+def _led_cmd() -> str:
+    return "LED_BLINK" if _led_working else ("LED_ON" if _led_capturing else "LED_OFF")
+
+
+async def _render_led(ws) -> None:
+    """The ONE place the LED is set, from the precedence state machine (working > capturing > idle).
+    Routing every change through here is what makes the indicator coherent — no two paths fight."""
+    try:
+        await ws.send(_led_cmd())
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def _led_safety(ws):
     """Backstop: clear the working blink after a while even if the worker's done-ping never arrives."""
+    global _led_working, _led_capturing
     try:
         await asyncio.sleep(LED_SAFETY_S)
-        await ws.send("LED_OFF")
+        _led_working = False
+        _led_capturing = False
+        await _render_led(ws)
     except Exception:  # noqa: BLE001
         pass
 
@@ -392,13 +424,18 @@ async def process_request(connection, request):
         if LED_TOKEN and tok != LED_TOKEN:
             return connection.respond(HTTPStatus.FORBIDDEN, "forbidden\n")
         # The worker drives these for ANY command (universal indicator), not just ESP-sourced ones:
-        # /led-blink while working, /led-off when done, /led-on as a solid 'listening' cue.
-        cmd = {"/led-off": "LED_OFF", "/led-blink": "LED_BLINK", "/led-on": "LED_ON"}.get(u.path)
-        if cmd and _active_esp is not None:
-            try:
-                await _active_esp.send(cmd)
-            except Exception:  # noqa: BLE001
-                pass
+        # /led-blink while working, /led-off when done, /led-on as a solid 'listening' cue. They feed the
+        # SAME precedence state machine as local capture, so the bulb is always one coherent state.
+        global _led_working, _led_capturing
+        if u.path == "/led-blink":
+            _led_working = True
+        elif u.path == "/led-off":           # done → full reset (clears any lingering capture too)
+            _led_working = False
+            _led_capturing = False
+        elif u.path == "/led-on":
+            _led_capturing = True
+        if _active_esp is not None:
+            await _render_led(_active_esp)
         return connection.respond(HTTPStatus.OK, "ok\n")
     if path.startswith("/capture-o"):     # /capture-off | /capture-on — global push-to-talk mute.
         # No token: muting briefly is low-risk and it auto-clears; keeps the secret out of Hammerspoon.

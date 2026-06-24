@@ -201,7 +201,10 @@ WAKE_NOISE_DIRECTIVE = (
     "'thanks', 'okay', 'you', 'bye', 'cool'), lone stray words ('speed'), filler, or anything nonsensical "
     "or blatantly unrelated — then it is almost certainly a false trigger: do NOT respond, do NOT thank "
     "them back, do NOT ask for clarification. Reply with EXACTLY "
-    f"'{IGNORE_SENTINEL}' and nothing else. Only respond normally when there is a real task or question.]"
+    f"'{IGNORE_SENTINEL}' and nothing else. BUT a clear, well-formed command or question is ALWAYS a real "
+    "request — even if it is identical to one you just handled (the user is deliberately repeating it, e.g. "
+    "retrying because it didn't take). NEVER drop a legitimate, actionable command as a false trigger just "
+    "because it repeats; only the genuinely noise-like cases above are false triggers.]"
 )
 
 # Always-on voice (ESP/Mac) turns are answered ALOUD only through the `say` MCP tool — the worker no

@@ -133,6 +133,13 @@ audio = the one `voice_speech` line. Only the last is played aloud.
   (jared-voice server's generic `/led-<state>` HTTP route).
 - Nothing is `request_id`-gated: the Mac speaks and lights up for an ESP- or phone-captured command the
   same as for one it captured itself.
+- **The ESP light is a single-owner state machine** (server-side, `working > capturing > idle`). Every
+  change — the ESP's own capture, the worker's `/led-blink|off`, and the Mac's at-enqueue `/led-blink` —
+  feeds the SAME two flags and renders with precedence, so two paths can never fight the bulb. (The old
+  code let the local capture machine and the worker's pings stomp each other last-writer-wins, which is
+  what produced the solid→off→blink flicker when both mics heard one command.) `/led-off` (done) is the
+  one reset that clears everything; an enqueued capture stays solid until the worker's blink takes over,
+  so the light never dips to off mid-command.
 
 ### TTS engine (Kokoro, on-demand)
 The spoken line plays through a local Kokoro daemon (`~/scripts/kokoro_daemon.py`). It is **not** kept
@@ -143,6 +150,10 @@ and — as a backstop for the ESP path — any claimed `voice_request` (`listene
 immediately and queues lines that arrive mid-load, and **self-exits after 30s idle** to give the RAM
 back. Zero permanent cost, no cold delay. (Warming at the worker *claim* alone was too late: the claim
 lands only ~2–3 s before the spoken line, but the cold load needs ~7 s — hence the old ~5 s delay.)
+
+While **wake-free mode is on**, the listener *pins* the daemon warm (a `/tmp/kokoro.pin` file the idle
+loop honours) and warms it on the toggle — so spaced-out commands in an active session never hit a cold
+reload between them. Turning wake-free off removes the pin and the daemon idle-exits as usual.
 
 ## Wake-free mode (speaker-ID gated) — ONE system, every source
 

@@ -41,6 +41,7 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "whisper-large-v3-turbo")
 HS_BIN = os.environ.get("HS_BIN", "/opt/homebrew/bin/hs")
 VOICE_DAEMON = os.path.expanduser("~/scripts/voice_daemon.sh")  # warm Kokoro TTS engine (pre-warmed at capture)
+JARED_VOICE_URL = os.environ.get("JARED_VOICE_URL", "https://jared-voice.fly.dev").rstrip("/")
 
 SR = 16000
 FRAME_S = 0.1          # 100ms capture frames — responsive endpointing
@@ -127,6 +128,16 @@ def route_tier() -> str:
     return "fast"
 
 
+def _esp_working() -> None:
+    """Tell the ESP a (Mac-captured) command is now being worked → its LED shows the universal 'working'
+    blink immediately. Without this the ESP, which also heard the utterance but dropped its own far-mic
+    copy as 'not Jared', would briefly show idle before the worker's slower blink-ping lands."""
+    try:
+        httpx.get(f"{JARED_VOICE_URL}/led-blink", timeout=3)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def enqueue(text: str) -> None:
     if not (SUPABASE_KEY and text):
         return
@@ -136,6 +147,7 @@ def enqueue(text: str) -> None:
                             "Content-Type": "application/json", "Prefer": "return=minimal"},
                    json={"transcript": text, "source": "mac", "focus": "hub", "tier": route_tier()}, timeout=10.0)
         log(f"enqueued: {text[:80]!r}")
+        threading.Thread(target=_esp_working, daemon=True).start()
     except Exception as e:  # noqa: BLE001
         log(f"enqueue failed: {e}")
 
