@@ -1009,6 +1009,7 @@ def process_request(db: Supabase, req: dict) -> None:
         model = "haiku"
     log(f"route={tier} → model={model} think={think}{(' runner=' + runner) if runner else ''}")
     ping_esp_led("blink")   # working — the ESP light blinks for EVERY command, not just ESP-sourced ones
+    push_activity(transcript[:80], "working")   # bottom-strip: the command is now being worked (thinking phase)
 
     # Role framing first, then the live govee device list (when there are lights).
     sys_ctx = HUB_SYSTEM
