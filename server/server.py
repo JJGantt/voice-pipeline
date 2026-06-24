@@ -47,6 +47,25 @@ VOICE_DEVICE_TOKEN = os.environ.get("VOICE_DEVICE_TOKEN")
 LED_TOKEN = os.environ.get("LED_TOKEN", "")
 # The currently-connected ESP, so the /led-off HTTP handler can reach it. One device → one global ref.
 _active_esp = None
+# Push-to-talk active anywhere (Hammerspoon dictation) → the ESP ignores ALL audio: the mute is global,
+# not Mac-only. Flipped by /capture-off and /capture-on; auto-clears as a safety so a missed unmute
+# can't strand the ESP deaf.
+_suppressed = False
+_suppress_safety = None
+# Wake-free (speaker-ID) mode for the ESP, congruent with the Mac: the global wakefree_enabled toggle is
+# bridged here by the Mac listener via /wakefree-on|off. When ON, the ESP captures on speech ENERGY (no
+# wake word) and verifies the utterance is Jared's voice (ECAPA + the shared voiceprint) before
+# enqueueing. When OFF, wake words. The model + voiceprint load lazily on turn-on (hence the 2 GB box).
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+_wakefree = False
+# Wake-free has no wake word to pick the route per-utterance (unlike 'Hey Rhasspy'=fast / 'Hey Jarvis'=
+# power), so it runs on ONE configurable route: app_settings.wakefree_route ('fast'=Haiku / 'power'=Opus).
+# Loaded with the voiceprint on turn-on and updated live by the Mac listener via /wakefree-route.
+_wake_route = "fast"
+_enc = None          # ECAPA model (lazy)
+_bank = None         # voiceprint: (N, 192) exemplar embeddings from app_settings.voiceprint
+_vthresh = 0.30
+_vpause = 2.0
 
 SAMPLE_RATE = 16_000
 FRAME_SAMPLES = 1280          # 80 ms @ 16 kHz — openWakeWord's expected chunk
@@ -203,42 +222,69 @@ async def connection(ws):
                 frame = np.clip(frame.astype(np.float32) * GAIN, -32768, 32767).astype(np.int16)
                 raw = frame.tobytes()
 
+            if _suppressed:               # global push-to-talk mute → drop everything, abort any capture
+                if capturing:
+                    capturing = False
+                    utterance = bytearray()
+                    oww.reset()
+                    await ws.send("LED_OFF")
+                continue
+
             if not capturing:
                 preroll.extend(raw)
                 if len(preroll) > preroll_max:
                     del preroll[: len(preroll) - preroll_max]
                 ambient.append(rms(frame))      # track the room's noise floor
+                floor = float(np.median(ambient)) if ambient else 0.0
+                speech_level = max(floor * FLOOR_MULT, floor + FLOOR_MIN_MARGIN)
 
-                scores = oww.predict(frame)
-                power_score = scores.get(WAKE_MODEL_POWER, 0.0)
-                fast_score = scores.get(WAKE_MODEL, 0.0)
-                # "Hey Jarvis" (power) checked first so it wins ties; "Hey Rhasspy" (fast) otherwise.
-                wake_tier = "power" if power_score >= WAKE_THRESHOLD else ("fast" if fast_score >= WAKE_THRESHOLD else None)
+                if _wakefree:
+                    # No wake word — start on speech energy; the speaker is verified at close. The route
+                    # (Haiku/Opus) is the configured wake-free mode, not per-utterance.
+                    wake_tier = _wake_route if rms(frame) > speech_level else None
+                    fast_score = power_score = 0.0
+                else:
+                    scores = oww.predict(frame)
+                    power_score = scores.get(WAKE_MODEL_POWER, 0.0)
+                    fast_score = scores.get(WAKE_MODEL, 0.0)
+                    # "Hey Jarvis" (power) checked first so it wins ties; "Hey Rhasspy" (fast) otherwise.
+                    wake_tier = "power" if power_score >= WAKE_THRESHOLD else ("fast" if fast_score >= WAKE_THRESHOLD else None)
                 if wake_tier:
-                    floor = float(np.median(ambient)) if ambient else 0.0
-                    threshold = max(floor * FLOOR_MULT, floor + FLOOR_MIN_MARGIN)
+                    threshold = speech_level
                     await ws.send("LED_ON")   # solid while recording you
                     capturing = True
                     utterance = bytearray(preroll)
                     preroll.clear()
                     started = time.monotonic()
                     last_voice = started
-                    log.info("wake! tier=%s (fast=%.2f power=%.2f)", wake_tier, fast_score, power_score)
+                    if _wakefree:
+                        log.info("wake-free: speech — capturing…")
+                    else:
+                        log.info("wake! tier=%s (fast=%.2f power=%.2f)", wake_tier, fast_score, power_score)
             else:
                 utterance.extend(raw)
                 now = time.monotonic()
                 if rms(frame) > threshold:
                     last_voice = now
                 elapsed = now - started
-                done = (elapsed >= MIN_UTTERANCE_S and now - last_voice >= SILENCE_HANGOVER_S) \
-                       or elapsed >= MAX_UTTERANCE_S
+                hang = _vpause if _wakefree else SILENCE_HANGOVER_S
+                done = (elapsed >= MIN_UTTERANCE_S and now - last_voice >= hang) or elapsed >= MAX_UTTERANCE_S
                 if done:
                     dur = len(utterance) / 2 / SAMPLE_RATE
-                    truncated = elapsed >= MAX_UTTERANCE_S and (now - last_voice) < SILENCE_HANGOVER_S
+                    truncated = elapsed >= MAX_UTTERANCE_S and (now - last_voice) < hang
                     if truncated:
                         log.warning("utterance hit %ds cap while still active — truncated", int(MAX_UTTERANCE_S))
                     elif dur >= LONG_UTTERANCE_WARN_S:
                         log.warning("long utterance: %.0fs", dur)
+                    if _wakefree:   # verify the speaker on the whole utterance; drop if it isn't Jared
+                        sim = _verify_jared(np.frombuffer(bytes(utterance), dtype=np.int16))
+                        if sim < _vthresh:
+                            log.info("wake-free: not Jared (sim=%.2f) — dropped", sim)
+                            await ws.send("LED_OFF")
+                            capturing = False
+                            utterance = bytearray()
+                            continue
+                        log.info("wake-free: Jared (sim=%.2f)", sim)
                     enqueued = False
                     try:
                         text = await transcribe(bytes(utterance))
@@ -271,21 +317,117 @@ async def _led_safety(ws):
         pass
 
 
+def _get_settings(keys):
+    """Read app_settings values (service key) — the shared voiceprint + wake-free thresholds."""
+    if not (SUPABASE_URL and SUPABASE_SERVICE_KEY):
+        return {}
+    try:
+        r = httpx.get(f"{SUPABASE_URL}/rest/v1/app_settings",
+                      params={"key": f"in.({','.join(keys)})", "select": "key,value"},
+                      headers={"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"},
+                      timeout=15)
+        return {row["key"]: row["value"] for row in r.json()}
+    except Exception as e:  # noqa: BLE001
+        log.warning("settings read failed: %s", e)
+        return {}
+
+
+def _load_voiceid():
+    """Lazy-load ECAPA + the shared voiceprint + thresholds when wake-free turns on."""
+    global _enc, _bank, _vthresh, _vpause, _wake_route
+    import base64
+    from speechbrain.inference.speaker import EncoderClassifier
+    if _enc is None:
+        _enc = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb", savedir="/app/.ecapa")
+    s = _get_settings(["voiceprint", "voiceid_threshold", "wakefree_pause_s", "wakefree_route"])
+    _bank = np.load(io.BytesIO(base64.b64decode(s["voiceprint"]))) if s.get("voiceprint") else None
+    _vthresh = float(s.get("voiceid_threshold") or 0.30)
+    _vpause = float(s.get("wakefree_pause_s") or 2.0)
+    _wake_route = "power" if s.get("wakefree_route") == "power" else "fast"
+    log.info("wake-free loaded: voiceprint=%s thresh=%.2f pause=%.1fs route=%s",
+             None if _bank is None else _bank.shape, _vthresh, _vpause, _wake_route)
+
+
+def _trim_voiced(wav, gate=0.006, margin_s=0.15):
+    step = int(0.05 * SAMPLE_RATE)
+    v = [i for i in range(0, len(wav) - step, step) if float(np.sqrt(np.mean(wav[i:i + step] ** 2))) >= gate]
+    if not v:
+        return np.array([], dtype=np.float32)
+    m = int(margin_s * SAMPLE_RATE)
+    return wav[max(0, v[0] - m): min(len(wav), v[-1] + step + m)]
+
+
+def _verify_jared(pcm_i16):
+    """Top-3 cosine of the trimmed utterance vs the voiceprint. 0 if no model/voiceprint loaded."""
+    if _enc is None or _bank is None:
+        return 0.0
+    import torch
+    wav = _trim_voiced(pcm_i16.astype(np.float32) / 32768.0)
+    if wav.size < int(0.4 * SAMPLE_RATE):
+        return 0.0
+    e = _enc.encode_batch(torch.tensor(wav).unsqueeze(0)).squeeze().detach().cpu().numpy()
+    e = e / (np.linalg.norm(e) + 1e-9)
+    sims = _bank @ e
+    k = min(3, len(sims))
+    return float(np.mean(np.sort(sims)[-k:]))
+
+
+async def _suppress_auto_clear():
+    """Safety: un-mute after 90s even if the /capture-on never arrives, so the ESP can't get stuck deaf."""
+    global _suppressed
+    await asyncio.sleep(90)
+    _suppressed = False
+    log.info("capture suppress auto-cleared (safety)")
+
+
 async def process_request(connection, request):
     """Plain HTTP on the same port (websockets 15 asyncio API). The worker POSTs /led-off?token=... when
     the model finishes, so the ESP light goes blink (working) → off. Returning a Response short-circuits
     the handshake; returning None lets the WS upgrade proceed."""
     path = request.path
-    if path.startswith("/led-off"):
+    if path.startswith("/led-"):
         from urllib.parse import urlparse, parse_qs
-        tok = parse_qs(urlparse(path).query).get("token", [None])[0]
+        u = urlparse(path)
+        tok = parse_qs(u.query).get("token", [None])[0]
         if LED_TOKEN and tok != LED_TOKEN:
             return connection.respond(HTTPStatus.FORBIDDEN, "forbidden\n")
-        if _active_esp is not None:
+        # The worker drives these for ANY command (universal indicator), not just ESP-sourced ones:
+        # /led-blink while working, /led-off when done, /led-on as a solid 'listening' cue.
+        cmd = {"/led-off": "LED_OFF", "/led-blink": "LED_BLINK", "/led-on": "LED_ON"}.get(u.path)
+        if cmd and _active_esp is not None:
             try:
-                await _active_esp.send("LED_OFF")
+                await _active_esp.send(cmd)
             except Exception:  # noqa: BLE001
                 pass
+        return connection.respond(HTTPStatus.OK, "ok\n")
+    if path.startswith("/capture-o"):     # /capture-off | /capture-on — global push-to-talk mute.
+        # No token: muting briefly is low-risk and it auto-clears; keeps the secret out of Hammerspoon.
+        global _suppressed, _suppress_safety
+        on = path.startswith("/capture-off")
+        _suppressed = on
+        if _suppress_safety:
+            _suppress_safety.cancel()
+            _suppress_safety = None
+        if on:
+            _suppress_safety = asyncio.create_task(_suppress_auto_clear())
+        log.info("capture %s (push-to-talk)", "MUTED" if on else "unmuted")
+        return connection.respond(HTTPStatus.OK, "ok\n")
+    if path.startswith("/wakefree-o"):    # /wakefree-on | /wakefree-off — global mode, bridged by the Mac listener
+        global _wakefree
+        on = path.startswith("/wakefree-on")
+        if on and not _wakefree:
+            _load_voiceid(); _wakefree = True
+            log.info("wake-free ON (speaker-ID capture)")
+        elif not on and _wakefree:
+            _wakefree = False
+            log.info("wake-free OFF (wake-word capture)")
+        return connection.respond(HTTPStatus.OK, "ok\n")
+    if path.startswith("/wakefree-route"):  # live route change, bridged by the Mac listener (?v=fast|power)
+        from urllib.parse import urlparse, parse_qs
+        global _wake_route
+        v = parse_qs(urlparse(path).query).get("v", [None])[0]
+        _wake_route = "power" if v == "power" else "fast"
+        log.info("wake-free route → %s", _wake_route)
         return connection.respond(HTTPStatus.OK, "ok\n")
     if path in ("/health", "/"):
         return connection.respond(HTTPStatus.OK, "ok\n")

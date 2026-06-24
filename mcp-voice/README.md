@@ -8,6 +8,14 @@ build step.
 
 ## Tools
 
+### `say` (`{ text: string }`)
+Speak ONE short line aloud to Jared — the only thing in the voice pipeline that gets played as audio.
+Inserts a row into Supabase `voice_speech`; every speaker-equipped surface (the Mac listener today)
+subscribes via realtime and plays it the instant it lands (Kokoro). The model calls this once per voice
+turn with a single present-tense line ("changing the floor lamp to white") fired *alongside* the action
+so synthesis overlaps execution; its final written reply is shown on screen but NOT spoken. Separate
+from `voice_messages` (the display thread) and from the activity bar. See `../ARCHITECTURE.md`.
+
 ### `list_sessions` (no args)
 Scans `~/.claude/projects/*/*.jsonl` and returns the **5 most recently active**
 sessions (by file mtime), newest first:

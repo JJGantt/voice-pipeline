@@ -11,8 +11,10 @@ front-end. The Mac is just another set of ears. Live state (listening → workin
 on screen via the Hammerspoon overlay HUD (see hud()).
 """
 
+import asyncio
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -45,6 +47,100 @@ HANGOVER_S = float(os.environ.get("HANGOVER_S", "3.0"))   # trailing silence tha
 MAX_UTTER_S = 30.0
 MIN_UTTER_S = 0.4      # ignore sub-0.4s "utterances" (just the wake tail)
 
+# Mic-ownership state machine. Two things take the mic from the wake-word listener: the GLOBAL mute
+# (app_settings.voice_muted — set by ANY explicit input: push-to-talk dictation OR a hub FAB button)
+# and wake-free mode (wakefree_enabled → wakefree.py owns the mic). The listener captures iff neither
+# holds it. The mute is ONE shared flag so every source (Mac + ESP) goes deaf together; push-to-talk
+# also fires instantly via SIGUSR (Hammerspoon) and propagates to the ESP by writing the flag.
+WAKEFREE_RUN = os.path.expanduser("~/repos/voice-pipeline/voice-id/run-wakefree.sh")
+_muted = threading.Event()      # set = global voice_muted (an explicit command is being captured)
+_wakefree = threading.Event()   # set = wake-free mode on
+_capture = threading.Event()    # set = the listener should own the mic (wake-word)
+_capture.set()
+
+
+def _recompute_capture() -> None:
+    (_capture.clear if (_muted.is_set() or _wakefree.is_set()) else _capture.set)()
+
+
+JARED_VOICE_URL = os.environ.get("JARED_VOICE_URL", "https://jared-voice.fly.dev").rstrip("/")
+
+
+def _ping_esp_capture(on: bool) -> None:
+    """Tell the jared-voice server to mute/unmute the ESP, so the global mute reaches it too."""
+    try:
+        httpx.get(f"{JARED_VOICE_URL}/capture-{'off' if on else 'on'}", timeout=3)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _ping_esp_wakefree(on: bool) -> None:
+    """Bridge the global wake-free mode to the ESP — it switches to speaker-ID capture (on) or back to
+    wake words (off), congruent with the Mac. Generous timeout: the server lazy-loads ECAPA on turn-on."""
+    try:
+        httpx.get(f"{JARED_VOICE_URL}/wakefree-{'on' if on else 'off'}", timeout=20)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _ping_esp_route(tier: str) -> None:
+    """Bridge a wake-free route change (Efficiency/Accuracy) to the ESP so its speaker-ID captures run on
+    the same tier as the Mac's — one system, congruent. (The Mac's own wakefree.py reads the route live.)"""
+    try:
+        httpx.get(f"{JARED_VOICE_URL}/wakefree-route", params={"v": tier}, timeout=5)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _apply_mute(on: bool) -> None:
+    """Apply the global mute EVERYWHERE: this Mac (listener mic / wakefree) AND the ESP (ping the
+    jared-voice server). One explicit command in flight = every source goes deaf."""
+    if on == _muted.is_set():
+        return
+    (_muted.set if on else _muted.clear)()
+    _recompute_capture()
+    if _wakefree.is_set():
+        subprocess.Popen(["pkill", "-USR1" if on else "-USR2", "-f", "wakefree.py"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    threading.Thread(target=_ping_esp_capture, args=(on,), daemon=True).start()
+
+
+def _on_ptt_start(*_):   # Hammerspoon double-tap → global mute (Mac instant + ESP via /capture)
+    _apply_mute(True)
+
+
+def _on_ptt_stop(*_):
+    _apply_mute(False)
+
+
+def set_wakefree(on: bool) -> None:
+    """Toggle wake-free mode (driven by the hub setting). On → listener yields the mic and starts
+    wakefree.py; Off → stop wakefree.py and reclaim the mic for wake-word capture."""
+    if on and not _wakefree.is_set():
+        _wakefree.set(); _recompute_capture()
+        log("wake-free ON — yielding mic, starting wakefree.py (+ ESP)")
+        try:
+            subprocess.Popen([WAKEFREE_RUN], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:  # noqa: BLE001
+            log(f"failed to start wakefree: {e}")
+        threading.Thread(target=_ping_esp_wakefree, args=(True,), daemon=True).start()
+    elif not on and _wakefree.is_set():
+        log("wake-free OFF — stopping wakefree.py, reclaiming mic (+ ESP)")
+        subprocess.Popen(["pkill", "-f", "wakefree.py"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _wakefree.clear(); _recompute_capture()
+        threading.Thread(target=_ping_esp_wakefree, args=(False,), daemon=True).start()
+
+
+def _read_setting(key: str) -> bool:
+    try:
+        r = httpx.get(f"{SUPABASE_URL}/rest/v1/app_settings",
+                      params={"key": f"eq.{key}", "select": "value"},
+                      headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=8)
+        rows = r.json()
+        return bool(rows) and str(rows[0].get("value")) not in ("0", "false", "off", "no", "", "None")
+    except Exception:  # noqa: BLE001
+        return False
+
 
 def log(msg: str) -> None:
     print(f"{datetime.now(timezone.utc).isoformat()} [mac-listener] {msg}", flush=True)
@@ -53,6 +149,7 @@ def log(msg: str) -> None:
 # ---- local feedback: a screen-level state HUD + Raspy's reply spoken aloud -----------------------
 SPEAK_SH = os.path.expanduser("~/scripts/speak.sh")
 HS_BIN = os.environ.get("HS_BIN", "/opt/homebrew/bin/hs")   # Hammerspoon IPC CLI
+VOICE_DAEMON = os.path.expanduser("~/scripts/voice_daemon.sh")  # starts the warm Kokoro TTS engine
 
 
 def hud(state: str) -> None:
@@ -67,40 +164,133 @@ def hud(state: str) -> None:
         pass
 
 
-def _latest_assistant_id():
+def warm_tts() -> None:
+    """Pre-warm the Kokoro TTS daemon the moment a command is incoming, so its ~8s model load happens
+    DURING capture + the model's thinking and the engine is already hot when the reply is spoken. The
+    daemon self-exits after idle, so this only holds the ~1 GB around active voice use — never
+    permanently. Idempotent + fire-and-forget (voice_daemon.sh no-ops if it's already running)."""
     try:
-        r = httpx.get(f"{SUPABASE_URL}/rest/v1/voice_messages",
-                      params={"focus": "eq.hub", "role": "eq.assistant", "order": "created_at.desc",
-                              "limit": "1", "select": "id"},
-                      headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=8)
-        rows = r.json()
-        return rows[0]["id"] if rows else None
+        subprocess.Popen([VOICE_DAEMON, "start"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:  # noqa: BLE001
-        return None
+        pass
 
 
-def speak_reply(baseline) -> None:
-    """Wait for Raspy's reply to land in the shared thread (whichever listener's request produced it —
-    robust to dedup), then speak it aloud. Background thread → never blocks the wake loop."""
-    deadline = time.time() + 45
-    while time.time() < deadline:
-        time.sleep(1.5)
+def _speak(text: str) -> None:
+    """Play a reply aloud via Kokoro (speak.sh), in its own thread so neither the realtime loop nor
+    the wake loop is ever blocked by synthesis/playback."""
+    try:
+        subprocess.run([SPEAK_SH], input=text, text=True, capture_output=True, timeout=90)
+    except Exception as e:  # noqa: BLE001
+        log(f"speak failed: {e}")
+
+
+# ---- universal feedback (event-driven) -----------------------------------------------------------
+# ONE persistent Supabase realtime subscription that drives ALL universal voice feedback on this Mac,
+# regardless of which input captured the command (see voice-pipeline/ARCHITECTURE.md, "Feedback is
+# universal"):
+#   · voice_speech INSERT   → play the assistant's single spoken line aloud (Kokoro). This is the only
+#                             audio channel; the model emits it via the `say` MCP tool.
+#   · voice_requests UPDATE → drive the HUD state: status 'claimed' → working, 'done'/'error' → done.
+# The local 'listening' state stays on the wake loop below — only this Mac knows its own mic is open.
+# No polling, no fixed wait; both tables are in the supabase_realtime publication (00016 / 00021 /
+# 00024). The lib server-assigns a distinct id per binding and only invokes the matching callback,
+# so the two bindings never cross-fire. Mirrors the worker's RealtimeWaker (same AsyncRealtimeClient).
+class RealtimeFeedback:
+    def __init__(self):
+        self._loop = None
+        self._sock = None
+        self._started = False
+
+    def start(self) -> None:
+        if self._started:
+            return
+        self._started = True
+        self._loop = asyncio.new_event_loop()
+        threading.Thread(target=self._run, name="rt-feedback", daemon=True).start()
+        log("realtime feedback starting (speech on voice_speech + universal HUD on voice_requests)")
+
+    def _run(self) -> None:
+        asyncio.set_event_loop(self._loop)
         try:
-            r = httpx.get(f"{SUPABASE_URL}/rest/v1/voice_messages",
-                          params={"focus": "eq.hub", "role": "eq.assistant", "order": "created_at.desc",
-                                  "limit": "1", "select": "id,text"},
-                          headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=8)
-            rows = r.json()
-            if rows and rows[0]["id"] != baseline and (rows[0].get("text") or "").strip():
-                hud("done")   # reply landed — flip the HUD before we speak it
-                try:
-                    subprocess.run([SPEAK_SH], input=rows[0]["text"], text=True, capture_output=True, timeout=90)
-                except Exception as e:  # noqa: BLE001
-                    log(f"speak failed: {e}")
-                return
-        except Exception:  # noqa: BLE001
-            pass
-    hud("off")   # no reply within the window — don't leave the HUD stuck on "working"
+            self._loop.run_until_complete(self._serve())
+        except Exception as e:  # noqa: BLE001
+            log(f"realtime feedback loop exited: {e}")
+
+    async def _serve(self) -> None:
+        from realtime import AsyncRealtimeClient
+        # Outer loop rebuilds the client if connect()/subscribe() itself fails (e.g. no network at
+        # boot); auto_reconnect handles transient drops once connected.
+        while True:
+            try:
+                self._sock = AsyncRealtimeClient(f"{SUPABASE_URL}/realtime/v1", SUPABASE_KEY,
+                                                 auto_reconnect=True)
+                await self._sock.connect()
+                ch = self._sock.channel("mac-listener-feedback")
+                ch.on_postgres_changes("INSERT", callback=self._on_speech,
+                                       schema="public", table="voice_speech")
+                ch.on_postgres_changes("UPDATE", callback=self._on_request,
+                                       schema="public", table="voice_requests")
+                ch.on_postgres_changes("UPDATE", callback=self._on_setting,
+                                       schema="public", table="app_settings")
+                await ch.subscribe(self._on_sub)
+                while self._sock.is_connected:
+                    await asyncio.sleep(1.0)
+            except Exception as e:  # noqa: BLE001
+                log(f"realtime feedback error: {e}; retrying in 5s")
+            try:
+                if self._sock:
+                    await self._sock.close()
+            except Exception:  # noqa: BLE001
+                pass
+            await asyncio.sleep(5.0)
+
+    def _on_speech(self, payload) -> None:
+        """A new spoken line (any source) → play it aloud. Universal: not gated on who captured it."""
+        try:
+            rec = (payload.get("data") or {}).get("record") or {}
+        except AttributeError:
+            return
+        text = (rec.get("text") or "").strip()
+        if text:
+            log(f"speaking: {text[:80]!r}")
+            threading.Thread(target=_speak, args=(text,), daemon=True).start()
+
+    def _on_setting(self, payload) -> None:
+        """A hub setting changed → react to the wake-free toggle and the global mute. Event-driven."""
+        try:
+            rec = (payload.get("data") or {}).get("record") or {}
+        except AttributeError:
+            return
+        key = rec.get("key")
+        truthy = str(rec.get("value")) not in ("0", "false", "off", "no", "", "None")
+        if key == "wakefree_enabled":
+            set_wakefree(truthy)
+        elif key == "voice_muted":      # global mute set by any explicit input (PTT / FAB)
+            _apply_mute(truthy)
+        elif key == "wakefree_route":   # Efficiency/Accuracy for wake-free → bridge to the ESP (Mac reads it live)
+            tier = "power" if str(rec.get("value")) == "power" else "fast"
+            threading.Thread(target=_ping_esp_route, args=(tier,), daemon=True).start()
+
+    def _on_request(self, payload) -> None:
+        """A command's status changed (any source) → reflect it on the HUD, and pre-warm TTS on claim.
+        Universal. (Warming lives here, not on a voice_requests INSERT binding, because realtime-py
+        doesn't reliably support two bindings on the same table; 'claimed' is ~0.3s after INSERT, so
+        the timing is unchanged. This Mac's OWN commands are warmed even earlier by the wake loop.)"""
+        try:
+            rec = (payload.get("data") or {}).get("record") or {}
+        except AttributeError:
+            return
+        status = str(rec.get("status") or "")
+        if status == "claimed":
+            warm_tts()              # any source's command is now being worked → make the TTS engine hot
+            log("HUD → working (a command was claimed)")
+            hud("working")          # the worker started a turn — every screen shows it
+        elif status in ("done", "error"):
+            log(f"HUD → done (status={status})")
+            hud("done")             # turn ended → HUD shows done, then fades
+
+    def _on_sub(self, state, err=None) -> None:
+        log(f"realtime feedback subscription: {state}{(' err=' + str(err)) if err else ''}")
 
 
 def strip_wake(text: str) -> str:
@@ -170,28 +360,37 @@ def transcribe(pcm: np.ndarray) -> str:
             pass
 
 
-def enqueue(text: str, tier: str = "") -> None:
-    """Insert the transcript into voice_requests (source='mac', focus='hub'). Best-effort."""
+def enqueue(text: str, tier: str = ""):
+    """Insert the transcript into voice_requests (source='mac', focus='hub'). Returns the new
+    request_id (so the reply can be matched the instant it lands) or None."""
     if not (SUPABASE_KEY and text):
-        return
+        return None
     try:
         payload: dict = {"transcript": text, "source": "mac", "focus": "hub"}
         if tier:
             payload["tier"] = tier
-        httpx.post(
+        r = httpx.post(
             f"{SUPABASE_URL}/rest/v1/voice_requests",
             headers={
                 "apikey": SUPABASE_KEY,
                 "Authorization": f"Bearer {SUPABASE_KEY}",
                 "Content-Type": "application/json",
-                "Prefer": "return=minimal",
+                "Prefer": "return=representation",
             },
             json=payload,
             timeout=10.0,
         )
-        log(f"enqueued (tier={tier or 'default'}): {text[:80]!r}")
+        rid = None
+        try:
+            rows = r.json()
+            rid = rows[0]["id"] if isinstance(rows, list) and rows else None
+        except Exception:  # noqa: BLE001
+            pass
+        log(f"enqueued (tier={tier or 'default'}, id={rid}): {text[:80]!r}")
+        return rid
     except Exception as e:  # noqa: BLE001
         log(f"enqueue failed: {e}")
+        return None
 
 
 def capture_utterance(stream) -> np.ndarray:
@@ -252,33 +451,51 @@ def main() -> int:
     oww = Model(wakeword_models=[WAKE_MODEL, WAKE_MODEL_POWER], inference_framework="onnx")
     log(f"listening — 'Hey Rhasspy' (fast/Haiku) or 'Hey Jarvis' (power/Opus)  (stt={stt}, hangover={HANGOVER_S}s)")
 
-    with sd.RawInputStream(samplerate=SAMPLE_RATE, blocksize=FRAME, dtype="int16", channels=1) as stream:
-        while True:
-            buf, _ = stream.read(FRAME)
-            audio = np.frombuffer(bytes(buf), dtype=np.int16)
-            scores = oww.predict(audio)
-            fast_score = scores.get(WAKE_MODEL, 0.0)
-            power_score = scores.get(WAKE_MODEL_POWER, 0.0)
-            fired_tier = None
-            if power_score >= WAKE_THRESHOLD:
-                fired_tier = "power"   # power checked first — higher specificity wins ties
-            elif fast_score >= WAKE_THRESHOLD:
-                fired_tier = "fast"
-            if fired_tier:
-                log(f"wake! tier={fired_tier} (fast={fast_score:.2f} power={power_score:.2f}) — capturing…")
-                hud("listening")                    # mic open, capturing the command
-                baseline = _latest_assistant_id()   # snapshot before this command's reply lands
-                pcm = capture_utterance(stream)
-                text = strip_wake(transcribe(pcm))
-                if text:
-                    log(f"transcript (tier={fired_tier}): {text!r}")
-                    hud("working")                  # mic closed; worker is now thinking / running tools
-                    enqueue(text, tier=fired_tier)
-                    threading.Thread(target=speak_reply, args=(baseline,), daemon=True).start()
-                else:
-                    hud("off")
-                    log("…nothing intelligible, ignoring")
-                oww.reset()  # clear the activation so the next wake is fresh
+    feedback = RealtimeFeedback()
+    feedback.start()   # one persistent realtime sub → universal speech + HUD state (any source)
+
+    # Push-to-talk takes the mic via signals; wake-free takes it via the hub toggle. Capture iff neither.
+    signal.signal(signal.SIGUSR1, _on_ptt_start)
+    signal.signal(signal.SIGUSR2, _on_ptt_stop)
+    if _read_setting("wakefree_enabled"):  # apply persisted hub toggle at boot; live flips via RealtimeFeedback
+        set_wakefree(True)
+    if _read_setting("voice_muted"):
+        _apply_mute(True)
+
+    while True:
+        if not _capture.is_set():
+            log("mic yielded (push-to-talk / wake-free) — waiting")
+            _capture.wait()              # block until the listener owns the mic again — event-driven
+            log("listening (wake word)")
+        with sd.RawInputStream(samplerate=SAMPLE_RATE, blocksize=FRAME, dtype="int16", channels=1) as stream:
+            oww.reset()
+            while _capture.is_set():
+                buf, _ = stream.read(FRAME)
+                audio = np.frombuffer(bytes(buf), dtype=np.int16)
+                scores = oww.predict(audio)
+                fast_score = scores.get(WAKE_MODEL, 0.0)
+                power_score = scores.get(WAKE_MODEL_POWER, 0.0)
+                fired_tier = None
+                if power_score >= WAKE_THRESHOLD:
+                    fired_tier = "power"   # power checked first — higher specificity wins ties
+                elif fast_score >= WAKE_THRESHOLD:
+                    fired_tier = "fast"
+                if fired_tier:
+                    log(f"wake! tier={fired_tier} (fast={fast_score:.2f} power={power_score:.2f}) — capturing…")
+                    hud("listening")                    # LOCAL: only this Mac knows its own mic is open
+                    warm_tts()                          # pre-warm TTS now — load overlaps capture + thinking
+                    pcm = capture_utterance(stream)
+                    hud("working")                      # capture done → transcribing / processing
+                    text = strip_wake(transcribe(pcm))
+                    if text:
+                        log(f"transcript (tier={fired_tier}): {text!r}")
+                        # working/done HUD and the spoken reply are now driven UNIVERSALLY off
+                        # voice_requests status + voice_speech (RealtimeFeedback) — for every source.
+                        enqueue(text, tier=fired_tier)
+                    else:
+                        hud("off")                      # nothing intelligible → clear the local indicator
+                        log("…nothing intelligible, ignoring")
+                    oww.reset()  # clear the activation so the next wake is fresh
 
 
 if __name__ == "__main__":

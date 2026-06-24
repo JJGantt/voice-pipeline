@@ -99,19 +99,49 @@ def push_activity(text: str, state: str = "tool") -> None:
         pass
 
 
-# After an ESP-sourced ('fly') request finishes, tell the voice server so the ESP light goes from
-# 'working' (blink) → off. The server holds the ESP socket; we just hit its /led-off HTTP route.
-LED_TOKEN = os.environ.get("LED_TOKEN", "")
-LED_PING_URL = os.environ.get("LED_PING_URL", "https://jared-voice.fly.dev/led-off")
+# Native push to Jared's phone: the past-tense result of a completed voice command lands as a phone
+# notification (APNs via the hub's /api/notify — the same proven sender + device tokens as the weight
+# reminder). The hub token rides the URL (same as the activity push above).
+HUB_NOTIFY_URL = os.environ.get(
+    "HUB_NOTIFY_URL",
+    "https://jared-status-hub.fly.dev/api/notify?token=REDACTED",
+)
 
 
-def ping_esp_led_off() -> None:
-    if not LED_PING_URL:
+def notify_phone(body: str, title: str = "Jarvis") -> None:
+    """Send a voice command's final result to Jared's phone as a push notification. Threaded + best-
+    effort so it never delays closing out the request and never raises."""
+    if not (HUB_NOTIFY_URL and body):
         return
-    try:
-        httpx.get(LED_PING_URL, params={"token": LED_TOKEN} if LED_TOKEN else None, timeout=3.0)
-    except Exception:  # noqa: BLE001
-        pass
+
+    def _send():
+        try:
+            httpx.post(HUB_NOTIFY_URL, json={"title": title, "body": body[:300], "kind": "voice"}, timeout=5.0)
+        except Exception:  # noqa: BLE001
+            pass
+
+    threading.Thread(target=_send, daemon=True).start()
+
+
+# Drive the ESP light to reflect EVERY command's lifecycle (universal indicator, not just ESP-sourced):
+# /led-blink while the worker is working, /led-off when done. The server holds the ESP socket; we hit its
+# HTTP routes. Fire-and-forget in a thread so it never adds latency to the command path.
+LED_TOKEN = os.environ.get("LED_TOKEN", "")
+LED_BASE_URL = os.environ.get("LED_BASE_URL", "https://jared-voice.fly.dev").rstrip("/")
+
+
+def ping_esp_led(state: str) -> None:
+    """Set the ESP light: state ∈ {off, blink, on}. Best-effort; no-op if the ESP server/light is absent."""
+    if not LED_BASE_URL:
+        return
+
+    def _go():
+        try:
+            httpx.get(f"{LED_BASE_URL}/led-{state}",
+                      params={"token": LED_TOKEN} if LED_TOKEN else None, timeout=3.0)
+        except Exception:  # noqa: BLE001
+            pass
+    threading.Thread(target=_go, daemon=True).start()
 
 # Orchestrator (Mac) — when focus is a specific Mac session, the transcript is
 # injected into that session's wall terminal via the orchestrator instead of
@@ -124,7 +154,7 @@ HEARTBEAT_INTERVAL_S = 10.0
 IDLE_POLL_S = 1.0
 HEARTBEAT_FRESH_S = 30.0      # a higher-priority worker counts as "present" within this
 DEDUP_WINDOW_S = 10.0         # 2 mics hearing one utterance land within this; collapse to the earliest
-SESSION_IDLE_RESET_S = 2 * 60 * 60  # reset hub session after 2h of inactivity
+SESSION_IDLE_RESET_S = 5 * 60       # default reset budget (5min idle); hub setting session_reset_s overrides
 HTTP_TIMEOUT_S = 30.0
 CLAUDE_TIMEOUT_S = float(os.environ.get("CLAUDE_TIMEOUT_S", "300"))
 
@@ -174,12 +204,22 @@ WAKE_NOISE_DIRECTIVE = (
     f"'{IGNORE_SENTINEL}' and nothing else. Only respond normally when there is a real task or question.]"
 )
 
-# Always-on voice (ESP/Mac) replies are spoken aloud, so they must be very short. Appended to fly/mac
-# turns. (The quick-add FAB has its own terser directive; typed web turns get neither.)
-VOICE_REPLY_DIRECTIVE = (
-    "\n\n[This came in by voice and the reply is spoken aloud — be VERY succinct: confirm the result in "
-    "ONE short phrase (e.g. 'Floor lamp blue at 10%', 'Logged the bagel', 'About 1,800 calories'). No "
-    "preamble, no 'I'll do X' narration, no follow-up question — just the essential result.]"
+# Always-on voice (ESP/Mac) turns are answered ALOUD only through the `say` MCP tool — the worker no
+# longer speaks the final written reply (the Mac listener plays voice_speech, not voice_messages).
+# Appended to fly/mac turns. (The quick-add FAB has its own terser directive; typed web turns get
+# neither and are silent.) See voice-pipeline/ARCHITECTURE.md "Feedback is universal".
+SAY_DIRECTIVE = (
+    "\n\n[This came in by voice. For a genuine turn (i.e. NOT a false trigger per the note above), the "
+    "ONLY thing spoken aloud is what you pass to the `say` tool — your written reply is shown on screen "
+    "but NOT spoken. Call `say` exactly once with a single short, natural spoken phrase: for an action, "
+    "say what you're DOING in the present tense and call it right as you act so it plays while the action "
+    "runs (e.g. 'changing the floor lamp to white', 'logging the bagel'); for a question, say the answer "
+    "(e.g. \"you've eaten about 1,800 calories\"). No preamble, no markdown, no follow-up question. If a "
+    "real action fails, call `say` again to report it briefly. Your final written reply is ALSO sent to "
+    "Jared's phone as a push notification, so make it ONE complete, self-contained PAST-tense sentence "
+    "stating exactly what you did or found — e.g. 'Logged your weight at 172.4 lb', 'Added an omelet to "
+    "your nutrition log', 'Set the floor lamp to blue', \"You've eaten about 1,800 calories today\". No "
+    "markdown, no preamble, no follow-up question.]"
 )
 
 # Role framing for every hub turn. The base preset is claude_code (a coding agent), so without this
@@ -393,15 +433,37 @@ def write_hub_session(session_id: str) -> None:
         log(f"write hub_session.json failed: {e}")
 
 
+_reset_cache = {"v": None, "t": 0.0}
+
+
+def session_reset_s() -> float:
+    """Idle budget before the hub conversation resets, from the hub setting `session_reset_s` (cached
+    ~30s so it's not a per-command DB hit). Falls back to SESSION_IDLE_RESET_S."""
+    now = time.monotonic()
+    if _reset_cache["v"] is None or now - _reset_cache["t"] > 30:
+        v = SESSION_IDLE_RESET_S
+        try:
+            r = httpx.get(f"{SUPABASE_URL}/rest/v1/app_settings",
+                          params={"key": "eq.session_reset_s", "select": "value"},
+                          headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=5)
+            rows = r.json()
+            if rows and rows[0].get("value"):
+                v = float(rows[0]["value"])
+        except Exception:  # noqa: BLE001
+            pass
+        _reset_cache.update(v=v, t=now)
+    return _reset_cache["v"]
+
+
 def should_reset_session(state: dict | None) -> bool:
-    """Reset (start fresh) if: no state, idle > 2h, or it's a new calendar day."""
+    """Reset (start fresh) if: no state, idle > the reset budget, or it's a new calendar day."""
     if not state or not state.get("session_id"):
         return True
     last = _parse_ts(state.get("last_activity_iso", ""))
     if not last:
         return True
     now = datetime.now(timezone.utc)
-    if (now - last).total_seconds() > SESSION_IDLE_RESET_S:
+    if (now - last).total_seconds() > session_reset_s():
         return True
     if last.astimezone().date() != now.astimezone().date():
         return True
@@ -669,15 +731,30 @@ class ApiRunner:
     async def _run(self, prompt, system, model, think, on_event):
         await self._ensure()
         self._messages.append({"role": "user", "content": prompt})
-        kwargs = dict(model=API_MODEL_IDS.get(model, model), system=system,
+        # Cache the stable prefix — the tool schemas (~10k tokens) + system — for 1 hour, so warm hits
+        # cost ~10% of input instead of full price every command. The breakpoint sits on the system
+        # block; tools precede it in the cache-prefix order (tools → system → messages), so they're
+        # cached too. The per-turn directives ride on the USER message (not system), so this prefix
+        # stays byte-identical across commands. 1h TTL survives the gaps between voice commands.
+        sys_param = ([{"type": "text", "text": system,
+                       "cache_control": {"type": "ephemeral", "ttl": "1h"}}] if system else system)
+        kwargs = dict(model=API_MODEL_IDS.get(model, model), system=sys_param,
                       tools=self._tools, messages=self._messages,
-                      max_tokens=8000 if think else 1024)
+                      max_tokens=8000 if think else 1024,
+                      extra_headers={"anthropic-beta": "extended-cache-ttl-2025-04-11"})
         if think:  # power tier: Opus adaptive thinking (budget_tokens is rejected on 4.8)
             kwargs["thinking"] = {"type": "adaptive"}
             kwargs["output_config"] = {"effort": "high"}
         final_text = ""
+        logged_cache = False
         for _ in range(8):  # agentic loop: chain tool calls until a final text reply
             resp = await self._client.messages.create(**kwargs)
+            if not logged_cache:  # verify caching engages: creation on cold, read on warm
+                u = getattr(resp, "usage", None)
+                if u is not None:
+                    log(f"cache: create={getattr(u, 'cache_creation_input_tokens', 0)} "
+                        f"read={getattr(u, 'cache_read_input_tokens', 0)} in={getattr(u, 'input_tokens', 0)}")
+                logged_cache = True
             self._messages.append({"role": "assistant", "content": resp.content})  # preserves thinking/tool blocks
             tool_results = []
             for b in resp.content:
@@ -704,7 +781,7 @@ class ApiRunner:
         self._start_loop()
         now = time.monotonic()
         today = datetime.now().astimezone().date()
-        if self._messages and (now - self._last > SESSION_IDLE_RESET_S or self._day != today):
+        if self._messages and (now - self._last > session_reset_s() or self._day != today):
             self.reset()
         self._last, self._day = now, today
         try:
@@ -891,7 +968,7 @@ def process_request(db: Supabase, req: dict) -> None:
     if quick:
         prompt += QUICK_REPLY_DIRECTIVE
     if source in ("fly", "mac"):
-        prompt += VOICE_REPLY_DIRECTIVE   # spoken aloud → keep it short
+        prompt += SAY_DIRECTIVE   # answered aloud only via the `say` tool; written reply is display-only
 
     # Tier (set by the hub's two FAB buttons): 'fast' = the sparkle button (simple, unambiguous
     # tool routing → Haiku, no thinking); 'power' = the brain button (precision macro estimates →
@@ -907,6 +984,7 @@ def process_request(db: Supabase, req: dict) -> None:
     else:
         model = "haiku"
     log(f"route={tier} → model={model}")
+    ping_esp_led("blink")   # working — the ESP light blinks for EVERY command, not just ESP-sourced ones
 
     # Role framing first, then the live govee device list (when there are lights).
     sys_ctx = HUB_SYSTEM
@@ -959,6 +1037,8 @@ def process_request(db: Supabase, req: dict) -> None:
             f"id=eq.{rid}",
             {"status": "done", "result": text, "updated_at": now_iso()},
         )
+        if source in ("fly", "mac") and text:
+            notify_phone(text)   # ambient voice command → push the past-tense result to Jared's phone
         log(f"done request {rid}: {text[:120]!r}")
     else:
         err = result.get("raw_error") or "unknown error"
@@ -1091,7 +1171,7 @@ def one_iteration(db: Supabase) -> bool:
             pass
     finally:
         if (req.get("source") or "").strip() == "fly":
-            ping_esp_led_off()   # model done (or dropped/errored) → clear the ESP working-light
+            ping_esp_led("off")   # model done (or dropped/errored) → clear the ESP working-light
     return True
 
 

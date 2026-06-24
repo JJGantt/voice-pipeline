@@ -6,3 +6,14 @@ firmware/.pio/
 server/__pycache__/
 server/.venv/
 *.pyc
+
+# voice-id subsystem: venv + downloaded ECAPA model + the enrolled voiceprint (biometric — it lives in
+# Supabase app_settings.voiceprint and is regenerated locally by enroll.py; never commit it).
+voice-id/.venv/
+voice-id/.model/
+voice-id/exemplars.npy
+voice-id/reference.npy
+
+# worker runtime logs (tracked historically by mistake; keep their churn out of commits)
+worker/worker.out.log
+worker/worker.err.log

@@ -12,9 +12,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Claude CLI (the Agent SDK drives it for the fallback path) + python deps for both processes
 RUN npm install -g @anthropic-ai/claude-code
 COPY requirements.txt .
-RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt claude-agent-sdk mcp python-dotenv
-# pre-download the wake-word models so the container starts instantly / offline
+# Install everything in ONE resolution so speechbrain can't re-pull a CUDA torch. The +cpu local
+# version on the pytorch CPU index sorts higher than PyPI's CUDA build, so pip picks the CPU wheel.
+RUN pip3 install --no-cache-dir --break-system-packages \
+      --extra-index-url https://download.pytorch.org/whl/cpu \
+      torch -r requirements.txt claude-agent-sdk mcp python-dotenv
+# pre-download the wake-word + ECAPA speaker models so the container starts instantly / offline
 RUN python3 -c "import openwakeword.utils as u; u.download_models()"
+RUN python3 -c "from speechbrain.inference.speaker import EncoderClassifier as E; E.from_hparams(source='speechbrain/spkrec-ecapa-voxceleb', savedir='/app/.ecapa')"
 
 # data MCP — build the TypeScript to dist/mcp.js
 WORKDIR /app/data-layer

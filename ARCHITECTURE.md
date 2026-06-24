@@ -59,7 +59,9 @@ DEVICES:
 
 - **`ApiRunner`** (efficiency): direct `anthropic` Messages API. Warm MCP stdio sessions started once;
   tool schemas inlined with the prompt; full agentic loop (sequential tool calls → final reply). No
-  built-in Claude Code tools, so nothing to hallucinate or discover.
+  built-in Claude Code tools, so nothing to hallucinate or discover. The stable prefix (tool schemas +
+  system, ~8k tokens) is **prompt-cached for 1 hour** (`cache_control ttl:1h` + the `extended-cache-ttl`
+  beta), so warm commands pay ~10% on that prefix — what makes always-on / wake-free affordable.
 - **`run_claude`** (accuracy): headless `claude -p` on the subscription (no API billing). Opus, with
   the `POWER_DIRECTIVE` (careful decomposition + `ultrathink` to unlock max thinking).
 
@@ -81,3 +83,132 @@ There is no third strategy. The old warm-Agent-SDK path (`SdkRunner`) was remove
 
 `app_settings.chatbox_route` ∈ `{fast, power}`, default `power`. Set in the hub Settings panel. Applies
 **only** to the typed chat box. The two buttons and the wake words carry their own tier and ignore it.
+
+## Feedback is universal — never scoped to which input captured the command
+
+Capture is arbitrary. Which device hears a wake word first (Mac mic vs ESP mic) is **not
+deterministic** — it comes down to who's closest/loudest in the moment — and it doesn't matter.
+Feedback must look identical and appear **everywhere** regardless of who happened to capture it. It's
+one system; the surfaces act together. Never scope feedback to the capturing device.
+
+Two kinds of feedback, two scopes:
+
+- **Capture indicator — LOCAL.** Only the device with the open mic can show "I'm listening": the Mac
+  HUD pill on the Mac mic, the ESP light on the ESP mic. This is the one inherently-local signal — a
+  device only knows about its own microphone.
+- **Processing + response — UNIVERSAL.** "working" (the brain is running), "done", and the spoken
+  reply reflect **one shared command lifecycle** that every surface subscribes to and renders the
+  same. An ESP-captured command still lights the Mac HUD and speaks on the Mac; a Mac-captured
+  command still blinks the ESP light. Drive these off the lifecycle in Supabase (`voice_requests`
+  status + the speech channel), **never** off "did I enqueue this row."
+
+These are **two independent channels** — visual state and a single spoken line. Don't conflate them.
+
+**1. Visual state (HUD pop-ups + ESP light).** The state machine, driven by system state in Supabase
+(`voice_requests` status) — NOT by the model:
+
+```
+listening → LOCAL     (only the capturing device's mic indicator)
+working   → UNIVERSAL (every screen / light, the instant the worker claims the turn)
+done      → UNIVERSAL (every screen / light clears when the turn ends)
+```
+
+**2. The spoken line (the `say` tool).** This is **not** a state transition and it does **not**
+narrate the lifecycle. It is the model saying **one** succinct thing about what it's doing — e.g.
+"changing the light to blue" — fired *alongside* the action tool so synthesis overlaps execution
+instead of stacking after it. Present tense, one short utterance per command (the `fly`/`mac` voice
+sources get a directive instructing exactly this). The model's final text is **not** spoken. The `say`
+tool lives in the `voice` MCP (`mcp-voice`) and inserts one row into the `voice_speech` table.
+
+So three distinct streams, none of which is the others: display thread = `voice_messages`; transient
+activity/state = the visual lifecycle above (+ `push_activity` tool events on the web activity bar);
+audio = the one `voice_speech` line. Only the last is played aloud.
+
+**Implemented (live, not aspirational):**
+- **Mac listener** holds one persistent realtime subscription (`RealtimeFeedback`): plays every
+  `voice_speech` line aloud (Kokoro via an on-demand warm daemon — see below), drives its on-screen HUD
+  off `voice_requests` status (`claimed`→working / `done`→done), and shows `listening` locally for its
+  own mic.
+- **Worker** drives the ESP light for every command — `/led-blink` on working, `/led-off` on done
+  (jared-voice server's generic `/led-<state>` HTTP route).
+- Nothing is `request_id`-gated: the Mac speaks and lights up for an ESP- or phone-captured command the
+  same as for one it captured itself.
+
+### TTS engine (Kokoro, on-demand)
+The spoken line plays through a local Kokoro daemon (`~/scripts/kokoro_daemon.py`). It is **not** kept
+resident (the model is ~1 GB): every capture source pre-warms it the **instant speech capture starts**,
+so the ~7s model load overlaps capture + STT + the model's thinking and the engine is hot by reply
+time. Warmed by: the wake word firing (`listener.py`), wake-free speech-energy start (`wakefree.py`),
+and — as a backstop for the ESP path — any claimed `voice_request` (`listener.py`). It binds its socket
+immediately and queues lines that arrive mid-load, and **self-exits after 30s idle** to give the RAM
+back. Zero permanent cost, no cold delay. (Warming at the worker *claim* alone was too late: the claim
+lands only ~2–3 s before the spoken line, but the cold load needs ~7 s — hence the old ~5 s delay.)
+
+## Wake-free mode (speaker-ID gated) — ONE system, every source
+
+A toggleable always-listening mode: no wake word — you just talk, and your **voice** is the gate. It's
+a **global** mode (`app_settings.wakefree_enabled`), congruent across every listener: ON → no wake
+word, every source (Mac *and* ESP) gates on Jared's voice; OFF → the two wake words everywhere.
+
+- **Speaker ID + one shared voiceprint.** ECAPA-TDNN. `enroll.py` saves a bank of per-phrase embeddings
+  (`exemplars.npy`) **and uploads it to `app_settings.voiceprint`** so the ESP/Fly server uses the exact
+  same one. An utterance is verified by cosine vs the closest exemplars (top-3 mean); ≥ `voiceid_threshold`
+  (default 0.30) = Jared. Enroll from **separate command-shaped phrases** (short ones + far-away
+  `--append` passes) — like-against-like coverage is what makes short/distant commands verify, not
+  slices of one monologue.
+- **Capture — same logic on both ends.** Segment on speech energy → end on a ~2s pause
+  (`wakefree_pause_s`) → trim silence → verify the speaker on the whole utterance → only then transcribe
+  (Groq) + enqueue `voice_requests {tier: wakefree_route}`. The TV / other people are filtered for free (never
+  transcribed); the worker's `__IGNORE__` directive drops any of *your* speech that isn't a command.
+  - **Mac:** `voice-id/wakefree.py` (ECAPA local, on-demand).
+  - **ESP:** the `jared-voice` Fly server runs the same ECAPA + the shared voiceprint (lazy-loaded on
+    turn-on; the box is **2 GB** for it) and captures on energy instead of openWakeWord while on.
+- **Route (Efficiency / Accuracy).** The wake-*word* path picks the route per-utterance from which word
+  fired (`Hey Rhasspy` → fast/Haiku, `Hey Jarvis` → power/Opus). Wake-free has no wake word to
+  disambiguate, so it runs on **one configurable route**, `app_settings.wakefree_route` ∈ `{fast, power}`
+  (default `fast`), set in the hub. `wakefree.py` reads it live per command; the listener bridges changes
+  to the ESP (`jared-voice/wakefree-route?v=…`). It is a mode, not per-command — flip it to send the
+  whole wake-free session to Opus.
+
+### Bridging the global state to every machine
+The hub Settings panel writes `app_settings`; the **Mac listener is the orchestrator** (it holds the
+realtime subscription on `app_settings`) and pushes state to the others over HTTP — so the ESP/Fly
+server needs no realtime client of its own (same pattern as the LED):
+- **`wakefree_enabled` flips** → listener does the Mac mic handoff (start/stop `wakefree.py`) **and**
+  pings `jared-voice/wakefree-on|off`.
+- **`wakefree_route` flips** → listener pings `jared-voice/wakefree-route?v=fast|power` (the Mac's own
+  `wakefree.py` reads it live per command, so no restart).
+- **`voice_muted` flips** → see Global mute below.
+
+### Global mute — any explicit input deafens every always-on listener
+An **explicit, hard-coded-route** command (push-to-talk dictation, or a hub FAB button) silences every
+*auto-routing* listener while it's in flight, so nothing else captures or re-routes it. One shared flag,
+`app_settings.voice_muted`:
+- **Set by:** the FAB buttons (web, while recording) and push-to-talk (Hammerspoon).
+- **Respected by:** the Mac listener (mutes its mic / pauses `wakefree.py`) and the ESP (the listener
+  pings `jared-voice/capture-off|on`; the server drops all audio, 90s safety auto-clear).
+Push-to-talk also fires an instant Mac SIGUSR; the FAB reaches the listener via realtime. Either way
+every source goes deaf together.
+
+### Mic ownership (Mac)
+The listener captures (wake word) iff **neither** the global mute nor wake-free holds the mic
+(`_muted` / `_wakefree` / `_capture` events). When wake-free is on, `wakefree.py` owns the mic and the
+listener parks (keeping `RealtimeFeedback` alive for speech + HUD).
+
+## Settings (`app_settings`, hub Settings panel)
+
+All live config is key/value rows in Supabase `app_settings`, edited from the hub gear, read by the
+relevant process. `app_settings` is in the realtime publication so the Mac reacts event-driven (and
+bridges to the ESP over HTTP).
+
+| key | default | read by |
+|---|---|---|
+| `chatbox_route` | `power` | worker — route for the typed chat box only |
+| `session_reset_s` | `300` | worker — idle seconds before the hub conversation resets (was 2h) |
+| `wakefree_enabled` | `0` | listener — global wake-free on/off (mic handoff + ESP bridge) |
+| `wakefree_route` | `fast` | wakefree (live) + ESP server — Efficiency/Accuracy route for wake-free commands |
+| `voice_muted` | `0` | listener + ESP — global mute (set by FAB / push-to-talk) |
+| `voiceid_threshold` | `0.30` | wakefree + ESP server — "it's Jared" cosine threshold |
+| `wakefree_pause_s` | `2.0` | wakefree + ESP server — trailing-silence that ends an utterance |
+| `voiceprint` | — | wakefree (local) + ESP server — base64 ECAPA exemplar bank (uploaded by `enroll.py`) |
+| `weight_reminder_*`, `surplus_cal` | — | hub server (reminders / nutrition) |
