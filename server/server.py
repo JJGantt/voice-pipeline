@@ -136,7 +136,7 @@ async def handle_transcript(text: str, duration_s: float, truncated: bool, tier:
     log.info("TRANSCRIPT (%.0fs%s, tier=%s): %r", duration_s, ", TRUNCATED" if truncated else "", tier or "-", text)
     # Strip a leading wake phrase the STT often captures ("Hey Rhasspy, …" / "Hey Jarvis, …") — it's the
     # trigger word, not part of the command. Tolerant of Whisper mishears (raspy/rhaspy/raspberry, jarvis/jarvas; "very").
-    text = re.sub(r"^\W*(hey|hi|ok|okay|very)?\W*(rhasspy|rhaspy|raspy|rasbee|rasby|raspberry|rasp|jarvis|jarvas|jervis)\b[\s,.!:;-]*",
+    text = re.sub(r"^\W*(hey|hi|ok|okay|very)?\W*(rhasspy|rhaspy|raspy|rasbee|rasby|raspberry|rasp|aspie|aspy|asbie|aspen|jarvis|jarvas|jervis)\b[\s,.!:;-]*",
                   "", text or "", count=1, flags=re.IGNORECASE).strip()
     if not (SUPABASE_URL and SUPABASE_ANON_KEY and text):
         return False
@@ -473,8 +473,90 @@ async def process_request(connection, request):
     return None
 
 
+# ---- Self-managed state ------------------------------------------------------------------------
+# Fly is the ALWAYS-ON host for the ESP; the Mac is an intermittent device. So the server reads its
+# own state (wake-free, mute, route, voiceprint, thresholds) straight from app_settings — on boot AND
+# live over realtime — instead of waiting for the Mac listener to push it. A server restart or a Mac
+# that's asleep can no longer strand the ESP in the wrong mode. The Mac's HTTP bridges remain only as
+# a redundant fast-path; the database is the source of truth.
+def _truthy(v) -> bool:
+    return str(v).strip().lower() not in ("0", "false", "off", "no", "", "none")
+
+
+def _load_voiceid_bg() -> None:
+    """Load ECAPA + the voiceprint OFF the event loop, so it never blocks the ESP websocket."""
+    try:
+        asyncio.get_running_loop().run_in_executor(None, _load_voiceid)
+    except RuntimeError:
+        _load_voiceid()
+
+
+def _apply_setting(key, value) -> None:
+    """Apply one app_settings change to the server's own state (no Mac bridge required)."""
+    global _wakefree, _suppressed, _wake_route
+    if key == "wakefree_enabled":
+        on = _truthy(value)
+        if on and not _wakefree:
+            _wakefree = True; _load_voiceid_bg()
+            log.info("wake-free ON (from app_settings)")
+        elif not on and _wakefree:
+            _wakefree = False
+            log.info("wake-free OFF (from app_settings)")
+    elif key == "voice_muted":
+        _suppressed = _truthy(value)
+        log.info("global mute %s (from app_settings)", "ON" if _suppressed else "off")
+    elif key == "wakefree_route":
+        _wake_route = "power" if str(value) == "power" else "fast"
+        log.info("wake-free route → %s (from app_settings)", _wake_route)
+    elif key in ("voiceid_threshold", "wakefree_pause_s", "voiceprint") and _wakefree:
+        _load_voiceid_bg()   # refresh thresholds / voiceprint live
+
+
+async def _settings_listener() -> None:
+    """Restore state from app_settings on boot, then react to hub changes live over realtime — so the
+    ESP's mode survives server restarts and hub toggles even with the Mac off."""
+    key = SUPABASE_SERVICE_KEY or SUPABASE_ANON_KEY
+    if not (SUPABASE_URL and key):
+        log.warning("settings listener: no supabase creds; ESP state will rely on the Mac bridge only")
+        return
+    s = _get_settings(["wakefree_enabled", "voice_muted", "wakefree_route"])
+    for k in ("wakefree_route", "voice_muted", "wakefree_enabled"):
+        if k in s:
+            _apply_setting(k, s[k])
+    log.info("startup state from DB: wakefree=%s muted=%s route=%s", _wakefree, _suppressed, _wake_route)
+    from realtime import AsyncRealtimeClient
+    while True:
+        sock = None
+        try:
+            sock = AsyncRealtimeClient(f"{SUPABASE_URL}/realtime/v1", key, auto_reconnect=True)
+            await sock.connect()
+            ch = sock.channel("jared-voice-settings")
+
+            def _cb(payload):
+                try:
+                    rec = (payload.get("data") or {}).get("record") or {}
+                    _apply_setting(rec.get("key"), rec.get("value"))
+                except Exception as e:  # noqa: BLE001
+                    log.warning("settings apply failed: %s", e)
+
+            ch.on_postgres_changes("UPDATE", callback=_cb, schema="public", table="app_settings")
+            await ch.subscribe()
+            log.info("settings listener subscribed (app_settings realtime)")
+            while sock.is_connected:
+                await asyncio.sleep(1.0)
+        except Exception as e:  # noqa: BLE001
+            log.warning("settings listener error: %s; retry in 5s", e)
+        try:
+            if sock:
+                await sock.close()
+        except Exception:  # noqa: BLE001
+            pass
+        await asyncio.sleep(5.0)
+
+
 async def main():
     log.info("voice backend up on :%d  wake=%s  stt=%s", PORT, WAKE_MODEL, GROQ_MODEL)
+    asyncio.create_task(_settings_listener())   # Fly owns its own state (app_settings: boot + live)
     # ping_interval=None: the ESP32 is a continuous PCM pump and doesn't reliably answer
     # WebSocket keepalive pings, so server-initiated pings were closing the connection mid-
     # utterance ("keepalive ping timeout"). The constant audio stream keeps the socket live;

@@ -181,15 +181,18 @@ word, every source (Mac *and* ESP) gates on Jared's voice; OFF → the two wake 
   to the ESP (`jared-voice/wakefree-route?v=…`). It is a mode, not per-command — flip it to send the
   whole wake-free session to Opus.
 
-### Bridging the global state to every machine
-The hub Settings panel writes `app_settings`; the **Mac listener is the orchestrator** (it holds the
-realtime subscription on `app_settings`) and pushes state to the others over HTTP — so the ESP/Fly
-server needs no realtime client of its own (same pattern as the LED):
-- **`wakefree_enabled` flips** → listener does the Mac mic handoff (start/stop `wakefree.py`) **and**
-  pings `jared-voice/wakefree-on|off`.
-- **`wakefree_route` flips** → listener pings `jared-voice/wakefree-route?v=fast|power` (the Mac's own
-  `wakefree.py` reads it live per command, so no restart).
-- **`voice_muted` flips** → see Global mute below.
+### State lives in the DB — every host reads it itself (the Mac is NOT the source of truth)
+`app_settings` (written by the hub) is the single source of truth. **Fly is the always-on host that
+runs the ESP precisely because the Mac is intermittent**, so the Fly server reads its own state
+straight from `app_settings` — on boot AND live via its own realtime subscription (`_settings_listener`
+in `server.py`): `wakefree_enabled` (→ load ECAPA + capture mode), `voice_muted` (→ global mute),
+`wakefree_route`, `voiceid_threshold`/`wakefree_pause_s`/`voiceprint`. A server restart or a sleeping
+Mac can no longer strand the ESP in the wrong mode — it restores itself from the DB.
+- The Mac listener still mirrors these to the ESP over HTTP (`/wakefree-on|off`, `/capture-off|on`,
+  `/wakefree-route`) as a **redundant fast-path**, and still does the Mac-local work (mic handoff,
+  start/stop `wakefree.py`). But that bridge is no longer load-bearing — if the Mac is off, Fly already
+  has the state. (The LED is likewise host-independent: the worker that drives it fails over Mac→Pi→Fly.)
+- `wakefree.py` (Mac) reads `wakefree_route` live per command; the worker maps `tier` → model.
 
 ### Global mute — any explicit input deafens every always-on listener
 An **explicit, hard-coded-route** command (push-to-talk dictation, or a hub FAB button) silences every
