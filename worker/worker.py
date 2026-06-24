@@ -1053,10 +1053,10 @@ def process_request(db: Supabase, req: dict) -> None:
             argstr = json.dumps(args, ensure_ascii=False, separators=(",", ":")) if args else ""
         except Exception:  # noqa: BLE001
             argstr = str(payload.get("input") or "")
-        if len(argstr) > 200:
-            argstr = argstr[:199] + "…"
+        if len(argstr) > 240:
+            argstr = argstr[:239] + "…"
         text = (short + (" " + argstr if argstr else "")).strip()
-        push_activity(text, "tool")  # direct push → instant activity bar (transient, not stored)
+        push_activity(text[:260], "tool")  # direct push → instant activity bar; full width like the rest
 
     # Per-source prompt directives (ride only on the prompt handed to Claude, never shown in the thread):
     #  · transcribed sources (ESP/Mac/quick-FAB) get false-positive awareness so noise mis-hears drop,
@@ -1104,7 +1104,7 @@ def process_request(db: Supabase, req: dict) -> None:
     use_agent = ag["mode"] and WORKER_ID != "fly" and (tier == "power" or (tier == "custom" and runner == "local"))
     log(f"route={tier} → model={model} think={think}{(' runner=' + runner) if runner else ''}{' AGENT' if use_agent else ''}")
     ping_esp_led("blink")   # working — the ESP light blinks for EVERY command, not just ESP-sourced ones
-    push_activity(transcript[:80], "working")   # bottom-strip: the command is now being worked (thinking phase)
+    push_activity(transcript[:240], "working")   # bottom-strip: the prompt being worked — fills full width like the result
 
     # Role framing first, then the live govee device list (when there are lights). Full-agent mode swaps the
     # locked-down hub framing for the unrestricted all-purpose framing.
