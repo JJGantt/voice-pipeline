@@ -93,8 +93,11 @@ def _ping_esp_route(tier: str) -> None:
 
 
 def _apply_mute(on: bool) -> None:
-    """Apply the global mute EVERYWHERE: this Mac (listener mic / wakefree) AND the ESP (ping the
-    jared-voice server). One explicit command in flight = every source goes deaf."""
+    """Apply the global mute EVERYWHERE: this Mac (listener mic / wakefree) AND the ESP. One explicit
+    command in flight = every source goes deaf. The ESP gets it two ways: an instant HTTP ping AND the
+    `voice_muted` DB flag (the source of truth the Fly server reads). Driving it off the DB flag means
+    the mute is held EXACTLY as long as push-to-talk is active — no arbitrary timeout can wake the ESP
+    mid-dictation (that 90s auto-clear was the bug)."""
     if on == _muted.is_set():
         return
     (_muted.set if on else _muted.clear)()
@@ -103,6 +106,7 @@ def _apply_mute(on: bool) -> None:
         subprocess.Popen(["pkill", "-USR1" if on else "-USR2", "-f", "wakefree.py"],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     threading.Thread(target=_ping_esp_capture, args=(on,), daemon=True).start()
+    threading.Thread(target=_write_setting, args=("voice_muted", "1" if on else "0"), daemon=True).start()
 
 
 def _on_ptt_start(*_):   # Hammerspoon double-tap → global mute (Mac instant + ESP via /capture)
@@ -144,6 +148,19 @@ def _read_setting(key: str) -> bool:
         return bool(rows) and str(rows[0].get("value")) not in ("0", "false", "off", "no", "", "None")
     except Exception:  # noqa: BLE001
         return False
+
+
+def _write_setting(key: str, value: str) -> None:
+    """Write a hub setting. Used to make push-to-talk's global mute a DB flag (`voice_muted`) the Fly
+    server reads, so the ESP mute is gated on real state instead of an arbitrary server-side timeout."""
+    try:
+        httpx.patch(f"{SUPABASE_URL}/rest/v1/app_settings",
+                    params={"key": f"eq.{key}"},
+                    headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                             "Content-Type": "application/json", "Prefer": "return=minimal"},
+                    json={"value": value}, timeout=8)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def log(msg: str) -> None:
@@ -478,8 +495,10 @@ def main() -> int:
     signal.signal(signal.SIGUSR2, _on_ptt_stop)
     if _read_setting("wakefree_enabled"):  # apply persisted hub toggle at boot; live flips via RealtimeFeedback
         set_wakefree(True)
-    if _read_setting("voice_muted"):
-        _apply_mute(True)
+    # Clear any stale global mute on boot: push-to-talk mutes are Mac-local, so a fresh listener means
+    # nothing is dictating. This un-sticks a voice_muted left set by a crash mid-dictation — the only
+    # safety we need now that the server's arbitrary 90s auto-clear is gone.
+    _write_setting("voice_muted", "0")
 
     while True:
         if not _capture.is_set():

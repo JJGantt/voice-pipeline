@@ -404,12 +404,9 @@ def _verify_jared(pcm_i16):
     return float(np.mean(np.sort(sims)[-k:]))
 
 
-async def _suppress_auto_clear():
-    """Safety: un-mute after 90s even if the /capture-on never arrives, so the ESP can't get stuck deaf."""
-    global _suppressed
-    await asyncio.sleep(90)
-    _suppressed = False
-    log.info("capture suppress auto-cleared (safety)")
+# (The old 90s _suppress_auto_clear was removed — it woke the ESP mid-dictation when a push-to-talk
+# session ran longer than 90s. The mute is now gated on the voice_muted DB flag the listener
+# sets/clears, so it lasts exactly as long as push-to-talk is held.)
 
 
 async def process_request(connection, request):
@@ -440,16 +437,13 @@ async def process_request(connection, request):
             await _render_led(_active_esp)
         return connection.respond(HTTPStatus.OK, "ok\n")
     if path.startswith("/capture-o"):     # /capture-off | /capture-on — global push-to-talk mute.
-        # No token: muting briefly is low-risk and it auto-clears; keeps the secret out of Hammerspoon.
-        global _suppressed, _suppress_safety
-        on = path.startswith("/capture-off")
-        _suppressed = on
-        if _suppress_safety:
-            _suppress_safety.cancel()
-            _suppress_safety = None
-        if on:
-            _suppress_safety = asyncio.create_task(_suppress_auto_clear())
-        log.info("capture %s (push-to-talk)", "MUTED" if on else "unmuted")
+        # Instant fast-path; the SOURCE OF TRUTH is the voice_muted DB flag (read live by
+        # _settings_listener), which holds the mute exactly as long as push-to-talk is active. No
+        # timeout here on purpose — the old 90s auto-clear woke the ESP mid-dictation. If a /capture-on
+        # is ever lost, voice_muted (set to 0 on release, and cleared by the listener on boot) un-sticks it.
+        global _suppressed
+        _suppressed = path.startswith("/capture-off")
+        log.info("capture %s (push-to-talk)", "MUTED" if _suppressed else "unmuted")
         return connection.respond(HTTPStatus.OK, "ok\n")
     if path.startswith("/wakefree-o"):    # /wakefree-on | /wakefree-off — global mode, bridged by the Mac listener
         global _wakefree
