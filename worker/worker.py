@@ -1060,7 +1060,7 @@ def process_request(db: Supabase, req: dict) -> None:
     # Real turn → now write the user bubble (deferred past the noise check), then close the activity bar.
     db.post("voice_messages",
             {"request_id": rid, "focus": "hub", "role": "user", "text": transcript, "done": True})
-    push_activity(text[:120], "done")  # close out the activity bar w/ the result
+    push_activity(text[:240], "done")  # close out the activity bar w/ the result (room for the full line)
 
     if result["ok"]:
         db.post(
