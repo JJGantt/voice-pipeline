@@ -22,6 +22,7 @@ import os
 import re
 import time
 import wave
+from datetime import datetime, timezone
 from collections import deque
 from http import HTTPStatus
 
@@ -130,7 +131,8 @@ async def transcribe(pcm: bytes) -> str:
     return (result if isinstance(result, str) else getattr(result, "text", "")).strip()
 
 
-async def handle_transcript(text: str, duration_s: float, truncated: bool, tier: str = "") -> bool:
+async def handle_transcript(text: str, duration_s: float, truncated: bool, tier: str = "",
+                            cap_start: str | None = None, cap_end: str | None = None) -> bool:
     """HANDOFF SEAM — the rest of the system hooks in here.
 
     `duration_s` is the captured length; `truncated` is True if the capture ended
@@ -157,7 +159,9 @@ async def handle_transcript(text: str, duration_s: float, truncated: bool, tier:
                     "Content-Type": "application/json",
                     "Prefer": "return=minimal",
                 },
-                json={"transcript": text, "source": "fly", **({"tier": tier} if tier else {})},
+                json={"transcript": text, "source": "fly", **({"tier": tier} if tier else {}),
+                      **({"capture_start": cap_start} if cap_start else {}),
+                      **({"capture_end": cap_end} if cap_end else {})},
             )
         return True
     except Exception as e:
@@ -273,6 +277,7 @@ async def connection(ws):
                     utterance = bytearray(preroll)
                     preroll.clear()
                     started = time.monotonic()
+                    started_wall = datetime.now(timezone.utc)   # wall-clock start of the recording window
                     last_voice = started
                     if _wakefree:
                         log.info("wake-free: speech — capturing…")
@@ -287,6 +292,7 @@ async def connection(ws):
                 hang = _vpause if _wakefree else SILENCE_HANGOVER_S
                 done = (elapsed >= MIN_UTTERANCE_S and now - last_voice >= hang) or elapsed >= MAX_UTTERANCE_S
                 if done:
+                    end_wall = datetime.now(timezone.utc)   # wall-clock end of the recording window
                     dur = len(utterance) / 2 / SAMPLE_RATE
                     truncated = elapsed >= MAX_UTTERANCE_S and (now - last_voice) < hang
                     if truncated:
@@ -306,7 +312,8 @@ async def connection(ws):
                     enqueued = False
                     try:
                         text = await transcribe(bytes(utterance))
-                        enqueued = await handle_transcript(text, dur, truncated, wake_tier or "")
+                        enqueued = await handle_transcript(text, dur, truncated, wake_tier or "",
+                                                           started_wall.isoformat(), end_wall.isoformat())
                     except Exception as e:
                         log.exception("transcription failed: %s", e)
                     if enqueued:

@@ -428,15 +428,20 @@ def transcribe(pcm: np.ndarray) -> str:
             pass
 
 
-def enqueue(text: str, tier: str = ""):
+def enqueue(text: str, tier: str = "", cap_start: str | None = None, cap_end: str | None = None):
     """Insert the transcript into voice_requests (source='mac', focus='hub'). Returns the new
-    request_id (so the reply can be matched the instant it lands) or None."""
+    request_id (so the reply can be matched the instant it lands) or None. cap_start/cap_end stamp the
+    recording's wall-clock window so the worker can dedup the ESP+Mac pair by span overlap."""
     if not (SUPABASE_KEY and text):
         return None
     try:
         payload: dict = {"transcript": text, "source": "mac", "focus": "hub"}
         if tier:
             payload["tier"] = tier
+        if cap_start:
+            payload["capture_start"] = cap_start
+        if cap_end:
+            payload["capture_end"] = cap_end
         r = httpx.post(
             f"{SUPABASE_URL}/rest/v1/voice_requests",
             headers={
@@ -555,14 +560,16 @@ def main() -> int:
                     log(f"wake! tier={fired_tier} (fast={fast_score:.2f} power={power_score:.2f}) — capturing…")
                     hud("listening")                    # LOCAL: only this Mac knows its own mic is open
                     warm_tts()                          # pre-warm TTS now — load overlaps capture + thinking
+                    cap_start = datetime.now(timezone.utc)   # wall-clock start of the recording window
                     pcm = capture_utterance(stream)
+                    cap_end = datetime.now(timezone.utc)     # …and its end (before transcription)
                     hud("working")                      # capture done → transcribing / processing
                     text = strip_wake(transcribe(pcm))
                     if text:
                         log(f"transcript (tier={fired_tier}): {text!r}")
                         # working/done HUD and the spoken reply are now driven UNIVERSALLY off
                         # voice_requests status + voice_speech (RealtimeFeedback) — for every source.
-                        enqueue(text, tier=fired_tier)
+                        enqueue(text, tier=fired_tier, cap_start=cap_start.isoformat(), cap_end=cap_end.isoformat())
                     else:
                         hud("off")                      # nothing intelligible → clear the local indicator
                         log("…nothing intelligible, ignoring")

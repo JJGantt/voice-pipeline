@@ -139,14 +139,19 @@ def _esp_working() -> None:
         pass
 
 
-def enqueue(text: str) -> None:
+def enqueue(text: str, cap_start: str | None = None, cap_end: str | None = None) -> None:
     if not (SUPABASE_KEY and text):
         return
     try:
+        payload = {"transcript": text, "source": "mac", "focus": "hub", "tier": route_tier()}
+        if cap_start:
+            payload["capture_start"] = cap_start
+        if cap_end:
+            payload["capture_end"] = cap_end
         httpx.post(f"{SUPABASE_URL}/rest/v1/voice_requests",
                    headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
                             "Content-Type": "application/json", "Prefer": "return=minimal"},
-                   json={"transcript": text, "source": "mac", "focus": "hub", "tier": route_tier()}, timeout=10.0)
+                   json=payload, timeout=10.0)
         log(f"enqueued: {text[:80]!r}")
         threading.Thread(target=_esp_working, daemon=True).start()
     except Exception as e:  # noqa: BLE001
@@ -258,12 +263,14 @@ def main() -> int:
                     seg = [prev, chunk]
                     silence_start = None
                     t0 = now
+                    t0_wall = datetime.now(timezone.utc)   # wall-clock start of the recording window
                     hud("listening")
                     warm_tts()      # speech started → warm TTS now so the spoken reply isn't cold-delayed
                 elif capturing:
                     seg.append(chunk)
                     silence_start = None if voiced else (silence_start or now)
                     if (silence_start and now - silence_start >= PAUSE_S) or (now - t0 >= MAX_UTTER_S):
+                        cap_end_wall = datetime.now(timezone.utc)   # wall-clock end of the recording window
                         pcm = trim_voiced(np.concatenate(seg), ENERGY_GATE)
                         capturing = False
                         seg = []
@@ -279,7 +286,7 @@ def main() -> int:
                                     if inject_mode():
                                         inject_text(text)  # paste into the focused Mac window + Enter (no hub)
                                     else:
-                                        enqueue(text)      # worker drives working/done HUD + speech via the listener
+                                        enqueue(text, t0_wall.isoformat(), cap_end_wall.isoformat())  # worker drives HUD/speech
                                 else:
                                     hud("off")
                             else:

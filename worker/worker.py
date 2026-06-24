@@ -33,7 +33,7 @@ import sys
 import tempfile
 import threading
 import time
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, date, timedelta
 from pathlib import Path
 
 import httpx
@@ -153,7 +153,8 @@ ORCH_TOKEN = os.environ.get("ORCH_TOKEN", "")
 HEARTBEAT_INTERVAL_S = 10.0
 IDLE_POLL_S = 1.0
 HEARTBEAT_FRESH_S = 30.0      # a higher-priority worker counts as "present" within this
-DEDUP_WINDOW_S = 10.0         # 2 mics hearing one utterance land within this; collapse to the earliest
+DEDUP_WINDOW_S = 10.0         # fallback only: 2 mics' enqueue times for rows that predate capture-window stamping
+DEDUP_TOL_S = 0.75            # pad each recording window by this (Fly↔Mac clock skew + ESP→Fly stream latency)
 SESSION_IDLE_RESET_S = 5 * 60       # default reset budget (5min idle); hub setting session_reset_s overrides
 HTTP_TIMEOUT_S = 30.0
 CLAUDE_TIMEOUT_S = float(os.environ.get("CLAUDE_TIMEOUT_S", "300"))
@@ -962,23 +963,29 @@ def claim_one(db: Supabase) -> dict | None:
 
 
 def _duplicate_of_recent(db: Supabase, req: dict) -> bool:
-    """True if an already-claimed/done request came in within DEDUP_WINDOW_S *before* this one — i.e. a
-    second always-on listener (ESP + Mac) heard the same utterance. Pure time: you don't fire two
-    distinct commands that close together, so anything within the window IS the same command. The
-    earliest-claimed one wins (it's already claimed/done; the later arrivals dedupe against it)."""
+    """True if an earlier already-claimed/done request covers the SAME RECORDING WINDOW as this one — i.e.
+    a second always-on mic (ESP + Mac) heard the same utterance. Compares the actual [capture_start,
+    capture_end] spans (overlap, each padded by DEDUP_TOL_S for clock skew + ESP stream latency), NOT
+    enqueue time — so the pair always collapses regardless of transcription speed, while two genuinely
+    distinct (sequential, non-overlapping) commands BOTH run even a second apart. Falls back to created_at
+    proximity only for a pair where either side predates capture-window stamping."""
     rid = req.get("id")
+    s, e = _parse_ts(req.get("capture_start") or ""), _parse_ts(req.get("capture_end") or "")
     ts = _parse_ts(req.get("created_at") or "")
-    if ts is None:
-        return False
-    rows = db.get("voice_requests", "select=id,created_at,status&order=created_at.desc&limit=12")
+    rows = db.get("voice_requests",
+                  "select=id,created_at,status,capture_start,capture_end&order=created_at.desc&limit=12")
+    tol = timedelta(seconds=DEDUP_TOL_S)
     for r in rows:
         if r.get("id") == rid or r.get("status") not in ("claimed", "done"):
             continue
-        ots = _parse_ts(r.get("created_at") or "")
-        if ots is None:
-            continue
-        if 0 <= (ts - ots).total_seconds() <= DEDUP_WINDOW_S:   # an earlier request within the window
-            return True
+        os_, oe = _parse_ts(r.get("capture_start") or ""), _parse_ts(r.get("capture_end") or "")
+        if s and e and os_ and oe:
+            if s <= oe + tol and os_ <= e + tol:   # padded window overlap → same utterance
+                return True
+        else:   # fallback: enqueue-time proximity for rows without a recording window
+            ots = _parse_ts(r.get("created_at") or "")
+            if ts and ots and 0 <= (ts - ots).total_seconds() <= DEDUP_WINDOW_S:
+                return True
     return False
 
 
