@@ -21,4 +21,7 @@ primary_region = "iad"
 
 [[vm]]
   size = "shared-cpu-1x"
-  memory = "1gb"
+  # 2GB: wake-free lazy-loads the ECAPA speaker model (~1GB of torch) on top of whisper + openWakeWord
+  # + the Claude SDK; 1GB OOM-kills the process when wake-free turns on (which drops the ESP → it
+  # flashes its reconnect pattern). Keep this at 2gb so a deploy never resets it back down.
+  memory = "2gb"
