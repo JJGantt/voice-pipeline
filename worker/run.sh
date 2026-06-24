@@ -27,10 +27,13 @@ if [ -z "${SUPABASE_KEY:-}" ]; then
   exit 2
 fi
 
-# Prefer a python3 that has httpx. The voice-pipeline server venv already does;
-# fall back to Homebrew python3.11 (also has httpx), then plain python3.
+# Prefer a python3 that has the deps. The dedicated worker venv (the Pi uses this) wins; then the
+# server venv (Mac); then Homebrew python3.11; then plain python3.
 PY="python3"
-if [ -x "$HOME/repos/voice-pipeline/server/.venv/bin/python" ]; then
+WVENV="$(cd "$(dirname "$0")/.." && pwd)/.venv-worker/bin/python"
+if [ -x "$WVENV" ]; then
+  PY="$WVENV"
+elif [ -x "$HOME/repos/voice-pipeline/server/.venv/bin/python" ]; then
   PY="$HOME/repos/voice-pipeline/server/.venv/bin/python"
 elif [ -x /opt/homebrew/bin/python3.11 ]; then
   PY=/opt/homebrew/bin/python3.11
