@@ -9,6 +9,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import { listRecentSessions } from './sessions.js';
 import { setFocus } from './focus.js';
 import { say } from './say.js';
+import { getRouting, setModel, setThinking, setRunner, setWakeWord } from './routing.js';
 
 const server = new Server({ name: 'voice', version: '1.0.0' }, { capabilities: { tools: {} } });
 
@@ -50,6 +51,52 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['text'],
       },
     },
+    {
+      name: 'get_routing',
+      description:
+        "Report how the conversational agent is currently routed: the model (haiku/sonnet/opus), thinking level (none/medium/maximum), runner (local subscription vs Anthropic API), and whether wake-free voice is on. Use this when Jared asks what model/thinking/routing is in effect.",
+      inputSchema: { type: 'object', properties: {} },
+    },
+    {
+      name: 'set_model',
+      description:
+        "Set which Claude model the conversational agent uses: 'haiku', 'sonnet', or 'opus'. This activates the Custom route so it takes effect immediately for voice and the chat box.",
+      inputSchema: {
+        type: 'object',
+        properties: { model: { type: 'string', description: 'haiku | sonnet | opus' } },
+        required: ['model'],
+      },
+    },
+    {
+      name: 'set_thinking',
+      description:
+        "Set the agent's thinking level: 'none' (no extended thinking), 'medium' (moderate), or 'maximum' (deepest — injects ultrathink). Activates the Custom route so it takes effect immediately.",
+      inputSchema: {
+        type: 'object',
+        properties: { level: { type: 'string', description: 'none | medium | maximum' } },
+        required: ['level'],
+      },
+    },
+    {
+      name: 'set_runner',
+      description:
+        "Set where the agent runs: 'local' (the free Claude subscription via claude -p on Mac/Pi) or 'api' (the Anthropic Messages API). Activates the Custom route so it takes effect immediately.",
+      inputSchema: {
+        type: 'object',
+        properties: { runner: { type: 'string', description: 'local | api' } },
+        required: ['runner'],
+      },
+    },
+    {
+      name: 'set_wake_word',
+      description:
+        "Turn the wake-free voice system on or off. Pass `on: true` to enable hands-free listening, `on: false` to disable it.",
+      inputSchema: {
+        type: 'object',
+        properties: { on: { type: 'boolean', description: 'true = enable wake-free voice, false = disable' } },
+        required: ['on'],
+      },
+    },
   ],
 }));
 
@@ -77,6 +124,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!line) return text('Error: `text` is required (the one short line to speak).');
       await say(line);
       return text(`Spoke aloud: ${line}`);
+    }
+    if (name === 'get_routing') {
+      return text(JSON.stringify(await getRouting(), null, 2));
+    }
+    if (name === 'set_model') {
+      return text(await setModel(a.model));
+    }
+    if (name === 'set_thinking') {
+      return text(await setThinking(a.level));
+    }
+    if (name === 'set_runner') {
+      return text(await setRunner(a.runner));
+    }
+    if (name === 'set_wake_word') {
+      return text(await setWakeWord(a.on));
     }
     return text(`Unknown tool: ${name}`);
   } catch (err) {

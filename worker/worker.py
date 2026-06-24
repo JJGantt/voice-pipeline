@@ -187,6 +187,10 @@ POWER_DIRECTIVE = (
     "them — don't lowball. Prefer the structured per-ingredient breakdown the log tool supports.]"
 )
 
+# Medium thinking: a mild nudge that contains the bare "think" keyword (the smallest extended-thinking
+# budget on `claude -p`), without the "ultrathink" maximum. Pairs with API effort="medium".
+MEDIUM_DIRECTIVE = "\n\n[Think it through before acting.]"
+
 # Sentinel the model emits to silently drop a turn (wake-word false positive). Matched loosely below.
 IGNORE_SENTINEL = "__IGNORE__"
 
@@ -813,7 +817,7 @@ class ApiRunner:
         except Exception as e:  # noqa: BLE001
             return f"tool error: {e}"
 
-    async def _run(self, prompt, system, model, think, on_event):
+    async def _run(self, prompt, system, model, think, on_event, effort="high"):
         await self._ensure()
         self._messages.append({"role": "user", "content": prompt})
         # Cache the stable prefix — the tool schemas (~10k tokens) + system — for 1 hour, so warm hits
@@ -827,9 +831,9 @@ class ApiRunner:
                       tools=self._tools, messages=self._messages,
                       max_tokens=8000 if think else 1024,
                       extra_headers={"anthropic-beta": "extended-cache-ttl-2025-04-11"})
-        if think:  # power tier: Opus adaptive thinking (budget_tokens is rejected on 4.8)
+        if think:  # adaptive thinking (budget_tokens is rejected on 4.8); effort sets the depth
             kwargs["thinking"] = {"type": "adaptive"}
-            kwargs["output_config"] = {"effort": "high"}
+            kwargs["output_config"] = {"effort": effort}
         final_text = ""
         logged_cache = False
         for _ in range(8):  # agentic loop: chain tool calls until a final text reply
@@ -862,7 +866,7 @@ class ApiRunner:
         return {"session_id": None, "text": final_text.strip(), "result": final_text.strip(),
                 "ok": bool(final_text.strip()), "raw_error": None}
 
-    def run(self, transcript, system_append="", on_event=None, model="haiku", think=False) -> dict:
+    def run(self, transcript, system_append="", on_event=None, model="haiku", think=False, effort="high") -> dict:
         self._start_loop()
         now = time.monotonic()
         today = datetime.now().astimezone().date()
@@ -871,7 +875,7 @@ class ApiRunner:
         self._last, self._day = now, today
         try:
             fut = asyncio.run_coroutine_threadsafe(
-                self._run(transcript, system_append, model, think, on_event), self._loop)
+                self._run(transcript, system_append, model, think, on_event, effort), self._loop)
             return fut.result(timeout=CLAUDE_TIMEOUT_S + 30)
         except Exception as e:  # noqa: BLE001 — never wedge the worker
             self.reset()
@@ -891,12 +895,12 @@ def chatbox_route(db: Supabase) -> str:
 
 
 def custom_config(db: Supabase) -> dict:
-    """The 'custom' route's knobs (hub Settings → Custom): model (haiku|sonnet|opus), thinking effort
-    (none|low|high), and runner (local subscription | api). Sane fallbacks if unset."""
+    """The 'custom' route's knobs (hub Settings → Custom): model (haiku|sonnet|opus), thinking level
+    (none|medium|max), and runner (local subscription | api). Sane fallbacks if unset."""
     rows = db.get("app_settings", "key=in.(custom_model,custom_think,custom_runner)&select=key,value")
     s = {r["key"]: r["value"] for r in rows} if isinstance(rows, list) else {}
     model = s.get("custom_model") if s.get("custom_model") in ("haiku", "sonnet", "opus") else "sonnet"
-    think = s.get("custom_think") if s.get("custom_think") in ("none", "low", "high") else "low"
+    think = s.get("custom_think") if s.get("custom_think") in ("none", "medium", "max") else "medium"
     runner = s.get("custom_runner") if s.get("custom_runner") in ("local", "api") else "local"
     return {"model": model, "think": think, "runner": runner}
 
@@ -1077,14 +1081,18 @@ def process_request(db: Supabase, req: dict) -> None:
     if tier not in ("fast", "power", "custom"):
         tier = chatbox_route(db)
     think = False        # API extended-thinking on/off
+    effort = "high"      # API thinking depth when think=True ("medium" | "high")
     runner = ""          # "" = the tier's default device; "local"|"api" only when custom forces it
     if tier == "custom":
         cfg = custom_config(db)
         model, runner = cfg["model"], cfg["runner"]
-        if cfg["think"] != "none":
-            think = True
-            if cfg["think"] == "high":
-                prompt += POWER_DIRECTIVE   # high effort → ultrathink (matters most on the subscription path)
+        if cfg["think"] == "max":           # maximum → ultrathink + high effort
+            think = True; effort = "high"
+            prompt += POWER_DIRECTIVE        # ultrathink (matters most on the subscription path)
+        elif cfg["think"] == "medium":      # medium → a mild think nudge + medium effort
+            think = True; effort = "medium"
+            prompt += MEDIUM_DIRECTIVE
+        # 'none' → think stays False
     elif tier == "power":
         model = "opus"; think = True
         prompt += POWER_DIRECTIVE
@@ -1114,13 +1122,13 @@ def process_request(db: Supabase, req: dict) -> None:
         # subscription (claude -p on Mac/Pi) with an API fallback so it never just fails. Fly has no
         # subscription login, so 'local' resolves to the API there too.
         if runner == "api" or WORKER_ID == "fly":
-            result = API.run(prompt, system_append=sys_ctx, on_event=_emit, model=model, think=think)
+            result = API.run(prompt, system_append=sys_ctx, on_event=_emit, model=model, think=think, effort=effort)
         else:
             result = run_claude(prompt, resume_id, on_event=_emit, system_append=sys_ctx, model=model,
                                 agent=use_agent, cwd=ag["cwd"])
             if not result.get("ok"):
                 log(f"custom local failed ({result.get('raw_error')}); falling back to API")
-                result = API.run(prompt, system_append=sys_ctx, on_event=_emit, model=model, think=think)
+                result = API.run(prompt, system_append=sys_ctx, on_event=_emit, model=model, think=think, effort=effort)
     elif tier == "fast":
         result = API.run(prompt, system_append=sys_ctx, on_event=_emit, model=model, think=False)
         if not result.get("ok"):
