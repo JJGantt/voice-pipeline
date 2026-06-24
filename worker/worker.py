@@ -157,6 +157,7 @@ DEDUP_WINDOW_S = 10.0         # 2 mics hearing one utterance land within this; c
 SESSION_IDLE_RESET_S = 5 * 60       # default reset budget (5min idle); hub setting session_reset_s overrides
 HTTP_TIMEOUT_S = 30.0
 CLAUDE_TIMEOUT_S = float(os.environ.get("CLAUDE_TIMEOUT_S", "300"))
+AGENT_TIMEOUT_S = float(os.environ.get("AGENT_TIMEOUT_S", "900"))  # full-agent (coding) runs get a longer leash
 
 HUB_SESSION_FILE = STATE_DIR / "hub_session.json"
 # Sentinel the hub UI enqueues to force a fresh Claude session (manual "Reset context").
@@ -237,6 +238,19 @@ HUB_SYSTEM = (
     "description tells you how to use it — follow those. Bash, curl, a shell, the filesystem, and file "
     "editing are NOT available to you; never attempt them. If no available tool can satisfy a request, "
     "say so briefly rather than improvising another way."
+)
+
+# Full-agent framing — the opposite of HUB_SYSTEM. Used only on the subscription path when "Full agent
+# mode" is on (power / custom-local, Mac+Pi). It places NO restriction on capability: the model keeps its
+# full native toolset (shell, file editing, web, etc.) AND the data/voice/govee MCP tools, and is told it
+# is a general-purpose agent — so Jared can code or do anything by voice. Requests arrive as transcriptions.
+AGENT_SYSTEM = (
+    "You are Jared's all-purpose assistant, driven by voice. You have your full set of capabilities — you can "
+    "write and run code, use the shell, edit files, search the web, and anything else — IN ADDITION to the "
+    "data/voice/govee MCP tools for his life data (nutrition, workouts, weight, lists, reminders, notes, "
+    "recipes) and smart lights. Use whatever combination of tools the request needs. Requests come from "
+    "speech-to-text, so expect occasional mis-hearings; if a request is genuinely unintelligible, say so. "
+    "Keep spoken replies brief and to the point."
 )
 
 
@@ -459,10 +473,38 @@ def session_reset_s() -> float:
     return _reset_cache["v"]
 
 
-def should_reset_session(state: dict | None) -> bool:
-    """Reset (start fresh) if: no state, idle > the reset budget, or it's a new calendar day."""
+_agent_cache = {"mode": None, "cwd": None, "t": 0.0}
+
+
+def agent_settings() -> dict:
+    """Full-agent-mode knobs from app_settings (cached ~15s): `agent_mode` (bool — upgrade the subscription
+    path to the unrestricted Claude Code agent) and `agent_cwd` (where that agent runs; default $HOME)."""
+    now = time.monotonic()
+    if _agent_cache["mode"] is None or now - _agent_cache["t"] > 15:
+        mode, cwd = False, os.path.expanduser("~")
+        try:
+            r = httpx.get(f"{SUPABASE_URL}/rest/v1/app_settings",
+                          params={"key": "in.(agent_mode,agent_cwd)", "select": "key,value"},
+                          headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=5)
+            s = {row["key"]: row["value"] for row in r.json()}
+            mode = str(s.get("agent_mode", "")).strip().lower() in ("1", "true", "on", "yes")
+            if s.get("agent_cwd"):
+                cwd = os.path.expanduser(s["agent_cwd"].strip())
+        except Exception:  # noqa: BLE001
+            pass
+        _agent_cache.update(mode=mode, cwd=cwd, t=now)
+    return {"mode": _agent_cache["mode"], "cwd": _agent_cache["cwd"]}
+
+
+def should_reset_session(state: dict | None, agent: bool = False) -> bool:
+    """Reset (start fresh) if: no state, idle > the reset budget, or it's a new calendar day. In full-agent
+    mode the conversation resets MANUALLY only — a long coding session shouldn't be wiped by an idle gap or a
+    midnight rollover (switching the mode off triggers a reset via the hub), so only a missing session forces
+    a fresh start."""
     if not state or not state.get("session_id"):
         return True
+    if agent:
+        return False
     last = _parse_ts(state.get("last_activity_iso", ""))
     if not last:
         return True
@@ -494,15 +536,20 @@ def write_mcp_config() -> str:
     return path
 
 
-def run_claude(transcript: str, resume_session_id: str | None, on_event=None, system_append: str = "", model: str = HUB_MODEL) -> dict:
+def run_claude(transcript: str, resume_session_id: str | None, on_event=None, system_append: str = "",
+               model: str = HUB_MODEL, agent: bool = False, cwd: str | None = None) -> dict:
     """Run `claude -p` headless and STREAM the stream-json output, parsing events as they arrive.
 
     on_event(kind, payload) fires live during the run so progress can be surfaced — currently
     on_event("tool", {"name", "input"}) for each tool call. Returns {"session_id", "text",
     "result", "ok", "raw_error"}.
 
-    Tool allowlist is restricted to the MCP servers: no Bash/Edit/Read. In headless `-p` mode a
-    tool that is not in --allowedTools is DENIED (not prompted), so the run never hangs.
+    Two shapes:
+      · HUB (agent=False): tool allowlist restricted to the MCP servers — no Bash/Edit/Read. In headless
+        `-p` mode a tool not in --allowedTools is DENIED (not prompted), so the run never hangs.
+      · FULL AGENT (agent=True): the unrestricted Claude Code agent — every native tool executes (via
+        --dangerously-skip-permissions, since `-p` can't prompt) ALONGSIDE the MCP tools, runs in `cwd`,
+        and gets the longer AGENT_TIMEOUT_S. No hub framing; an all-purpose voice agent (coding, etc.).
     """
     mcp_path = write_mcp_config()
     cmd = [CLAUDE_BIN, "-p", transcript]
@@ -514,10 +561,14 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
         "--strict-mcp-config",
         "--output-format", "stream-json",
         "--verbose",
-        "--allowedTools", "mcp__data", "mcp__voice", "mcp__govee-lights",
     ]
+    if agent:
+        cmd += ["--dangerously-skip-permissions"]   # all native tools execute; MCP tools still present
+    else:
+        cmd += ["--allowedTools", "mcp__data", "mcp__voice", "mcp__govee-lights"]   # MCP-only; built-ins denied
     if system_append:
         cmd += ["--append-system-prompt", system_append]
+    timeout_s = AGENT_TIMEOUT_S if agent else CLAUDE_TIMEOUT_S
 
     session_id = None
     assistant_chunks: list[str] = []
@@ -535,13 +586,13 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
     try:
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, bufsize=1, env=sub_env,  # line-buffered so events arrive promptly
+            text=True, bufsize=1, env=sub_env, cwd=cwd,  # line-buffered; cwd is where a full agent operates
         )
         # Watchdog: kill the run if it exceeds the timeout, which ends the streaming loop at EOF.
         done = threading.Event()
 
         def _watchdog():
-            if not done.wait(CLAUDE_TIMEOUT_S):
+            if not done.wait(timeout_s):
                 timed_out["v"] = True
                 try:
                     proc.kill()
@@ -947,7 +998,9 @@ def process_request(db: Supabase, req: dict) -> None:
 
     # Hub session management.
     state = read_hub_session()
-    if should_reset_session(state):
+    ag = agent_settings()
+    session_agent = ag["mode"] and WORKER_ID != "fly"   # full-agent session → reset manually only
+    if should_reset_session(state, agent=session_agent):
         resume_id = None
         log("hub session: starting FRESH (reset rule fired)")
     else:
@@ -1007,12 +1060,17 @@ def process_request(db: Supabase, req: dict) -> None:
         prompt += POWER_DIRECTIVE
     else:
         model = "haiku"
-    log(f"route={tier} → model={model} think={think}{(' runner=' + runner) if runner else ''}")
+    # Full-agent mode applies only to the subscription path it runs on: power, or custom-local. Never fast
+    # (API/Haiku) and never Fly (no subscription / API-only). When on, the run is an unrestricted Claude Code
+    # agent in agent_cwd; otherwise the locked-down hub assistant.
+    use_agent = ag["mode"] and WORKER_ID != "fly" and (tier == "power" or (tier == "custom" and runner == "local"))
+    log(f"route={tier} → model={model} think={think}{(' runner=' + runner) if runner else ''}{' AGENT' if use_agent else ''}")
     ping_esp_led("blink")   # working — the ESP light blinks for EVERY command, not just ESP-sourced ones
     push_activity(transcript[:80], "working")   # bottom-strip: the command is now being worked (thinking phase)
 
-    # Role framing first, then the live govee device list (when there are lights).
-    sys_ctx = HUB_SYSTEM
+    # Role framing first, then the live govee device list (when there are lights). Full-agent mode swaps the
+    # locked-down hub framing for the unrestricted all-purpose framing.
+    sys_ctx = AGENT_SYSTEM if use_agent else HUB_SYSTEM
     govee = govee_context()
     if govee:
         sys_ctx += "\n\n" + govee
@@ -1028,7 +1086,8 @@ def process_request(db: Supabase, req: dict) -> None:
         if runner == "api" or WORKER_ID == "fly":
             result = API.run(prompt, system_append=sys_ctx, on_event=_emit, model=model, think=think)
         else:
-            result = run_claude(prompt, resume_id, on_event=_emit, system_append=sys_ctx, model=model)
+            result = run_claude(prompt, resume_id, on_event=_emit, system_append=sys_ctx, model=model,
+                                agent=use_agent, cwd=ag["cwd"])
             if not result.get("ok"):
                 log(f"custom local failed ({result.get('raw_error')}); falling back to API")
                 result = API.run(prompt, system_append=sys_ctx, on_event=_emit, model=model, think=think)
@@ -1040,7 +1099,8 @@ def process_request(db: Supabase, req: dict) -> None:
     elif WORKER_ID == "fly":
         result = API.run(prompt, system_append=sys_ctx, on_event=_emit, model=model, think=True)  # Fly: no subscription
     else:
-        result = run_claude(prompt, resume_id, on_event=_emit, system_append=sys_ctx, model=model)  # subscription, free
+        result = run_claude(prompt, resume_id, on_event=_emit, system_append=sys_ctx, model=model,
+                            agent=use_agent, cwd=ag["cwd"])  # subscription, free
 
     if result.get("session_id"):
         write_hub_session(result["session_id"])
