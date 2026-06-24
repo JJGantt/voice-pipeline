@@ -1322,6 +1322,22 @@ def one_iteration(db: Supabase) -> bool:
     return True
 
 
+def _heartbeat_loop(stop_evt: threading.Event) -> None:
+    """Heartbeat on its OWN thread + client so the worker stays 'present' even while a long command blocks
+    the main loop. Otherwise its presence goes stale mid-task and a lower-priority worker poaches the
+    user's follow-up — running it against a different machine/session and losing the conversation context.
+    A rapid follow-up is the user tagging an extra thought onto the same thread, so it MUST queue on the
+    same worker and resume the same session. Fires immediately, then every HEARTBEAT_INTERVAL_S."""
+    with httpx.Client(timeout=HTTP_TIMEOUT_S) as hb_client:
+        hb_db = Supabase(hb_client)
+        while not stop_evt.is_set():
+            try:
+                heartbeat(hb_db)
+            except Exception as e:  # noqa: BLE001
+                log(f"heartbeat thread error: {e}")
+            stop_evt.wait(HEARTBEAT_INTERVAL_S)
+
+
 def main() -> int:
     if not SUPABASE_KEY:
         print("FATAL: SUPABASE_KEY is required (service_role key). See README.",
@@ -1348,19 +1364,22 @@ def main() -> int:
         waker = RealtimeWaker()
         waker.start()   # event-driven claim; no-op fallback to polling if realtime is unavailable
 
-        last_heartbeat = 0.0
-        while _running:
-            now = time.monotonic()
-            if now - last_heartbeat >= HEARTBEAT_INTERVAL_S:
-                heartbeat(db)
-                last_heartbeat = now
+        # Heartbeat on its own thread so a long command (a multi-minute agent run) never lets this
+        # worker's presence go stale — which would let a lower-priority worker poach the user's follow-up
+        # onto a different session. The main loop is then free to block on process_request as long as a
+        # command takes, and the queued follow-up runs HERE, next, resuming the same conversation.
+        hb_stop = threading.Event()
+        threading.Thread(target=_heartbeat_loop, args=(hb_stop,), name="heartbeat", daemon=True).start()
 
-            processed = one_iteration(db)
-            # Loop quickly if we just worked (drain the queue); else wait for the next INSERT.
-            # waker.wait wakes instantly on a realtime INSERT, else times out after IDLE_POLL_S so
-            # heartbeats keep cadence and a dropped socket degrades to the old polling behavior.
-            if not processed:
-                waker.wait(IDLE_POLL_S)
+        try:
+            while _running:
+                processed = one_iteration(db)
+                # Loop quickly if we just worked (drain the queue); else wait for the next INSERT.
+                # waker.wait wakes instantly on a realtime INSERT, else times out after IDLE_POLL_S.
+                if not processed:
+                    waker.wait(IDLE_POLL_S)
+        finally:
+            hb_stop.set()
 
     log("stopped")
     return 0
