@@ -1,34 +1,30 @@
 #!/usr/bin/env python3
-"""Pi audio service — owns the TV speaker (HDMI) and is the single audio owner for the voice system.
+"""Pi audio service — plays the assistant's spoken REPLY through the TV (HDMI), via PipeWire.
 
-Subscribes to Supabase realtime and plays, serialized through one lock so nothing overlaps:
-  - voice_requests UPDATE → status 'claimed'  → the "heard you / processing" cue (audio_processing_sound).
-    Gated on 'claimed' (a single, post-dedup event the worker emits once per command) rather than the raw
-    INSERT, so two mics on one utterance don't double-ding.
-  - voice_speech   INSERT                      → the assistant's final reply, synthesized via warm Kokoro
-    (audio_spoken_reply). The reply is already a past-tense one-liner, so we just speak it.
+Subscribes to Supabase realtime:
+  - voice_speech   INSERT  → the assistant's final reply, synthesized via warm Kokoro (audio_spoken_reply).
+  - voice_requests UPDATE  → drives the 'working' floor lamp (amber on 'claimed', off on 'done').
 
-Kokoro is loaded ONCE at startup and kept resident (warm) — the Pi has the RAM and stays idle between
-commands, so synthesis is hot. Output goes through ALSA card 1 (the connected TV HDMI; card 0 errors).
-WARM STREAM: one aplay reads raw PCM from a pipe and stays open for the life of the service, so the HDMI
-link is held locked and NEVER cold-opens. A feeder thread writes that pipe forever — digital silence when
-idle, the reply/cue samples when there's something to play — and the blocking pipe write paces it to the
-audio clock (near-zero CPU). Because the device is always warm the first syllable never clips, with no
-silence pad and no added latency. It is OUTPUT ONLY (nothing is ever captured), so a feedback howl like the
-pw-loopback one is impossible. Barge-in just drops the queued audio; it never kills the stream.
-Env (see ~/voice/pi/.env-audio): SUPABASE_URL, SUPABASE_KEY, optional ALSA_DEV, HEARD_WAV, KOKORO_VOICE.
+The heard-you POP is NOT here anymore — the UI/browser plays it itself, synced to the moment it paints your
+words (status-hub tv.js). Likewise the eventual plan is for the reply audio to move to the browser too, so
+the Pi stops being an audio device. For now Kokoro stays resident here and the reply plays out.
+
+Output goes through PipeWire (pw-cat → the HDMI sink), NOT direct-to-hardware, so the Pi shares the speaker
+with the browser instead of locking it. A feeder thread writes raw int16 to pw-cat forever — digital
+silence when idle, reply samples when speaking — which keeps the PipeWire stream active so the sink never
+suspends (no cold-clip). Output-only, so feedback is impossible. The service unit must export
+XDG_RUNTIME_DIR=/run/user/1000 to reach the user PipeWire.
+Env (see ~/voice/pi/.env-audio): SUPABASE_URL, SUPABASE_KEY, optional PW_SINK, KOKORO_VOICE.
 """
 import os, re, asyncio, threading, subprocess, time, collections, socket, json
 from datetime import datetime, timezone
 import numpy as np
-import soundfile as sf
 import httpx
 from realtime import AsyncRealtimeClient
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 PW_SINK   = os.environ.get("PW_SINK", "alsa_output.platform-107c706400.hdmi.hdmi-stereo")  # HDMI via PipeWire
-HEARD_WAV = os.path.expanduser(os.environ.get("HEARD_WAV", "~/voice/sfx-candidates/02_initial_message-pop.wav"))
 VOICE     = os.environ.get("KOKORO_VOICE", "af_heart")
 STREAM_RATE  = 24000     # Kokoro's native rate → no resample for speech; PipeWire upconverts to the HDMI's 48k
 STREAM_CHUNK = 600       # frames per pipe write (~25ms) — small so enqueued audio is picked up fast (low lag)
@@ -42,7 +38,6 @@ MODEL_ONNX = os.path.expanduser(os.environ.get("KOKORO_MODEL", "~/voice/pi/kokor
 VOICES_BIN = os.path.expanduser(os.environ.get("KOKORO_VOICES", "~/voice/pi/voices-v1.0.bin"))
 _pending = collections.deque()  # int16 chunks queued for the warm stream (the clip playing right now)
 _audio_lock = threading.Lock()  # guards _pending
-_cue_i16 = None                 # heard-you cue, resampled to STREAM_RATE mono int16 once at startup
 _speak_queue = collections.deque()   # replies waiting to be spoken — FIFO, in order; succinct so a short
 _speak_lock = threading.Lock()       # queue is fine. Never dropped except the one you talk over.
 _speak_event = threading.Event()
@@ -117,29 +112,6 @@ def _stream_loop():
         except Exception as e:  # noqa: BLE001
             log(f"pw-cat stream error: {e}; reopening in 1s")
             time.sleep(1)
-
-
-def _load_cue_i16():
-    """Load the heard-you cue once, downmix to mono, resample to STREAM_RATE, cache as int16 for the stream."""
-    global _cue_i16
-    if not os.path.exists(HEARD_WAV):
-        log(f"heard-you wav missing: {HEARD_WAV}")
-        return
-    try:
-        data, sr = sf.read(HEARD_WAV, dtype="float32")
-        if data.ndim > 1:
-            data = data.mean(axis=1)
-        if sr != STREAM_RATE:
-            n = int(len(data) * STREAM_RATE / sr)
-            data = np.interp(np.linspace(0, len(data), n, endpoint=False), np.arange(len(data)), data)
-        _cue_i16 = _to_int16(data)
-    except Exception as e:  # noqa: BLE001
-        log(f"cue load failed: {e}")
-
-
-def play_heard() -> None:
-    if _cue_i16 is not None:
-        _enqueue_audio(_cue_i16)
 
 
 def _lamp_scan(timeout: float = 1.2):
@@ -410,19 +382,11 @@ def on_speech(payload):
         _speak_event.set()
 
 
-def on_request_change(payload):
-    """One binding for voice_requests (INSERT + UPDATE):
-      INSERT = a command just CAME THROUGH — its transcript exists, the same moment it appears on the TV.
-        Fire the heard-you POP now. This is 'we heard you', NOT 'the agent started working'.
-      UPDATE 'claimed' → working lamp amber; 'done'/'error' → lamp off."""
+def on_request(payload):
+    """'claimed' → working lamp amber; 'done'/'error' → off. (The heard-you POP is no longer fired here — the
+    UI/browser plays it itself, synced to the moment it paints your words. See status-hub tv.js.)"""
     global _lamp_working
-    data = payload.get("data") or {}
-    if data.get("type") == "INSERT":
-        if _toggles.get("audio_processing_sound"):
-            log("heard-you cue (command received)")
-            play_heard()
-        return
-    status = str((data.get("record") or {}).get("status") or "")
+    status = str((_rec(payload)).get("status") or "")
     if status == "claimed":
         _lamp_working = True
         _lamp_render()
@@ -452,11 +416,11 @@ async def serve():
             await sock.connect()
             ch = sock.channel("pi-audio")
             ch.on_postgres_changes("UPDATE", callback=on_presence, schema="public", table="voice_presence")
-            ch.on_postgres_changes("*", callback=on_request_change, schema="public", table="voice_requests")
+            ch.on_postgres_changes("UPDATE", callback=on_request, schema="public", table="voice_requests")
             ch.on_postgres_changes("INSERT", callback=on_speech, schema="public", table="voice_speech")
             ch.on_postgres_changes("UPDATE", callback=on_setting, schema="public", table="app_settings")
             await ch.subscribe()
-            log("subscribed (voice_presence → hearing, voice_requests INSERT → pop / UPDATE → lamp, voice_speech → TTS, app_settings → toggles)")
+            log("subscribed (voice_presence → hearing, voice_requests UPDATE → lamp, voice_speech → TTS, app_settings → toggles)")
             while sock.is_connected:
                 await asyncio.sleep(1.0)
         except Exception as e:
@@ -474,7 +438,6 @@ def main():
     except Exception as e:
         log(f"warmup failed: {e}")
     fetch_toggles()
-    _load_cue_i16()                                              # heard-you cue → stream format, once
     threading.Thread(target=_stream_loop, daemon=True).start()   # the always-open warm output (no cold clip)
     threading.Thread(target=_play_http_server, daemon=True).start()  # accept pre-synth'd PCM (synth-on-Mac)
     threading.Thread(target=_speaker_loop, daemon=True).start()   # speaks only the latest reply
