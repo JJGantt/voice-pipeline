@@ -323,15 +323,27 @@ def _speaker_loop():
                 _speak_event.clear()
         if not text:
             continue
+        t0 = time.monotonic()
         while _hearing or _muted:      # hold until you've stopped talking / released push-to-talk
             time.sleep(0.1)
-        speak(text)
+        held = time.monotonic() - t0   # tail part 2: hold (invisible until now) — reply waiting on you/mute
+        if held > 0.15:
+            log(f"reply HELD {held:.1f}s (you were talking / push-to-talk) before synth")
+        speak(text)                    # tail part 3: 'first audio Xs' = synth of the first clause
 
 
 def on_speech(payload):
     rec = _rec(payload)
     text = rec.get("text") or ""
     if text and _toggles.get("audio_spoken_reply"):
+        lat = ""
+        ca = rec.get("created_at")    # tail part 1: realtime delivery (reply written → we got it)
+        if ca:
+            try:
+                lat = f" (delivery {(datetime.now(timezone.utc) - datetime.fromisoformat(ca)).total_seconds():.1f}s)"
+            except Exception:  # noqa: BLE001
+                pass
+        log(f"reply queued{lat} — {text[:40]!r}")
         with _speak_lock:
             _speak_queue.append(text)   # FIFO — play in order, don't drop
         _speak_event.set()
