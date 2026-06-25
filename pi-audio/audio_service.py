@@ -222,18 +222,44 @@ def _shorten(text: str) -> str:
     return strip_markdown(text)[:600]
 
 
+def _clauses(text: str):
+    """Split a reply into clause-sized pieces on sentence/clause punctuation, so each can be synthesized and
+    START PLAYING while the next is still synthesizing. Kokoro's own create_stream only splits on full
+    sentences — a one-sentence reply wouldn't stream at all — so this is what gets the first words out fast.
+    Split after punctuation+space (so decimals/amounts like '9.5'/'1,000' stay intact), and also before a
+    coordinating conjunction so a punctuation-free sentence still streams. Tiny fragments are glued back."""
+    parts = re.split(r"(?<=[.!?;:,—–])\s+|\s+(?=(?:and|but|so|then|because|while|plus|which)\b)", text)
+    out = []
+    for p in (p.strip() for p in parts):
+        if not p:
+            continue
+        if out and len(out[-1]) < 12:    # glue a tiny fragment onto the previous piece (no 1-word synths)
+            out[-1] += " " + p
+        else:
+            out.append(p)
+    return out
+
+
 def speak(text: str) -> None:
     text = _shorten(text)
     if not text:
         return
     t = time.monotonic()
-    samples, sr = _kok.create(text, voice=VOICE, speed=1.0, lang="en-us")
-    if samples is None or len(samples) == 0:
-        return
-    log(f"synth {time.monotonic() - t:.1f}s — {text[:60]!r}")
-    _enqueue_audio(_to_int16(samples))   # Kokoro is already STREAM_RATE mono → no resample
-    while True:                          # block until the feeder has taken this whole clip (keeps _pending
-        with _audio_lock:                # holding ≤1 clip, so a barge-in drops only this one, not the queue)
+    first = True
+    for clause in _clauses(text):
+        if _hearing or _muted:                 # barged in / muted between clauses → drop the rest
+            break
+        samples, sr = _kok.create(clause, voice=VOICE, speed=1.0, lang="en-us")
+        if _hearing or _muted:                 # ...or during this clause's synth → drop it, don't enqueue
+            break
+        if samples is None or len(samples) == 0:
+            continue
+        _enqueue_audio(_to_int16(samples))      # Kokoro is already STREAM_RATE mono → no resample
+        if first:
+            log(f"first audio {time.monotonic() - t:.1f}s — {text[:50]!r}")
+            first = False
+    while True:                                 # drain (keeps _pending bounded so barge-in drops only this)
+        with _audio_lock:
             if not _pending:
                 break
         time.sleep(0.05)
@@ -255,21 +281,21 @@ def _rec(payload):
 
 
 async def _clear_hearing(delay: float = 1.3):
-    """Presence went stale → your voice stopped being confirmed → the whole command is captured and about
-    to transcribe. THIS falling edge is when the 'heard you' cue fires (not the start, not after STT)."""
+    """Presence went stale → your voice stopped being confirmed. Clear _hearing so a held reply can start and
+    barge-in releases. (The heard-you cue no longer fires here — it's on the 'claimed' event now, in lockstep
+    with the screen's working indicator.)"""
     global _hearing
     try:
         await asyncio.sleep(delay)
-        if _hearing and _toggles.get("audio_processing_sound"):
-            threading.Thread(target=play_heard, daemon=True).start()
         _hearing = False
     except asyncio.CancelledError:
         pass
 
 
 def on_presence(payload):
-    """Track 'hearing Jared' from voice_presence; each fresh confirm restarts the falling-edge timer. The
-    cue itself fires in _clear_hearing when confirms stop — i.e. the command is done and about to transcribe."""
+    """Track 'hearing Jared' from voice_presence; each fresh confirm restarts the timer that clears _hearing
+    once you stop. _hearing gates 'don't start a reply while you're talking' and drives barge-in. (The
+    heard-you cue is NOT here — it's on the 'claimed' event, synced to the screen.)"""
     global _hearing, _hearing_clear
     rec = _rec(payload)
     hj = rec.get("heard_jared_at")
@@ -279,8 +305,8 @@ def on_presence(payload):
         fresh = False
     if not fresh:
         return
-    _stop_speech()              # barge-in: you're talking → shut up any reply that's playing or queued
-    _hearing = True
+    _hearing = True             # set BEFORE the barge-in clear so a mid-synth reply reliably sees it and stops
+    _stop_speech()              # barge-in: you're talking → drop any reply audio queued right now
     if _hearing_clear:
         _hearing_clear.cancel()
     _hearing_clear = asyncio.create_task(_clear_hearing())
@@ -312,13 +338,17 @@ def on_speech(payload):
 
 
 def on_request(payload):
-    """Drive the lamp's Working state off any command's status (universal, same as the Mac HUD):
-    'claimed' → processing (amber, unless you're still talking → blue wins); 'done'/'error' → clear."""
+    """'claimed' is the moment the screen flips to 'working', so fire BOTH the working lamp AND the heard-you
+    cue here — the pop lands in lockstep with the screen instead of on a separate presence timer that drifted
+    late. 'done'/'error' → lamp off."""
     global _lamp_working
     status = str(_rec(payload).get("status") or "")
     if status == "claimed":
         _lamp_working = True
         _lamp_render()
+        if _toggles.get("audio_processing_sound"):
+            log("heard-you cue (on claimed)")
+            threading.Thread(target=play_heard, daemon=True).start()
     elif status in ("done", "error"):
         _lamp_working = False
         _lamp_render()
