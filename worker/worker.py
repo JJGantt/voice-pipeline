@@ -60,6 +60,12 @@ WORKER_PRIORITY = [
 
 STATE_DIR = Path(os.path.expanduser(os.environ.get("STATE_DIR", "~/.voice-worker")))
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
+# synth-on-Mac (hub setting `synth_on_mac`, default OFF): the Mac's PyTorch Kokoro synthesizes ~4x faster
+# than the Pi's CPU ONNX, so when on, the Mac worker turns the reply to PCM here and ships it to the Pi to
+# play — instead of writing voice_speech for the Pi to synthesize (slow). Falls back to voice_speech on
+# any failure, so the Pi-synth path stays the safety net.
+MAC_SYNTH_URL = os.environ.get("MAC_SYNTH_URL", "http://127.0.0.1:8731/synth")
+PI_PLAY_URL   = os.environ.get("PI_PLAY_URL", "http://raspberrypi.local:27187/play")
 # Most hub turns are tool use, but nutrition macro estimation leans on the model's internal
 # food knowledge — so default to Sonnet (strong priors, still fast). Override with HUB_MODEL
 # ('haiku' for max speed on trivial turns, 'opus' for the best macro/disambiguation quality).
@@ -509,6 +515,43 @@ def agent_settings() -> dict:
             pass
         _agent_cache.update(mode=mode, cwd=cwd, t=now)
     return {"mode": _agent_cache["mode"], "cwd": _agent_cache["cwd"]}
+
+
+_synth_mac_cache = {"v": None, "t": 0.0}
+
+
+def synth_on_mac() -> bool:
+    """Whether to synthesize replies on the Mac and ship PCM to the Pi (fast) instead of writing voice_speech
+    for the Pi to synthesize (~4x slower). Hub setting `synth_on_mac`, cached ~30s. Default OFF."""
+    now = time.monotonic()
+    if _synth_mac_cache["v"] is None or now - _synth_mac_cache["t"] > 30:
+        v = False
+        try:
+            r = httpx.get(f"{SUPABASE_URL}/rest/v1/app_settings",
+                          params={"key": "eq.synth_on_mac", "select": "value"},
+                          headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=5)
+            rows = r.json()
+            if rows:
+                v = str(rows[0].get("value")).strip().lower() in ("1", "true", "on", "yes")
+        except Exception:  # noqa: BLE001
+            pass
+        _synth_mac_cache.update(v=v, t=now)
+    return _synth_mac_cache["v"]
+
+
+def speak_via_mac(text: str) -> bool:
+    """Synthesize `text` on the Mac synth server and POST the PCM to the Pi to play. Returns True on success;
+    on ANY failure returns False so the caller falls back to the Pi-synth voice_speech path."""
+    try:
+        r = httpx.post(MAC_SYNTH_URL, content=text.encode("utf-8"), timeout=20)
+        if r.status_code != 200 or not r.content:
+            return False
+        p = httpx.post(PI_PLAY_URL, content=r.content,
+                       headers={"Content-Type": "application/octet-stream"}, timeout=15)
+        return p.status_code == 200
+    except Exception as e:  # noqa: BLE001
+        log(f"mac-synth path failed ({e}); falling back to Pi synth")
+        return False
 
 
 def publish_repo_dirs() -> None:
@@ -1218,7 +1261,10 @@ def process_request(db: Supabase, req: dict) -> None:
         )
         if source in ("fly", "mac") and text:
             notify_phone(text)   # ambient voice command → push the past-tense result to Jared's phone
-            db.post("voice_speech", {"text": text})  # speak it aloud via the Pi audio service (warm Kokoro → TV)
+            # Speak it: Mac-synth→Pi when enabled (faster), else the Pi synthesizes from voice_speech. The
+            # Mac path returns False on any failure, so voice_speech (Pi synth) stays the safety net.
+            if not (WORKER_ID == "mac" and synth_on_mac() and speak_via_mac(text)):
+                db.post("voice_speech", {"text": text})  # Pi audio service synthesizes (warm Kokoro → TV)
         log(f"done request {rid}: {text[:120]!r}")
     else:
         err = result.get("raw_error") or "unknown error"
