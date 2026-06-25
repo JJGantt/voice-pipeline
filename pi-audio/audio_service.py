@@ -10,14 +10,15 @@ Subscribes to Supabase realtime and plays, serialized through one lock so nothin
 
 Kokoro is loaded ONCE at startup and kept resident (warm) — the Pi has the RAM and stays idle between
 commands, so synthesis is hot. Output goes through ALSA card 1 (the connected TV HDMI; card 0 errors).
-NOTE: the HDMI sink suspends when idle, so a cold ALSA open clips the first ~150ms of a reply. Fix: every
-clip is prefixed with LEAD_SILENCE_S of silence in the SAME stream, so the HDMI link does its cold-lock
-during the silence and the first real syllable plays clean. (Keeping the sink 'warm' with pw-loopback was
-tried and must NEVER be repeated — it bridges the sink to itself and howls. A silence prefix routes and
-captures nothing, so feedback is impossible.)
+WARM STREAM: one aplay reads raw PCM from a pipe and stays open for the life of the service, so the HDMI
+link is held locked and NEVER cold-opens. A feeder thread writes that pipe forever — digital silence when
+idle, the reply/cue samples when there's something to play — and the blocking pipe write paces it to the
+audio clock (near-zero CPU). Because the device is always warm the first syllable never clips, with no
+silence pad and no added latency. It is OUTPUT ONLY (nothing is ever captured), so a feedback howl like the
+pw-loopback one is impossible. Barge-in just drops the queued audio; it never kills the stream.
 Env (see ~/voice/pi/.env-audio): SUPABASE_URL, SUPABASE_KEY, optional ALSA_DEV, HEARD_WAV, KOKORO_VOICE.
 """
-import os, re, asyncio, threading, subprocess, tempfile, time, collections, socket, json
+import os, re, asyncio, threading, subprocess, time, collections, socket, json
 from datetime import datetime, timezone
 import numpy as np
 import soundfile as sf
@@ -29,7 +30,8 @@ SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 ALSA_DEV  = os.environ.get("ALSA_DEV", "plughw:1,0")
 HEARD_WAV = os.path.expanduser(os.environ.get("HEARD_WAV", "~/voice/sfx-candidates/02_initial_message-pop.wav"))
 VOICE     = os.environ.get("KOKORO_VOICE", "af_heart")
-LEAD_SILENCE_S = float(os.environ.get("LEAD_SILENCE_S", "0.4"))  # silence prefix that absorbs the HDMI cold-lock
+STREAM_RATE  = 24000     # Kokoro's native rate → no resample for speech; plughw upconverts to the HDMI's 48k
+STREAM_CHUNK = 1200      # frames per pipe write (~50ms) — small enough to keep the buffer topped, refill often
 
 # Toggle cache, mirrored from app_settings (boot fetch + realtime UPDATE). Default on.
 _toggles = {"audio_processing_sound": True, "audio_spoken_reply": True}
@@ -38,9 +40,9 @@ _hearing_clear = None        # timer that detects the falling edge once presence
 _kok = None                  # resident Kokoro-ONNX synthesizer
 MODEL_ONNX = os.path.expanduser(os.environ.get("KOKORO_MODEL", "~/voice/pi/kokoro-v1.0.onnx"))
 VOICES_BIN = os.path.expanduser(os.environ.get("KOKORO_VOICES", "~/voice/pi/voices-v1.0.bin"))
-_play_lock = threading.Lock()  # one speaker → serialize every playback
-_cur_play = None               # in-flight aplay process (for barge-in / cut-off)
-_heard_padded = None           # heard-you cue with the silence prefix baked in (built once at startup)
+_pending = collections.deque()  # int16 chunks queued for the warm stream (the clip playing right now)
+_audio_lock = threading.Lock()  # guards _pending
+_cue_i16 = None                 # heard-you cue, resampled to STREAM_RATE mono int16 once at startup
 _speak_queue = collections.deque()   # replies waiting to be spoken — FIFO, in order; succinct so a short
 _speak_lock = threading.Lock()       # queue is fine. Never dropped except the one you talk over.
 _speak_event = threading.Event()
@@ -74,58 +76,70 @@ def strip_markdown(md: str) -> str:
     return re.sub(r"\s+", " ", md).strip()
 
 
-def _play(path: str) -> None:
-    """Play a WAV straight to the HDMI ALSA device. Direct-to-hw, no PipeWire routing — boring and safe."""
-    global _cur_play
-    with _play_lock:
-        p = subprocess.Popen(["aplay", "-D", ALSA_DEV, path],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        _cur_play = p
-        try:
-            p.wait()
-        finally:
-            _cur_play = None
+def _to_int16(samples):
+    """Float [-1,1] → little-endian int16, the format the warm stream is fed in."""
+    s = np.clip(np.asarray(samples, dtype=np.float32), -1.0, 1.0)
+    return (s * 32767.0).astype("<i2")
+
+
+def _enqueue_audio(i16) -> None:
+    """Hand int16 samples to the warm stream in STREAM_CHUNK pieces; played in order after what's queued."""
+    with _audio_lock:
+        for i in range(0, len(i16), STREAM_CHUNK):
+            _pending.append(i16[i:i + STREAM_CHUNK])
 
 
 def _stop_speech() -> None:
-    """Barge-in: cut off the reply PLAYING right now (you're talking over it). The QUEUE is kept — remaining
-    succinct replies still play once you're done; only the one you talked over is dropped."""
-    p = _cur_play
-    if p is not None:
+    """Barge-in: drop the audio queued right now (the clip you're talking over). The stream stays open and
+    instantly reverts to silence — it is NEVER killed. The reply queue (_speak_queue) is untouched, so the
+    rest still plays once you're done; only the one you talked over is dropped."""
+    with _audio_lock:
+        _pending.clear()
+
+
+def _stream_loop():
+    """The single always-open output. One aplay reads raw int16 from this pipe and never closes, so the HDMI
+    link is held warm — nothing ever cold-opens, so nothing ever clips. We write a queued chunk if there is
+    one, else digital silence; the blocking write paces us to the audio clock. Output only — no capture, so
+    feedback is impossible. If aplay ever dies (device error) we reopen; the warm invariant self-heals."""
+    silence = np.zeros(STREAM_CHUNK, dtype="<i2").tobytes()
+    while True:
         try:
-            p.terminate()
-        except Exception:  # noqa: BLE001
-            pass
+            proc = subprocess.Popen(
+                ["aplay", "-D", ALSA_DEV, "-q", "-f", "S16_LE", "-r", str(STREAM_RATE), "-c", "1",
+                 "--buffer-time=300000", "--period-time=50000", "-"],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            while True:
+                with _audio_lock:
+                    chunk = _pending.popleft() if _pending else None
+                proc.stdin.write(chunk.tobytes() if chunk is not None else silence)
+                proc.stdin.flush()
+        except Exception as e:  # noqa: BLE001
+            log(f"warm stream error: {e}; reopening in 1s")
+            time.sleep(1)
 
 
-def _lead(samples, sr):
-    """Prefix a clip with LEAD_SILENCE_S of silence so the HDMI cold-lock lands on silence, not the audio."""
-    samples = np.asarray(samples)
-    pad_len = int(sr * LEAD_SILENCE_S)
-    pad = np.zeros((pad_len,) + samples.shape[1:], dtype=samples.dtype)
-    return np.concatenate([pad, samples])
-
-
-def _build_padded_cue() -> None:
-    """Bake the silence prefix into the heard-you cue once, so its own first sound isn't cold-clipped."""
-    global _heard_padded
+def _load_cue_i16():
+    """Load the heard-you cue once, downmix to mono, resample to STREAM_RATE, cache as int16 for the stream."""
+    global _cue_i16
     if not os.path.exists(HEARD_WAV):
+        log(f"heard-you wav missing: {HEARD_WAV}")
         return
     try:
-        data, sr = sf.read(HEARD_WAV)
-        out = os.path.join(tempfile.gettempdir(), "heard_padded.wav")
-        sf.write(out, _lead(data, sr), sr)
-        _heard_padded = out
+        data, sr = sf.read(HEARD_WAV, dtype="float32")
+        if data.ndim > 1:
+            data = data.mean(axis=1)
+        if sr != STREAM_RATE:
+            n = int(len(data) * STREAM_RATE / sr)
+            data = np.interp(np.linspace(0, len(data), n, endpoint=False), np.arange(len(data)), data)
+        _cue_i16 = _to_int16(data)
     except Exception as e:  # noqa: BLE001
-        log(f"cue pad failed: {e}")
+        log(f"cue load failed: {e}")
 
 
 def play_heard() -> None:
-    path = _heard_padded or HEARD_WAV
-    if os.path.exists(path):
-        _play(path)
-    else:
-        log(f"heard-you wav missing: {HEARD_WAV}")
+    if _cue_i16 is not None:
+        _enqueue_audio(_cue_i16)
 
 
 def _lamp_scan(timeout: float = 1.2):
@@ -216,14 +230,13 @@ def speak(text: str) -> None:
     samples, sr = _kok.create(text, voice=VOICE, speed=1.0, lang="en-us")
     if samples is None or len(samples) == 0:
         return
-    wav = tempfile.mktemp(suffix=".wav")
-    sf.write(wav, _lead(samples, sr), sr)
     log(f"synth {time.monotonic() - t:.1f}s — {text[:60]!r}")
-    _play(wav)
-    try:
-        os.remove(wav)
-    except OSError:
-        pass
+    _enqueue_audio(_to_int16(samples))   # Kokoro is already STREAM_RATE mono → no resample
+    while True:                          # block until the feeder has taken this whole clip (keeps _pending
+        with _audio_lock:                # holding ≤1 clip, so a barge-in drops only this one, not the queue)
+            if not _pending:
+                break
+        time.sleep(0.05)
 
 
 def fetch_toggles() -> None:
@@ -354,7 +367,8 @@ def main():
     except Exception as e:
         log(f"warmup failed: {e}")
     fetch_toggles()
-    _build_padded_cue()                                          # silence-prefixed heard-you cue (no cold clip)
+    _load_cue_i16()                                              # heard-you cue → stream format, once
+    threading.Thread(target=_stream_loop, daemon=True).start()   # the always-open warm output (no cold clip)
     threading.Thread(target=_speaker_loop, daemon=True).start()   # speaks only the latest reply
     if LAMP_ENABLED:
         threading.Thread(target=_lamp_worker, daemon=True).start()   # 'working' floor lamp (amber)
