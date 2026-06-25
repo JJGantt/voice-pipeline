@@ -621,6 +621,8 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
     raw_error = None
     proc = None
     timed_out = {"v": False}
+    t_spawn = t_init = t_first = None   # timing seams: spawn → MCP-ready (system init) → first model token
+    n_tools = 0
 
     # Subscription path: `claude -p` must use the logged-in Claude subscription, not an API key. If
     # ANTHROPIC_API_KEY is in the env (it is, so the SDK path can use it), the CLI silently bills the
@@ -629,6 +631,7 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
     sub_env.pop("ANTHROPIC_API_KEY", None)
 
     try:
+        t_spawn = time.monotonic()
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1, env=sub_env, cwd=cwd,  # line-buffered; cwd is where a full agent operates
@@ -669,22 +672,28 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
                 continue
             etype = ev.get("type")
 
-            if etype == "system":  # init event carries the session id
+            if etype == "system":  # init event = process up + MCP servers loaded (the cold-start boundary)
+                if t_init is None:
+                    t_init = time.monotonic()
                 if ev.get("session_id"):
                     session_id = ev["session_id"]
 
             elif etype == "assistant":  # text lives in content[*].text; tool calls in content[*].tool_use
+                if t_first is None:     # first model output → end of "thinking before it says anything"
+                    t_first = time.monotonic()
                 msg = ev.get("message", {})
                 for block in msg.get("content", []) or []:
                     if not isinstance(block, dict):
                         continue
                     if block.get("type") == "text":
                         assistant_chunks.append(block.get("text", ""))
-                    elif block.get("type") == "tool_use" and on_event:
-                        try:
-                            on_event("tool", {"name": block.get("name", ""), "input": block.get("input")})
-                        except Exception:  # noqa: BLE001
-                            pass
+                    elif block.get("type") == "tool_use":
+                        n_tools += 1
+                        if on_event:
+                            try:
+                                on_event("tool", {"name": block.get("name", ""), "input": block.get("input")})
+                            except Exception:  # noqa: BLE001
+                                pass
                 if ev.get("session_id"):
                     session_id = ev["session_id"]
 
@@ -699,6 +708,14 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
         done.set()
         proc.wait(timeout=5)
         stderr = "".join(err_buf)
+        t_end = time.monotonic()
+        if t_spawn:                       # latency breakdown of this run (where the seconds actually go)
+            cold = f"{t_init - t_spawn:.1f}s" if t_init else "n/a"
+            ttf  = f"{t_first - t_init:.1f}s" if (t_first and t_init) else "n/a"
+            gen  = f"{t_end - t_first:.1f}s" if t_first else "n/a"
+            log(f"timing: cold-start(spawn→mcp) {cold} | first-token {ttf} | "
+                f"gen+{n_tools}tools {gen} | total {t_end - t_spawn:.1f}s | "
+                f"model={model} resume={'y' if resume_session_id else 'n'} agent={'y' if agent else 'n'}")
 
         if timed_out["v"]:
             return {"session_id": session_id, "text": "", "result": "",
