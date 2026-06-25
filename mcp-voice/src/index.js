@@ -9,7 +9,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 import { listRecentSessions } from './sessions.js';
 import { setFocus } from './focus.js';
 import { say } from './say.js';
-import { getRouting, setModel, setThinking, setRunner, setAlwaysOn } from './routing.js';
+import { getRouting, setModel, setThinking, setRunner, setAlwaysOn, setInjectMode } from './routing.js';
 
 const server = new Server({ name: 'voice', version: '1.0.0' }, { capabilities: { tools: {} } });
 
@@ -88,6 +88,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'set_inject_mode',
+      description:
+        "Turn voice-inject mode on or off. When on, your transcribed voice is injected straight into the active conversation (hands-free). Pass `on: true` to enable, `on: false` to disable.",
+      inputSchema: {
+        type: 'object',
+        properties: { on: { type: 'boolean', description: 'true = enable inject mode, false = disable' } },
+        required: ['on'],
+      },
+    },
+    {
       name: 'set_always_on',
       description:
         "Turn the ALWAYS-ON voice system on or off. This is the hands-free, no-wake-word listening mode — Jared calls it 'always on', 'AO', or 'wake-free', and they all mean THIS one toggle. So 'turn on always-on', 'turn always on on', 'enable AO', 'turn off always on', 'disable wake-free', etc. all map here. Pass `on: true` to enable, `on: false` to disable.",
@@ -139,6 +149,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     if (name === 'set_always_on') {
       return text(await setAlwaysOn(a.on));
+    }
+    if (name === 'set_inject_mode') {
+      return text(await setInjectMode(a.on));
     }
     return text(`Unknown tool: ${name}`);
   } catch (err) {

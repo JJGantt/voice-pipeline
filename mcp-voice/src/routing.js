@@ -70,7 +70,7 @@ async function activateCustom(extra) {
 }
 
 export async function getRouting() {
-  const s = await readSettings(['custom_model', 'custom_think', 'custom_runner', 'wakefree_enabled', 'chatbox_route', 'wakefree_route']);
+  const s = await readSettings(['custom_model', 'custom_think', 'custom_runner', 'wakefree_enabled', 'voice_inject_mode', 'chatbox_route', 'wakefree_route']);
   const model = MODELS.includes(s.custom_model) ? s.custom_model : 'sonnet';
   const thinking = THINK.includes(s.custom_think) ? s.custom_think : 'medium';
   const runner = s.custom_runner === 'api' ? 'api' : 'local';
@@ -81,6 +81,7 @@ export async function getRouting() {
     thinking, thinking_label: THINK_LABEL[thinking],
     runner, runner_label: RUNNER_LABEL[runner],
     always_on: alwaysOn,   // hands-free, no-wake-word voice (aka 'AO' / 'wake-free')
+    inject_mode: truthy(s.voice_inject_mode ?? '0'),   // voice-inject mode (transcripts injected into the conversation)
     custom_route_active: active,
     note: active
       ? 'Custom route is active, so these are what the conversational agent uses now.'
@@ -115,4 +116,11 @@ export async function setAlwaysOn(on) {
   const v = truthy(on);
   await writeSettings({ wakefree_enabled: v ? '1' : '0' });
   return `Always-on (wake-free) voice ${v ? 'enabled' : 'disabled'}.`;
+}
+
+// Voice-inject mode — toggles voice_inject_mode (the mac-listener reads it live).
+export async function setInjectMode(on) {
+  const v = truthy(on);
+  await writeSettings({ voice_inject_mode: v ? '1' : '0' });
+  return `Voice-inject mode ${v ? 'enabled' : 'disabled'}.`;
 }
