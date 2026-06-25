@@ -231,8 +231,10 @@ VOICE_REPLY_DIRECTIVE = (
     "answer ONLY what was asked and nothing more. A simple action → a quick confirmation ('Logged your weight "
     "at 172.4 pounds.'). A question → just the answer ('About 1,800 calories.') — do NOT volunteer extra info, "
     "progress, remaining amounts, goals, comparisons, or 'you're this far from X.' Never explain your "
-    "reasoning, restate the request, narrate what you noticed, or add caveats. Just the answer or what you "
-    "did. Plain spoken words only — never any markdown, tables, code, lists, bullets, or symbols. No preamble.]"
+    "reasoning, restate the request, narrate what you noticed, or add caveats. NEVER say where the answer "
+    "came from or that it was already available — no 'it's in the conversation', 'from earlier', 'as I "
+    "mentioned', 'according to your log', 'I already told you.' State the fact on its own. Just the answer or "
+    "what you did. Plain spoken words only — never any markdown, tables, code, lists, bullets, or symbols. No preamble.]"
 )
 
 # Role framing for every hub turn. The base preset is claude_code (a coding agent), so without this
