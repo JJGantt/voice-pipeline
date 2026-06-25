@@ -9,8 +9,11 @@ Subscribes to Supabase realtime and plays, serialized through one lock so nothin
     (audio_spoken_reply). The reply is already a past-tense one-liner, so we just speak it.
 
 Kokoro is loaded ONCE at startup and kept resident (warm) — the Pi has the RAM and stays idle between
-commands, so synthesis is hot. Output goes through ALSA card 1 (the connected TV HDMI; card 0 errors).
-Env (see ~/voice/pi/.env-audio): SUPABASE_URL, SUPABASE_KEY, optional ALSA_DEV, HEARD_WAV, KOKORO_VOICE.
+commands, so synthesis is hot. Playback goes through PipeWire (pw-play) to the HDMI sink, and a silent
+pw-loopback holds that sink in RUNNING state so PipeWire never suspends it. (Direct-to-hw aplay used to
+cold-open the suspended sink every reply, clipping the first syllable — 'yesterday' → 'esterday'.) The
+service runs as a system unit, so the unit must export XDG_RUNTIME_DIR=/run/user/1000 to reach PipeWire.
+Env (see ~/voice/pi/.env-audio): SUPABASE_URL, SUPABASE_KEY, optional PW_SINK, HEARD_WAV, KOKORO_VOICE.
 """
 import os, re, asyncio, threading, subprocess, tempfile, time, collections, socket, json
 from datetime import datetime, timezone
@@ -20,7 +23,7 @@ from realtime import AsyncRealtimeClient
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-ALSA_DEV  = os.environ.get("ALSA_DEV", "plughw:1,0")
+PW_SINK   = os.environ.get("PW_SINK", "alsa_output.platform-107c706400.hdmi.hdmi-stereo")
 HEARD_WAV = os.path.expanduser(os.environ.get("HEARD_WAV", "~/voice/sfx-candidates/02_initial_message-pop.wav"))
 VOICE     = os.environ.get("KOKORO_VOICE", "af_heart")
 
@@ -38,14 +41,14 @@ _speak_lock = threading.Lock()       # queue is fine. Never dropped except the o
 _speak_event = threading.Event()
 _muted = False                 # push-to-talk / FAB active → cut off + hold replies until you're done
 
-# ---- Floor lamp = central voice-state indicator (Govee H6072, LAN, ~10ms send) -----------------------
-# Mirrors the SAME shared state every surface shows: Hearing-you (solid blue) > Working (amber) > idle.
-# LAN-direct UDP off the cached IP — no cloud. Idle = off (tunable; could instead restore a warm default).
+# ---- Floor lamp = the 'Working' indicator (Govee H6072, LAN, ~10ms send) -----------------------------
+# Deliberately NOT a hearing light: blue is Jared's ambient color, and the hearing edge lagged. The lamp
+# only signals processing — amber the moment a command is claimed, off when it's done. LAN-direct UDP off
+# the cached IP, no cloud. (Hearing still shows on the ESP LED + Mac HUD, just not here.)
 FLOOR_DEV  = os.environ.get("FLOOR_DEV", "")
 FLOOR_SKU  = os.environ.get("FLOOR_SKU", "H6072")
 LAMP_MCAST = ("239.255.255.250", 4001)
 LAMP_RECV_PORT, LAMP_CMD_PORT = 4002, 4003
-LAMP_HEAR  = (0, 90, 255)      # solid blue — your voice is being confirmed (Hearing-you)
 LAMP_WORK  = (255, 120, 0)     # amber — a command is processing (Working)
 LAMP_ENABLED = os.environ.get("LAMP_ENABLED", "1") not in ("0", "false", "off", "no", "")
 _lamp_ip = None
@@ -66,16 +69,30 @@ def strip_markdown(md: str) -> str:
     return re.sub(r"\s+", " ", md).strip()
 
 
-def _aplay(path: str) -> None:
+def _play(path: str) -> None:
+    """Play a WAV through PipeWire (NOT direct-to-hw) so it rides the always-warm HDMI sink the keep-warm
+    loopback holds open. A cold ALSA open is what was clipping the first syllable off every reply."""
     global _cur_play
     with _play_lock:
-        p = subprocess.Popen(["aplay", "-D", ALSA_DEV, path],
+        p = subprocess.Popen(["pw-play", "--target", PW_SINK, path],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         _cur_play = p
         try:
             p.wait()
         finally:
             _cur_play = None
+
+
+def _keepwarm_loop():
+    """Hold the HDMI sink RUNNING with a silent pw-loopback so PipeWire never suspends it (suspend releases
+    the ALSA device → the next play cold-opens → clips). Respawn if the loopback ever dies."""
+    while True:
+        try:
+            subprocess.Popen(["pw-loopback", "-P", PW_SINK],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).wait()
+        except Exception as e:  # noqa: BLE001
+            log(f"keep-warm error: {e}")
+        time.sleep(2)
 
 
 def _stop_speech() -> None:
@@ -91,7 +108,7 @@ def _stop_speech() -> None:
 
 def play_heard() -> None:
     if os.path.exists(HEARD_WAV):
-        _aplay(HEARD_WAV)
+        _play(HEARD_WAV)
     else:
         log(f"heard-you wav missing: {HEARD_WAV}")
 
@@ -144,26 +161,25 @@ def _lamp_send(msg: dict) -> None:
         log(f"lamp send failed: {e}")
 
 
-def _lamp_apply(state: str) -> None:
-    if state == "idle":
+def _lamp_apply(working: bool) -> None:
+    if working:
+        r, g, b = LAMP_WORK
+        _lamp_send({"msg": {"cmd": "turn", "data": {"value": 1}}})
+        _lamp_send({"msg": {"cmd": "colorwc", "data": {"color": {"r": r, "g": g, "b": b}, "colorTemInKelvin": 0}}})
+    else:
         _lamp_send({"msg": {"cmd": "turn", "data": {"value": 0}}})
-        return
-    r, g, b = LAMP_HEAR if state == "hear" else LAMP_WORK
-    _lamp_send({"msg": {"cmd": "turn", "data": {"value": 1}}})
-    _lamp_send({"msg": {"cmd": "colorwc", "data": {"color": {"r": r, "g": g, "b": b}, "colorTemInKelvin": 0}}})
 
 
 def _lamp_worker():
-    """Drive the lamp off the shared state, precedence Hearing > Working > idle. Sends only on a real
-    state change so it's not strobing the lamp; each change is a direct LAN UDP, reacting in ~10ms."""
+    """Amber while a command is processing, off otherwise. Sends only on a real change so it's not strobing
+    the lamp; each change is a direct LAN UDP, reacting in ~10ms."""
     last = None
     while True:
         _lamp_event.wait()
         _lamp_event.clear()
-        state = "hear" if _hearing else ("work" if _lamp_working else "idle")
-        if state != last:
-            last = state
-            _lamp_apply(state)
+        if _lamp_working != last:
+            last = _lamp_working
+            _lamp_apply(_lamp_working)
 
 
 def _lamp_render():
@@ -188,7 +204,7 @@ def speak(text: str) -> None:
     wav = tempfile.mktemp(suffix=".wav")
     sf.write(wav, samples, sr)
     log(f"synth {time.monotonic() - t:.1f}s — {text[:60]!r}")
-    _aplay(wav)
+    _play(wav)
     try:
         os.remove(wav)
     except OSError:
@@ -219,7 +235,6 @@ async def _clear_hearing(delay: float = 1.3):
         if _hearing and _toggles.get("audio_processing_sound"):
             threading.Thread(target=play_heard, daemon=True).start()
         _hearing = False
-        _lamp_render()              # hearing dropped → fall back to Working (if claimed) or idle
     except asyncio.CancelledError:
         pass
 
@@ -238,7 +253,6 @@ def on_presence(payload):
         return
     _stop_speech()              # barge-in: you're talking → shut up any reply that's playing or queued
     _hearing = True
-    _lamp_render()              # solid blue — Hearing-you beats Working
     if _hearing_clear:
         _hearing_clear.cancel()
     _hearing_clear = asyncio.create_task(_clear_hearing())
@@ -325,13 +339,14 @@ def main():
     except Exception as e:
         log(f"warmup failed: {e}")
     fetch_toggles()
+    threading.Thread(target=_keepwarm_loop, daemon=True).start()  # hold the HDMI sink warm (no clipped starts)
     threading.Thread(target=_speaker_loop, daemon=True).start()   # speaks only the latest reply
     if LAMP_ENABLED:
-        threading.Thread(target=_lamp_worker, daemon=True).start()   # central-state floor lamp
+        threading.Thread(target=_lamp_worker, daemon=True).start()   # 'working' floor lamp (amber)
         ip = _lamp_scan()
         log(f"floor lamp {'at ' + ip if ip else 'not found on LAN yet (will rescan on first event)'}")
         _lamp_render()                                              # settle to idle (off) at boot
-    log(f"ready — toggles {_toggles}, ALSA {ALSA_DEV}")
+    log(f"ready — toggles {_toggles}, sink {PW_SINK}")
     asyncio.run(serve())
 
 
