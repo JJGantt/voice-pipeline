@@ -21,7 +21,8 @@ import tempfile
 import threading
 import time
 import wave
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -42,15 +43,28 @@ GROQ_MODEL = os.environ.get("GROQ_MODEL", "whisper-large-v3-turbo")
 HS_BIN = os.environ.get("HS_BIN", "/opt/homebrew/bin/hs")
 VOICE_DAEMON = os.path.expanduser("~/scripts/voice_daemon.sh")  # warm Kokoro TTS engine (pre-warmed at capture)
 JARED_VOICE_URL = os.environ.get("JARED_VOICE_URL", "https://jared-voice.fly.dev").rstrip("/")
+# 'Heard you' cue for inject mode: inject bypasses the hub/worker and hands off to the focused window, so
+# it has no TV/Pi round-trip to signal you. Play the same cue locally on the Mac so you know it caught you.
+HEARD_WAV = os.path.expanduser(os.environ.get("HEARD_WAV", "~/voice/sfx-candidates/02_initial_message-pop.wav"))
 
 SR = 16000
 FRAME_S = 0.1          # 100ms capture frames — responsive endpointing
 ENERGY_GATE = 0.006    # below this RMS = silence (calibrated under Jared's speech ~0.008+)
 THRESHOLD = float(os.environ.get("VOICEID_THRESHOLD", "0.30"))   # cosine ≥ this = Jared (overridden by hub setting)
 TOPK = 3
-PAUSE_S = float(os.environ.get("WAKEFREE_PAUSE_S", "2.0"))       # silence that ends an utterance
-MAX_UTTER_S = 30.0
+PAUSE_S = float(os.environ.get("WAKEFREE_PAUSE_S", "2.0"))       # how long with no confirmed-Jared window ends it
+MAX_UTTER_S = 600.0   # runaway backstop ONLY (matches the ESP server) — the speaker gate ends a command
+                      # when you actually stop; this never touches real speech. Was a stale 30s default.
 MIN_UTTER_S = 0.5
+# Speaker-gated endpointing: keep the utterance alive on Jared's VERIFIED presence (rolling ECAPA), not a
+# blind energy timeout — so thinking-pauses don't chop a command. Mirrors the Fly ESP server's design.
+VAD_WINDOW_S = 2.0           # trailing audio scored per check
+VAD_CHECK_EVERY_S = 0.7      # re-score cadence while capturing
+VAD_FIRST_CHECK_S = 1.4      # min audio before the first check (the close Mac mic confirms fast)
+VAD_NO_JARED_ABORT_S = 3.5  # never confirmed within this much audio → not Jared, drop
+KEEPALIVE_MARGIN = 0.16      # hysteresis: once confirmed, stay locked unless match falls to ~not-you/silence
+ABSENT_MISSES = 2            # close only after this many CONSECUTIVE non-confirming checks — event-based, NOT a
+                             # timer that can race the check cadence and cut you off between words
 
 # Push-to-talk coordination: Hammerspoon sends SIGUSR1 (pause) / SIGUSR2 (resume) while you dictate to
 # Claude, so wake-free never fights the mic or executes your dictation. set = capturing; cleared = mic released.
@@ -68,6 +82,49 @@ def hud(state: str) -> None:
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:  # noqa: BLE001
         pass
+
+
+def cue() -> None:
+    """Play the 'heard you' cue locally on the Mac (afplay) — used in inject mode, where there's no hub
+    round-trip to signal capture. Fire-and-forget; missing file or afplay is a silent no-op."""
+    try:
+        if os.path.exists(HEARD_WAV):
+            subprocess.Popen(["afplay", HEARD_WAV], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def publish_presence(jared: bool) -> None:
+    """Upsert the Mac's row in the shared voice_presence — the system-wide 'who is hearing Jared' truth.
+    Fire-and-forget in a daemon thread so the audio loop never stalls on the network call. Any mic's
+    fresh heard_jared_at makes the whole system 'Hearing Jared' (drives every indicator + send-suppression)."""
+    def _post():
+        try:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            body = {"source": "mac", "updated_at": now_iso, "heard_sound_at": now_iso}
+            if jared:
+                body["heard_jared_at"] = now_iso
+            httpx.post(f"{SUPABASE_URL}/rest/v1/voice_presence?on_conflict=source",
+                       headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                                "Content-Type": "application/json",
+                                "Prefer": "resolution=merge-duplicates,return=minimal"},
+                       json=body, timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
+    threading.Thread(target=_post, daemon=True).start()
+
+
+def other_heard_jared():
+    """Most recent time a mic OTHER than the Mac confirmed Jared (datetime, or None). At capture close the
+    Mac yields ONLY if the ESP clearly heard you more recently (the Mac is the primary mic)."""
+    try:
+        r = httpx.get(f"{SUPABASE_URL}/rest/v1/voice_presence",
+                      params={"source": "neq.mac", "select": "heard_jared_at"},
+                      headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=4)
+        stamps = [datetime.fromisoformat(row["heard_jared_at"]) for row in r.json() if row.get("heard_jared_at")]
+        return max(stamps) if stamps else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def warm_tts() -> None:
@@ -240,6 +297,7 @@ def main() -> int:
     # Push-to-talk releases the mic: SIGUSR1 pauses capture (closes the stream), SIGUSR2 resumes.
     signal.signal(signal.SIGUSR1, lambda *_: _resumed.clear())
     signal.signal(signal.SIGUSR2, lambda *_: _resumed.set())
+    vad_pool = ThreadPoolExecutor(max_workers=1)   # off-thread speaker checks so audio capture never stalls
 
     while True:
         if not _resumed.is_set():
@@ -249,8 +307,12 @@ def main() -> int:
         seg: list[np.ndarray] = []
         prev = np.zeros(frame, dtype=np.float32)   # 1-frame pre-roll so the first phoneme isn't clipped
         capturing = False
-        silence_start = None
         t0 = 0.0
+        vad_future = None          # in-flight speaker check (one at a time)
+        last_check = 0.0           # when the last check was launched
+        miss = 0                   # consecutive non-confirming checks since the last confirm
+        jared_seen = False         # confirmed Jared at all this utterance?
+        last_confirm = None        # wall-clock of the last confirm (send-suppression vs the other mic)
         with sd.InputStream(samplerate=SR, channels=1, dtype="float32", blocksize=frame) as stream:
             while _resumed.is_set():
                 chunk, _ = stream.read(frame)
@@ -261,37 +323,80 @@ def main() -> int:
                 if voiced and not capturing:
                     capturing = True
                     seg = [prev, chunk]
-                    silence_start = None
                     t0 = now
                     t0_wall = datetime.now(timezone.utc)   # wall-clock start of the recording window
+                    vad_future, last_check, miss, jared_seen, last_confirm = None, 0.0, 0, False, None
                     hud("listening")
                     warm_tts()      # speech started → warm TTS now so the spoken reply isn't cold-delayed
                 elif capturing:
                     seg.append(chunk)
-                    silence_start = None if voiced else (silence_start or now)
-                    if (silence_start and now - silence_start >= PAUSE_S) or (now - t0 >= MAX_UTTER_S):
+                    audio_s = sum(len(s) for s in seg) / SR
+                    # Launch one speaker check at a time on the trailing window, OFF-thread so frame capture
+                    # never stalls. The Mac is fast (~0.1s/check), so this stays real-time as you talk.
+                    if vad_future is None and audio_s >= VAD_FIRST_CHECK_S and now - last_check >= VAD_CHECK_EVERY_S:
+                        last_check = now
+                        win = trim_voiced(np.concatenate(seg)[-int(VAD_WINDOW_S * SR):], ENERGY_GATE)
+                        if win.size >= int(0.4 * SR):
+                            vad_future = vad_pool.submit(score, win)   # enough voice to score
+                        elif jared_seen:
+                            miss += 1                                  # window went silent → you're not speaking
+                    if vad_future is not None and vad_future.done():
+                        try:
+                            sim = vad_future.result()
+                        except Exception:
+                            sim = 0.0
+                        vad_future = None
+                        thr = THRESHOLD - (KEEPALIVE_MARGIN if jared_seen else 0.0)
+                        if sim >= thr:
+                            miss = 0
+                            if not jared_seen:
+                                jared_seen = True
+                                log(f"Jared confirmed (sim={sim:.2f}) — tracking")
+                            hud("locked")          # live 'it's you' — you're being heard right now
+                            publish_presence(True)  # shared 'Hearing Jared' truth
+                            last_confirm = datetime.now(timezone.utc)
+                        elif jared_seen:
+                            miss += 1
+                            log(f"vad sim={sim:.2f}<thr={thr:.2f} miss={miss}")
+                    close, reason = False, ""
+                    if now - t0 >= MAX_UTTER_S:
+                        close, reason = True, "max"
+                    elif jared_seen and miss >= ABSENT_MISSES:    # consecutive non-confirms → you've stopped
+                        close, reason = True, "absent"
+                    elif not jared_seen and audio_s >= VAD_NO_JARED_ABORT_S:
+                        close, reason = True, "noise"
+                    if close:
                         cap_end_wall = datetime.now(timezone.utc)   # wall-clock end of the recording window
+                        if vad_future is not None:
+                            vad_future.cancel()
+                            vad_future = None
                         pcm = trim_voiced(np.concatenate(seg), ENERGY_GATE)
                         capturing = False
                         seg = []
-                        silence_start = None
-                        if pcm.size < int(SR * MIN_UTTER_S):
+                        if reason == "noise" or pcm.size < int(SR * MIN_UTTER_S):
+                            if reason == "noise":
+                                log(f"never confirmed Jared ({audio_s:.1f}s) — skipped")
                             hud("off")
-                        else:
-                            sim = score(pcm)               # speaker-ID on the whole trimmed command
-                            if sim >= THRESHOLD:
+                        else:                          # tracked as Jared live → no end-of-utterance re-check
+                            other = other_heard_jared()  # shared presence: is another mic still on you?
+                            suppressed = (other is not None and last_confirm is not None
+                                          and (datetime.now(timezone.utc) - other).total_seconds() <= 1.5
+                                          and other > last_confirm + timedelta(seconds=0.3))
+                            if suppressed:               # ESP clearly heard you later → this is the partial; drop it
+                                log("another mic still has you — suppressing this Mac partial")
+                                hud("off")
+                            else:
                                 text = transcribe(pcm)
                                 if text:
-                                    log(f"Jared (sim={sim:.2f}) → {text!r}")
+                                    log(f"Jared → {text!r} (reason={reason})")
                                     if inject_mode():
+                                        cue()              # local 'heard you' cue (you're at the computer; no TV round-trip)
                                         inject_text(text)  # paste into the focused Mac window + Enter (no hub)
+                                        hud("listening")   # inject mode keeps the mic open → back to the waiting state
                                     else:
                                         enqueue(text, t0_wall.isoformat(), cap_end_wall.isoformat())  # worker drives HUD/speech
                                 else:
                                     hud("off")
-                            else:
-                                hud("off")
-                                log(f"not Jared (sim={sim:.2f}) — skipped")
                 prev = chunk
 
 

@@ -5,6 +5,7 @@ firmware/.pio/
 # python
 server/__pycache__/
 server/.venv/
+__pycache__/
 *.pyc
 
 # voice-id subsystem: venv + downloaded ECAPA model + the enrolled voiceprint (biometric — it lives in
@@ -17,3 +18,7 @@ voice-id/reference.npy
 # worker runtime logs (tracked historically by mistake; keep their churn out of commits)
 worker/worker.out.log
 worker/worker.err.log
+
+# wake-free listener runtime log
+voice-id/wakefree.out.log
+voice-id/wakefree.err.log

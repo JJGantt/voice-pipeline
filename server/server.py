@@ -22,7 +22,7 @@ import os
 import re
 import time
 import wave
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from collections import deque
 from http import HTTPStatus
 
@@ -80,6 +80,8 @@ _vpause = 2.0
 # the worker's universal pings stomping each other last-writer-wins) cannot happen.
 _led_working = False     # set by the worker's /led-blink, cleared by /led-off (universal, any source)
 _led_capturing = False   # set while this ESP is recording an utterance
+_other_hearing_jared = False  # another mic (Mac) currently hears Jared → keep this ESP's LED solid too
+_other_clear_task = None      # timer that clears the above when the other mic goes stale
 
 SAMPLE_RATE = 16_000
 FRAME_SAMPLES = 1280          # 80 ms @ 16 kHz — openWakeWord's expected chunk
@@ -93,6 +95,20 @@ SILENCE_HANGOVER_S = float(os.environ.get("HANGOVER_S", "3.0"))  # trailing sile
 MIN_UTTERANCE_S = 0.6        # never endpoint before this (avoids instant cut)
 MAX_UTTERANCE_S = float(os.environ.get("MAX_UTTERANCE_S", "600"))  # absolute safety cap (10 min)
 LONG_UTTERANCE_WARN_S = 300.0  # warn if a single capture runs this long
+
+# Wake-free speaker-gated endpointing (replaces energy-vs-noise-floor, which a loud TV corrupts — it
+# both clips you mid-sentence and holds the capture open for ages). Keep the capture alive on YOUR
+# verified presence: re-score the trailing window with ECAPA off the event loop and close only after
+# you've been absent (no confirmed-Jared window) for the hangover. Tune from the logged vad/endpoint lines.
+VAD_WINDOW_S = 2.0           # trailing audio fed to ECAPA per check
+VAD_CHECK_EVERY_S = 0.7      # re-score cadence while capturing
+VAD_ABSENT_MISSES = 2       # close only after this many CONSECUTIVE non-confirming checks (event-based, not a
+                            # timer that races the cadence and clips you between words)
+VAD_FIRST_CHECK_S = 1.8      # wait for this much audio before the first check
+VAD_NO_JARED_ABORT_S = 3.5  # never confirmed you within this much audio → it's noise/TV, drop cheap
+VAD_KEEPALIVE_MARGIN = 0.16  # hysteresis: once confirmed, only DROP you when the match falls to clearly-
+                             # not-you/silence (~0.14), not on the dips your far-field voice grazes (0.17–0.24).
+                             # Calibrated from logs: your real sim 0.17–0.34, room/TV noise ≤0.11 — a clean gap.
 PREROLL_S = 0.5              # audio kept from just before the wake hit
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -221,8 +237,15 @@ async def connection(ws):
     utterance = bytearray()
     wake_tier = None                # which wake word fired this utterance ('fast' | 'power')
     threshold = 0.0                 # adaptive speech/silence level, set at wake
+    capture_floor = 0.0             # noise floor measured at capture start (for endpoint diagnostics)
     last_voice = 0.0
     started = 0.0
+    # Wake-free speaker-gated VAD state (reset at each capture start):
+    check_task = None               # in-flight ECAPA check (one at a time, off the event loop)
+    last_check = 0.0                # monotonic time the last check was launched
+    miss = 0                        # consecutive non-confirming checks since the last confirm
+    jared_seen = False              # have we confirmed Jared at all this capture?
+    last_confirm = None             # wall-clock of the last confirm (send-suppression vs the other mic)
 
     async for msg in ws:
         if not isinstance(msg, (bytes, bytearray)):
@@ -243,6 +266,11 @@ async def connection(ws):
 
             if _suppressed or _inject:    # push-to-talk mute OR inject mode (Mac-only) → ESP drops everything
                 if capturing:
+                    log.info("capture ABORTED mid-utterance (%.1fs in) by %s",
+                             time.monotonic() - started, "mute" if _suppressed else "inject")
+                    if check_task is not None:
+                        check_task.cancel()
+                        check_task = None
                     capturing = False
                     utterance = bytearray()
                     oww.reset()
@@ -271,14 +299,16 @@ async def connection(ws):
                     wake_tier = "power" if power_score >= WAKE_THRESHOLD else ("fast" if fast_score >= WAKE_THRESHOLD else None)
                 if wake_tier:
                     threshold = speech_level
-                    _led_capturing = True     # solid while recording you (precedence: working > this > idle)
-                    await _render_led(ws)
-                    capturing = True
+                    capture_floor = floor     # remember the room floor that set this threshold (diagnostics)
+                    capturing = True          # LED stays as-is until we CONFIRM it's Jared (not raw energy)
                     utterance = bytearray(preroll)
                     preroll.clear()
                     started = time.monotonic()
                     started_wall = datetime.now(timezone.utc)   # wall-clock start of the recording window
                     last_voice = started
+                    if check_task is not None:
+                        check_task.cancel()
+                    check_task, last_check, miss, jared_seen, last_confirm = None, 0.0, 0, False, None
                     if _wakefree:
                         log.info("wake-free: speech — capturing…")
                     else:
@@ -286,46 +316,125 @@ async def connection(ws):
             else:
                 utterance.extend(raw)
                 now = time.monotonic()
-                if rms(frame) > threshold:
-                    last_voice = now
                 elapsed = now - started
                 hang = _vpause if _wakefree else SILENCE_HANGOVER_S
-                done = (elapsed >= MIN_UTTERANCE_S and now - last_voice >= hang) or elapsed >= MAX_UTTERANCE_S
-                if done:
-                    end_wall = datetime.now(timezone.utc)   # wall-clock end of the recording window
-                    dur = len(utterance) / 2 / SAMPLE_RATE
-                    truncated = elapsed >= MAX_UTTERANCE_S and (now - last_voice) < hang
-                    if truncated:
-                        log.warning("utterance hit %ds cap while still active — truncated", int(MAX_UTTERANCE_S))
-                    elif dur >= LONG_UTTERANCE_WARN_S:
-                        log.warning("long utterance: %.0fs", dur)
-                    if _wakefree:   # verify the speaker on the whole utterance; drop if it isn't Jared
-                        sim = _verify_jared(np.frombuffer(bytes(utterance), dtype=np.int16))
-                        if sim < _vthresh:
-                            log.info("wake-free: not Jared (sim=%.2f) — dropped", sim)
+
+                # Speaker-gated endpointing for wake-free (when ECAPA + voiceprint are loaded): keep the
+                # capture alive on Jared's verified presence, not on energy. Falls back to the energy
+                # endpoint for wake-word captures (or before the voiceprint loads).
+                speaker_gated = _wakefree and _enc is not None and _bank is not None
+                close = False
+                reason = ""
+                is_noise = False           # True → never confirmed you (drop without enqueue)
+                if speaker_gated:
+                    audio_s = len(utterance) / 2 / SAMPLE_RATE
+                    # Launch one ECAPA check at a time on the trailing window, OFF the event loop so
+                    # frame capture keeps flowing while it runs (~0.4s for a 2.5s window on this box).
+                    if check_task is None and audio_s >= VAD_FIRST_CHECK_S and now - last_check >= VAD_CHECK_EVERY_S:
+                        win = bytes(utterance[-int(VAD_WINDOW_S * SAMPLE_RATE) * 2:])
+                        last_check = now
+                        check_task = asyncio.create_task(_check_speaker(np.frombuffer(win, dtype=np.int16), now))
+                    if check_task is not None and check_task.done():
+                        try:
+                            sim, _ = check_task.result()
+                        except Exception:
+                            sim = 0.0
+                        check_task = None
+                        thr = _vthresh - (VAD_KEEPALIVE_MARGIN if jared_seen else 0.0)
+                        if sim >= thr:
+                            miss = 0
+                            if not jared_seen:
+                                jared_seen = True
+                                log.info("wake-free: Jared confirmed (sim=%.2f) — tracking", sim)
+                                _led_capturing = True        # LED → solid: confirmed it's YOU
+                                await _render_led(ws)
+                            asyncio.create_task(_publish_presence(True))   # shared 'Hearing Jared' truth
+                            last_confirm = datetime.now(timezone.utc)
+                        elif jared_seen:
+                            miss += 1
+                            log.info("wake-free: vad sim=%.2f<thr=%.2f miss=%d", sim, thr, miss)
+                    if elapsed >= MAX_UTTERANCE_S:
+                        close, reason = True, "max"
+                    elif jared_seen and miss >= VAD_ABSENT_MISSES:   # consecutive non-confirms → you've stopped
+                        close, reason = True, "absent"
+                    elif not jared_seen and audio_s >= VAD_NO_JARED_ABORT_S:  # never you → it's noise
+                        close, reason, is_noise = True, "noise-abort", True
+                else:
+                    if rms(frame) > threshold:
+                        last_voice = now
+                    if (elapsed >= MIN_UTTERANCE_S and now - last_voice >= hang) or elapsed >= MAX_UTTERANCE_S:
+                        close, reason = True, ("max" if elapsed >= MAX_UTTERANCE_S else "silence")
+
+                if not close:
+                    continue
+
+                # ---- close the capture ----
+                if check_task is not None:
+                    check_task.cancel()
+                    check_task = None
+                end_wall = datetime.now(timezone.utc)   # wall-clock end of the recording window
+                dur = len(utterance) / 2 / SAMPLE_RATE
+                _arr = np.frombuffer(bytes(utterance), dtype=np.int16)
+                log.info("endpoint: dur=%.1fs reason=%s jared_seen=%s floor=%.0f thresh=%.0f utt_rms=%.0f peak=%d",
+                         dur, reason, (jared_seen if speaker_gated else "-"), capture_floor, threshold,
+                         rms(_arr), int(np.abs(_arr).max()) if _arr.size else 0)
+                truncated = reason == "max"
+                if truncated:
+                    log.warning("utterance hit %ds cap while still active — truncated", int(MAX_UTTERANCE_S))
+                elif dur >= LONG_UTTERANCE_WARN_S:
+                    log.warning("long utterance: %.0fs", dur)
+
+                # Speaker decision: the gated path already tracked you live (noise-abort = never you →
+                # drop). The energy path (wake words) still verifies the whole utterance once, as before.
+                if speaker_gated:
+                    if is_noise:
+                        log.info("wake-free: never confirmed Jared (%.1fs) — dropped", dur)
+                        _led_capturing = False
+                        await _render_led(ws)
+                        capturing = False
+                        utterance = bytearray()
+                        continue
+                    # Send-suppression (shared presence): if the OTHER mic still has you — heard you within
+                    # 1.5s and at least as recently as this ESP did — this capture is a PARTIAL. Drop it; that
+                    # mic will send the complete one. (Mac is primary: ESP yields ties via the −0.3s margin.)
+                    other = await _other_heard_jared()
+                    if other is not None and last_confirm is not None:
+                        _n = datetime.now(timezone.utc)
+                        if (_n - other).total_seconds() <= 1.5 and other >= last_confirm - timedelta(seconds=0.3):
+                            log.info("wake-free: another mic still has you — suppressing this ESP partial (%.1fs)", dur)
                             _led_capturing = False
                             await _render_led(ws)
                             capturing = False
                             utterance = bytearray()
                             continue
-                        log.info("wake-free: Jared (sim=%.2f)", sim)
-                    enqueued = False
-                    try:
-                        text = await transcribe(bytes(utterance))
-                        enqueued = await handle_transcript(text, dur, truncated, wake_tier or "",
-                                                           started_wall.isoformat(), end_wall.isoformat())
-                    except Exception as e:
-                        log.exception("transcription failed: %s", e)
-                    if enqueued:
-                        # Stay solid (capturing) until the worker's /led-blink takes over (working) and
-                        # its /led-off (done) clears everything — so the bulb never dips to off between.
-                        asyncio.create_task(_led_safety(ws))  # backstop in case no done-ping arrives
-                    else:
-                        _led_capturing = False                # nothing to do → idle
+                elif _wakefree:
+                    sim = _verify_jared(_arr)
+                    if sim < _vthresh:
+                        log.info("wake-free: not Jared (sim=%.2f) — dropped", sim)
+                        _led_capturing = False
                         await _render_led(ws)
-                    capturing = False
-                    utterance = bytearray()
-                    oww.reset()
+                        capturing = False
+                        utterance = bytearray()
+                        continue
+                    log.info("wake-free: Jared (sim=%.2f)", sim)
+
+                enqueued = False
+                try:
+                    text = await transcribe(bytes(utterance))
+                    enqueued = await handle_transcript(text, dur, truncated, wake_tier or "",
+                                                       started_wall.isoformat(), end_wall.isoformat())
+                except Exception as e:
+                    log.exception("transcription failed: %s", e)
+                if enqueued:
+                    # Stay solid (capturing) until the worker's /led-blink takes over (working) and
+                    # its /led-off (done) clears everything — so the bulb never dips to off between.
+                    asyncio.create_task(_led_safety(ws))  # backstop in case no done-ping arrives
+                else:
+                    _led_capturing = False                # nothing to do → idle
+                    await _render_led(ws)
+                capturing = False
+                utterance = bytearray()
+                oww.reset()
 
     if _active_esp is ws:
         _active_esp = None
@@ -336,7 +445,47 @@ LED_SAFETY_S = 60.0  # clear the 'working' blink after this long even if the wor
 
 
 def _led_cmd() -> str:
-    return "LED_BLINK" if _led_working else ("LED_ON" if _led_capturing else "LED_OFF")
+    # Precedence: HEARING JARED (this ESP confirmed it's you, OR any other mic) wins over working — so it
+    # stays SOLID blue while you're talking even if a command is processing in the background. You stop →
+    # blink (working). Idle → off. Solid is gated on CONFIRMED you, never on raw sound/energy.
+    return "LED_ON" if (_led_capturing or _other_hearing_jared) else ("LED_BLINK" if _led_working else "LED_OFF")
+
+
+async def _clear_other_hearing_after(delay: float = 1.6) -> None:
+    """Drop the 'other mic hears Jared' flag once that mic stops publishing (it goes stale), then repaint."""
+    global _other_hearing_jared
+    try:
+        await asyncio.sleep(delay)
+        _other_hearing_jared = False
+        if _active_esp is not None:
+            await _render_led(_active_esp)
+    except asyncio.CancelledError:
+        pass
+
+
+def _on_presence(payload) -> None:
+    """Another mic's voice_presence changed → reflect the shared 'Hearing Jared' on this ESP's LED, so it
+    stays solid blue while the Mac still has you even when the ESP itself isn't capturing."""
+    global _other_hearing_jared, _other_clear_task
+    try:
+        rec = (payload.get("data") or {}).get("record") or {}
+    except AttributeError:
+        return
+    if rec.get("source") == "esp":
+        return                                   # our own row — ignore
+    hj = rec.get("heard_jared_at")
+    try:
+        fresh = bool(hj) and (datetime.now(timezone.utc) - datetime.fromisoformat(hj)).total_seconds() <= 1.5
+    except Exception:  # noqa: BLE001
+        fresh = False
+    if not fresh:
+        return
+    _other_hearing_jared = True
+    if _active_esp is not None:
+        asyncio.create_task(_render_led(_active_esp))
+    if _other_clear_task:
+        _other_clear_task.cancel()
+    _other_clear_task = asyncio.create_task(_clear_other_hearing_after())
 
 
 async def _render_led(ws) -> None:
@@ -408,11 +557,61 @@ def _verify_jared(pcm_i16):
     wav = _trim_voiced(pcm_i16.astype(np.float32) / 32768.0)
     if wav.size < int(0.4 * SAMPLE_RATE):
         return 0.0
+    _t = time.monotonic()
     e = _enc.encode_batch(torch.tensor(wav).unsqueeze(0)).squeeze().detach().cpu().numpy()
+    log.info("ECAPA encode: %.0fms for %.1fs voiced audio", (time.monotonic() - _t) * 1000, wav.size / SAMPLE_RATE)
     e = e / (np.linalg.norm(e) + 1e-9)
     sims = _bank @ e
     k = min(3, len(sims))
     return float(np.mean(np.sort(sims)[-k:]))
+
+
+async def _check_speaker(window_i16, win_end):
+    """Run the (blocking) ECAPA verify off the event loop so frame capture keeps flowing while it runs.
+    Returns (similarity, win_end); win_end is the capture time the window closed at, so the caller can
+    timestamp 'last confirmed Jared' precisely rather than at result-collection time."""
+    sim = await asyncio.to_thread(_verify_jared, window_i16)
+    return sim, win_end
+
+
+async def _publish_presence(jared: bool) -> None:
+    """Upsert this ESP's row in the shared voice_presence — the system-wide 'who is hearing Jared' truth.
+    Fire-and-forget on each confirmed check; any mic's fresh heard_jared_at makes the whole system
+    'Hearing Jared' (drives every indicator + lets the other mic suppress a partial capture)."""
+    key = SUPABASE_SERVICE_KEY or SUPABASE_ANON_KEY
+    if not (SUPABASE_URL and key):
+        return
+    now_iso = datetime.now(timezone.utc).isoformat()
+    body = {"source": "esp", "updated_at": now_iso, "heard_sound_at": now_iso}
+    if jared:
+        body["heard_jared_at"] = now_iso
+    try:
+        async with httpx.AsyncClient(timeout=5) as c:
+            await c.post(f"{SUPABASE_URL}/rest/v1/voice_presence?on_conflict=source",
+                         headers={"apikey": key, "Authorization": f"Bearer {key}",
+                                  "Content-Type": "application/json",
+                                  "Prefer": "resolution=merge-duplicates,return=minimal"},
+                         json=body)
+    except Exception:  # noqa: BLE001 — presence is best-effort
+        pass
+
+
+async def _other_heard_jared():
+    """Most recent time a mic OTHER than this ESP confirmed Jared (datetime, or None). Used at capture
+    close to suppress a partial: if the Mac still has you, the ESP drops its fragment and the Mac sends
+    the whole utterance."""
+    key = SUPABASE_SERVICE_KEY or SUPABASE_ANON_KEY
+    if not (SUPABASE_URL and key):
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=4) as c:
+            r = await c.get(f"{SUPABASE_URL}/rest/v1/voice_presence",
+                            params={"source": "neq.esp", "select": "heard_jared_at"},
+                            headers={"apikey": key, "Authorization": f"Bearer {key}"})
+        stamps = [datetime.fromisoformat(row["heard_jared_at"]) for row in r.json() if row.get("heard_jared_at")]
+        return max(stamps) if stamps else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 # (The old 90s _suppress_auto_clear was removed — it woke the ESP mid-dictation when a push-to-talk
@@ -550,8 +749,9 @@ async def _settings_listener() -> None:
                     log.warning("settings apply failed: %s", e)
 
             ch.on_postgres_changes("UPDATE", callback=_cb, schema="public", table="app_settings")
+            ch.on_postgres_changes("UPDATE", callback=_on_presence, schema="public", table="voice_presence")
             await ch.subscribe()
-            log.info("settings listener subscribed (app_settings realtime)")
+            log.info("settings listener subscribed (app_settings + voice_presence realtime)")
             while sock.is_connected:
                 await asyncio.sleep(1.0)
         except Exception as e:  # noqa: BLE001
