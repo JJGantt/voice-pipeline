@@ -249,7 +249,7 @@ VOICE_REPLY_DIRECTIVE = (
 HUB_SYSTEM = (
     "You are the assistant behind Jared's personal life-data hub. This is NOT a coding session and you "
     "are NOT exploring a codebase. Your sole job is to fulfill each request by calling the MCP tools you "
-    "have been given to read and update his life data (nutrition, workouts, weight, reminders, "
+    "have been given to read and update his life data (nutrition, workouts, weight, "
     "smart lights, and the like). The tools are the only way to act, and each tool's own "
     "description tells you how to use it — follow those. Bash, curl, a shell, the filesystem, and file "
     "editing are NOT available to you; never attempt them. "
@@ -672,6 +672,10 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
     # Anthropic API instead — so strip it for this subprocess only. The SDK runner still sees it.
     sub_env = os.environ.copy()
     sub_env.pop("ANTHROPIC_API_KEY", None)
+    # Load ALL MCP tool schemas inline every turn — no lazy tool-search/discovery round-trip. This is a
+    # tool-centric agent (its whole job is calling these tools), and the trimmed toolset is well under the
+    # context budget, so we want every tool callable directly. (Default 'auto' defers above 10% of context.)
+    sub_env["ENABLE_TOOL_SEARCH"] = "false"
 
     try:
         t_spawn = time.monotonic()
