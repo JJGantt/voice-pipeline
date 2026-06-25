@@ -252,10 +252,6 @@ def _play_http_server():
         def do_GET(self):
             if self.path == "/health":
                 self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
-            elif self.path == "/cue":   # heard-you pop, fired DIRECTLY by the worker (~30ms) not via the
-                if _toggles.get("audio_processing_sound"):   # ~0.5s Supabase realtime round-trip
-                    play_heard()
-                self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
             else:
                 self.send_response(404); self.end_headers()
 
@@ -416,11 +412,19 @@ def on_speech(payload):
         _speak_event.set()
 
 
-def on_request(payload):
-    """'claimed' → working lamp amber, 'done'/'error' → off. (The heard-you POP is NOT fired here anymore —
-    the Supabase realtime round-trip added ~0.5s of lag. The worker now hits /cue directly on claim instead.)"""
+def on_request_change(payload):
+    """One binding for voice_requests (INSERT + UPDATE):
+      INSERT = a command just CAME THROUGH — its transcript exists, the same moment it appears on the TV.
+        Fire the heard-you POP now. This is 'we heard you', NOT 'the agent started working'.
+      UPDATE 'claimed' → working lamp amber; 'done'/'error' → lamp off."""
     global _lamp_working
-    status = str(_rec(payload).get("status") or "")
+    data = payload.get("data") or {}
+    if data.get("type") == "INSERT":
+        if _toggles.get("audio_processing_sound"):
+            log("heard-you cue (command received)")
+            play_heard()
+        return
+    status = str((data.get("record") or {}).get("status") or "")
     if status == "claimed":
         _lamp_working = True
         _lamp_render()
@@ -450,11 +454,11 @@ async def serve():
             await sock.connect()
             ch = sock.channel("pi-audio")
             ch.on_postgres_changes("UPDATE", callback=on_presence, schema="public", table="voice_presence")
-            ch.on_postgres_changes("UPDATE", callback=on_request, schema="public", table="voice_requests")
+            ch.on_postgres_changes("*", callback=on_request_change, schema="public", table="voice_requests")
             ch.on_postgres_changes("INSERT", callback=on_speech, schema="public", table="voice_speech")
             ch.on_postgres_changes("UPDATE", callback=on_setting, schema="public", table="app_settings")
             await ch.subscribe()
-            log("subscribed (voice_presence → hearing/lamp, voice_requests → working/lamp, voice_speech → TTS, app_settings → toggles)")
+            log("subscribed (voice_presence → hearing, voice_requests INSERT → pop / UPDATE → lamp, voice_speech → TTS, app_settings → toggles)")
             while sock.is_connected:
                 await asyncio.sleep(1.0)
         except Exception as e:

@@ -149,22 +149,6 @@ def ping_esp_led(state: str) -> None:
             pass
     threading.Thread(target=_go, daemon=True).start()
 
-
-# Heard-you cue: hit the Pi audio service DIRECTLY (local network, ~tens of ms) the instant work starts,
-# instead of writing the DB and waiting for the Supabase realtime round-trip back to the Pi (~0.5s). That
-# round-trip was why the pop landed a beat late. Fire-and-forget so it never adds latency to the command.
-PI_CUE_URL = os.environ.get("PI_CUE_URL", "http://raspberrypi.local:27187/cue")
-
-
-def ping_pi_cue() -> None:
-    """Fire the Pi's heard-you pop now, over HTTP. Best-effort; no-op if the Pi audio service is unreachable."""
-    def _go():
-        try:
-            httpx.get(PI_CUE_URL, timeout=3.0)
-        except Exception:  # noqa: BLE001
-            pass
-    threading.Thread(target=_go, daemon=True).start()
-
 # Orchestrator (Mac) — when focus is a specific Mac session, the transcript is
 # injected into that session's wall terminal via the orchestrator instead of
 # running a fresh `claude -p`.
@@ -1205,7 +1189,6 @@ def process_request(db: Supabase, req: dict) -> None:
     use_agent = ag["mode"] and WORKER_ID != "fly" and (tier == "power" or (tier == "custom" and runner == "local"))
     log(f"route={tier} → model={model} think={think}{(' runner=' + runner) if runner else ''}{' AGENT' if use_agent else ''}")
     ping_esp_led("blink")   # working — the ESP light blinks for EVERY command, not just ESP-sourced ones
-    ping_pi_cue()           # heard-you pop NOW, direct to the Pi (~30ms) — not via the ~0.5s realtime hop
     push_activity(transcript[:240], "working")   # bottom-strip: the prompt being worked — fills full width like the result
 
     # Role framing first, then the live govee device list (when there are lights). Full-agent mode swaps the
