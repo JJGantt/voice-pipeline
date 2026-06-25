@@ -124,7 +124,8 @@ def set_wakefree(on: bool) -> None:
         _wakefree.set(); _recompute_capture()
         log("wake-free ON — yielding mic, starting wakefree.py (+ ESP)")
         try:
-            subprocess.Popen([WAKEFREE_RUN], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            wflog = open(os.path.expanduser("~/repos/voice-pipeline/voice-id/wakefree.out.log"), "a")
+            subprocess.Popen([WAKEFREE_RUN], stdout=wflog, stderr=wflog)  # logged so capture/speaker-ID/inject is visible
         except Exception as e:  # noqa: BLE001
             log(f"failed to start wakefree: {e}")
         # Pin the TTS engine warm for the whole session (don't let it idle-exit between commands and
@@ -146,7 +147,8 @@ INJECT_FLAG = os.path.expanduser("~/.hammerspoon/voice-inject-mode")
 
 def set_inject_mode(on: bool) -> None:
     """Voice inject mode (hub toggle `voice_inject_mode`). On → ensure always-listening (wake-free) is up
-    so the Mac mic drives it, and drop the hook flag so my replies are spoken + spoken-word-friendly. Off →
+    so the Mac mic drives it, and write the inject flag so the transcript is pasted into the focused window.
+    Speech is a SEPARATE switch (voice_speak_replies) — inject mode no longer implies spoken replies. Off →
     remove the flag and restore wake-free to its own hub setting. The ESP is gated off by the Fly server
     itself (it reads voice_inject_mode), so the Mac stays the only listener."""
     if on:
@@ -156,7 +158,7 @@ def set_inject_mode(on: bool) -> None:
             open(INJECT_FLAG, "w").close()
         except OSError:
             pass
-        log("inject mode ON — Mac-mic → focused window; ESP gated off by the server; replies spoken")
+        log("inject mode ON — Mac-mic → focused window; ESP gated off by the server (speech is a separate toggle)")
     else:
         try:
             os.remove(INJECT_FLAG)
@@ -166,6 +168,29 @@ def set_inject_mode(on: bool) -> None:
             pass
         set_wakefree(_read_setting("wakefree_enabled"))   # inject forced wake-free on; restore its own toggle
         log("inject mode OFF — wake-free restored to its hub setting")
+
+
+# Speech-reply switch (hub toggle `voice_speak_replies`), independent of inject mode: mirrors to the
+# voice-speak flag that the Stop / PreToolUse hooks (voice_speak.py) gate on. Default off → the final
+# reply is injected silently; on → it's read aloud via the warm Kokoro daemon.
+SPEAK_FLAG = os.path.expanduser("~/.hammerspoon/voice-speak")
+
+
+def set_speak_replies(on: bool) -> None:
+    if on:
+        try:
+            open(SPEAK_FLAG, "w").close()
+        except OSError:
+            pass
+        log("speak replies ON — final reply read aloud")
+    else:
+        try:
+            os.remove(SPEAK_FLAG)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+        log("speak replies OFF — replies stay silent")
 
 
 def _read_setting(key: str) -> bool:
@@ -212,6 +237,44 @@ def hud(state: str) -> None:
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:  # noqa: BLE001
         pass
+
+
+# ---- Central HUD state, driven off the SHARED voice state (voice_presence + voice_requests) -----------
+# Same precedence as the ESP LED and the floor lamp: Hearing-you (locked) > Working > idle. So the pill
+# shows 'Hearing you' the instant any mic confirms you — even over a processing command — which is the
+# feedback that was missing (nothing showed until 'working' before).
+_hud_hearing = False
+_hud_working = False
+_hud_hearing_timer = None
+_hud_lock = threading.Lock()
+
+
+def _hud_render() -> None:
+    if _hud_hearing:
+        hud("locked")
+    elif _hud_working:
+        hud("working")
+    else:
+        hud("off")
+
+
+def _hud_hearing_on() -> None:
+    global _hud_hearing, _hud_hearing_timer
+    with _hud_lock:
+        _hud_hearing = True
+        if _hud_hearing_timer:
+            _hud_hearing_timer.cancel()
+        _hud_hearing_timer = threading.Timer(1.6, _hud_hearing_off)
+        _hud_hearing_timer.daemon = True
+        _hud_hearing_timer.start()
+    _hud_render()
+
+
+def _hud_hearing_off() -> None:
+    global _hud_hearing
+    with _hud_lock:
+        _hud_hearing = False
+    _hud_render()
 
 
 def warm_tts() -> None:
@@ -297,6 +360,8 @@ class RealtimeFeedback:
                                        schema="public", table="voice_requests")
                 ch.on_postgres_changes("UPDATE", callback=self._on_setting,
                                        schema="public", table="app_settings")
+                ch.on_postgres_changes("UPDATE", callback=self._on_presence,
+                                       schema="public", table="voice_presence")
                 await ch.subscribe(self._on_sub)
                 while self._sock.is_connected:
                     await asyncio.sleep(1.0)
@@ -310,15 +375,16 @@ class RealtimeFeedback:
             await asyncio.sleep(5.0)
 
     def _on_speech(self, payload) -> None:
-        """A new spoken line (any source) → play it aloud. Universal: not gated on who captured it."""
+        """voice_speech is now spoken by the Pi audio service (warm Kokoro → the TV) — the single audio
+        owner — so the Mac no longer plays it (avoids a double-play). Kept subscribed only for visibility;
+        the Mac-as-speaker option can return later as a hub-toggled output source."""
         try:
             rec = (payload.get("data") or {}).get("record") or {}
         except AttributeError:
             return
         text = (rec.get("text") or "").strip()
         if text:
-            log(f"speaking: {text[:80]!r}")
-            threading.Thread(target=_speak, args=(text,), daemon=True).start()
+            log(f"voice_speech (spoken on the Pi/TV now, not here): {text[:80]!r}")
 
     def _on_setting(self, payload) -> None:
         """A hub setting changed → react to the wake-free toggle and the global mute. Event-driven."""
@@ -336,8 +402,10 @@ class RealtimeFeedback:
             v = str(rec.get("value"))   # pass the real route through — never downgrade custom/power to fast
             tier = v if v in ("power", "custom") else "fast"
             threading.Thread(target=_ping_esp_route, args=(tier,), daemon=True).start()
-        elif key == "voice_inject_mode":   # hands-free: Mac-mic speech → focused window (ESP off, replies spoken)
+        elif key == "voice_inject_mode":   # hands-free: Mac-mic speech → focused window (ESP off)
             set_inject_mode(truthy)
+        elif key == "voice_speak_replies":   # read the final reply aloud (independent of inject mode)
+            set_speak_replies(truthy)
 
     def _on_request(self, payload) -> None:
         """A command's status changed (any source) → reflect it on the HUD, and pre-warm TTS on claim.
@@ -348,14 +416,32 @@ class RealtimeFeedback:
             rec = (payload.get("data") or {}).get("record") or {}
         except AttributeError:
             return
+        global _hud_working
         status = str(rec.get("status") or "")
         if status == "claimed":
             warm_tts()              # any source's command is now being worked → make the TTS engine hot
-            log("HUD → working (a command was claimed)")
-            hud("working")          # the worker started a turn — every screen shows it
+            _hud_working = True
+            _hud_render()           # shows 'working' UNLESS you're currently being heard (then it stays locked)
         elif status in ("done", "error"):
-            log(f"HUD → done (status={status})")
-            hud("done")             # turn ended → HUD shows done, then fades
+            _hud_working = False
+            if _hud_hearing:
+                _hud_render()
+            else:
+                hud("done" if status == "done" else "error")   # brief flash → fades
+
+    def _on_presence(self, payload) -> None:
+        """Any mic confirmed Jared (shared voice_presence) → HUD 'Hearing you'. Central, not just this Mac's mic."""
+        try:
+            rec = (payload.get("data") or {}).get("record") or {}
+        except AttributeError:
+            return
+        hj = rec.get("heard_jared_at")
+        try:
+            fresh = bool(hj) and (datetime.now(timezone.utc) - datetime.fromisoformat(hj)).total_seconds() <= 1.5
+        except Exception:  # noqa: BLE001
+            fresh = False
+        if fresh:
+            _hud_hearing_on()
 
     def _on_sub(self, state, err=None) -> None:
         log(f"realtime feedback subscription: {state}{(' err=' + str(err)) if err else ''}")
@@ -533,6 +619,7 @@ def main() -> int:
     if _read_setting("wakefree_enabled"):  # apply persisted hub toggle at boot; live flips via RealtimeFeedback
         set_wakefree(True)
     set_inject_mode(_read_setting("voice_inject_mode"))  # apply persisted inject toggle (forces wake-free on if set)
+    set_speak_replies(_read_setting("voice_speak_replies"))  # apply persisted speech toggle (default off)
     # Clear any stale global mute on boot: push-to-talk mutes are Mac-local, so a fresh listener means
     # nothing is dictating. This un-sticks a voice_muted left set by a crash mid-dictation — the only
     # safety we need now that the server's arbitrary 90s auto-clear is gone.
