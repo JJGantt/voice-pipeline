@@ -114,10 +114,32 @@ HUB_NOTIFY_URL = os.environ.get(
 )
 
 
+_push_cache = {"v": None, "t": 0.0}
+
+
+def push_enabled() -> bool:
+    """Whether to push command results to Jared's phone. Hub setting `push_enabled` (Settings → Push
+    notifications), cached ~30s. Default ON."""
+    now = time.monotonic()
+    if _push_cache["v"] is None or now - _push_cache["t"] > 30:
+        v = True
+        try:
+            r = httpx.get(f"{SUPABASE_URL}/rest/v1/app_settings",
+                          params={"key": "eq.push_enabled", "select": "value"},
+                          headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=5)
+            rows = r.json()
+            if rows:
+                v = str(rows[0].get("value")).strip().lower() not in ("0", "false", "off", "no", "")
+        except Exception:  # noqa: BLE001
+            pass
+        _push_cache.update(v=v, t=now)
+    return _push_cache["v"]
+
+
 def notify_phone(body: str, title: str = "Hub") -> None:
     """Send a voice command's final result to Jared's phone as a push notification. Threaded + best-
-    effort so it never delays closing out the request and never raises."""
-    if not (HUB_NOTIFY_URL and body):
+    effort so it never delays closing out the request and never raises. Skipped if push is toggled off."""
+    if not (HUB_NOTIFY_URL and body) or not push_enabled():
         return
 
     def _send():
