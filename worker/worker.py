@@ -211,7 +211,11 @@ WAKE_NOISE_DIRECTIVE = (
     "request — even if it is identical to one you just handled (a deliberate retry), AND even if it is "
     "preceded or surrounded by a garbled fragment or a misheard wake word (e.g. a stray 'aspie' / 'raspy' "
     "at the start). In that case, mentally strip the junk and ACT on the real command — do NOT discard the "
-    f"whole utterance. Use '{IGNORE_SENTINEL}' ONLY when there is NO actionable request anywhere in the text.]"
+    "whole utterance. Because this is speech-to-text, individual WORDS are also often misheard as near-"
+    "homophones — correct them to the intended meaning using the conversation context (e.g. 'permit'→"
+    "'commit', 'lock'→'log', a word that phonetically matches an obvious action or a staged/logged/listed "
+    "item) instead of taking the garbled word literally or asking what they meant. "
+    f"Use '{IGNORE_SENTINEL}' ONLY when there is NO actionable request anywhere in the text.]"
 )
 
 # Always-on voice (ESP/Mac) turns are answered ALOUD only through the `say` MCP tool — the worker no
