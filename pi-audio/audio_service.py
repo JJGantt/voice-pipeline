@@ -27,13 +27,11 @@ from realtime import AsyncRealtimeClient
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-ALSA_DEV  = os.environ.get("ALSA_DEV", "plughw:1,0")
+PW_SINK   = os.environ.get("PW_SINK", "alsa_output.platform-107c706400.hdmi.hdmi-stereo")  # HDMI via PipeWire
 HEARD_WAV = os.path.expanduser(os.environ.get("HEARD_WAV", "~/voice/sfx-candidates/02_initial_message-pop.wav"))
 VOICE     = os.environ.get("KOKORO_VOICE", "af_heart")
-STREAM_RATE  = 24000     # Kokoro's native rate → no resample for speech; plughw upconverts to the HDMI's 48k
+STREAM_RATE  = 24000     # Kokoro's native rate → no resample for speech; PipeWire upconverts to the HDMI's 48k
 STREAM_CHUNK = 600       # frames per pipe write (~25ms) — small so enqueued audio is picked up fast (low lag)
-STREAM_BUFFER_US = 150000  # aplay buffer (~150ms): the device's playback latency. Smaller = snappier, but
-STREAM_PERIOD_US = 30000   # too small underruns (clicks). 150ms was clean in testing; raise if xruns appear.
 
 # Toggle cache, mirrored from app_settings (boot fetch + realtime UPDATE). Default on.
 _toggles = {"audio_processing_sound": True, "audio_spoken_reply": True}
@@ -100,16 +98,16 @@ def _stop_speech() -> None:
 
 
 def _stream_loop():
-    """The single always-open output. One aplay reads raw int16 from this pipe and never closes, so the HDMI
-    link is held warm — nothing ever cold-opens, so nothing ever clips. We write a queued chunk if there is
-    one, else digital silence; the blocking write paces us to the audio clock. Output only — no capture, so
-    feedback is impossible. If aplay ever dies (device error) we reopen; the warm invariant self-heals."""
+    """The single always-open output, now through PipeWire (pw-cat) instead of grabbing the HDMI hardware
+    exclusively. PipeWire owns the sink, so the browser/UI can MIX its own sounds in alongside us — the
+    whole point: one shared speaker. The continuous-silence write keeps the PipeWire stream active so the
+    sink never suspends (no cold-clip), and it's output-only so feedback is impossible. Reopens on error."""
     silence = np.zeros(STREAM_CHUNK, dtype="<i2").tobytes()
     while True:
         try:
             proc = subprocess.Popen(
-                ["aplay", "-D", ALSA_DEV, "-q", "-f", "S16_LE", "-r", str(STREAM_RATE), "-c", "1",
-                 f"--buffer-time={STREAM_BUFFER_US}", f"--period-time={STREAM_PERIOD_US}", "-"],
+                ["pw-cat", "-p", "--target", PW_SINK, "--rate", str(STREAM_RATE), "--channels", "1",
+                 "--format", "s16", "--raw", "--latency", "80ms", "-"],
                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             while True:
                 with _audio_lock:
@@ -117,7 +115,7 @@ def _stream_loop():
                 proc.stdin.write(chunk.tobytes() if chunk is not None else silence)
                 proc.stdin.flush()
         except Exception as e:  # noqa: BLE001
-            log(f"warm stream error: {e}; reopening in 1s")
+            log(f"pw-cat stream error: {e}; reopening in 1s")
             time.sleep(1)
 
 
@@ -485,7 +483,7 @@ def main():
         ip = _lamp_scan()
         log(f"floor lamp {'at ' + ip if ip else 'not found on LAN yet (will rescan on first event)'}")
         _lamp_render()                                              # settle to idle (off) at boot
-    log(f"ready — toggles {_toggles}, ALSA {ALSA_DEV}")
+    log(f"ready — toggles {_toggles}, sink {PW_SINK}")
     asyncio.run(serve())
 
 
