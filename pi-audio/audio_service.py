@@ -31,7 +31,9 @@ ALSA_DEV  = os.environ.get("ALSA_DEV", "plughw:1,0")
 HEARD_WAV = os.path.expanduser(os.environ.get("HEARD_WAV", "~/voice/sfx-candidates/02_initial_message-pop.wav"))
 VOICE     = os.environ.get("KOKORO_VOICE", "af_heart")
 STREAM_RATE  = 24000     # Kokoro's native rate → no resample for speech; plughw upconverts to the HDMI's 48k
-STREAM_CHUNK = 1200      # frames per pipe write (~50ms) — small enough to keep the buffer topped, refill often
+STREAM_CHUNK = 600       # frames per pipe write (~25ms) — small so enqueued audio is picked up fast (low lag)
+STREAM_BUFFER_US = 150000  # aplay buffer (~150ms): the device's playback latency. Smaller = snappier, but
+STREAM_PERIOD_US = 30000   # too small underruns (clicks). 150ms was clean in testing; raise if xruns appear.
 
 # Toggle cache, mirrored from app_settings (boot fetch + realtime UPDATE). Default on.
 _toggles = {"audio_processing_sound": True, "audio_spoken_reply": True}
@@ -107,7 +109,7 @@ def _stream_loop():
         try:
             proc = subprocess.Popen(
                 ["aplay", "-D", ALSA_DEV, "-q", "-f", "S16_LE", "-r", str(STREAM_RATE), "-c", "1",
-                 "--buffer-time=300000", "--period-time=50000", "-"],
+                 f"--buffer-time={STREAM_BUFFER_US}", f"--period-time={STREAM_PERIOD_US}", "-"],
                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             while True:
                 with _audio_lock:
@@ -249,6 +251,10 @@ def _play_http_server():
 
         def do_GET(self):
             if self.path == "/health":
+                self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+            elif self.path == "/cue":   # heard-you pop, fired DIRECTLY by the worker (~30ms) not via the
+                if _toggles.get("audio_processing_sound"):   # ~0.5s Supabase realtime round-trip
+                    play_heard()
                 self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
             else:
                 self.send_response(404); self.end_headers()
@@ -411,17 +417,13 @@ def on_speech(payload):
 
 
 def on_request(payload):
-    """'claimed' is the moment the screen flips to 'working', so fire BOTH the working lamp AND the heard-you
-    cue here — the pop lands in lockstep with the screen instead of on a separate presence timer that drifted
-    late. 'done'/'error' → lamp off."""
+    """'claimed' → working lamp amber, 'done'/'error' → off. (The heard-you POP is NOT fired here anymore —
+    the Supabase realtime round-trip added ~0.5s of lag. The worker now hits /cue directly on claim instead.)"""
     global _lamp_working
     status = str(_rec(payload).get("status") or "")
     if status == "claimed":
         _lamp_working = True
         _lamp_render()
-        if _toggles.get("audio_processing_sound"):
-            log("heard-you cue (on claimed)")
-            threading.Thread(target=play_heard, daemon=True).start()
     elif status in ("done", "error"):
         _lamp_working = False
         _lamp_render()
