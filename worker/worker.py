@@ -114,7 +114,7 @@ HUB_NOTIFY_URL = os.environ.get(
 )
 
 
-def notify_phone(body: str, title: str = "Jarvis") -> None:
+def notify_phone(body: str, title: str = "Hub") -> None:
     """Send a voice command's final result to Jared's phone as a push notification. Threaded + best-
     effort so it never delays closing out the request and never raises."""
     if not (HUB_NOTIFY_URL and body):
