@@ -215,25 +215,24 @@ WAKE_NOISE_DIRECTIVE = (
     "homophones — correct them to the intended meaning using the conversation context (e.g. 'permit'→"
     "'commit', 'lock'→'log', a word that phonetically matches an obvious action or a staged/logged/listed "
     "item) instead of taking the garbled word literally or asking what they meant. "
-    f"Use '{IGNORE_SENTINEL}' ONLY when there is NO actionable request anywhere in the text.]"
+    f"Use '{IGNORE_SENTINEL}' ONLY when there is NO actionable request anywhere in the text. This also "
+    "covers YOU talking but NOT commanding — testing, narrating, thinking aloud, chatting, or explicitly "
+    f"saying you don't need anything done: for ALL of those, reply with EXACTLY '{IGNORE_SENTINEL}'. NEVER "
+    "explain that there's nothing to do or that it isn't a command (no 'this is background talk', no "
+    "'nothing to log') — that explanation gets read ALOUD, which is exactly what must not happen.]"
 )
 
-# Always-on voice (ESP/Mac) turns are answered ALOUD only through the `say` MCP tool — the worker no
-# longer speaks the final written reply (the Mac listener plays voice_speech, not voice_messages).
-# Appended to fly/mac turns. (The quick-add FAB has its own terser directive; typed web turns get
-# neither and are silent.) See voice-pipeline/ARCHITECTURE.md "Feedback is universal".
-SAY_DIRECTIVE = (
-    "\n\n[This came in by voice. For a genuine turn (i.e. NOT a false trigger per the note above), the "
-    "ONLY thing spoken aloud is what you pass to the `say` tool — your written reply is shown on screen "
-    "but NOT spoken. Call `say` exactly once with a single short, natural spoken phrase: for an action, "
-    "say what you're DOING in the present tense and call it right as you act so it plays while the action "
-    "runs (e.g. 'changing the floor lamp to white', 'logging the bagel'); for a question, say the answer "
-    "(e.g. \"you've eaten about 1,800 calories\"). No preamble, no markdown, no follow-up question. If a "
-    "real action fails, call `say` again to report it briefly. Your final written reply is ALSO sent to "
-    "Jared's phone as a push notification, so make it ONE complete, self-contained PAST-tense sentence "
-    "stating exactly what you did or found — e.g. 'Logged your weight at 172.4 lb', 'Added an omelet to "
-    "your nutrition log', 'Set the floor lamp to blue', \"You've eaten about 1,800 calories today\". No "
-    "markdown, no preamble, no follow-up question.]"
+# Voice (ESP/Mac) turns: the worker speaks the final WRITTEN reply itself — programmatically, via the Pi
+# audio service (warm Kokoro → the TV) — and pushes it to Jared's phone. No `say` tool, no separate spoken
+# phrase. So the reply must be one clean past-tense line. Appended to fly/mac turns (the quick-add FAB has
+# its own terser directive; typed web turns get neither). See voice-pipeline/ARCHITECTURE.md.
+VOICE_REPLY_DIRECTIVE = (
+    "\n\n[Voice command — your reply is spoken aloud and pushed to your phone. Full sentences are fine, but "
+    "answer ONLY what was asked and nothing more. A simple action → a quick confirmation ('Logged your weight "
+    "at 172.4 pounds.'). A question → just the answer ('About 1,800 calories.') — do NOT volunteer extra info, "
+    "progress, remaining amounts, goals, comparisons, or 'you're this far from X.' Never explain your "
+    "reasoning, restate the request, narrate what you noticed, or add caveats. Just the answer or what you "
+    "did. Plain spoken words only — never any markdown, tables, code, lists, bullets, or symbols. No preamble.]"
 )
 
 # Role framing for every hub turn. The base preset is claude_code (a coding agent), so without this
@@ -1094,7 +1093,7 @@ def process_request(db: Supabase, req: dict) -> None:
     if quick:
         prompt += QUICK_REPLY_DIRECTIVE
     if source in ("fly", "mac"):
-        prompt += SAY_DIRECTIVE   # answered aloud only via the `say` tool; written reply is display-only
+        prompt += VOICE_REPLY_DIRECTIVE   # one past-tense line; spoken by the Pi audio service + phone push
 
     # Tier (set by the hub's two FAB buttons): 'fast' = the sparkle button (simple, unambiguous
     # tool routing → Haiku, no thinking); 'power' = the brain button (precision macro estimates →
@@ -1175,7 +1174,7 @@ def process_request(db: Supabase, req: dict) -> None:
 
     # Wake-word false positive: the model flagged the transcript as noise/mishear → drop it silently.
     # No user OR assistant turn is written, so the conversation stays clean; just clear the activity bar.
-    if audio and re.sub(r"[^a-z]", "", text.lower()) == "ignore":
+    if audio and ("__ignore__" in text.lower() or re.sub(r"[^a-z]", "", text.lower()) == "ignore"):
         push_activity("(ignored — likely noise)", "done")
         db.patch("voice_requests", f"id=eq.{rid}",
                  {"status": "done", "result": "(ignored: wake-word false positive)", "updated_at": now_iso()})
@@ -1200,6 +1199,7 @@ def process_request(db: Supabase, req: dict) -> None:
         )
         if source in ("fly", "mac") and text:
             notify_phone(text)   # ambient voice command → push the past-tense result to Jared's phone
+            db.post("voice_speech", {"text": text})  # speak it aloud via the Pi audio service (warm Kokoro → TV)
         log(f"done request {rid}: {text[:120]!r}")
     else:
         err = result.get("raw_error") or "unknown error"

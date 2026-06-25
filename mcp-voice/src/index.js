@@ -8,7 +8,6 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { listRecentSessions } from './sessions.js';
 import { setFocus } from './focus.js';
-import { say } from './say.js';
 import { getRouting, setModel, setThinking, setRunner, setAlwaysOn, setInjectMode } from './routing.js';
 
 const server = new Server({ name: 'voice', version: '1.0.0' }, { capabilities: { tools: {} } });
@@ -34,21 +33,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ['target'],
-      },
-    },
-    {
-      name: 'say',
-      description:
-        "Speak ONE short line aloud to Jared — this is the ONLY thing that gets played as audio. Call it once per voice turn with a single succinct sentence. For an ACTION, say what you're doing in the present tense right as you act (\"changing the floor lamp to white\", \"logging the bagel\") — call it alongside the action so it's spoken while the action runs. For a QUESTION, say the answer (\"you've eaten 750 calories\"). One natural spoken phrase — no preamble, no markdown, no lists. Your final written reply is shown on screen and is NOT spoken, so anything you want heard must go through this tool. If something fails, you may call it again (\"couldn't reach the lamp\").",
-      inputSchema: {
-        type: 'object',
-        properties: {
-          text: {
-            type: 'string',
-            description: 'The one short line to speak aloud (present tense for actions; the answer for questions).',
-          },
-        },
-        required: ['text'],
       },
     },
     {
@@ -128,12 +112,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const target = (a.target || '').toString().trim();
       if (!target) return text('Error: `target` is required (use "hub" or a session reference).');
       return text(await setFocus(target));
-    }
-    if (name === 'say') {
-      const line = (a.text || '').toString().trim();
-      if (!line) return text('Error: `text` is required (the one short line to speak).');
-      await say(line);
-      return text(`Spoke aloud: ${line}`);
     }
     if (name === 'get_routing') {
       return text(JSON.stringify(await getRouting(), null, 2));
