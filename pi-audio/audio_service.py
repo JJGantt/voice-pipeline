@@ -9,23 +9,27 @@ Subscribes to Supabase realtime and plays, serialized through one lock so nothin
     (audio_spoken_reply). The reply is already a past-tense one-liner, so we just speak it.
 
 Kokoro is loaded ONCE at startup and kept resident (warm) — the Pi has the RAM and stays idle between
-commands, so synthesis is hot. Playback goes through PipeWire (pw-play) to the HDMI sink, and a silent
-pw-loopback holds that sink in RUNNING state so PipeWire never suspends it. (Direct-to-hw aplay used to
-cold-open the suspended sink every reply, clipping the first syllable — 'yesterday' → 'esterday'.) The
-service runs as a system unit, so the unit must export XDG_RUNTIME_DIR=/run/user/1000 to reach PipeWire.
-Env (see ~/voice/pi/.env-audio): SUPABASE_URL, SUPABASE_KEY, optional PW_SINK, HEARD_WAV, KOKORO_VOICE.
+commands, so synthesis is hot. Output goes through ALSA card 1 (the connected TV HDMI; card 0 errors).
+NOTE: the HDMI sink suspends when idle, so a cold ALSA open clips the first ~150ms of a reply. Fix: every
+clip is prefixed with LEAD_SILENCE_S of silence in the SAME stream, so the HDMI link does its cold-lock
+during the silence and the first real syllable plays clean. (Keeping the sink 'warm' with pw-loopback was
+tried and must NEVER be repeated — it bridges the sink to itself and howls. A silence prefix routes and
+captures nothing, so feedback is impossible.)
+Env (see ~/voice/pi/.env-audio): SUPABASE_URL, SUPABASE_KEY, optional ALSA_DEV, HEARD_WAV, KOKORO_VOICE.
 """
 import os, re, asyncio, threading, subprocess, tempfile, time, collections, socket, json
 from datetime import datetime, timezone
+import numpy as np
 import soundfile as sf
 import httpx
 from realtime import AsyncRealtimeClient
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-PW_SINK   = os.environ.get("PW_SINK", "alsa_output.platform-107c706400.hdmi.hdmi-stereo")
+ALSA_DEV  = os.environ.get("ALSA_DEV", "plughw:1,0")
 HEARD_WAV = os.path.expanduser(os.environ.get("HEARD_WAV", "~/voice/sfx-candidates/02_initial_message-pop.wav"))
 VOICE     = os.environ.get("KOKORO_VOICE", "af_heart")
+LEAD_SILENCE_S = float(os.environ.get("LEAD_SILENCE_S", "0.4"))  # silence prefix that absorbs the HDMI cold-lock
 
 # Toggle cache, mirrored from app_settings (boot fetch + realtime UPDATE). Default on.
 _toggles = {"audio_processing_sound": True, "audio_spoken_reply": True}
@@ -36,6 +40,7 @@ MODEL_ONNX = os.path.expanduser(os.environ.get("KOKORO_MODEL", "~/voice/pi/kokor
 VOICES_BIN = os.path.expanduser(os.environ.get("KOKORO_VOICES", "~/voice/pi/voices-v1.0.bin"))
 _play_lock = threading.Lock()  # one speaker → serialize every playback
 _cur_play = None               # in-flight aplay process (for barge-in / cut-off)
+_heard_padded = None           # heard-you cue with the silence prefix baked in (built once at startup)
 _speak_queue = collections.deque()   # replies waiting to be spoken — FIFO, in order; succinct so a short
 _speak_lock = threading.Lock()       # queue is fine. Never dropped except the one you talk over.
 _speak_event = threading.Event()
@@ -70,29 +75,16 @@ def strip_markdown(md: str) -> str:
 
 
 def _play(path: str) -> None:
-    """Play a WAV through PipeWire (NOT direct-to-hw) so it rides the always-warm HDMI sink the keep-warm
-    loopback holds open. A cold ALSA open is what was clipping the first syllable off every reply."""
+    """Play a WAV straight to the HDMI ALSA device. Direct-to-hw, no PipeWire routing — boring and safe."""
     global _cur_play
     with _play_lock:
-        p = subprocess.Popen(["pw-play", "--target", PW_SINK, path],
+        p = subprocess.Popen(["aplay", "-D", ALSA_DEV, path],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         _cur_play = p
         try:
             p.wait()
         finally:
             _cur_play = None
-
-
-def _keepwarm_loop():
-    """Hold the HDMI sink RUNNING with a silent pw-loopback so PipeWire never suspends it (suspend releases
-    the ALSA device → the next play cold-opens → clips). Respawn if the loopback ever dies."""
-    while True:
-        try:
-            subprocess.Popen(["pw-loopback", "-P", PW_SINK],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).wait()
-        except Exception as e:  # noqa: BLE001
-            log(f"keep-warm error: {e}")
-        time.sleep(2)
 
 
 def _stop_speech() -> None:
@@ -106,9 +98,32 @@ def _stop_speech() -> None:
             pass
 
 
+def _lead(samples, sr):
+    """Prefix a clip with LEAD_SILENCE_S of silence so the HDMI cold-lock lands on silence, not the audio."""
+    samples = np.asarray(samples)
+    pad_len = int(sr * LEAD_SILENCE_S)
+    pad = np.zeros((pad_len,) + samples.shape[1:], dtype=samples.dtype)
+    return np.concatenate([pad, samples])
+
+
+def _build_padded_cue() -> None:
+    """Bake the silence prefix into the heard-you cue once, so its own first sound isn't cold-clipped."""
+    global _heard_padded
+    if not os.path.exists(HEARD_WAV):
+        return
+    try:
+        data, sr = sf.read(HEARD_WAV)
+        out = os.path.join(tempfile.gettempdir(), "heard_padded.wav")
+        sf.write(out, _lead(data, sr), sr)
+        _heard_padded = out
+    except Exception as e:  # noqa: BLE001
+        log(f"cue pad failed: {e}")
+
+
 def play_heard() -> None:
-    if os.path.exists(HEARD_WAV):
-        _play(HEARD_WAV)
+    path = _heard_padded or HEARD_WAV
+    if os.path.exists(path):
+        _play(path)
     else:
         log(f"heard-you wav missing: {HEARD_WAV}")
 
@@ -202,7 +217,7 @@ def speak(text: str) -> None:
     if samples is None or len(samples) == 0:
         return
     wav = tempfile.mktemp(suffix=".wav")
-    sf.write(wav, samples, sr)
+    sf.write(wav, _lead(samples, sr), sr)
     log(f"synth {time.monotonic() - t:.1f}s — {text[:60]!r}")
     _play(wav)
     try:
@@ -339,14 +354,14 @@ def main():
     except Exception as e:
         log(f"warmup failed: {e}")
     fetch_toggles()
-    threading.Thread(target=_keepwarm_loop, daemon=True).start()  # hold the HDMI sink warm (no clipped starts)
+    _build_padded_cue()                                          # silence-prefixed heard-you cue (no cold clip)
     threading.Thread(target=_speaker_loop, daemon=True).start()   # speaks only the latest reply
     if LAMP_ENABLED:
         threading.Thread(target=_lamp_worker, daemon=True).start()   # 'working' floor lamp (amber)
         ip = _lamp_scan()
         log(f"floor lamp {'at ' + ip if ip else 'not found on LAN yet (will rescan on first event)'}")
         _lamp_render()                                              # settle to idle (off) at boot
-    log(f"ready — toggles {_toggles}, sink {PW_SINK}")
+    log(f"ready — toggles {_toggles}, ALSA {ALSA_DEV}")
     asyncio.run(serve())
 
 
