@@ -222,6 +222,63 @@ def _shorten(text: str) -> str:
     return strip_markdown(text)[:600]
 
 
+def _play_pcm(i16) -> None:
+    """Play already-synthesized audio (e.g. from the faster Mac synth) straight into the warm stream, with
+    the same drain/barge-in semantics as a Pi-synth reply. Input is int16 LE mono at STREAM_RATE."""
+    if _hearing or _muted or i16 is None or len(i16) == 0:
+        return
+    log(f"play (mac-synth pcm) {len(i16) / STREAM_RATE:.1f}s")
+    _enqueue_audio(i16)
+    while True:                          # drain (keeps _pending bounded so barge-in drops only this)
+        with _audio_lock:
+            if not _pending:
+                break
+        time.sleep(0.05)
+
+
+def _play_http_server():
+    """Accept pre-synthesized PCM from the Mac (the synth-on-Mac path) and play it through the warm stream.
+    POST /play body = raw int16 LE mono at STREAM_RATE; routed through the SAME gated queue as Pi-synth
+    replies, so it respects barge-in and the don't-start-while-you're-talking hold. Header X-Dry-Run:1
+    confirms receipt + parse WITHOUT playing (so the path is testable with no sound). GET /health → ok."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *_):  # no per-request stderr spam
+            pass
+
+        def do_GET(self):
+            if self.path == "/health":
+                self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+            else:
+                self.send_response(404); self.end_headers()
+
+        def do_POST(self):
+            if self.path != "/play":
+                self.send_response(404); self.end_headers(); return
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(n)
+                i16 = np.frombuffer(body, dtype="<i2")
+                if self.headers.get("X-Dry-Run") == "1":
+                    log(f"/play DRY-RUN: {len(body)} bytes = {len(i16) / STREAM_RATE:.2f}s (not played)")
+                elif _toggles.get("audio_spoken_reply"):
+                    with _speak_lock:
+                        _speak_queue.append(("pcm", i16))
+                    _speak_event.set()
+                    log(f"/play: {len(i16) / STREAM_RATE:.2f}s pcm queued")
+                self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+            except Exception as e:  # noqa: BLE001
+                log(f"/play error: {e}")
+                try:
+                    self.send_response(500); self.end_headers()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    port = int(os.environ.get("PLAY_PORT", "27187"))
+    ThreadingHTTPServer(("0.0.0.0", port), H).serve_forever()
+
+
 def _clauses(text: str):
     """Split a reply into clause-sized pieces on sentence/clause punctuation, so each can be synthesized and
     START PLAYING while the next is still synthesizing. Kokoro's own create_stream only splits on full
@@ -318,18 +375,22 @@ def _speaker_loop():
     while True:
         _speak_event.wait()
         with _speak_lock:
-            text = _speak_queue.popleft() if _speak_queue else None
+            item = _speak_queue.popleft() if _speak_queue else None
             if not _speak_queue:
                 _speak_event.clear()
-        if not text:
+        if not item:
             continue
+        kind, payload = item
         t0 = time.monotonic()
         while _hearing or _muted:      # hold until you've stopped talking / released push-to-talk
             time.sleep(0.1)
         held = time.monotonic() - t0   # tail part 2: hold (invisible until now) — reply waiting on you/mute
         if held > 0.15:
-            log(f"reply HELD {held:.1f}s (you were talking / push-to-talk) before synth")
-        speak(text)                    # tail part 3: 'first audio Xs' = synth of the first clause
+            log(f"reply HELD {held:.1f}s (you were talking / push-to-talk) before playing")
+        if kind == "pcm":
+            _play_pcm(payload)         # already synthesized (on the faster Mac) → just stream it
+        else:
+            speak(payload)             # synth on the Pi (fallback path); 'first audio Xs' = first clause
 
 
 def on_speech(payload):
@@ -345,7 +406,7 @@ def on_speech(payload):
                 pass
         log(f"reply queued{lat} — {text[:40]!r}")
         with _speak_lock:
-            _speak_queue.append(text)   # FIFO — play in order, don't drop
+            _speak_queue.append(("text", text))   # FIFO — play in order, don't drop
         _speak_event.set()
 
 
@@ -411,6 +472,7 @@ def main():
     fetch_toggles()
     _load_cue_i16()                                              # heard-you cue → stream format, once
     threading.Thread(target=_stream_loop, daemon=True).start()   # the always-open warm output (no cold clip)
+    threading.Thread(target=_play_http_server, daemon=True).start()  # accept pre-synth'd PCM (synth-on-Mac)
     threading.Thread(target=_speaker_loop, daemon=True).start()   # speaks only the latest reply
     if LAMP_ENABLED:
         threading.Thread(target=_lamp_worker, daemon=True).start()   # 'working' floor lamp (amber)
