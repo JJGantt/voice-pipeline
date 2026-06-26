@@ -1286,14 +1286,16 @@ def process_request(db: Supabase, req: dict) -> None:
         return
 
     # Real turn → now write the user bubble (deferred past the noise check), then close the activity bar.
+    # Tag the row with the mode so the hub UI can show this mode's thread separately and switch live.
+    msg_mode = "agent" if session_agent else "hub"
     db.post("voice_messages",
-            {"request_id": rid, "focus": "hub", "role": "user", "text": transcript, "done": True})
+            {"request_id": rid, "focus": "hub", "mode": msg_mode, "role": "user", "text": transcript, "done": True})
     push_activity(text[:240], "done")  # close out the activity bar w/ the result (room for the full line)
 
     if result["ok"]:
         db.post(
             "voice_messages",
-            {"request_id": rid, "focus": "hub", "role": "assistant",
+            {"request_id": rid, "focus": "hub", "mode": msg_mode, "role": "assistant",
              "text": text, "done": True},
         )
         db.patch(
@@ -1314,7 +1316,7 @@ def process_request(db: Supabase, req: dict) -> None:
         if result.get("text"):
             db.post(
                 "voice_messages",
-                {"request_id": rid, "focus": "hub", "role": "assistant",
+                {"request_id": rid, "focus": "hub", "mode": msg_mode, "role": "assistant",
                  "text": result["text"], "done": True},
             )
         db.patch(
