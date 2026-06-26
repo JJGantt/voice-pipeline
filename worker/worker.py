@@ -19,8 +19,11 @@ Design notes:
 - Serialized: exactly one request is processed at a time, never concurrent.
 - Defensive: every Supabase call is wrapped so a transient HTTP error logs and
   is swallowed rather than killing the loop.
-- The hub `claude` session is reused via `--resume` and reset on a 2h idle gap or
-  a calendar-day rollover (see should_reset_session()).
+- Hub mode and full-agent mode keep SEPARATE, independently-persisted `claude` sessions (hub_session.json /
+  agent_session.json), each resumed via `--resume`. The hub session resets on an idle gap or calendar-day
+  rollover (session_reset_s) or manually; the agent session resets ONLY on a manual "Reset context". Switching
+  the agent_mode toggle just changes which session a request resumes — it never clobbers the other's context.
+  See should_reset_session() / session_file().
 """
 
 import asyncio
@@ -188,7 +191,9 @@ HTTP_TIMEOUT_S = 30.0
 CLAUDE_TIMEOUT_S = float(os.environ.get("CLAUDE_TIMEOUT_S", "300"))
 AGENT_TIMEOUT_S = float(os.environ.get("AGENT_TIMEOUT_S", "900"))  # full-agent (coding) runs get a longer leash
 
-HUB_SESSION_FILE = STATE_DIR / "hub_session.json"
+HUB_SESSION_FILE = STATE_DIR / "hub_session.json"       # hub mode: idle/day reset, or manual
+AGENT_SESSION_FILE = STATE_DIR / "agent_session.json"   # full-agent mode: a SEPARATE, persistent context that
+                                                        # never auto-resets — only manual erase clears it
 # Sentinel the hub UI enqueues to force a fresh Claude session (manual "Reset context").
 # Must match VOICE_RESET_SENTINEL in the status-hub server.
 RESET_SENTINEL = "__RESET_CONTEXT__"
@@ -475,23 +480,31 @@ def higher_priority_present(db: Supabase) -> bool:
 # --------------------------------------------------------------------------- #
 
 
-def read_hub_session() -> dict | None:
+def session_file(agent: bool) -> Path:
+    """Hub mode and full-agent mode keep SEPARATE, independently-persisted Claude sessions, so switching
+    between them never carries over or clobbers the other's context."""
+    return AGENT_SESSION_FILE if agent else HUB_SESSION_FILE
+
+
+def read_session(agent: bool) -> dict | None:
+    f = session_file(agent)
     try:
-        if HUB_SESSION_FILE.exists():
-            return json.loads(HUB_SESSION_FILE.read_text())
+        if f.exists():
+            return json.loads(f.read_text())
     except Exception as e:  # noqa: BLE001
-        log(f"read hub_session.json failed: {e}")
+        log(f"read {f.name} failed: {e}")
     return None
 
 
-def write_hub_session(session_id: str) -> None:
+def write_session(agent: bool, session_id: str) -> None:
+    f = session_file(agent)
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
-        HUB_SESSION_FILE.write_text(
+        f.write_text(
             json.dumps({"session_id": session_id, "last_activity_iso": now_iso()})
         )
     except Exception as e:  # noqa: BLE001
-        log(f"write hub_session.json failed: {e}")
+        log(f"write {session_file(agent).name} failed: {e}")
 
 
 _reset_cache = {"v": None, "t": 0.0}
@@ -1090,18 +1103,20 @@ def process_request(db: Supabase, req: dict) -> None:
     transcript = req.get("transcript") or ""
     log(f"claimed request {rid}: {transcript[:80]!r}")
 
-    # Manual context reset from the hub UI: drop the resumed hub session so the next command starts
-    # fresh. The status-hub server already cleared the visible thread and pushed a live reset to
-    # every surface — here we just forget the Claude session and ack (no Claude run, no turns).
+    # Manual context reset from the hub UI: drop the CURRENT mode's session so the next command starts
+    # fresh — full-agent mode resets its own context, hub mode its own (whichever you're in). The status-hub
+    # already cleared the visible thread and pushed a live reset to every surface — here we just forget the
+    # Claude session and ack (no Claude run, no turns).
     if transcript.strip() == RESET_SENTINEL:
+        reset_agent = agent_settings()["mode"] and WORKER_ID != "fly"
         try:
-            HUB_SESSION_FILE.unlink(missing_ok=True)
+            session_file(reset_agent).unlink(missing_ok=True)
         except Exception as e:
-            log(f"reset: unlink hub_session failed: {e}")
+            log(f"reset: unlink session failed: {e}")
         API.reset()   # drop the API agent's conversation
         db.patch("voice_requests", f"id=eq.{rid}",
                  {"status": "done", "result": "(context reset)", "updated_at": now_iso()})
-        log("hub context reset — session dropped")
+        log(f"{'agent' if reset_agent else 'hub'} context reset — session dropped")
         return
 
     focus = get_focus(db)
@@ -1133,16 +1148,17 @@ def process_request(db: Supabase, req: dict) -> None:
     # (The user turn is written AFTER the model runs — deferred so a wake-word false positive that the
     # model drops never appears in the conversation. See below.)
 
-    # Hub session management.
-    state = read_hub_session()
+    # Session management — hub mode and full-agent mode keep SEPARATE, persisted contexts; switching modes
+    # just changes which one this request resumes.
     ag = agent_settings()
-    session_agent = ag["mode"] and WORKER_ID != "fly"   # full-agent session → reset manually only
+    session_agent = ag["mode"] and WORKER_ID != "fly"   # full-agent mode → its own session, manual reset only
+    state = read_session(session_agent)
     if should_reset_session(state, agent=session_agent):
         resume_id = None
-        log("hub session: starting FRESH (reset rule fired)")
+        log(f"{'agent' if session_agent else 'hub'} session: starting FRESH (reset rule fired)")
     else:
         resume_id = state["session_id"]
-        log(f"hub session: resuming {resume_id}")
+        log(f"{'agent' if session_agent else 'hub'} session: resuming {resume_id}")
 
     # Surface tool calls live by pushing them straight to the hub's activity bar (transient — not
     # stored in voice_messages, so they never appear in the conversation thread).
@@ -1255,7 +1271,7 @@ def process_request(db: Supabase, req: dict) -> None:
                             agent=use_agent, cwd=ag["cwd"])  # subscription, free
 
     if result.get("session_id"):
-        write_hub_session(result["session_id"])
+        write_session(session_agent, result["session_id"])
         log(f"captured session_id {result['session_id']}")
 
     text = (result.get("text") or "").strip()
