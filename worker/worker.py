@@ -218,7 +218,9 @@ POWER_DIRECTIVE = (
     "\n\n[Precision mode — ultrathink. Take your time and reason carefully before acting. If this "
     "involves estimating nutrition for a dish whose exact contents aren't given, decompose it into its "
     "likely ingredients with realistic restaurant portions, estimate each component's macros, and sum "
-    "them — don't lowball. Prefer the structured per-ingredient breakdown the log tool supports.]"
+    "them — don't lowball. ALWAYS use the structured per-ingredient breakdown the log tool supports: "
+    "give each component its OWN protein/carbs/fat (and calories when you know them); the server computes "
+    "the meal's totals by summing the ingredients, so keep each component's macros accurate.]"
 )
 
 # Medium thinking: a mild nudge that contains the bare "think" keyword (the smallest extended-thinking
