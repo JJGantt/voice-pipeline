@@ -52,7 +52,7 @@ SOURCE OF TRUTH:  Supabase (felyggqjjhltwokdfhop)
 DEVICES:
   Mac  — primary worker, has the Claude subscription (claude -p). launchd: com.jaredgantt.voice-worker
   Pi   — fallback worker (WORKER_PRIORITY=mac,pi). aarch64, active host.
-  Fly  — cloud fallback (fly-worker/). No subscription → accuracy route uses the API there.
+  Fly  — cloud fallback, bundled into the jared-voice server image (server/, WORKER_ID=fly). No subscription → accuracy route uses the API there.
 ```
 
 ## Worker execution strategies
@@ -72,8 +72,9 @@ There is no third strategy. The old warm-Agent-SDK path (`SdkRunner`) was remove
 
 - **Worker claim priority** is `WORKER_PRIORITY` (default `mac,pi`): the highest-priority worker with a
   fresh heartbeat claims; others defer. Mac → Pi today.
-- **Fly** (`fly-worker/`) is the last resort and currently **dormant/undeployed**. When deployed, the
-  accuracy route on Fly uses the API (`ApiRunner` with thinking) since there's no subscription there.
+- **Fly** is the last resort, bundled into the jared-voice server image (built from `server/` by
+  `assemble.sh`; runs `worker.py` as `WORKER_ID=fly`, deferring to Mac/Pi). Its accuracy route uses the
+  API (`ApiRunner` with thinking) since there's no subscription there.
 
 ### Known gaps (don't pretend these are done)
 - Fast route picks a device by **priority**, not a true "fastest-wins" race. Priority is a proxy for now.
