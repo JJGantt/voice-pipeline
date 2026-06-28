@@ -89,6 +89,12 @@ VOICE_MCP_JS = os.environ.get(
 GOVEE_PY = os.environ.get("GOVEE_PY", "/opt/homebrew/bin/python3.11")
 GOVEE_MCP_PY = os.environ.get("GOVEE_MCP_PY", "/Users/jaredgantt/repos/govee-mcp/govee_mcp.py")
 
+# PetLibro cat-feeder MCP (local LAN control: feed the cats / status / food level / schedule).
+# Uses the project venv python (has tinytuya); the feeder is LAN-only, so this only works from a
+# host on the home network (Mac primary, Pi fallback — Pi overrides the paths via env).
+PETLIBRO_PY = os.environ.get("PETLIBRO_PY", "/Users/jaredgantt/repos/petlibro-mcp/.venv/bin/python")
+PETLIBRO_MCP_PY = os.environ.get("PETLIBRO_MCP_PY", "/Users/jaredgantt/repos/petlibro-mcp/petlibro_mcp.py")
+
 # Low-latency activity push to the status-hub server: transient "what Jarvis is doing" events go
 # straight to the SSE clients (bypassing Supabase realtime) so the on-screen activity bar tracks
 # tool calls in real time. Authenticated by the hub's kiosk token in the URL.
@@ -279,7 +285,7 @@ HUB_SYSTEM = (
     "You are the assistant behind Jared's personal life-data hub. This is NOT a coding session and you "
     "are NOT exploring a codebase. Your sole job is to fulfill each request by calling the MCP tools you "
     "have been given to read and update his life data (nutrition, workouts, weight, "
-    "smart lights, and the like). The tools are the only way to act, and each tool's own "
+    "smart lights, the cat feeder, and the like). The tools are the only way to act, and each tool's own "
     "description tells you how to use it — follow those. Bash, curl, a shell, the filesystem, and file "
     "editing are NOT available to you; never attempt them. "
     "GOLDEN RULE: when a request clearly maps to your tools, COMPLETE it in one shot — fill in any "
@@ -298,7 +304,8 @@ AGENT_SYSTEM = (
     "You are Jared's all-purpose assistant, driven by voice. You have your full set of capabilities — you can "
     "write and run code, use the shell, edit files, search the web, and anything else — IN ADDITION to the "
     "data/voice/govee MCP tools for his life data (nutrition, workouts, weight, lists, reminders, notes, "
-    "recipes) and smart lights. Use whatever combination of tools the request needs. Requests come from "
+    "recipes), smart lights, and the cat feeder (petlibro-feeder: feed the cats, check food level / last "
+    "feed / schedule). Use whatever combination of tools the request needs. Requests come from "
     "speech-to-text, so expect occasional mis-hearings; if a request is genuinely unintelligible, say so. "
     "Keep spoken replies brief and to the point."
 )
@@ -650,6 +657,7 @@ def write_mcp_config() -> str:
             "data": {"command": "node", "args": [DATA_MCP_JS], "env": env},
             "voice": {"command": "node", "args": [VOICE_MCP_JS], "env": env},
             "govee-lights": {"command": GOVEE_PY, "args": [GOVEE_MCP_PY], "env": env},
+            "petlibro-feeder": {"command": PETLIBRO_PY, "args": [PETLIBRO_MCP_PY], "env": env},
         }
     }
     fd, path = tempfile.mkstemp(prefix="voice-mcp-", suffix=".json")
@@ -687,7 +695,7 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
     if agent:
         cmd += ["--dangerously-skip-permissions"]   # all native tools execute; MCP tools still present
     else:
-        cmd += ["--allowedTools", "mcp__data", "mcp__voice", "mcp__govee-lights"]   # MCP-only; built-ins denied
+        cmd += ["--allowedTools", "mcp__data", "mcp__voice", "mcp__govee-lights", "mcp__petlibro-feeder"]   # MCP-only; built-ins denied
     if system_append:
         cmd += ["--append-system-prompt", system_append]
     timeout_s = AGENT_TIMEOUT_S if agent else CLAUDE_TIMEOUT_S
