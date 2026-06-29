@@ -109,16 +109,7 @@ VAD_NO_JARED_ABORT_S = 3.5  # never confirmed you within this much audio → it'
 VAD_KEEPALIVE_MARGIN = 0.16  # hysteresis: once confirmed, only DROP you when the match falls to clearly-
                              # not-you/silence (~0.14), not on the dips your far-field voice grazes (0.17–0.24).
                              # Calibrated from logs: your real sim 0.17–0.34, room/TV noise ≤0.11 — a clean gap.
-PREROLL_S = 0.5              # MINIMUM audio kept before the detected onset (guaranteed floor)
-# Onset recovery: the energy trigger is deliberately high (it avoids false starts), so for far-field/quiet
-# speech it fires a syllable or two IN — clipping your first word. On trigger we walk BACK through a longer
-# lookback ring to where speech actually began, using a LOWER onset threshold, bridging brief inter-syllable
-# dips and stopping at true pre-speech silence. Bounded by LOOKBACK_S, so a noisy room adds at most that much
-# prefix to a capture that's STILL speaker-gated. Recovers the dropped first word without lowering the trigger.
-LOOKBACK_S = 2.5            # how far back we'll reach to recover a soft onset
-ONSET_FLOOR_MULT = 1.6      # onset threshold = max(floor*this, floor+ONSET_FLOOR_MARGIN); LOWER than the
-ONSET_FLOOR_MARGIN = 70     #   trigger's FLOOR_MULT(3)/FLOOR_MIN_MARGIN(150) so the quiet first syllable counts
-ONSET_GAP_S = 0.32          # bridge energy dips up to this long while walking back; longer = the true start
+PREROLL_S = 0.5              # audio kept from just before the wake hit
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("voice")
@@ -239,7 +230,8 @@ async def connection(ws):
     oww.reset()
 
     pending = bytearray()           # raw bytes not yet aligned to a frame
-    lookback = deque(maxlen=max(1, int(LOOKBACK_S * SAMPLE_RATE / FRAME_SAMPLES)))  # (raw, rms) per pre-capture frame — for the onset walk-back
+    preroll = bytearray()           # rolling pre-wake audio
+    preroll_max = int(PREROLL_S * SAMPLE_RATE) * 2
     ambient = deque(maxlen=max(1, int(AMBIENT_WINDOW_S * SAMPLE_RATE / FRAME_SAMPLES)))
     capturing = False
     utterance = bytearray()
@@ -287,16 +279,17 @@ async def connection(ws):
                 continue
 
             if not capturing:
-                cur_rms = rms(frame)
-                lookback.append((raw, cur_rms))
-                ambient.append(cur_rms)         # track the room's noise floor
+                preroll.extend(raw)
+                if len(preroll) > preroll_max:
+                    del preroll[: len(preroll) - preroll_max]
+                ambient.append(rms(frame))      # track the room's noise floor
                 floor = float(np.median(ambient)) if ambient else 0.0
                 speech_level = max(floor * FLOOR_MULT, floor + FLOOR_MIN_MARGIN)
 
                 if _wakefree:
                     # No wake word — start on speech energy; the speaker is verified at close. The route
                     # (Haiku/Opus) is the configured wake-free mode, not per-utterance.
-                    wake_tier = _wake_route if cur_rms > speech_level else None
+                    wake_tier = _wake_route if rms(frame) > speech_level else None
                     fast_score = power_score = 0.0
                 else:
                     scores = oww.predict(frame)
@@ -308,23 +301,8 @@ async def connection(ws):
                     threshold = speech_level
                     capture_floor = floor     # remember the room floor that set this threshold (diagnostics)
                     capturing = True          # LED stays as-is until we CONFIRM it's Jared (not raw energy)
-                    # Recover the dropped onset: walk back from the trigger frame to where speech actually
-                    # began — energy above a lower onset threshold, bridging brief dips — then seed from there.
-                    onset_level = max(floor * ONSET_FLOOR_MULT, floor + ONSET_FLOOR_MARGIN)
-                    frames = list(lookback)            # oldest → newest; the newest IS the trigger frame
-                    gap_budget = max(1, int(ONSET_GAP_S * SAMPLE_RATE / FRAME_SAMPLES))
-                    min_keep = max(1, int(PREROLL_S * SAMPLE_RATE / FRAME_SAMPLES))
-                    start, gap = len(frames) - 1, 0
-                    for i in range(len(frames) - 1, -1, -1):
-                        if frames[i][1] >= onset_level:
-                            start, gap = i, 0
-                        else:
-                            gap += 1
-                            if gap > gap_budget:
-                                break
-                    start = max(0, min(start, len(frames) - min_keep))   # never keep LESS than PREROLL_S
-                    utterance = bytearray(b"".join(f[0] for f in frames[start:]))
-                    lookback.clear()
+                    utterance = bytearray(preroll)
+                    preroll.clear()
                     started = time.monotonic()
                     started_wall = datetime.now(timezone.utc)   # wall-clock start of the recording window
                     last_voice = started
