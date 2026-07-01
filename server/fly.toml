@@ -8,7 +8,9 @@ primary_region = "iad"
 # Live-tunable knobs (change here + redeploy, or `fly machine update --env KEY=VAL`).
 [env]
   HANGOVER_S = "3.0"        # trailing-silence seconds before an utterance ends
-  GAIN = "1"                # 1 = none; mic now delivers full-level 32-bit audio
+  GAIN = "5"                # software boost: the ESP mic actually delivers LOW-level audio (~5k peak even
+                            # up close), so 1x left speech buried at the noise floor and ECAPA couldn't match it.
+                            # 5x brings a normal-voice peak to ~25k (under the 32767 clip). Tune if it clips.
   WAKE_MODEL = "hey_rhasspy" # openWakeWord pretrained name ("Hey Rhasspy")
   MAX_UTTERANCE_S = "600"   # absolute safety cap in seconds (10 min)
 
