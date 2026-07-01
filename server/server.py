@@ -116,7 +116,11 @@ VAD_KEEPALIVE_MIN = 0.14     # once confirmed, KEEP the capture alive until the 
                              # with a margin, lowering voiceid_threshold dragged it UNDER the noise floor and
                              # captures held open forever (0.20 threshold made it 0.04 — a capture ran 78s until
                              # push-to-talk aborted it). Keep this fixed regardless of how low the confirm bar goes.
-PREROLL_S = 0.5              # audio kept from just before the wake hit
+PREROLL_S = 1.2              # audio kept from BEFORE the energy trigger, so a soft first syllable that only
+                            # crosses the threshold mid-word isn't clipped. Longer than the trigger latency to
+                            # be safe. CRITICAL: the VAD timing below subtracts this (seed_len_s) so the pre-roll
+                            # never counts toward the first-check / no-Jared-abort timers — measuring the speaker
+                            # window on the INFLATED total is exactly what broke the earlier walk-back version.
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("voice")
@@ -247,6 +251,8 @@ async def connection(ws):
     capture_floor = 0.0             # noise floor measured at capture start (for endpoint diagnostics)
     last_voice = 0.0
     started = 0.0
+    seed_len_s = 0.0             # seconds of pre-roll prepended at trigger; subtracted from the VAD's audio_s
+                                # so a longer pre-roll can never shorten the speaker-verification window
     # Wake-free speaker-gated VAD state (reset at each capture start):
     check_task = None               # in-flight ECAPA check (one at a time, off the event loop)
     last_check = 0.0                # monotonic time the last check was launched
@@ -309,6 +315,7 @@ async def connection(ws):
                     capture_floor = floor     # remember the room floor that set this threshold (diagnostics)
                     capturing = True          # LED stays as-is until we CONFIRM it's Jared (not raw energy)
                     utterance = bytearray(preroll)
+                    seed_len_s = len(utterance) / 2 / SAMPLE_RATE   # pre-roll length — excluded from VAD timing below
                     preroll.clear()
                     started = time.monotonic()
                     started_wall = datetime.now(timezone.utc)   # wall-clock start of the recording window
@@ -334,7 +341,9 @@ async def connection(ws):
                 reason = ""
                 is_noise = False           # True → never confirmed you (drop without enqueue)
                 if speaker_gated:
-                    audio_s = len(utterance) / 2 / SAMPLE_RATE
+                    audio_s = len(utterance) / 2 / SAMPLE_RATE - seed_len_s   # POST-trigger audio only — the
+                    # pre-roll must NOT count toward VAD_FIRST_CHECK_S / VAD_NO_JARED_ABORT_S (that inflation is
+                    # what made the earlier pre-roll abort captures before they could confirm you)
                     # Launch one ECAPA check at a time on the trailing window, OFF the event loop so
                     # frame capture keeps flowing while it runs (~0.4s for a 2.5s window on this box).
                     if check_task is None and audio_s >= VAD_FIRST_CHECK_S and now - last_check >= VAD_CHECK_EVERY_S:
