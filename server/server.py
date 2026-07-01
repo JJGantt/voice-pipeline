@@ -89,8 +89,12 @@ FRAME_SAMPLES = 1280          # 80 ms @ 16 kHz — openWakeWord's expected chunk
 # The floor is estimated from the ambient audio just before the wake word (TV
 # included); speech is whatever rises clearly above it, so it self-calibrates.
 AMBIENT_WINDOW_S = 3.0        # rolling window used to estimate the noise floor
-FLOOR_MULT = 3.0             # speech must exceed floor * this
-FLOOR_MIN_MARGIN = 150       # ...and at least this far above floor (guards floor≈0)
+FLOOR_MULT = 1.4             # speech only has to rise modestly above the room floor to START a capture —
+                            # ECAPA (the voiceprint gate) is the real discriminator, so the energy trigger
+                            # should be lenient. Was 3.0, which required speaking ~3x over a loud TV to even
+                            # record; the TV then still failed the voiceprint gate anyway. Lower = your quieter
+                            # / far-field voice actually triggers; the cost is more (harmless) ECAPA checks.
+FLOOR_MIN_MARGIN = 100       # ...and at least this far above floor (guards floor≈0)
 SILENCE_HANGOVER_S = float(os.environ.get("HANGOVER_S", "3.0"))  # trailing silence to end (env-tunable)
 MIN_UTTERANCE_S = 0.6        # never endpoint before this (avoids instant cut)
 MAX_UTTERANCE_S = float(os.environ.get("MAX_UTTERANCE_S", "600"))  # absolute safety cap (10 min)
