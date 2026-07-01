@@ -110,9 +110,12 @@ VAD_ABSENT_MISSES = 2       # close only after this many CONSECUTIVE non-confirm
                             # timer that races the cadence and clips you between words)
 VAD_FIRST_CHECK_S = 1.8      # wait for this much audio before the first check
 VAD_NO_JARED_ABORT_S = 3.5  # never confirmed you within this much audio → it's noise/TV, drop cheap
-VAD_KEEPALIVE_MARGIN = 0.16  # hysteresis: once confirmed, only DROP you when the match falls to clearly-
-                             # not-you/silence (~0.14), not on the dips your far-field voice grazes (0.17–0.24).
-                             # Calibrated from logs: your real sim 0.17–0.34, room/TV noise ≤0.11 — a clean gap.
+VAD_KEEPALIVE_MIN = 0.14     # once confirmed, KEEP the capture alive until the match falls to clearly-not-you
+                             # / silence (~0.14, just above the ≤0.11 room/TV noise ceiling). ABSOLUTE and
+                             # DECOUPLED from the confirm bar (_vthresh) on purpose: if this tracked _vthresh
+                             # with a margin, lowering voiceid_threshold dragged it UNDER the noise floor and
+                             # captures held open forever (0.20 threshold made it 0.04 — a capture ran 78s until
+                             # push-to-talk aborted it). Keep this fixed regardless of how low the confirm bar goes.
 PREROLL_S = 0.5              # audio kept from just before the wake hit
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -344,7 +347,7 @@ async def connection(ws):
                         except Exception:
                             sim = 0.0
                         check_task = None
-                        thr = _vthresh - (VAD_KEEPALIVE_MARGIN if jared_seen else 0.0)
+                        thr = min(_vthresh, VAD_KEEPALIVE_MIN) if jared_seen else _vthresh
                         if sim >= thr:
                             miss = 0
                             if not jared_seen:
