@@ -497,7 +497,7 @@ async def serve():
             ch.on_postgres_changes("INSERT", callback=on_speech, schema="public", table="voice_speech")
             ch.on_postgres_changes("UPDATE", callback=on_setting, schema="public", table="app_settings")
             await ch.subscribe()
-            log("subscribed (voice_presence → hearing, voice_requests UPDATE → lamp, voice_speech → TTS, app_settings → toggles)")
+            log("subscribed (voice_presence → hearing, voice_requests lifecycle → lamp, voice_speech → TTS, app_settings → toggles)")
             while sock.is_connected:
                 await asyncio.sleep(1.0)
         except Exception as e:
