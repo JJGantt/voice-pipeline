@@ -7,6 +7,12 @@ primary_region = "iad"
 
 # Live-tunable knobs (change here + redeploy, or `fly machine update --env KEY=VAL`).
 [env]
+  # Pin BLAS/OpenMP to 1 thread. On the shared 1-vCPU VM, torch/numpy default to spawning a thread per
+  # host core, which oversubscribes the single core we're scheduled on and makes one ECAPA encode thrash
+  # from ~0.2s up to 7-10s — past the 3.5s abort window, so real commands drop before the voiceprint
+  # confirms you. These env vars cap the pools at import time; server.py also calls torch.set_num_threads(1).
+  OMP_NUM_THREADS = "1"
+  MKL_NUM_THREADS = "1"
   HANGOVER_S = "3.0"        # trailing-silence seconds before an utterance ends
   GAIN = "5"                # software boost: the ESP mic actually delivers LOW-level audio (~5k peak even
                             # up close), so 1x left speech buried at the noise floor and ECAPA couldn't match it.

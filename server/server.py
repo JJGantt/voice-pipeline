@@ -89,11 +89,11 @@ FRAME_SAMPLES = 1280          # 80 ms @ 16 kHz — openWakeWord's expected chunk
 # The floor is estimated from the ambient audio just before the wake word (TV
 # included); speech is whatever rises clearly above it, so it self-calibrates.
 AMBIENT_WINDOW_S = 3.0        # rolling window used to estimate the noise floor
-FLOOR_MULT = 1.4             # speech only has to rise modestly above the room floor to START a capture —
+FLOOR_MULT = 1.75            # speech only has to rise modestly above the room floor to START a capture —
                             # ECAPA (the voiceprint gate) is the real discriminator, so the energy trigger
-                            # should be lenient. Was 3.0, which required speaking ~3x over a loud TV to even
-                            # record; the TV then still failed the voiceprint gate anyway. Lower = your quieter
-                            # / far-field voice actually triggers; the cost is more (harmless) ECAPA checks.
+                            # should be lenient. Was 3.0 (needed ~3x over a loud TV to even record); 1.4 was an
+                            # overcorrection that fired on nearly all ambient TV noise, keeping ECAPA pinned.
+                            # 1.75 = your quieter / far-field voice still triggers, with fewer wasted checks.
 FLOOR_MIN_MARGIN = 100       # ...and at least this far above floor (guards floor≈0)
 SILENCE_HANGOVER_S = float(os.environ.get("HANGOVER_S", "3.0"))  # trailing silence to end (env-tunable)
 MIN_UTTERANCE_S = 0.6        # never endpoint before this (avoids instant cut)
@@ -357,6 +357,9 @@ async def connection(ws):
                             sim = 0.0
                         check_task = None
                         thr = min(_vthresh, VAD_KEEPALIVE_MIN) if jared_seen else _vthresh
+                        # DIAG: log every speaker check (sim vs thr) so a dropped command shows WHY —
+                        # too-low sim (bad match / clipping) vs a check that never ran in time (slow encode).
+                        log.info("wake-free: check sim=%.2f thr=%.2f seen=%s audio_s=%.1f", sim, thr, jared_seen, audio_s)
                         if sim >= thr:
                             miss = 0
                             if not jared_seen:
@@ -544,6 +547,17 @@ def _load_voiceid():
     """Lazy-load ECAPA + the shared voiceprint + thresholds when wake-free turns on."""
     global _enc, _bank, _vthresh, _vpause, _wake_route
     import base64
+    import torch
+    # On this shared 1-vCPU machine, torch's default thread pool oversubscribes the single core it
+    # actually gets scheduled on, so a single ECAPA encode thrashes and balloons from ~0.2s to 7-10s.
+    # That blows past the 3.5s no-Jared abort window, so real commands drop as noise before ECAPA can
+    # confirm you. Pin to one thread — a single small inference is FASTER single-threaded here (no
+    # coordination overhead), and the latency stays stable inside the confirm window.
+    torch.set_num_threads(1)
+    try:
+        torch.set_num_interop_threads(1)   # can only be set once, before any inter-op work starts
+    except RuntimeError:
+        pass
     from speechbrain.inference.speaker import EncoderClassifier
     if _enc is None:
         _enc = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb", savedir="/app/.ecapa")
