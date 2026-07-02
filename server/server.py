@@ -71,6 +71,16 @@ _enc = None          # ECAPA model (lazy)
 _bank = None         # voiceprint: (N, 192) exemplar embeddings from app_settings.voiceprint
 _vthresh = 0.30
 _vpause = 2.0
+# ---- Voiceprint enrollment from THIS mic (/enroll-start) -----------------------------------------
+# The original exemplars were recorded on the Mac mic; matching ESP far-field audio against them is a
+# cross-device comparison that costs similarity. Enroll mode collects exemplars from the ESP itself:
+# while armed, each energy-endpointed utterance is embedded (same trim+normalize as verification) and
+# appended to the shared bank in app_settings.voiceprint — so both devices' channels are represented
+# and top-3 matching picks whichever exemplars fit the capturing mic. Speaker gating is bypassed while
+# armed (you can't gate on the voiceprint you're rebuilding). LED: blink = armed, solid flash = phrase
+# accepted, off = done. IMPORTANT: only arm this with other voices (TV!) silenced — it enrolls whoever talks.
+_enroll_left = 0     # phrases still to collect (0 = enroll mode off)
+_enroll_new = []     # embeddings collected this run
 
 # ---- Single-owner LED state ---------------------------------------------------------------------
 # The ESP has one LED and it must reflect ONE coherent state, never a race between code paths. Two
@@ -130,6 +140,14 @@ oww = Model(wakeword_models=[WAKE_MODEL, WAKE_MODEL_POWER], inference_framework=
 
 
 def pcm_to_wav(pcm: bytes) -> bytes:
+    # Peak-normalize to -1 dBFS headroom: utterances are stored un-gained (the mic runs quiet, ~-14 dBFS
+    # peaks), so bring the level up for Whisper WITHOUT the clipping the old stored-gain caused. Skip
+    # near-silence (peak ≤ ~1% FS) — normalizing an empty capture would just amplify room noise.
+    arr = np.frombuffer(pcm, dtype=np.int16)
+    peak = int(np.abs(arr).max()) if arr.size else 0
+    if peak > 327:
+        arr = (arr.astype(np.float32) * (0.9 * 32767.0 / peak)).astype(np.int16)
+        pcm = arr.tobytes()
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
         w.setnchannels(1)
@@ -154,8 +172,30 @@ async def transcribe(pcm: bytes) -> str:
             model=GROQ_MODEL,
             response_format="text",
         )
-    result = await asyncio.to_thread(_call)
+    try:
+        result = await asyncio.to_thread(_call)
+    except Exception as e:  # noqa: BLE001 — one retry for transient Groq/network blips
+        log.warning("Groq transcription failed (%s) — retrying once", e)
+        await asyncio.sleep(0.5)
+        result = await asyncio.to_thread(_call)   # a second failure propagates to the caller
     return (result if isinstance(result, str) else getattr(result, "text", "")).strip()
+
+
+async def _notify_transcribe_failure() -> None:
+    """A capture was confirmed as a command but transcription failed even after the retry. Say so in the
+    hub conversation — a spoken command silently vanishing is the worst failure mode this pipeline has."""
+    if not (SUPABASE_URL and SUPABASE_SERVICE_KEY):
+        return
+    try:
+        async with httpx.AsyncClient(timeout=6) as c:
+            await c.post(f"{SUPABASE_URL}/rest/v1/voice_messages",
+                         headers={"apikey": SUPABASE_SERVICE_KEY,
+                                  "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                                  "Content-Type": "application/json", "Prefer": "return=minimal"},
+                         json={"focus": "hub", "mode": "hub", "role": "assistant", "done": True,
+                               "text": "⚠️ Heard you, but speech-to-text failed twice — say that again?"})
+    except Exception:  # noqa: BLE001 — the log line above is the floor
+        pass
 
 
 async def handle_transcript(text: str, duration_s: float, truncated: bool, tier: str = "",
@@ -273,9 +313,13 @@ async def connection(ws):
             raw = bytes(pending[: FRAME_SAMPLES * 2])
             del pending[: FRAME_SAMPLES * 2]
             frame = np.frombuffer(raw, dtype=np.int16)
-            if GAIN != 1.0:                 # boost the quiet mic, then re-pack
+            if GAIN != 1.0:
+                # The boost feeds DETECTION ONLY (energy floors + wake word) — the buffered audio (raw)
+                # stays un-gained. Gaining the stored audio (the old behavior) clipped loud/close speech
+                # to the int16 rail (peak=32767), and a clipped waveform distorts ECAPA embeddings so
+                # badly that Jared scores as a stranger (sim 0.03-0.16 vs thr 0.30). ECAPA and Whisper
+                # are level-robust — they need fidelity, not volume; each normalizes at point of use.
                 frame = np.clip(frame.astype(np.float32) * GAIN, -32768, 32767).astype(np.int16)
-                raw = frame.tobytes()
 
             if _suppressed or _inject:    # push-to-talk mute OR inject mode (Mac-only) → ESP drops everything
                 if capturing:
@@ -336,7 +380,7 @@ async def connection(ws):
                 # Speaker-gated endpointing for wake-free (when ECAPA + voiceprint are loaded): keep the
                 # capture alive on Jared's verified presence, not on energy. Falls back to the energy
                 # endpoint for wake-word captures (or before the voiceprint loads).
-                speaker_gated = _wakefree and _enc is not None and _bank is not None
+                speaker_gated = _wakefree and _enc is not None and _bank is not None and _enroll_left == 0
                 close = False
                 reason = ""
                 is_noise = False           # True → never confirmed you (drop without enqueue)
@@ -393,15 +437,28 @@ async def connection(ws):
                     check_task = None
                 end_wall = datetime.now(timezone.utc)   # wall-clock end of the recording window
                 dur = len(utterance) / 2 / SAMPLE_RATE
-                _arr = np.frombuffer(bytes(utterance), dtype=np.int16)
-                log.info("endpoint: dur=%.1fs reason=%s jared_seen=%s floor=%.0f thresh=%.0f utt_rms=%.0f peak=%d",
-                         dur, reason, (jared_seen if speaker_gated else "-"), capture_floor, threshold,
+                _arr = np.frombuffer(bytes(utterance), dtype=np.int16)   # RAW un-gained audio
+                # floor/thresh are tracked in the gained (detection) domain — divide by GAIN so every
+                # number in this line is in the same raw-mic units. peak=32767 here now means the MIC
+                # itself clipped (acoustic overload), not the software gain.
+                log.info("endpoint: dur=%.1fs reason=%s jared_seen=%s floor=%.0f thresh=%.0f utt_rms=%.0f peak=%d (raw units)",
+                         dur, reason, (jared_seen if speaker_gated else "-"), capture_floor / GAIN, threshold / GAIN,
                          rms(_arr), int(np.abs(_arr).max()) if _arr.size else 0)
                 truncated = reason == "max"
                 if truncated:
                     log.warning("utterance hit %ds cap while still active — truncated", int(MAX_UTTERANCE_S))
                 elif dur >= LONG_UTTERANCE_WARN_S:
                     log.warning("long utterance: %.0fs", dur)
+
+                # Enroll mode: this utterance is a voiceprint phrase, not a command — embed it into the
+                # bank and skip verification/transcription entirely.
+                if _enroll_left > 0 and _wakefree:
+                    await _enroll_sample(_arr, capture_floor / GAIN, ws)
+                    _led_capturing = False
+                    capturing = False
+                    utterance = bytearray()
+                    oww.reset()
+                    continue
 
                 # Speaker decision: the gated path already tracked you live (noise-abort = never you →
                 # drop). The energy path (wake words) still verifies the whole utterance once, as before.
@@ -444,6 +501,7 @@ async def connection(ws):
                                                        started_wall.isoformat(), end_wall.isoformat())
                 except Exception as e:
                     log.exception("transcription failed: %s", e)
+                    asyncio.create_task(_notify_transcribe_failure())
                 if enqueued:
                     # Stay solid (capturing) until the worker's /led-blink takes over (working) and
                     # its /led-off (done) clears everything — so the bulb never dips to off between.
@@ -464,9 +522,12 @@ LED_SAFETY_S = 60.0  # clear the 'working' blink after this long even if the wor
 
 
 def _led_cmd() -> str:
-    # Precedence: HEARING JARED (this ESP confirmed it's you, OR any other mic) wins over working — so it
-    # stays SOLID blue while you're talking even if a command is processing in the background. You stop →
-    # blink (working). Idle → off. Solid is gated on CONFIRMED you, never on raw sound/energy.
+    # Precedence: ENROLLING (armed, waiting for phrases) blinks above all else — unambiguous 'the mic is
+    # in enroll mode' at the device. Then HEARING JARED (this ESP confirmed it's you, OR any other mic)
+    # wins over working — so it stays SOLID blue while you're talking even if a command is processing in
+    # the background. You stop → blink (working). Idle → off. Solid is gated on CONFIRMED you.
+    if _enroll_left > 0:
+        return "LED_BLINK"
     return "LED_ON" if (_led_capturing or _other_hearing_jared) else ("LED_BLINK" if _led_working else "LED_OFF")
 
 
@@ -579,21 +640,103 @@ def _trim_voiced(wav, gate=0.006, margin_s=0.15):
     return wav[max(0, v[0] - m): min(len(wav), v[-1] + step + m)]
 
 
-def _verify_jared(pcm_i16):
-    """Top-3 cosine of the trimmed utterance vs the voiceprint. 0 if no model/voiceprint loaded."""
-    if _enc is None or _bank is None:
-        return 0.0
+def _embed(pcm_i16, min_voiced_s: float = 0.4):
+    """Trim → peak-normalize → ECAPA-embed an utterance. Returns a unit-norm (192,) embedding, or None
+    if the model isn't loaded / not enough voiced audio. Shared by verification AND enrollment so both
+    sides of every comparison go through the identical pipeline."""
+    if _enc is None:
+        return None
     import torch
     wav = _trim_voiced(pcm_i16.astype(np.float32) / 32768.0)
-    if wav.size < int(0.4 * SAMPLE_RATE):
-        return 0.0
+    if wav.size < int(min_voiced_s * SAMPLE_RATE):
+        return None
+    # Peak-normalize before encoding: the embedding then doesn't depend on mic distance / device gain,
+    # so ESP far-field checks land on the same scale as the enrolled exemplars. Skip near-silence
+    # (peak ≤ 0.01 ≈ -40 dBFS) — boosting pure room noise 90x would just embed the noise.
+    peak = float(np.abs(wav).max())
+    if peak > 0.01:
+        wav = wav * (0.9 / peak)
     _t = time.monotonic()
     e = _enc.encode_batch(torch.tensor(wav).unsqueeze(0)).squeeze().detach().cpu().numpy()
     log.info("ECAPA encode: %.0fms for %.1fs voiced audio", (time.monotonic() - _t) * 1000, wav.size / SAMPLE_RATE)
-    e = e / (np.linalg.norm(e) + 1e-9)
+    return e / (np.linalg.norm(e) + 1e-9)
+
+
+def _verify_jared(pcm_i16):
+    """Top-3 cosine of the trimmed utterance vs the voiceprint. 0 if no model/voiceprint loaded."""
+    if _bank is None:
+        return 0.0
+    e = _embed(pcm_i16)
+    if e is None:
+        return 0.0
     sims = _bank @ e
     k = min(3, len(sims))
     return float(np.mean(np.sort(sims)[-k:]))
+
+
+def _upload_voiceprint(bank) -> bool:
+    """Write the merged exemplar bank back to app_settings.voiceprint — the shared source of truth every
+    mic loads from."""
+    key = SUPABASE_SERVICE_KEY or SUPABASE_ANON_KEY
+    if not (SUPABASE_URL and key):
+        return False
+    import base64
+    buf = io.BytesIO()
+    np.save(buf, bank.astype(np.float32))
+    try:
+        r = httpx.patch(f"{SUPABASE_URL}/rest/v1/app_settings?key=eq.voiceprint",
+                        headers={"apikey": key, "Authorization": f"Bearer {key}",
+                                 "Content-Type": "application/json", "Prefer": "return=minimal"},
+                        json={"value": base64.b64encode(buf.getvalue()).decode(),
+                              "updated_at": datetime.now(timezone.utc).isoformat()},
+                        timeout=10)
+        return r.status_code < 300
+    except Exception as e:  # noqa: BLE001
+        log.exception("voiceprint upload failed: %s", e)
+        return False
+
+
+async def _enroll_sample(pcm_i16, floor_raw: float, ws) -> None:
+    """Handle one energy-endpointed utterance while enroll mode is armed: embed it, add it to the bank
+    when the last phrase lands, and flash the LED so Jared gets per-phrase confirmation at the device."""
+    global _enroll_left, _enroll_new, _bank
+    utt_rms = rms(pcm_i16)
+    if utt_rms < max(floor_raw * 2.0, 200.0):
+        log.info("enroll: sample too quiet (rms=%.0f, floor=%.0f) — speak closer; not counted", utt_rms, floor_raw)
+        return
+    e = await asyncio.to_thread(_embed, pcm_i16, 1.0)   # ≥1s of voiced audio for a stable exemplar
+    if e is None:
+        log.info("enroll: not enough voiced audio — not counted")
+        return
+    if _bank is not None:
+        sims = _bank @ e
+        log.info("enroll: phrase accepted (sim vs old bank: %.2f)", float(np.sort(sims)[-min(3, len(sims)):].mean()))
+    else:
+        log.info("enroll: phrase accepted")
+    _enroll_new.append(e)
+    _enroll_left -= 1
+    if ws is not None:      # solid flash = 'got it', then back to the armed blink
+        try:
+            await ws.send("LED_ON")
+            await asyncio.sleep(0.4)
+            await _render_led(ws)
+        except Exception:  # noqa: BLE001
+            pass
+    if _enroll_left > 0:
+        log.info("enroll: %d phrase(s) to go", _enroll_left)
+        return
+    new = np.vstack(_enroll_new).astype(np.float32)
+    prev_shape = None if _bank is None else _bank.shape
+    merged = new if _bank is None else np.vstack([_bank, new]).astype(np.float32)
+    _bank = merged
+    if _upload_voiceprint(merged):
+        log.info("enroll: DONE — bank now %s (was %s; +%d from this mic), uploaded to app_settings",
+                 merged.shape, prev_shape, new.shape[0])
+    else:
+        log.warning("enroll: upload FAILED — new exemplars kept in memory only for this process")
+    _enroll_new = []
+    if ws is not None:
+        await _render_led(ws)
 
 
 async def _check_speaker(window_i16, win_end):
@@ -701,6 +844,33 @@ async def process_request(connection, request):
         v = parse_qs(urlparse(path).query).get("v", [None])[0]
         _wake_route = v if v in ("power", "custom") else "fast"
         log.info("wake-free route → %s", _wake_route)
+        return connection.respond(HTTPStatus.OK, "ok\n")
+    if path.startswith("/enroll-"):
+        # Voiceprint enrollment from the ESP mic (token-gated like /led-*). /enroll-start?n=10 arms it:
+        # the next n energy-endpointed utterances become exemplars in the shared bank. /enroll-stop
+        # disarms and discards a partial run. /enroll-status reports progress. Arm ONLY in a quiet room —
+        # it enrolls whoever talks.
+        from urllib.parse import urlparse, parse_qs
+        global _enroll_left, _enroll_new
+        u = urlparse(path)
+        tok = parse_qs(u.query).get("token", [None])[0]
+        if LED_TOKEN and tok != LED_TOKEN:
+            return connection.respond(HTTPStatus.FORBIDDEN, "forbidden\n")
+        if u.path == "/enroll-start":
+            if not _wakefree:
+                return connection.respond(HTTPStatus.CONFLICT, "wake-free mode is off — enable it first\n")
+            n = int(parse_qs(u.query).get("n", ["10"])[0])
+            _enroll_left, _enroll_new = max(1, min(n, 30)), []
+            _load_voiceid_bg()   # make sure ECAPA + the current bank are loaded
+            log.info("enroll: ARMED for %d phrases (speak near the ESP; LED blinks while armed)", _enroll_left)
+        elif u.path == "/enroll-stop":
+            log.info("enroll: stopped with %d collected (discarded)", len(_enroll_new))
+            _enroll_left, _enroll_new = 0, []
+        elif u.path == "/enroll-status":
+            body = f'{{"left": {_enroll_left}, "collected": {len(_enroll_new)}}}\n'
+            return connection.respond(HTTPStatus.OK, body)
+        if _active_esp is not None:
+            await _render_led(_active_esp)
         return connection.respond(HTTPStatus.OK, "ok\n")
     if path in ("/health", "/"):
         return connection.respond(HTTPStatus.OK, "ok\n")

@@ -291,13 +291,39 @@ def trim_voiced(pcm: np.ndarray, gate: float, margin_s: float = 0.15) -> np.ndar
     return pcm[max(0, voiced[0] - m): min(len(pcm), voiced[-1] + step + m)]
 
 
+def _load_bank():
+    """Prefer the SHARED voiceprint (app_settings.voiceprint) — one bank for every mic, kept current by
+    re-enrollment on any device (e.g. the ESP's /enroll-start). Falls back to the local exemplars.npy
+    from enroll.py. Read at boot; the listener's supervisor respawns this process, so a restart after
+    re-enrollment picks the new bank up."""
+    import base64
+    import io
+    try:
+        r = httpx.get(f"{SUPABASE_URL}/rest/v1/app_settings",
+                      params={"key": "eq.voiceprint", "select": "value"},
+                      headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=8)
+        rows = r.json()
+        if rows and rows[0].get("value"):
+            bank = np.load(io.BytesIO(base64.b64decode(rows[0]["value"])))
+            log(f"voiceprint: shared bank from app_settings {bank.shape}")
+            return bank
+    except Exception as e:  # noqa: BLE001
+        log(f"voiceprint: shared bank unavailable ({e}); trying local exemplars.npy")
+    ref_bank = HERE / "exemplars.npy"
+    if ref_bank.exists():
+        bank = np.load(ref_bank)
+        log(f"voiceprint: local exemplars.npy {bank.shape}")
+        return bank
+    return None
+
+
 def main() -> int:
     if not SUPABASE_KEY:
         print("FATAL: SUPABASE_KEY required.", file=sys.stderr); return 2
-    ref_bank = HERE / "exemplars.npy"
-    if not ref_bank.exists():
-        print("FATAL: no exemplars.npy — run enroll.py first.", file=sys.stderr); return 2
-    bank = np.load(ref_bank)
+    bank = _load_bank()
+    if bank is None:
+        print("FATAL: no voiceprint (app_settings.voiceprint empty and no exemplars.npy) — enroll first.",
+              file=sys.stderr); return 2
 
     global THRESHOLD, PAUSE_S      # hub UI controls these via app_settings (fall back to the defaults above)
     THRESHOLD = get_setting("voiceid_threshold", THRESHOLD)
@@ -308,6 +334,11 @@ def main() -> int:
     log(f"wake-free listening — Jared's voice only (thresh={THRESHOLD}, pause={PAUSE_S}s, stt=groq:{GROQ_MODEL})")
 
     def score(seg_f32: np.ndarray) -> float:
+        # Peak-normalize before encoding (same as the server + enrollment) so the embedding doesn't
+        # depend on mic distance/level and every comparison runs through the identical pipeline.
+        peak = float(np.abs(seg_f32).max())
+        if peak > 0.01:
+            seg_f32 = seg_f32 * (0.9 / peak)
         e = enc.encode_batch(torch.tensor(seg_f32).unsqueeze(0)).squeeze().detach().cpu().numpy()
         e = e / (np.linalg.norm(e) + 1e-9)
         sims = bank @ e
