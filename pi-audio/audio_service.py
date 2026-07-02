@@ -165,6 +165,30 @@ def _lamp_send(msg: dict) -> None:
 _lamp_saved = None   # the lamp's OWN state before the working overlay — captured on the idle→working
                      # edge, restored exactly on working→idle. The lamp is a real room light; the amber
                      # is a temporary overlay, never allowed to end in a blind 'off'.
+# The snapshot is ALSO persisted to disk: a pi-audio restart mid-overlay loses process memory, and
+# that stranded the lamp in amber once already (the restore edge found no snapshot). With the file,
+# a fresh process can still put the light back.
+LAMP_SAVED_FILE = os.path.expanduser("~/data/lamp_prior.json")
+
+
+def _lamp_save_prior(st) -> None:
+    global _lamp_saved
+    _lamp_saved = st
+    try:
+        with open(LAMP_SAVED_FILE, "w") as f:
+            json.dump(st, f)
+    except OSError:
+        pass
+
+
+def _lamp_load_prior():
+    if _lamp_saved is not None:
+        return _lamp_saved
+    try:
+        with open(LAMP_SAVED_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
 
 
 def _lamp_status(timeout: float = 1.0):
@@ -217,16 +241,23 @@ def _is_work_amber(st) -> bool:
 
 
 def _lamp_apply(working: bool) -> None:
-    global _lamp_saved
     if working:
         st = _lamp_status()
         if st is not None and not _is_work_amber(st):
-            _lamp_saved = st                     # exact prior state (on/off, brightness, color/kelvin)
+            _lamp_save_prior(st)                 # exact prior state (on/off, brightness, color/kelvin)
         r, g, b = LAMP_WORK
         _lamp_send({"msg": {"cmd": "turn", "data": {"value": 1}}})
         _lamp_send({"msg": {"cmd": "colorwc", "data": {"color": {"r": r, "g": g, "b": b}, "colorTemInKelvin": 0}}})
     else:
-        st = _lamp_saved
+        # Restore ONLY if the lamp is actually showing our amber overlay right now. Anything else
+        # (user changed it mid-command, boot with the lamp in normal use, a stray done event) means
+        # the lamp is the user's — touching it would stomp a real room light. This same guard makes
+        # boot self-healing automatic: a stuck overlay from a mid-overlay restart reads as amber and
+        # gets restored from the persisted snapshot; a normal lamp is left completely alone.
+        cur = _lamp_status()
+        if cur is not None and not _is_work_amber(cur):
+            return
+        st = _lamp_load_prior()
         if st is None:
             # Never guess and never go dark: with no known prior state, leaving the amber is the only
             # honest option (a blind 'off' kills a light he may be using).
@@ -522,7 +553,7 @@ def main():
         threading.Thread(target=_lamp_worker, daemon=True).start()   # 'working' floor lamp (amber)
         ip = _lamp_scan()
         log(f"floor lamp {'at ' + ip if ip else 'not found on LAN yet (will rescan on first event)'}")
-        _lamp_render()                                              # settle to idle (off) at boot
+        _lamp_render()   # boot settle: restores ONLY a stuck working-amber overlay; a normal lamp is untouched
     log(f"ready — toggles {_toggles}, sink {PW_SINK}")
     asyncio.run(serve())
 
