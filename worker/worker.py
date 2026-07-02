@@ -1054,6 +1054,58 @@ def inject_to_terminal(text: str) -> tuple[bool, str | None]:
         return False, f"orchestrator unreachable: {e}"
 
 
+def reclaim_stale(db: Supabase) -> dict | None:
+    """Recover a request stuck in 'claimed' by a worker that died mid-run (OOM, sleep, power loss).
+
+    Presence-gated, NOT a timer on the work itself: the claimer heartbeats every 10s from its own
+    thread even during a long command, so while its worker_presence.last_seen is fresh the claim is
+    never touched — however long the command runs. A stale heartbeat (+ a claim older than the same
+    freshness window, so a just-claimed row whose owner hasn't beaten yet isn't stolen) can only mean
+    the owner is gone; without this, such rows sat 'claimed' forever and were silently never answered.
+
+    Fresh-enough orphans (within the hub's own session_reset_s staleness boundary) are re-claimed and
+    re-run; older ones are closed as errors — replaying a command from hours ago would be worse than
+    dropping it. The re-claim PATCH is guarded on (status, claimed_by) so two reclaimers can't both win."""
+    rows = db.get(
+        "voice_requests",
+        "status=eq.claimed&order=created_at.asc&limit=5"
+        "&select=id,transcript,source,tier,claimed_by,claimed_at,created_at",
+    )
+    if not rows:
+        return None
+    presence = {r.get("worker"): _parse_ts(r.get("last_seen", ""))
+                for r in db.get("worker_presence", "select=worker,last_seen")}
+    now = datetime.now(timezone.utc)
+    for req in rows:
+        owner = req.get("claimed_by") or ""
+        if owner == WORKER_ID:
+            continue                      # my own in-flight row
+        beat = presence.get(owner)
+        if beat and (now - beat).total_seconds() <= HEARTBEAT_FRESH_S:
+            continue                      # owner alive — just still working
+        claimed_at = _parse_ts(req.get("claimed_at") or "")
+        if claimed_at and (now - claimed_at).total_seconds() <= HEARTBEAT_FRESH_S:
+            continue                      # claim newer than the freshness window — give the owner time
+        created = _parse_ts(req.get("created_at") or "")
+        if created and (now - created).total_seconds() > session_reset_s():
+            db.patch("voice_requests", f"id=eq.{req['id']}&status=eq.claimed&claimed_by=eq.{owner}",
+                     {"status": "error", "error": f"orphaned: worker '{owner}' went silent mid-run",
+                      "updated_at": now_iso()})
+            log(f"closed orphaned request {req['id']} (claimed by silent '{owner}', too old to replay)")
+            continue
+        got = db.patch(
+            "voice_requests",
+            f"id=eq.{req['id']}&status=eq.claimed&claimed_by=eq.{owner}",
+            {"status": "claimed", "claimed_by": WORKER_ID, "claimed_at": now_iso(),
+             "assigned_to": WORKER_ID, "updated_at": now_iso()},
+            extra_headers={"Prefer": "return=representation"},
+        )
+        if got:
+            log(f"reclaimed request {req['id']} from silent worker '{owner}'")
+            return got[0]
+    return None
+
+
 def claim_one(db: Supabase) -> dict | None:
     """Find one pending request and atomically claim it. Returns the row or None."""
     if higher_priority_present(db):
@@ -1064,7 +1116,7 @@ def claim_one(db: Supabase) -> dict | None:
         "status=eq.pending&order=created_at.asc&limit=1&select=id,transcript,source,tier",
     )
     if not pending:
-        return None
+        return reclaim_stale(db)
     req = pending[0]
     rid = req["id"]
 
