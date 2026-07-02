@@ -30,6 +30,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -232,6 +233,23 @@ POWER_DIRECTIVE = (
 # Medium thinking: a mild nudge that contains the bare "think" keyword (the smallest extended-thinking
 # budget on `claude -p`), without the "ultrathink" maximum. Pairs with API effort="medium".
 MEDIUM_DIRECTIVE = "\n\n[Think it through before acting.]"
+
+# Photo turns (attachments on the request): the photos are downloaded locally, their paths ride the
+# prompt, and Read is allowed so the model can view them. The critical framing: however many photos
+# arrive, they ALL describe ONE item — context to pin it down (the dish, its nutrition label, the
+# menu/restaurant that identifies it) — never separate things to log.
+ATTACH_DIRECTIVE = (
+    "\n\n[The user attached {n} photo(s), saved locally at the paths below. View EVERY photo with the "
+    "Read tool before acting. All of the photos together describe ONE single item (one dish, product, "
+    "or entry) — never treat multiple photos, or multiple things visible in one photo, as separate "
+    "items. If a finger or hand is pointing at something, THAT is the item. The photos are context to "
+    "identify that one item: the item itself, its nutrition-facts label, a menu listing it, or the "
+    "restaurant/packaging that pins down exactly which it is. Read exact macros straight off any "
+    "nutrition label; otherwise identify the item and estimate carefully. Honor any quantity/portion "
+    "in the user's text (grams eaten, fraction of the dish, servings). Unless the text clearly says "
+    "otherwise, the intent is to log ONE nutrition entry."
+    "\nPhotos:\n{paths}]"
+)
 
 # Sentinel the model emits to silently drop a turn (wake-word false positive). Matched loosely below.
 IGNORE_SENTINEL = "__IGNORE__"
@@ -655,6 +673,35 @@ def should_reset_session(state: dict | None, agent: bool = False) -> bool:
 # --------------------------------------------------------------------------- #
 
 
+def fetch_attachments(paths: list) -> tuple[str | None, list[str]]:
+    """Download a request's attachment objects (private voice-attachments bucket, flat uuid.ext names)
+    to a temp dir so the CLI's Read tool can view them. Returns (tmpdir, local_paths); tmpdir is None
+    when nothing landed. Caller removes tmpdir after the run."""
+    tmpdir = None
+    local: list[str] = []
+    for p in paths:
+        name = str(p).strip().lstrip("/")
+        if not re.fullmatch(r"[\w.\-]+", name):   # flat bucket — reject anything path-like
+            log(f"attachment path rejected: {p!r}")
+            continue
+        try:
+            r = httpx.get(f"{SUPABASE_URL}/storage/v1/object/voice-attachments/{name}",
+                          headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
+                          timeout=30)
+            if r.status_code != 200 or not r.content:
+                log(f"attachment fetch failed ({r.status_code}): {name}")
+                continue
+            if tmpdir is None:
+                tmpdir = tempfile.mkdtemp(prefix="voice-att-")
+            fp = os.path.join(tmpdir, name)
+            with open(fp, "wb") as f:
+                f.write(r.content)
+            local.append(fp)
+        except Exception as e:  # noqa: BLE001
+            log(f"attachment fetch error: {name}: {e}")
+    return tmpdir, local
+
+
 def write_mcp_config() -> str:
     env = {"SUPABASE_URL": SUPABASE_URL, "SUPABASE_KEY": SUPABASE_KEY}
     cfg = {
@@ -672,7 +719,8 @@ def write_mcp_config() -> str:
 
 
 def run_claude(transcript: str, resume_session_id: str | None, on_event=None, system_append: str = "",
-               model: str = HUB_MODEL, agent: bool = False, cwd: str | None = None) -> dict:
+               model: str = HUB_MODEL, agent: bool = False, cwd: str | None = None,
+               allow_read: bool = False) -> dict:
     """Run `claude -p` headless and STREAM the stream-json output, parsing events as they arrive.
 
     on_event(kind, payload) fires live during the run so progress can be surfaced — currently
@@ -700,7 +748,10 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
     if agent:
         cmd += ["--dangerously-skip-permissions"]   # all native tools execute; MCP tools still present
     else:
-        cmd += ["--allowedTools", "mcp__data", "mcp__voice", "mcp__govee-lights", "mcp__petlibro-feeder"]   # MCP-only; built-ins denied
+        allowed = ["mcp__data", "mcp__voice", "mcp__govee-lights", "mcp__petlibro-feeder"]
+        if allow_read:
+            allowed.append("Read")   # photo turns only: Read is how the CLI views image files
+        cmd += ["--allowedTools", *allowed]   # MCP-only otherwise; built-ins denied
     if system_append:
         cmd += ["--append-system-prompt", system_append]
     timeout_s = AGENT_TIMEOUT_S if agent else CLAUDE_TIMEOUT_S
@@ -1235,7 +1286,9 @@ def process_request(db: Supabase, req: dict) -> None:
     # Dedup: multiple always-on listeners (ESP + Mac) hear one utterance, so it lands as several requests
     # a few seconds apart. If a near-simultaneous, near-identical transcript was already handled, drop this
     # one so the command never runs twice. v1 keeps the earlier request; quality-ranked pick comes later.
-    if _duplicate_of_recent(db, req):
+    # Typed input (source 'web') can't be double-heard — and it has no capture window, so the enqueue-time
+    # fallback would wrongly swallow two deliberate sends inside 10s. Mic sources only.
+    if (req.get("source") or "").strip() != "web" and _duplicate_of_recent(db, req):
         db.patch("voice_requests", f"id=eq.{rid}",
                  {"status": "done", "result": "(duplicate — dropped)", "updated_at": now_iso()})
         log(f"dropped duplicate request {rid}: {transcript[:60]!r}")
@@ -1301,6 +1354,17 @@ def process_request(db: Supabase, req: dict) -> None:
     # Resolve the route. Buttons + wake words set the tier directly; the typed chat box has none, so it
     # follows the chat-box route setting. TWO routes only: fast (efficiency) | power (accuracy).
     tier = (req.get("tier") or "").strip()
+    # Photo attachments (storage object names riding the request) pin the route: vision happens via the
+    # CLI's Read tool, so photos ALWAYS ride the subscription path — power tier (Opus + thinking, which
+    # nutrition estimation wants anyway), NEVER the API.
+    attachments = req.get("attachments") or []
+    if isinstance(attachments, str):
+        try:
+            attachments = json.loads(attachments)
+        except Exception:  # noqa: BLE001
+            attachments = []
+    if attachments:
+        tier = "power"
     if tier not in ("fast", "power", "custom"):
         tier = chatbox_route(db)
     think = False        # API extended-thinking on/off
@@ -1335,12 +1399,33 @@ def process_request(db: Supabase, req: dict) -> None:
     govee = govee_context()
     if govee:
         sys_ctx += "\n\n" + govee
+    # Photo turns: pull the attachment objects local so Read can view them, and put the paths + the
+    # ONE-item framing on the prompt. (attachments forced tier='power' above, so the dispatch below
+    # lands on run_claude — except Fly, intercepted first.)
+    att_tmp, att_paths = None, []
+    if attachments and WORKER_ID != "fly":
+        att_tmp, att_paths = fetch_attachments(attachments)
+        if att_paths:
+            prompt += ATTACH_DIRECTIVE.format(n=len(att_paths), paths="\n".join(att_paths))
+            log(f"attachments: {len(att_paths)} photo(s) staged in {att_tmp}")
+        else:
+            prompt += ("\n\n[The user attached photo(s), but they could not be retrieved — tell them "
+                       "that briefly instead of guessing at the contents.]")
+
     # Two routes, two strategies (see ARCHITECTURE.md):
     #  · EFFICIENCY (fast)  → clean API agent (MCP-only, Haiku), fastest device. On API error, fall back
     #    to the free subscription so Raspy never breaks.
     #  · ACCURACY  (power)  → subscription `claude -p` (Opus + thinking) on Mac → Pi. On Fly there's no
     #    subscription login, so accuracy uses the API there with the same model + thinking.
-    if tier == "custom":
+    if attachments and WORKER_ID == "fly":
+        # Photos ride the subscription path only (vision via Read; the API bills money). No subscription
+        # login on Fly, so a photo request that lands here (Mac AND Pi down) is refused, not run on the
+        # API — the same rule as custom-local: local means local.
+        log("photo request reached Fly (Mac+Pi down) — refusing the API; photos are subscription-only")
+        result = {"ok": False, "text": "",
+                  "result": "(photo request — no subscription worker up; not run on the API)",
+                  "raw_error": "no-subscription-worker", "session_id": None}
+    elif tier == "custom":
         # Custom route honors the chosen runner. 'api' = Anthropic API directly. 'local' = the free
         # subscription (claude -p on Mac/Pi) and it STAYS local — NEVER a silent API fallback (that bills
         # money the user explicitly opted out of). On Fly there's no subscription, so a 'local' command
@@ -1364,7 +1449,11 @@ def process_request(db: Supabase, req: dict) -> None:
         result = API.run(prompt, system_append=sys_ctx, on_event=_emit, model=model, think=True)  # Fly: no subscription
     else:
         result = run_claude(prompt, resume_id, on_event=_emit, system_append=sys_ctx, model=model,
-                            agent=use_agent, cwd=ag["cwd"])  # subscription, free
+                            agent=use_agent, cwd=ag["cwd"],
+                            allow_read=bool(att_paths))  # subscription, free; Read only on photo turns
+
+    if att_tmp:
+        shutil.rmtree(att_tmp, ignore_errors=True)   # staged photos served their turn
 
     if result.get("session_id"):
         write_session(session_agent, result["session_id"])
@@ -1385,14 +1474,15 @@ def process_request(db: Supabase, req: dict) -> None:
     # Tag the row with the mode so the hub UI can show this mode's thread separately and switch live.
     msg_mode = "agent" if session_agent else "hub"
     db.post("voice_messages",
-            {"request_id": rid, "focus": "hub", "mode": msg_mode, "role": "user", "text": transcript, "done": True})
+            {"request_id": rid, "focus": "hub", "mode": msg_mode, "role": "user", "text": transcript,
+             "done": True, **({"attachments": attachments} if attachments else {})})
     push_activity(text[:240], "done")  # close out the activity bar w/ the result (room for the full line)
 
     if result["ok"]:
         db.post(
             "voice_messages",
             {"request_id": rid, "focus": "hub", "mode": msg_mode, "role": "assistant",
-             "text": text, "done": True},
+             "text": text, "done": True, "worker": WORKER_ID},
         )
         db.patch(
             "voice_requests",
@@ -1413,7 +1503,7 @@ def process_request(db: Supabase, req: dict) -> None:
             db.post(
                 "voice_messages",
                 {"request_id": rid, "focus": "hub", "mode": msg_mode, "role": "assistant",
-                 "text": result["text"], "done": True},
+                 "text": result["text"], "done": True, "worker": WORKER_ID},
             )
         db.patch(
             "voice_requests",
