@@ -77,6 +77,24 @@ def _watchdog() -> None:
             os._exit(3)
 
 
+def _alive_beacon() -> None:
+    """Mic-liveness beacon: stamp voice_presence.alive_at every 30s WHILE frames are flowing (gated on
+    _last_frame, not on the process merely existing). The hub keys the 'Mac mic' indicator on whichever
+    process OWNS the mic — mac-wakefree when wake-free is on, mac-listener otherwise."""
+    while True:
+        if time.monotonic() - _last_frame < 10:
+            try:
+                httpx.post(f"{SUPABASE_URL}/rest/v1/voice_presence?on_conflict=source",
+                           headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                                    "Content-Type": "application/json",
+                                    "Prefer": "resolution=merge-duplicates,return=minimal"},
+                           json={"source": "mac-listener",
+                                 "alive_at": datetime.now(timezone.utc).isoformat()}, timeout=5)
+            except Exception:  # noqa: BLE001
+                pass
+        time.sleep(30)
+
+
 def _recompute_capture() -> None:
     (_capture.clear if (_muted.is_set() or _wakefree.is_set()) else _capture.set)()
 
@@ -676,6 +694,7 @@ def main() -> int:
     with sd.RawInputStream(samplerate=SAMPLE_RATE, blocksize=FRAME, dtype="int16", channels=1) as stream:
         _last_frame = time.monotonic()
         threading.Thread(target=_watchdog, daemon=True).start()
+        threading.Thread(target=_alive_beacon, daemon=True).start()
         oww.reset()
         while True:
                 buf, _ = stream.read(FRAME)

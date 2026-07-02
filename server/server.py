@@ -81,6 +81,10 @@ _vpause = 2.0
 # accepted, off = done. IMPORTANT: only arm this with other voices (TV!) silenced — it enrolls whoever talks.
 _enroll_left = 0     # phrases still to collect (0 = enroll mode off)
 _enroll_new = []     # embeddings collected this run
+# ESP-mic liveness: stamped on every audio message from the device; the alive beacon publishes it to
+# voice_presence.alive_at so the hub can show 'ESP mic down' when frames stop (device dead, WiFi out,
+# socket wedged) — regardless of whether the websocket object still exists.
+_last_esp_frame = 0.0
 
 # ---- Single-owner LED state ---------------------------------------------------------------------
 # The ESP has one LED and it must reflect ONE coherent state, never a race between code paths. Two
@@ -265,7 +269,7 @@ def _client_token(ws) -> str | None:
 
 
 async def connection(ws):
-    global _active_esp, _led_working, _led_capturing
+    global _active_esp, _led_working, _led_capturing, _last_esp_frame
     peer = getattr(ws, "remote_address", "?")
     # Device-token gate: enforced only when VOICE_DEVICE_TOKEN is set, so existing
     # firmware that doesn't send a token keeps working until it's updated.
@@ -308,6 +312,7 @@ async def connection(ws):
                 log.info("device %s %s dBm", peer, msg)
             continue
         pending.extend(msg)
+        _last_esp_frame = time.monotonic()   # ESP-mic liveness (feeds the alive beacon)
 
         while len(pending) >= FRAME_SAMPLES * 2:
             raw = bytes(pending[: FRAME_SAMPLES * 2])
@@ -747,6 +752,28 @@ async def _check_speaker(window_i16, win_end):
     return sim, win_end
 
 
+async def _alive_beacon() -> None:
+    """Mic-liveness beacon: stamp voice_presence.alive_at (source 'esp') every 30s WHILE audio frames
+    are arriving from the device. Gated on _last_esp_frame — real audio flow, not process/socket
+    existence — so a stale beacon always means the ESP mic is genuinely down."""
+    key = SUPABASE_SERVICE_KEY or SUPABASE_ANON_KEY
+    if not (SUPABASE_URL and key):
+        return
+    while True:
+        if _last_esp_frame and time.monotonic() - _last_esp_frame < 10:
+            try:
+                async with httpx.AsyncClient(timeout=5) as c:
+                    await c.post(f"{SUPABASE_URL}/rest/v1/voice_presence?on_conflict=source",
+                                 headers={"apikey": key, "Authorization": f"Bearer {key}",
+                                          "Content-Type": "application/json",
+                                          "Prefer": "resolution=merge-duplicates,return=minimal"},
+                                 json={"source": "esp",
+                                       "alive_at": datetime.now(timezone.utc).isoformat()})
+            except Exception:  # noqa: BLE001 — best-effort; a missed beat reads as one late beacon
+                pass
+        await asyncio.sleep(30)
+
+
 async def _publish_presence(jared: bool) -> None:
     """Upsert this ESP's row in the shared voice_presence — the system-wide 'who is hearing Jared' truth.
     Fire-and-forget on each confirmed check; any mic's fresh heard_jared_at makes the whole system
@@ -967,6 +994,7 @@ async def _settings_listener() -> None:
 async def main():
     log.info("voice backend up on :%d  wake=%s  stt=%s", PORT, WAKE_MODEL, GROQ_MODEL)
     asyncio.create_task(_settings_listener())   # Fly owns its own state (app_settings: boot + live)
+    asyncio.create_task(_alive_beacon())        # ESP-mic liveness → voice_presence.alive_at
     # ping_interval=None: the ESP32 is a continuous PCM pump and doesn't reliably answer
     # WebSocket keepalive pings, so server-initiated pings were closing the connection mid-
     # utterance ("keepalive ping timeout"). The constant audio stream keeps the socket live;

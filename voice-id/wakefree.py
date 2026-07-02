@@ -94,6 +94,24 @@ def _watchdog() -> None:
             os._exit(WATCHDOG_EXIT_CODE)
 
 
+def _alive_beacon() -> None:
+    """Mic-liveness beacon: stamp voice_presence.alive_at every 30s WHILE frames are flowing. The hub
+    shows a stale beacon as 'mic down' — the signal that would have caught the Jun 25 six-day hang.
+    Gated on _last_frame (real audio arriving), not on this process merely existing."""
+    while True:
+        if time.monotonic() - _last_frame < 10:
+            try:
+                httpx.post(f"{SUPABASE_URL}/rest/v1/voice_presence?on_conflict=source",
+                           headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                                    "Content-Type": "application/json",
+                                    "Prefer": "resolution=merge-duplicates,return=minimal"},
+                           json={"source": "mac-wakefree",
+                                 "alive_at": datetime.now(timezone.utc).isoformat()}, timeout=5)
+            except Exception:  # noqa: BLE001
+                pass
+        time.sleep(30)
+
+
 def log(msg: str) -> None:
     print(f"{datetime.now(timezone.utc).isoformat()} [wakefree] {msg}", flush=True)
 
@@ -366,6 +384,7 @@ def main() -> int:
     with sd.InputStream(samplerate=SR, channels=1, dtype="float32", blocksize=frame) as stream:
         _last_frame = time.monotonic()
         threading.Thread(target=_watchdog, daemon=True).start()
+        threading.Thread(target=_alive_beacon, daemon=True).start()
         while True:
                 chunk, _ = stream.read(frame)
                 chunk = chunk.flatten()
