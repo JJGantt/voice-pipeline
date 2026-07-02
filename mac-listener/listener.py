@@ -576,10 +576,68 @@ def transcribe(pcm: np.ndarray) -> str:
             pass
 
 
+LED_TOKEN = os.environ.get("LED_TOKEN", "")
+
+
+def _esp_blink() -> None:
+    """Blink the ESP the instant a Mac-captured command is committed (capture-accept), so both
+    working indicators start together instead of waiting for the worker's claim ping."""
+    try:
+        httpx.get(f"{JARED_VOICE_URL}/led-blink",
+                  params={"token": LED_TOKEN} if LED_TOKEN else None, timeout=3)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def open_request(tier: str, cap_start: str, cap_end: str) -> str | None:
+    """Open the command's lifecycle row at CAPTURE-ACCEPT (status 'transcribing', no transcript yet) —
+    the moment the working indicators turn on (floor lamp amber via pi-audio's realtime sub on this
+    insert; ESP blink pinged alongside). Returns the row id, or None (fall back to insert-at-enqueue)."""
+    if not SUPABASE_KEY:
+        return None
+    try:
+        r = httpx.post(f"{SUPABASE_URL}/rest/v1/voice_requests",
+                       headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                                "Content-Type": "application/json", "Prefer": "return=representation"},
+                       json={"status": "transcribing", "source": "mac", "focus": "hub",
+                             **({"tier": tier} if tier else {}),
+                             "capture_start": cap_start, "capture_end": cap_end}, timeout=6)
+        rows = r.json()
+        return rows[0]["id"] if isinstance(rows, list) and rows else None
+    except Exception as e:  # noqa: BLE001
+        log(f"open-request failed: {e}")
+        return None
+
+
+def update_request_pending(rid: str, text: str) -> None:
+    """Fill the lifecycle row in with the transcript and hand it to the workers (status 'pending')."""
+    try:
+        httpx.patch(f"{SUPABASE_URL}/rest/v1/voice_requests?id=eq.{rid}",
+                    headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                             "Content-Type": "application/json", "Prefer": "return=minimal"},
+                    json={"transcript": text, "status": "pending",
+                          "updated_at": datetime.now(timezone.utc).isoformat()}, timeout=10)
+    except Exception as e:  # noqa: BLE001
+        log(f"enqueue (update) failed: {e}")
+
+
+def close_request_error(rid: str, err: str) -> None:
+    """Close a lifecycle row whose capture never became a runnable command — turns the indicators off."""
+    try:
+        httpx.patch(f"{SUPABASE_URL}/rest/v1/voice_requests?id=eq.{rid}",
+                    headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                             "Content-Type": "application/json", "Prefer": "return=minimal"},
+                    json={"status": "error", "error": err,
+                          "updated_at": datetime.now(timezone.utc).isoformat()}, timeout=6)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def enqueue(text: str, tier: str = "", cap_start: str | None = None, cap_end: str | None = None):
-    """Insert the transcript into voice_requests (source='mac', focus='hub'). Returns the new
-    request_id (so the reply can be matched the instant it lands) or None. cap_start/cap_end stamp the
-    recording's wall-clock window so the worker can dedup the ESP+Mac pair by span overlap."""
+    """Fallback path (used when open_request failed at capture-accept): insert the finished transcript
+    into voice_requests (source='mac', focus='hub'). Returns the new request_id or None. cap_start/
+    cap_end stamp the recording's wall-clock window so the worker can dedup the ESP+Mac pair by span
+    overlap."""
     if not (SUPABASE_KEY and text):
         return None
     try:
@@ -727,6 +785,10 @@ def main() -> int:
                     pcm = capture_utterance(stream)
                     cap_end = datetime.now(timezone.utc)     # …and its end (before transcription)
                     hud("working")                      # capture done → transcribing / processing
+                    # CAPTURE ACCEPTED — the command is committed from this instant: open the lifecycle
+                    # row (lamp amber) + blink the ESP NOW, before STT runs.
+                    rid = open_request(fired_tier, cap_start.isoformat(), cap_end.isoformat())
+                    threading.Thread(target=_esp_blink, daemon=True).start()
                     # Transcription blocks stream reads (Groq / whisper.cpp) — pause the watchdog's expectation.
                     _expect_frames.clear()
                     try:
@@ -735,8 +797,13 @@ def main() -> int:
                             log(f"transcript (tier={fired_tier}): {text!r}")
                             # working/done HUD and the spoken reply are now driven UNIVERSALLY off
                             # voice_requests status + voice_speech (RealtimeFeedback) — for every source.
-                            enqueue(text, tier=fired_tier, cap_start=cap_start.isoformat(), cap_end=cap_end.isoformat())
+                            if rid:
+                                update_request_pending(rid, text)
+                            else:
+                                enqueue(text, tier=fired_tier, cap_start=cap_start.isoformat(), cap_end=cap_end.isoformat())
                         else:
+                            if rid:
+                                close_request_error(rid, "empty or failed transcription")
                             hud("off")                  # nothing intelligible → clear the local indicator
                             log("…nothing intelligible, ignoring")
                     finally:

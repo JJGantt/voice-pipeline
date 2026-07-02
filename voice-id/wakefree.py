@@ -226,12 +226,61 @@ def route_tier() -> str:
     return "fast"
 
 
+LED_TOKEN = os.environ.get("LED_TOKEN", "")
+
+
 def _esp_working() -> None:
-    """Tell the ESP a (Mac-captured) command is now being worked → its LED shows the universal 'working'
+    """Tell the ESP a (Mac-captured) command is now in flight → its LED shows the universal 'working'
     blink immediately. Without this the ESP, which also heard the utterance but dropped its own far-mic
     copy as 'not Jared', would briefly show idle before the worker's slower blink-ping lands."""
     try:
-        httpx.get(f"{JARED_VOICE_URL}/led-blink", timeout=3)
+        httpx.get(f"{JARED_VOICE_URL}/led-blink",
+                  params={"token": LED_TOKEN} if LED_TOKEN else None, timeout=3)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def open_request(tier: str, cap_start: str, cap_end: str) -> str | None:
+    """Open the command's lifecycle row at CAPTURE-ACCEPT (status 'transcribing', no transcript yet).
+    This is what turns the working indicators on — the floor lamp goes amber on this insert and the
+    ESP blink is pinged alongside it — at the earliest moment the system has committed to the command,
+    not after STT or at worker-claim. Returns the row id, or None (fall back to insert-at-enqueue)."""
+    if not SUPABASE_KEY:
+        return None
+    try:
+        r = httpx.post(f"{SUPABASE_URL}/rest/v1/voice_requests",
+                       headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                                "Content-Type": "application/json", "Prefer": "return=representation"},
+                       json={"status": "transcribing", "source": "mac", "focus": "hub", "tier": tier,
+                             "capture_start": cap_start, "capture_end": cap_end}, timeout=6)
+        rows = r.json()
+        return rows[0]["id"] if isinstance(rows, list) and rows else None
+    except Exception as e:  # noqa: BLE001
+        log(f"open-request failed: {e}")
+        return None
+
+
+def update_request_pending(rid: str, text: str) -> None:
+    """Fill the lifecycle row in with the transcript and hand it to the workers (status 'pending')."""
+    try:
+        httpx.patch(f"{SUPABASE_URL}/rest/v1/voice_requests?id=eq.{rid}",
+                    headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                             "Content-Type": "application/json", "Prefer": "return=minimal"},
+                    json={"transcript": text, "status": "pending",
+                          "updated_at": datetime.now(timezone.utc).isoformat()}, timeout=10)
+        log(f"enqueued: {text[:80]!r}")
+    except Exception as e:  # noqa: BLE001
+        log(f"enqueue (update) failed: {e}")
+
+
+def close_request_error(rid: str, err: str) -> None:
+    """Close a lifecycle row whose capture never became a runnable command — turns the indicators off."""
+    try:
+        httpx.patch(f"{SUPABASE_URL}/rest/v1/voice_requests?id=eq.{rid}",
+                    headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                             "Content-Type": "application/json", "Prefer": "return=minimal"},
+                    json={"status": "error", "error": err,
+                          "updated_at": datetime.now(timezone.utc).isoformat()}, timeout=6)
     except Exception:  # noqa: BLE001
         pass
 
@@ -476,16 +525,28 @@ def main() -> int:
                                     log("another mic still has you — suppressing this Mac partial")
                                     hud("off")
                                 else:
+                                    # CAPTURE ACCEPTED — the command is committed from this instant:
+                                    # open the lifecycle row (lamp amber) + blink the ESP NOW, pre-STT.
+                                    # Inject mode has no hub lifecycle (paste-to-window), so skip both.
+                                    inject = inject_mode()
+                                    rid = None
+                                    if not inject:
+                                        rid = open_request(route_tier(), t0_wall.isoformat(), cap_end_wall.isoformat())
+                                        threading.Thread(target=_esp_working, daemon=True).start()
                                     text = transcribe(pcm)
                                     if text:
                                         log(f"Jared → {text!r} (reason={reason})")
-                                        if inject_mode():
+                                        if inject:
                                             cue()              # local 'heard you' cue (you're at the computer; no TV round-trip)
                                             inject_text(text)  # paste into the focused Mac window + Enter (no hub)
                                             hud("listening")   # inject mode keeps the mic open → back to the waiting state
+                                        elif rid:
+                                            update_request_pending(rid, text)   # worker drives HUD/speech
                                         else:
-                                            enqueue(text, t0_wall.isoformat(), cap_end_wall.isoformat())  # worker drives HUD/speech
+                                            enqueue(text, t0_wall.isoformat(), cap_end_wall.isoformat())  # fallback: insert at enqueue
                                     else:
+                                        if rid:
+                                            close_request_error(rid, "empty or failed transcription")
                                         hud("off")
                             finally:
                                 _last_frame = time.monotonic()

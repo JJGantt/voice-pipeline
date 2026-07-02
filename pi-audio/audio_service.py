@@ -162,13 +162,86 @@ def _lamp_send(msg: dict) -> None:
         log(f"lamp send failed: {e}")
 
 
+_lamp_saved = None   # the lamp's OWN state before the working overlay — captured on the idle→working
+                     # edge, restored exactly on working→idle. The lamp is a real room light; the amber
+                     # is a temporary overlay, never allowed to end in a blind 'off'.
+
+
+def _lamp_status(timeout: float = 1.0):
+    """Query the lamp's live state over LAN (devStatus → {onOff, brightness, color, colorTemInKelvin}),
+    or None. Same protocol as govee-mcp's _lan_status_blocking."""
+    global _lamp_ip
+    if not _lamp_ip or (time.monotonic() - _lamp_scan_at) > 30:
+        _lamp_scan()
+    if not _lamp_ip:
+        return None
+    recv = send = None
+    try:
+        recv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        recv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try: recv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except OSError: pass
+        recv.bind(("0.0.0.0", LAMP_RECV_PORT))
+        recv.settimeout(timeout)
+        send = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        send.sendto(json.dumps({"msg": {"cmd": "devStatus", "data": {}}}).encode(), (_lamp_ip, LAMP_CMD_PORT))
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                data, _ = recv.recvfrom(2048)
+            except socket.timeout:
+                return None
+            try:
+                m = json.loads(data.decode()).get("msg", {})
+            except (ValueError, UnicodeDecodeError):
+                continue
+            if m.get("cmd") == "devStatus":
+                return m.get("data", {})
+    except Exception as e:  # noqa: BLE001
+        log(f"lamp status query failed: {e}")
+    finally:
+        for s in (recv, send):
+            try: s and s.close()
+            except OSError: pass
+    return None
+
+
+def _is_work_amber(st) -> bool:
+    """True if a devStatus reading is our own working overlay — guards against ever snapshotting the
+    amber itself as the 'prior' state (e.g. back-to-back commands racing the restore)."""
+    c = (st or {}).get("color") or {}
+    return (int(st.get("onOff", 0)) == 1
+            and abs(int(c.get("r", -1)) - LAMP_WORK[0]) <= 5
+            and abs(int(c.get("g", -1)) - LAMP_WORK[1]) <= 5
+            and abs(int(c.get("b", -1)) - LAMP_WORK[2]) <= 5)
+
+
 def _lamp_apply(working: bool) -> None:
+    global _lamp_saved
     if working:
+        st = _lamp_status()
+        if st is not None and not _is_work_amber(st):
+            _lamp_saved = st                     # exact prior state (on/off, brightness, color/kelvin)
         r, g, b = LAMP_WORK
         _lamp_send({"msg": {"cmd": "turn", "data": {"value": 1}}})
         _lamp_send({"msg": {"cmd": "colorwc", "data": {"color": {"r": r, "g": g, "b": b}, "colorTemInKelvin": 0}}})
     else:
-        _lamp_send({"msg": {"cmd": "turn", "data": {"value": 0}}})
+        st = _lamp_saved
+        if st is None:
+            # Never guess and never go dark: with no known prior state, leaving the amber is the only
+            # honest option (a blind 'off' kills a light he may be using).
+            log("lamp: no saved prior state — leaving as-is")
+            return
+        # Restore color/brightness FIRST (so the device's remembered state is right even when the
+        # prior state was off), then the power state.
+        if st.get("brightness") is not None:
+            _lamp_send({"msg": {"cmd": "brightness", "data": {"value": int(st["brightness"])}}})
+        color = st.get("color") or {}
+        _lamp_send({"msg": {"cmd": "colorwc",
+                            "data": {"color": {"r": int(color.get("r", 255)), "g": int(color.get("g", 255)),
+                                               "b": int(color.get("b", 255))},
+                                     "colorTemInKelvin": int(st.get("colorTemInKelvin") or 0)}}})
+        _lamp_send({"msg": {"cmd": "turn", "data": {"value": 1 if int(st.get("onOff", 0)) == 1 else 0}}})
 
 
 def _lamp_worker():
@@ -180,6 +253,7 @@ def _lamp_worker():
         _lamp_event.clear()
         if _lamp_working != last:
             last = _lamp_working
+            log(f"lamp → {'working (amber overlay)' if _lamp_working else 'restore prior state'}")
             _lamp_apply(_lamp_working)
 
 
@@ -383,11 +457,13 @@ def on_speech(payload):
 
 
 def on_request(payload):
-    """'claimed' → working lamp amber; 'done'/'error' → off. (The heard-you POP is no longer fired here — the
-    UI/browser plays it itself, synced to the moment it paints your words. See status-hub tv.js.)"""
+    """Working lamp = "a command of mine is in flight": amber from the moment a capture is ACCEPTED
+    (the capturer inserts the row as 'transcribing', before STT even runs) through pending/claimed,
+    restored to the lamp's prior state on 'done'/'error'. (The heard-you POP is no longer fired here —
+    the UI/browser plays it itself, synced to the moment it paints your words. See status-hub tv.js.)"""
     global _lamp_working
     status = str((_rec(payload)).get("status") or "")
-    if status == "claimed":
+    if status in ("transcribing", "pending", "claimed"):
         _lamp_working = True
         _lamp_render()
     elif status in ("done", "error"):
@@ -417,6 +493,7 @@ async def serve():
             ch = sock.channel("pi-audio")
             ch.on_postgres_changes("UPDATE", callback=on_presence, schema="public", table="voice_presence")
             ch.on_postgres_changes("UPDATE", callback=on_request, schema="public", table="voice_requests")
+            ch.on_postgres_changes("INSERT", callback=on_request, schema="public", table="voice_requests")
             ch.on_postgres_changes("INSERT", callback=on_speech, schema="public", table="voice_speech")
             ch.on_postgres_changes("UPDATE", callback=on_setting, schema="public", table="app_settings")
             await ch.subscribe()

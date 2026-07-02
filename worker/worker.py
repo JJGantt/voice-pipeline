@@ -1054,6 +1054,34 @@ def inject_to_terminal(text: str) -> tuple[bool, str | None]:
         return False, f"orchestrator unreachable: {e}"
 
 
+_last_transcribing_sweep = 0.0
+
+
+def sweep_stuck_transcribing(db: Supabase) -> None:
+    """Close rows stuck in 'transcribing' — the capturer opened the lifecycle row at capture-accept and
+    then died before STT finished. The transcription budget is bounded (~61s: one 30s Groq call + one
+    retry), so >90s in this state can only mean a dead capturer; erroring the row is what releases the
+    working indicators (ESP blink + floor lamp) that turned on at accept. Throttled to one sweep/30s."""
+    global _last_transcribing_sweep
+    now_mono = time.monotonic()
+    if now_mono - _last_transcribing_sweep < 30:
+        return
+    _last_transcribing_sweep = now_mono
+    try:
+        rows = db.get("voice_requests",
+                      "status=eq.transcribing&select=id,created_at&order=created_at.asc&limit=5")
+        now = datetime.now(timezone.utc)
+        for r in rows or []:
+            ts = _parse_ts(r.get("created_at") or "")
+            if ts and (now - ts).total_seconds() > 90:
+                db.patch("voice_requests", f"id=eq.{r['id']}&status=eq.transcribing",
+                         {"status": "error", "error": "transcription never completed (capturer died)",
+                          "updated_at": now_iso()})
+                log(f"closed stuck transcribing request {r['id']}")
+    except Exception as e:  # noqa: BLE001
+        log(f"transcribing sweep failed: {e}")
+
+
 def reclaim_stale(db: Supabase) -> dict | None:
     """Recover a request stuck in 'claimed' by a worker that died mid-run (OOM, sleep, power loss).
 
@@ -1108,6 +1136,7 @@ def reclaim_stale(db: Supabase) -> dict | None:
 
 def claim_one(db: Supabase) -> dict | None:
     """Find one pending request and atomically claim it. Returns the row or None."""
+    sweep_stuck_transcribing(db)
     if higher_priority_present(db):
         return None
 

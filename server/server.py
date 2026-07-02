@@ -202,13 +202,62 @@ async def _notify_transcribe_failure() -> None:
         pass
 
 
+async def _open_request(tier: str = "", cap_start: str | None = None, cap_end: str | None = None) -> str | None:
+    """Open the command's lifecycle row at CAPTURE-ACCEPT — status 'transcribing', no transcript yet.
+    This is the moment the working indicators turn on (ESP blink here, floor lamp via pi-audio's
+    realtime sub on this insert): the earliest instant the system has committed to processing the
+    command. Returns the row id, or None (no creds / insert failed → caller falls back to the old
+    insert-at-enqueue behavior)."""
+    if not (SUPABASE_URL and SUPABASE_SERVICE_KEY):
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=6) as c:
+            r = await c.post(
+                f"{SUPABASE_URL}/rest/v1/voice_requests",
+                headers={"apikey": SUPABASE_SERVICE_KEY,
+                         "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                         "Content-Type": "application/json", "Prefer": "return=representation"},
+                json={"status": "transcribing", "source": "fly", "focus": "hub",
+                      **({"tier": tier} if tier else {}),
+                      **({"capture_start": cap_start} if cap_start else {}),
+                      **({"capture_end": cap_end} if cap_end else {})},
+            )
+            rows = r.json()
+            return rows[0]["id"] if isinstance(rows, list) and rows else None
+    except Exception as e:  # noqa: BLE001
+        log.warning("open-request failed: %s", e)
+        return None
+
+
+async def _close_request_error(rid: str, err: str) -> None:
+    """Close a lifecycle row whose capture never became a runnable command (empty/failed STT) — the
+    error status is what turns the working indicators back off."""
+    if not (SUPABASE_URL and SUPABASE_SERVICE_KEY and rid):
+        return
+    try:
+        async with httpx.AsyncClient(timeout=6) as c:
+            await c.patch(
+                f"{SUPABASE_URL}/rest/v1/voice_requests?id=eq.{rid}",
+                headers={"apikey": SUPABASE_SERVICE_KEY,
+                         "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                         "Content-Type": "application/json", "Prefer": "return=minimal"},
+                json={"status": "error", "error": err,
+                      "updated_at": datetime.now(timezone.utc).isoformat()},
+            )
+    except Exception as e:  # noqa: BLE001
+        log.warning("close-request failed: %s", e)
+
+
 async def handle_transcript(text: str, duration_s: float, truncated: bool, tier: str = "",
-                            cap_start: str | None = None, cap_end: str | None = None) -> bool:
+                            cap_start: str | None = None, cap_end: str | None = None,
+                            rid: str | None = None) -> bool:
     """HANDOFF SEAM — the rest of the system hooks in here.
 
     `duration_s` is the captured length; `truncated` is True if the capture ended
     by hitting MAX_UTTERANCE_S while speech was still active (the hub surfaces this).
     `tier` ('fast'|'power'|'') comes from which wake word fired; it rides the queue row.
+    With `rid` (the lifecycle row opened at capture-accept) the transcript PATCHes that row to
+    'pending'; without one it falls back to inserting the row here.
     """
     log.info("TRANSCRIPT (%.0fs%s, tier=%s): %r", duration_s, ", TRUNCATED" if truncated else "", tier or "-", text)
     # Strip a leading wake phrase the STT often captures ("Hey Rhasspy, …" / "Hey Jarvis, …") — it's the
@@ -217,23 +266,31 @@ async def handle_transcript(text: str, duration_s: float, truncated: bool, tier:
                   "", text or "", count=1, flags=re.IGNORECASE).strip()
     if not (SUPABASE_URL and SUPABASE_ANON_KEY and text):
         return False
-    # Best-effort enqueue into the Supabase voice_requests table. The anon key is INSERT-only by RLS,
-    # so we send only the two fields and ask for no representation back. Returns whether it enqueued
-    # (the caller drives the LED: blink while the worker is working, off otherwise).
     try:
         async with httpx.AsyncClient(timeout=10) as c:
-            await c.post(
-                f"{SUPABASE_URL}/rest/v1/voice_requests",
-                headers={
-                    "apikey": SUPABASE_ANON_KEY,
-                    "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
-                    "Content-Type": "application/json",
-                    "Prefer": "return=minimal",
-                },
-                json={"transcript": text, "source": "fly", **({"tier": tier} if tier else {}),
-                      **({"capture_start": cap_start} if cap_start else {}),
-                      **({"capture_end": cap_end} if cap_end else {})},
-            )
+            if rid and SUPABASE_SERVICE_KEY:
+                await c.patch(
+                    f"{SUPABASE_URL}/rest/v1/voice_requests?id=eq.{rid}",
+                    headers={"apikey": SUPABASE_SERVICE_KEY,
+                             "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                             "Content-Type": "application/json", "Prefer": "return=minimal"},
+                    json={"transcript": text, "status": "pending",
+                          "updated_at": datetime.now(timezone.utc).isoformat()},
+                )
+            else:
+                # Fallback (no lifecycle row): insert at enqueue, as before. The anon key is INSERT-only by RLS.
+                await c.post(
+                    f"{SUPABASE_URL}/rest/v1/voice_requests",
+                    headers={
+                        "apikey": SUPABASE_ANON_KEY,
+                        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+                        "Content-Type": "application/json",
+                        "Prefer": "return=minimal",
+                    },
+                    json={"transcript": text, "source": "fly", **({"tier": tier} if tier else {}),
+                          **({"capture_start": cap_start} if cap_start else {}),
+                          **({"capture_end": cap_end} if cap_end else {})},
+                )
         return True
     except Exception as e:
         log.warning("supabase enqueue failed: %s", e)
@@ -499,20 +556,30 @@ async def connection(ws):
                         continue
                     log.info("wake-free: Jared (sim=%.2f)", sim)
 
+                # ---- CAPTURE ACCEPTED: the command is committed from this instant. Open its lifecycle
+                # row (status 'transcribing' — pi-audio turns the floor lamp amber on this insert) and
+                # flip the LED from solid (hearing you) to blink (working on it) NOW, before STT. The
+                # indicators answer "did my command go through?", so they start the moment we KNOW
+                # we're going to work, not when the worker eventually claims it.
+                rid = await _open_request(wake_tier or "", started_wall.isoformat(), end_wall.isoformat())
+                _led_capturing = False
+                _led_working = True
+                await _render_led(ws)
+                asyncio.create_task(_led_safety(ws))  # backstop in case no done-ping ever arrives
                 enqueued = False
                 try:
                     text = await transcribe(bytes(utterance))
                     enqueued = await handle_transcript(text, dur, truncated, wake_tier or "",
-                                                       started_wall.isoformat(), end_wall.isoformat())
+                                                       started_wall.isoformat(), end_wall.isoformat(), rid=rid)
                 except Exception as e:
                     log.exception("transcription failed: %s", e)
                     asyncio.create_task(_notify_transcribe_failure())
-                if enqueued:
-                    # Stay solid (capturing) until the worker's /led-blink takes over (working) and
-                    # its /led-off (done) clears everything — so the bulb never dips to off between.
-                    asyncio.create_task(_led_safety(ws))  # backstop in case no done-ping arrives
-                else:
-                    _led_capturing = False                # nothing to do → idle
+                if not enqueued:
+                    # Nothing intelligible / enqueue failed → close the lifecycle row (lamp off) and idle the LED.
+                    if rid:
+                        asyncio.create_task(_close_request_error(rid, "empty or failed transcription"))
+                    _led_working = False
+                    _led_capturing = False
                     await _render_led(ws)
                 capturing = False
                 utterance = bytearray()
@@ -975,10 +1042,34 @@ async def _settings_listener() -> None:
                 except Exception as e:  # noqa: BLE001
                     log.warning("settings apply failed: %s", e)
 
+            def _on_request(payload) -> None:
+                # Authoritative LED 'working' state from the command lifecycle itself: in flight
+                # (transcribing / pending / claimed) → blink; done/error → off. The HTTP pings
+                # (capturers at capture-accept, worker at claim/done) remain as the fast edge; this
+                # keeps the LED truthful even when a ping is lost or a capture dies mid-transcription
+                # — same source of truth as the floor lamp (pi-audio watches these very rows).
+                global _led_working, _led_capturing
+                try:
+                    rec = (payload.get("data") or {}).get("record") or {}
+                except AttributeError:
+                    return
+                status = str(rec.get("status") or "")
+                if status in ("transcribing", "pending", "claimed"):
+                    _led_working = True
+                elif status in ("done", "error"):
+                    _led_working = False
+                    _led_capturing = False
+                else:
+                    return
+                if _active_esp is not None:
+                    asyncio.create_task(_render_led(_active_esp))
+
             ch.on_postgres_changes("UPDATE", callback=_cb, schema="public", table="app_settings")
             ch.on_postgres_changes("UPDATE", callback=_on_presence, schema="public", table="voice_presence")
+            ch.on_postgres_changes("INSERT", callback=_on_request, schema="public", table="voice_requests")
+            ch.on_postgres_changes("UPDATE", callback=_on_request, schema="public", table="voice_requests")
             await ch.subscribe()
-            log.info("settings listener subscribed (app_settings + voice_presence realtime)")
+            log.info("settings listener subscribed (app_settings + voice_presence + voice_requests realtime)")
             while sock.is_connected:
                 await asyncio.sleep(1.0)
         except Exception as e:  # noqa: BLE001
