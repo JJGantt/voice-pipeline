@@ -58,6 +58,24 @@ _wakefree = threading.Event()   # set = wake-free mode on
 _capture = threading.Event()    # set = the listener should own the mic (wake-word)
 _capture.set()
 
+# CoreAudio liveness watchdog (same design as wakefree.py): the input stream is opened ONCE and never
+# stopped — mic yields are a software mute (frames read + discarded). Stopping a CoreAudio stream from
+# a paused state is what deadlocked in the HAL mutex on Jun 25 and silently killed the Mac mic for six
+# days. Frames arrive at a fixed hardware cadence, so "no frame in >10s while we expect them" can only
+# mean the stream is wedged → os._exit (no unwinding, launchd KeepAlive restarts us). _expect_frames is
+# cleared around known-blocking work (Groq transcription) where reads legitimately pause.
+_last_frame = time.monotonic()
+_expect_frames = threading.Event()
+_expect_frames.set()
+
+
+def _watchdog() -> None:
+    while True:
+        time.sleep(5)
+        if _expect_frames.is_set() and time.monotonic() - _last_frame > 10:
+            log("no audio frames for >10s — CoreAudio stream wedged; exiting for launchd restart")
+            os._exit(3)
+
 
 def _recompute_capture() -> None:
     (_capture.clear if (_muted.is_set() or _wakefree.is_set()) else _capture.set)()
@@ -117,25 +135,51 @@ def _on_ptt_stop(*_):
     _apply_mute(False)
 
 
+_wf_proc: subprocess.Popen | None = None   # current wakefree.py child — supervised, respawned on death
+
+
+def _spawn_wakefree() -> None:
+    """Start wakefree.py and supervise it: a daemon thread blocks on wait() (event-driven, no polling)
+    and respawns the child if it dies while wake-free mode is still on — e.g. its CoreAudio watchdog
+    self-exited on a wedged stream. Without this, a dead child silently took the Mac mic down for days."""
+    global _wf_proc
+    try:
+        wflog = open(os.path.expanduser("~/repos/voice-pipeline/voice-id/wakefree.out.log"), "a")
+        _wf_proc = subprocess.Popen([WAKEFREE_RUN], stdout=wflog, stderr=wflog)  # logged so capture/speaker-ID/inject is visible
+    except Exception as e:  # noqa: BLE001
+        log(f"failed to start wakefree: {e}")
+        return
+
+    def _supervise(proc: subprocess.Popen) -> None:
+        rc = proc.wait()
+        if not (_wakefree.is_set() and proc is _wf_proc):
+            return                      # deliberate stop (mode off) or an already-superseded child
+        if rc == 2:
+            log("wakefree.py exited rc=2 (fatal config — missing key/exemplars); NOT respawning")
+            return
+        log(f"wakefree.py died rc={rc} while wake-free is on — respawning")
+        time.sleep(1)                   # supervisor throttle: keeps a crash-loop from spinning hot
+        if _wakefree.is_set() and proc is _wf_proc:
+            _spawn_wakefree()
+
+    threading.Thread(target=_supervise, args=(_wf_proc,), daemon=True).start()
+
+
 def set_wakefree(on: bool) -> None:
     """Toggle wake-free mode (driven by the hub setting). On → listener yields the mic and starts
     wakefree.py; Off → stop wakefree.py and reclaim the mic for wake-word capture."""
     if on and not _wakefree.is_set():
         _wakefree.set(); _recompute_capture()
         log("wake-free ON — yielding mic, starting wakefree.py (+ ESP)")
-        try:
-            wflog = open(os.path.expanduser("~/repos/voice-pipeline/voice-id/wakefree.out.log"), "a")
-            subprocess.Popen([WAKEFREE_RUN], stdout=wflog, stderr=wflog)  # logged so capture/speaker-ID/inject is visible
-        except Exception as e:  # noqa: BLE001
-            log(f"failed to start wakefree: {e}")
+        _spawn_wakefree()
         # Pin the TTS engine warm for the whole session (don't let it idle-exit between commands and
         # cold-reload), and warm it now so the first command isn't delayed.
         _pin_tts(True); warm_tts()
         threading.Thread(target=_ping_esp_wakefree, args=(True,), daemon=True).start()
     elif not on and _wakefree.is_set():
         log("wake-free OFF — stopping wakefree.py, reclaiming mic (+ ESP)")
+        _wakefree.clear(); _recompute_capture()   # cleared FIRST so the supervisor won't respawn the kill
         subprocess.Popen(["pkill", "-f", "wakefree.py"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        _wakefree.clear(); _recompute_capture()
         _pin_tts(False)   # session over → let the daemon idle-exit and give the ~1 GB back
         threading.Thread(target=_ping_esp_wakefree, args=(False,), daemon=True).start()
 
@@ -564,6 +608,7 @@ def capture_utterance(stream) -> np.ndarray:
     Speech = RMS a few × above that floor; once we've heard speech, HANGOVER_S of sub-threshold
     frames ends the utterance.
     """
+    global _last_frame
     frames: list[np.ndarray] = []
     noise = None
     spoke = False
@@ -571,6 +616,7 @@ def capture_utterance(stream) -> np.ndarray:
     t0 = time.monotonic()
     while True:
         buf, _ = stream.read(FRAME)
+        _last_frame = time.monotonic()
         i16 = np.frombuffer(bytes(buf), dtype=np.int16)
         frames.append(i16.copy())
         rms = float(np.sqrt(np.mean((i16.astype(np.float32) / 32768.0) ** 2)))
@@ -625,15 +671,26 @@ def main() -> int:
     # safety we need now that the server's arbitrary 90s auto-clear is gone.
     _write_setting("voice_muted", "0")
 
-    while True:
-        if not _capture.is_set():
-            log("mic yielded (push-to-talk / wake-free) — waiting")
-            _capture.wait()              # block until the listener owns the mic again — event-driven
-            log("listening (wake word)")
-        with sd.RawInputStream(samplerate=SAMPLE_RATE, blocksize=FRAME, dtype="int16", channels=1) as stream:
-            oww.reset()
-            while _capture.is_set():
+    global _last_frame
+    yielded_logged = False
+    with sd.RawInputStream(samplerate=SAMPLE_RATE, blocksize=FRAME, dtype="int16", channels=1) as stream:
+        _last_frame = time.monotonic()
+        threading.Thread(target=_watchdog, daemon=True).start()
+        oww.reset()
+        while True:
                 buf, _ = stream.read(FRAME)
+                _last_frame = time.monotonic()
+                if not _capture.is_set():
+                    # Software mute: the stream stays hot (stopping it is the HAL deadlock); frames are
+                    # read and dropped so nothing buffers while push-to-talk / wake-free holds the mic.
+                    if not yielded_logged:
+                        log("mic yielded (push-to-talk / wake-free) — discarding frames, stream stays open")
+                        yielded_logged = True
+                    continue
+                if yielded_logged:
+                    yielded_logged = False
+                    oww.reset()          # fresh activation state — don't fire on stale pre-yield scores
+                    log("listening (wake word)")
                 audio = np.frombuffer(bytes(buf), dtype=np.int16)
                 scores = oww.predict(audio)
                 fast_score = scores.get(WAKE_MODEL, 0.0)
@@ -651,15 +708,21 @@ def main() -> int:
                     pcm = capture_utterance(stream)
                     cap_end = datetime.now(timezone.utc)     # …and its end (before transcription)
                     hud("working")                      # capture done → transcribing / processing
-                    text = strip_wake(transcribe(pcm))
-                    if text:
-                        log(f"transcript (tier={fired_tier}): {text!r}")
-                        # working/done HUD and the spoken reply are now driven UNIVERSALLY off
-                        # voice_requests status + voice_speech (RealtimeFeedback) — for every source.
-                        enqueue(text, tier=fired_tier, cap_start=cap_start.isoformat(), cap_end=cap_end.isoformat())
-                    else:
-                        hud("off")                      # nothing intelligible → clear the local indicator
-                        log("…nothing intelligible, ignoring")
+                    # Transcription blocks stream reads (Groq / whisper.cpp) — pause the watchdog's expectation.
+                    _expect_frames.clear()
+                    try:
+                        text = strip_wake(transcribe(pcm))
+                        if text:
+                            log(f"transcript (tier={fired_tier}): {text!r}")
+                            # working/done HUD and the spoken reply are now driven UNIVERSALLY off
+                            # voice_requests status + voice_speech (RealtimeFeedback) — for every source.
+                            enqueue(text, tier=fired_tier, cap_start=cap_start.isoformat(), cap_end=cap_end.isoformat())
+                        else:
+                            hud("off")                  # nothing intelligible → clear the local indicator
+                            log("…nothing intelligible, ignoring")
+                    finally:
+                        _last_frame = time.monotonic()
+                        _expect_frames.set()
                     oww.reset()  # clear the activation so the next wake is fresh
 
 

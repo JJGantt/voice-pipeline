@@ -67,9 +67,31 @@ ABSENT_MISSES = 2            # close only after this many CONSECUTIVE non-confir
                              # timer that can race the check cadence and cut you off between words
 
 # Push-to-talk coordination: Hammerspoon sends SIGUSR1 (pause) / SIGUSR2 (resume) while you dictate to
-# Claude, so wake-free never fights the mic or executes your dictation. set = capturing; cleared = mic released.
+# Claude, so wake-free never fights the mic or executes your dictation. set = capturing; cleared = muted.
+# The pause is a SOFTWARE mute: frames keep arriving and are discarded. The stream is never stopped —
+# AudioDeviceStop from a paused state is what deadlocked in the HAL mutex on Jun 25 and froze this
+# process for six days. CoreAudio input is shared on macOS, so holding the stream open never blocks
+# the push-to-talk recorder itself.
 _resumed = threading.Event()
 _resumed.set()
+
+# CoreAudio liveness: stream.read returns at a fixed hardware cadence (every 100ms), muted or not. The
+# watchdog fires only when that guaranteed cadence stops while we're actually reading — i.e. the stream
+# is wedged inside CoreAudio — and hard-exits WITHOUT unwinding (os._exit skips the stream teardown that
+# deadlocks). _expect_frames is cleared around known-blocking work (Groq transcription etc.) where reads
+# legitimately pause. The listener supervises this process and respawns it.
+_last_frame = time.monotonic()
+_expect_frames = threading.Event()
+_expect_frames.set()
+WATCHDOG_EXIT_CODE = 3
+
+
+def _watchdog() -> None:
+    while True:
+        time.sleep(5)
+        if _expect_frames.is_set() and time.monotonic() - _last_frame > 10:
+            log("no audio frames for >10s — CoreAudio stream wedged; exiting for respawn")
+            os._exit(WATCHDOG_EXIT_CODE)
 
 
 def log(msg: str) -> None:
@@ -294,29 +316,43 @@ def main() -> int:
 
     # Segment on speech ENERGY (any length), then verify the speaker ONCE on the trimmed utterance.
     frame = int(FRAME_S * SR)
-    # Push-to-talk releases the mic: SIGUSR1 pauses capture (closes the stream), SIGUSR2 resumes.
+    # Push-to-talk mutes in software: SIGUSR1 discards frames, SIGUSR2 resumes. The stream never stops.
     signal.signal(signal.SIGUSR1, lambda *_: _resumed.clear())
     signal.signal(signal.SIGUSR2, lambda *_: _resumed.set())
     vad_pool = ThreadPoolExecutor(max_workers=1)   # off-thread speaker checks so audio capture never stalls
 
-    while True:
-        if not _resumed.is_set():
-            log("paused (push-to-talk) — mic released")
-            _resumed.wait()                    # block until resumed — event-driven, no poll
-            log("resumed — listening")
-        seg: list[np.ndarray] = []
-        prev = np.zeros(frame, dtype=np.float32)   # 1-frame pre-roll so the first phoneme isn't clipped
-        capturing = False
-        t0 = 0.0
-        vad_future = None          # in-flight speaker check (one at a time)
-        last_check = 0.0           # when the last check was launched
-        miss = 0                   # consecutive non-confirming checks since the last confirm
-        jared_seen = False         # confirmed Jared at all this utterance?
-        last_confirm = None        # wall-clock of the last confirm (send-suppression vs the other mic)
-        with sd.InputStream(samplerate=SR, channels=1, dtype="float32", blocksize=frame) as stream:
-            while _resumed.is_set():
+    global _last_frame
+    seg: list[np.ndarray] = []
+    prev = np.zeros(frame, dtype=np.float32)   # 1-frame pre-roll so the first phoneme isn't clipped
+    capturing = False
+    t0 = 0.0
+    vad_future = None          # in-flight speaker check (one at a time)
+    last_check = 0.0           # when the last check was launched
+    miss = 0                   # consecutive non-confirming checks since the last confirm
+    jared_seen = False         # confirmed Jared at all this utterance?
+    last_confirm = None        # wall-clock of the last confirm (send-suppression vs the other mic)
+    paused_logged = False
+    with sd.InputStream(samplerate=SR, channels=1, dtype="float32", blocksize=frame) as stream:
+        _last_frame = time.monotonic()
+        threading.Thread(target=_watchdog, daemon=True).start()
+        while True:
                 chunk, _ = stream.read(frame)
                 chunk = chunk.flatten()
+                _last_frame = time.monotonic()
+                if not _resumed.is_set():
+                    if capturing:              # drop any partial capture — dictation isn't a command
+                        capturing = False
+                        seg = []
+                        vad_future = None
+                        hud("off")
+                    if not paused_logged:
+                        log("paused (push-to-talk) — muted in software, stream stays open")
+                        paused_logged = True
+                    prev = np.zeros(frame, dtype=np.float32)
+                    continue
+                if paused_logged:
+                    paused_logged = False
+                    log("resumed — listening")
                 now = time.monotonic()
                 voiced = float(np.sqrt(np.mean(chunk ** 2))) >= ENERGY_GATE
 
@@ -378,25 +414,32 @@ def main() -> int:
                                 log(f"never confirmed Jared ({audio_s:.1f}s) — skipped")
                             hud("off")
                         else:                          # tracked as Jared live → no end-of-utterance re-check
-                            other = other_heard_jared()  # shared presence: is another mic still on you?
-                            suppressed = (other is not None and last_confirm is not None
-                                          and (datetime.now(timezone.utc) - other).total_seconds() <= 1.5
-                                          and other > last_confirm + timedelta(seconds=0.3))
-                            if suppressed:               # ESP clearly heard you later → this is the partial; drop it
-                                log("another mic still has you — suppressing this Mac partial")
-                                hud("off")
-                            else:
-                                text = transcribe(pcm)
-                                if text:
-                                    log(f"Jared → {text!r} (reason={reason})")
-                                    if inject_mode():
-                                        cue()              # local 'heard you' cue (you're at the computer; no TV round-trip)
-                                        inject_text(text)  # paste into the focused Mac window + Enter (no hub)
-                                        hud("listening")   # inject mode keeps the mic open → back to the waiting state
-                                    else:
-                                        enqueue(text, t0_wall.isoformat(), cap_end_wall.isoformat())  # worker drives HUD/speech
-                                else:
+                            # Blocking network work (presence check + Groq + enqueue) pauses stream reads —
+                            # tell the watchdog frames are legitimately not arriving until we're back.
+                            _expect_frames.clear()
+                            try:
+                                other = other_heard_jared()  # shared presence: is another mic still on you?
+                                suppressed = (other is not None and last_confirm is not None
+                                              and (datetime.now(timezone.utc) - other).total_seconds() <= 1.5
+                                              and other > last_confirm + timedelta(seconds=0.3))
+                                if suppressed:               # ESP clearly heard you later → this is the partial; drop it
+                                    log("another mic still has you — suppressing this Mac partial")
                                     hud("off")
+                                else:
+                                    text = transcribe(pcm)
+                                    if text:
+                                        log(f"Jared → {text!r} (reason={reason})")
+                                        if inject_mode():
+                                            cue()              # local 'heard you' cue (you're at the computer; no TV round-trip)
+                                            inject_text(text)  # paste into the focused Mac window + Enter (no hub)
+                                            hud("listening")   # inject mode keeps the mic open → back to the waiting state
+                                        else:
+                                            enqueue(text, t0_wall.isoformat(), cap_end_wall.isoformat())  # worker drives HUD/speech
+                                    else:
+                                        hud("off")
+                            finally:
+                                _last_frame = time.monotonic()
+                                _expect_frames.set()
                 prev = chunk
 
 
