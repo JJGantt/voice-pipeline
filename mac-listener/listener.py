@@ -74,6 +74,15 @@ def _watchdog() -> None:
         time.sleep(5)
         if _expect_frames.is_set() and time.monotonic() - _last_frame > 10:
             log("no audio frames for >10s — CoreAudio stream wedged; exiting for launchd restart")
+            # os._exit skips ALL cleanup, so a 'listening'/'working' pill that was open at the instant
+            # the stream wedged (e.g. the Mac slept mid-capture) would stay frozen on screen — the
+            # 'listening' state has no self-timeout. Clear it SYNCHRONOUSLY (not the fire-and-forget
+            # hud()) so it lands before we exit. Restart's startup reset (below) is the backstop.
+            try:
+                subprocess.run([HS_BIN, "-c", 'VoiceHUD("off")'],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+            except Exception:  # noqa: BLE001
+                pass
             os._exit(3)
 
 
@@ -746,6 +755,10 @@ def main() -> int:
     # nothing is dictating. This un-sticks a voice_muted left set by a crash mid-dictation — the only
     # safety we need now that the server's arbitrary 90s auto-clear is gone.
     _write_setting("voice_muted", "0")
+    # Same self-heal for the HUD: a prior instance that died mid-capture (watchdog os._exit, SIGKILL, or
+    # a forced sleep) can leave the 'listening' pill frozen on screen. A fresh listener means the mic is
+    # idle, so clear it now — every (re)start un-sticks a stale overlay.
+    hud("off")
 
     global _last_frame
     yielded_logged = False
