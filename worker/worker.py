@@ -189,7 +189,12 @@ ORCH_TOKEN = os.environ.get("ORCH_TOKEN", "")
 
 # Timing
 HEARTBEAT_INTERVAL_S = 10.0
-IDLE_POLL_S = 1.0
+# Idle-claim cadence. Realtime is the wake signal (INSERT → instant claim); the poll is only a
+# safety net, so while the subscription is healthy it can be slow — at 1s the three workers were
+# hammering Supabase with ~280k reads/day of empty [] (a real chunk of the free-plan egress quota).
+# When realtime is down/degraded the poll IS the pickup path, so it tightens to near the old cadence.
+IDLE_POLL_S = 15.0            # realtime subscribed — poll is just a missed-event backstop
+IDLE_POLL_DEGRADED_S = 2.0    # realtime down — polling is the only pickup path, stay snappy
 HEARTBEAT_FRESH_S = 30.0      # a higher-priority worker counts as "present" within this
 DEDUP_WINDOW_S = 10.0         # fallback only: 2 mics' enqueue times for rows that predate capture-window stamping
 DEDUP_TOL_S = 0.75            # pad each recording window by this (Fly↔Mac clock skew + ESP→Fly stream latency)
@@ -1546,6 +1551,7 @@ REALTIME_ENABLED = os.environ.get("REALTIME", "1").strip().lower() not in ("0", 
 class RealtimeWaker:
     def __init__(self):
         self.event = threading.Event()
+        self.healthy = False   # True only while the voice_requests subscription is live — drives the poll cadence
         self._loop = None
         self._sock = None
         self._started = False
@@ -1558,7 +1564,7 @@ class RealtimeWaker:
         try:
             import realtime  # noqa: F401 — probe availability before spawning the thread
         except Exception as e:  # noqa: BLE001 — missing lib must not break the worker; just poll
-            log(f"realtime listener unavailable ({e}); falling back to {IDLE_POLL_S}s polling")
+            log(f"realtime listener unavailable ({e}); falling back to {IDLE_POLL_DEGRADED_S}s polling")
             return
         self._started = True
         self._loop = asyncio.new_event_loop()
@@ -1590,6 +1596,7 @@ class RealtimeWaker:
                     await asyncio.sleep(1.0)
             except Exception as e:  # noqa: BLE001
                 log(f"realtime listener error: {e}; retrying in 5s (poll fallback active)")
+            self.healthy = False   # disconnected (or never subscribed) → main loop tightens its poll
             try:
                 if self._sock:
                     await self._sock.close()
@@ -1602,6 +1609,7 @@ class RealtimeWaker:
         self.event.set()  # a command was enqueued → wake the main loop now
 
     def _on_sub(self, state, err=None) -> None:
+        self.healthy = "SUBSCRIBED" in str(state).upper()   # any other state (TIMED_OUT/CLOSED/ERROR) → degraded poll
         log(f"realtime subscription: {state}{(' err=' + str(err)) if err else ''}")
 
     def wait(self, timeout: float) -> bool:
@@ -1730,9 +1738,10 @@ def main() -> int:
             while _running:
                 processed = one_iteration(db)
                 # Loop quickly if we just worked (drain the queue); else wait for the next INSERT.
-                # waker.wait wakes instantly on a realtime INSERT, else times out after IDLE_POLL_S.
+                # waker.wait wakes instantly on a realtime INSERT; the timeout is only the missed-event
+                # backstop — slow while the subscription is healthy, tight when realtime is down.
                 if not processed:
-                    waker.wait(IDLE_POLL_S)
+                    waker.wait(IDLE_POLL_S if waker.healthy else IDLE_POLL_DEGRADED_S)
         finally:
             hb_stop.set()
 
