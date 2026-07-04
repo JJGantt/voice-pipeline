@@ -245,9 +245,12 @@ ATTACH_DIRECTIVE = (
     "items. If a finger or hand is pointing at something, THAT is the item. The photos are context to "
     "identify that one item: the item itself, its nutrition-facts label, a menu listing it, or the "
     "restaurant/packaging that pins down exactly which it is. Read exact macros straight off any "
-    "nutrition label; otherwise identify the item and estimate carefully. Honor any quantity/portion "
-    "in the user's text (grams eaten, fraction of the dish, servings). Unless the text clearly says "
-    "otherwise, the intent is to log ONE nutrition entry."
+    "nutrition label; otherwise identify the item and estimate carefully. A nutrition-facts label with "
+    "no other text is the whole package eaten — if the label states multiple servings per container, "
+    "multiply the per-serving macros by that count; don't log just one serving. Honor any quantity/"
+    "portion given in the user's text instead (grams eaten, fraction of the dish, 'one serving') — "
+    "that overrides the whole-package default. Unless the text clearly says otherwise, the intent is "
+    "to log ONE nutrition entry."
     "\nPhotos:\n{paths}]"
 )
 
