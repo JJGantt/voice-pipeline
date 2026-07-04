@@ -1336,14 +1336,27 @@ def process_request(db: Supabase, req: dict) -> None:
     quick = source == "web-quick"
     audio = source in ("fly", "mac", "web-quick")   # transcribed (mishear-prone); typed text is excluded
     prompt = transcript
-    # Give the model the real current date/time (worker-local, i.e. Jared's timezone on Mac/Pi) so any
-    # relative date resolves correctly — without it the model defaults to its training era (e.g. logging
-    # "yesterday" against 2024). Rides on the prompt, NOT the cached system block, so it can't change the
-    # per-command system prefix and break the API's prompt cache.
-    _now = datetime.now().astimezone()
-    prompt += ("\n\n[Current date and time: " + _now.strftime("%A, %B %-d, %Y, %-I:%M %p %Z") + " ("
+    # Give the model the current wall clock so any relative date resolves correctly — without it the
+    # model defaults to its training era (e.g. logging "yesterday" against 2024). Pure wall-clock, no
+    # timezone concept: prefer the REQUESTING DEVICE's own clock (client_now, sent by the phone/browser)
+    # over this worker machine's clock — the worker runs on the Mac/Pi, which is only "wherever Jared is"
+    # when the request actually came from home; the ESP puck has no clock of its own to report either,
+    # so it falls back here too, which is correct since it's fixed at home. Rides on the prompt, NOT the
+    # cached system block, so it can't change the per-command system prefix and break the prompt cache.
+    client_now = (req.get("client_now") or "").strip()
+    _m = re.match(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})$", client_now)
+    if _m:
+        _now = datetime(*(int(x) for x in _m.groups()))
+        _now_str = _now.strftime("%A, %B %-d, %Y, %-I:%M %p")
+    else:
+        _now = datetime.now().astimezone()
+        _now_str = _now.strftime("%A, %B %-d, %Y, %-I:%M %p %Z")
+    prompt += ("\n\n[The current wall-clock time, right now, is " + _now_str + " ("
                + _now.strftime("%Y-%m-%d") + "). Resolve any relative date/time — 'today', 'yesterday', "
-               "'last night', 'this morning', 'last week' — against THIS, never your training data.]")
+               "'last night', 'this morning', 'last week' — against THIS, never your training data. When "
+               "logging something for 'now' (no different time named), pass this exact moment as "
+               "occurred_at (YYYY-MM-DDTHH:MM:SS) to the logging tool explicitly rather than omitting it "
+               "— the tool's own clock may not be wherever this was actually said/typed.]")
     if audio:
         prompt += WAKE_NOISE_DIRECTIVE
     if quick:
