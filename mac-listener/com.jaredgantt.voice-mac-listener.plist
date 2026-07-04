@@ -1,17 +1,27 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Always-on Mac voice listener. Install with:
-       cp com.jaredgantt.voice-mac-listener.plist ~/Library/LaunchAgents/
-       launchctl load ~/Library/LaunchAgents/com.jaredgantt.voice-mac-listener.plist
-     First run will need Microphone permission granted (System Settings → Privacy → Microphone). -->
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>com.jaredgantt.voice-mac-listener</string>
-  <key>ProgramArguments</key>
-  <array><string>/Users/jaredgantt/repos/voice-pipeline/mac-listener/run.sh</string></array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/Users/jaredgantt/repos/voice-pipeline/mac-listener/listener.out.log</string>
-  <key>StandardErrorPath</key><string>/Users/jaredgantt/repos/voice-pipeline/mac-listener/listener.err.log</string>
+	<key>KeepAlive</key>
+	<true/>
+	<!-- Interactive exempts this agent from launchd's efficiency management. Without it, the KeepAlive
+	     respawn after a crash/watchdog exit gets parked ("pended nondemand spawn = inefficient") and the
+	     mic silently stays dead — observed for 24h after the Jul 3 CoreAudio-wedge exit. -->
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>Label</key>
+	<string>com.jaredgantt.voice-mac-listener</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/jaredgantt/repos/voice-pipeline/mac-listener/run.sh</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/jaredgantt/repos/voice-pipeline/mac-listener/listener.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/jaredgantt/repos/voice-pipeline/mac-listener/listener.out.log</string>
+	<key>WorkingDirectory</key>
+	<string>/Users/jaredgantt/repos/voice-pipeline/mac-listener</string>
 </dict>
 </plist>

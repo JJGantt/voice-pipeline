@@ -1666,6 +1666,31 @@ def _heartbeat_loop(stop_evt: threading.Event) -> None:
             stop_evt.wait(HEARTBEAT_INTERVAL_S)
 
 
+LISTENER_LABEL = "com.jaredgantt.voice-mac-listener"
+
+
+def _listener_supervisor(stop_evt: threading.Event) -> None:
+    """Mac only: revive the wake-word listener whenever its launchd job is dead. launchd's KeepAlive is
+    NOT sufficient on this macOS — it parks the respawn of an exited agent ("pended nondemand spawn =
+    inefficient"), which left the Mac mic silently dead for 24h after the Jul 3 CoreAudio-wedge exit.
+    A demand spawn (launchctl kickstart) always works, so the always-on worker checks the job every 60s
+    and kicks it if it has no PID. The listener's own wedge path now re-execs in place (no exit at all);
+    this covers everything else: hard crashes, jetsam kills, and login-time RunAtLoad spawns that launchd
+    also pends."""
+    while not stop_evt.is_set():
+        try:
+            out = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=10).stdout
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) == 3 and parts[2] == LISTENER_LABEL and parts[0] == "-":
+                    log(f"listener job dead (last status {parts[1]}) — kickstarting")
+                    subprocess.run(["launchctl", "kickstart", f"gui/{os.getuid()}/{LISTENER_LABEL}"],
+                                   capture_output=True, timeout=10)
+        except Exception as e:  # noqa: BLE001
+            log(f"listener supervisor error: {e}")
+        stop_evt.wait(60)
+
+
 def main() -> int:
     if not SUPABASE_KEY:
         print("FATAL: SUPABASE_KEY is required (service_role key). See README.",
@@ -1698,6 +1723,8 @@ def main() -> int:
         # command takes, and the queued follow-up runs HERE, next, resuming the same conversation.
         hb_stop = threading.Event()
         threading.Thread(target=_heartbeat_loop, args=(hb_stop,), name="heartbeat", daemon=True).start()
+        if WORKER_ID == "mac":   # the Mac mic's keeper — see _listener_supervisor
+            threading.Thread(target=_listener_supervisor, args=(hb_stop,), name="listener-supervisor", daemon=True).start()
 
         try:
             while _running:

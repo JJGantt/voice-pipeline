@@ -62,8 +62,13 @@ _capture.set()
 # stopped — mic yields are a software mute (frames read + discarded). Stopping a CoreAudio stream from
 # a paused state is what deadlocked in the HAL mutex on Jun 25 and silently killed the Mac mic for six
 # days. Frames arrive at a fixed hardware cadence, so "no frame in >10s while we expect them" can only
-# mean the stream is wedged → os._exit (no unwinding, launchd KeepAlive restarts us). _expect_frames is
-# cleared around known-blocking work (Groq transcription) where reads legitimately pause.
+# mean the stream is wedged → os.execv(run.sh): replace this process image in place (same PID, no Python
+# unwinding — as safe as os._exit for the HAL-mutex concern) so the restart NEVER depends on launchd.
+# Relying on launchd KeepAlive is what took the mic down for 24h on Jul 3: this macOS parks the respawn
+# of an exited agent ("pended nondemand spawn = inefficient") indefinitely; only a demand spawn
+# (launchctl kickstart) is reliable. os._exit(3) remains only as the fallback if execv itself fails —
+# the worker's listener supervisor then kickstarts the job. _expect_frames is cleared around
+# known-blocking work (Groq transcription) where reads legitimately pause.
 _last_frame = time.monotonic()
 _expect_frames = threading.Event()
 _expect_frames.set()
@@ -73,17 +78,21 @@ def _watchdog() -> None:
     while True:
         time.sleep(5)
         if _expect_frames.is_set() and time.monotonic() - _last_frame > 10:
-            log("no audio frames for >10s — CoreAudio stream wedged; exiting for launchd restart")
-            # os._exit skips ALL cleanup, so a 'listening'/'working' pill that was open at the instant
+            log("no audio frames for >10s — CoreAudio stream wedged; re-execing in place")
+            # The restart skips ALL cleanup, so a 'listening'/'working' pill that was open at the instant
             # the stream wedged (e.g. the Mac slept mid-capture) would stay frozen on screen — the
             # 'listening' state has no self-timeout. Clear it SYNCHRONOUSLY (not the fire-and-forget
-            # hud()) so it lands before we exit. Restart's startup reset (below) is the backstop.
+            # hud()) so it lands before we restart. Restart's startup reset (below) is the backstop.
             try:
                 subprocess.run([HS_BIN, "-c", 'VoiceHUD("off")'],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
             except Exception:  # noqa: BLE001
                 pass
-            os._exit(3)
+            run_sh = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run.sh")
+            try:
+                os.execv(run_sh, [run_sh])   # same PID, fresh process image — launchd never consulted
+            except OSError:
+                os._exit(3)   # last resort; the worker's listener supervisor kickstarts the job
 
 
 def _alive_beacon() -> None:
