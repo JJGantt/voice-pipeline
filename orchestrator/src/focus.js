@@ -1,8 +1,12 @@
-// Focus controller. Polls voice_focus id=1 and reconciles the world:
+// Focus controller. Watches voice_focus id=1 and reconciles the world:
 //   focus = <session id>  -> close that session's desk tab, spawn a pty
 //                            running `claude --resume <id>`, advertise terminal_url.
 //   focus = 'hub'         -> kill the pty, re-open the desk tab for whatever
 //                            was last focused, clear terminal_url.
+// A realtime subscription reconciles the instant the row changes (faster than the old 2s poll ever
+// was); polling survives only as a missed-event backstop — 60s while the subscription is healthy,
+// FOCUS_POLL_MS when it isn't. The always-2s poll was ~43k Supabase reads/day of unchanged rows.
+import { createClient } from '@supabase/supabase-js';
 import { config, terminalUrl } from './config.js';
 import { getFocus, patchFocus } from './supabase.js';
 import { cwdFromSessionFile } from './sessions.js';
@@ -102,13 +106,33 @@ async function tick() {
   }
 }
 
+let rtHealthy = false; // voice_focus subscription live → the poll is only a backstop
+
 export function startFocusWatcher() {
   // Initialize currentFocus to whatever's there now WITHOUT acting, so a
   // daemon restart while a session is focused doesn't immediately re-spawn.
   // We simply let the first tick reconcile from a clean slate.
   tick();
-  timer = setInterval(tick, config.FOCUS_POLL_MS);
+  // Realtime: any change to the focus row reconciles immediately. Our own patchFocus writes echo
+  // back as events too — harmless, reconcile() is idempotent against currentFocus.
+  try {
+    const supa = createClient(config.SUPABASE_URL, config.SUPABASE_KEY);
+    supa.channel('orch-focus')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'voice_focus' }, tick)
+      .subscribe((status) => {
+        rtHealthy = status === 'SUBSCRIBED';
+        console.log('[focus] realtime:', status);
+      });
+  } catch (e) {
+    console.error('[focus] realtime unavailable (polling at FOCUS_POLL_MS):', e.message);
+  }
+  // Adaptive backstop: a setTimeout chain (not setInterval) so the cadence follows rtHealthy.
+  const loop = () => {
+    tick();
+    timer = setTimeout(loop, rtHealthy ? 60000 : config.FOCUS_POLL_MS);
+  };
+  timer = setTimeout(loop, config.FOCUS_POLL_MS);
   return () => {
-    if (timer) clearInterval(timer);
+    if (timer) clearTimeout(timer);
   };
 }

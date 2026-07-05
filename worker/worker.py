@@ -495,6 +495,21 @@ def _parse_ts(s: str):
             return None
 
 
+# worker_presence reads are cached briefly: heartbeats only update every HEARTBEAT_INTERVAL_S (10s),
+# so a fresher read returns identical data, and every consumer tolerates HEARTBEAT_FRESH_S (30s) of
+# staleness — reading it on every claim iteration was just egress noise.
+_presence_cache = {"rows": None, "at": 0.0}
+PRESENCE_CACHE_S = 10.0
+
+
+def presence_rows(db: Supabase) -> list:
+    now = time.monotonic()
+    if _presence_cache["rows"] is None or now - _presence_cache["at"] > PRESENCE_CACHE_S:
+        _presence_cache["rows"] = db.get("worker_presence", "select=worker,last_seen") or []
+        _presence_cache["at"] = now
+    return _presence_cache["rows"]
+
+
 def higher_priority_present(db: Supabase) -> bool:
     """True if any worker ranked ABOVE me in WORKER_PRIORITY has a fresh heartbeat."""
     try:
@@ -505,7 +520,7 @@ def higher_priority_present(db: Supabase) -> bool:
     higher = set(WORKER_PRIORITY[:my_rank])
     if not higher:
         return False
-    rows = db.get("worker_presence", "select=worker,last_seen")
+    rows = presence_rows(db)
     now = datetime.now(timezone.utc)
     for row in rows:
         if row.get("worker") in higher:
@@ -1161,7 +1176,7 @@ def reclaim_stale(db: Supabase) -> dict | None:
     if not rows:
         return None
     presence = {r.get("worker"): _parse_ts(r.get("last_seen", ""))
-                for r in db.get("worker_presence", "select=worker,last_seen")}
+                for r in presence_rows(db)}   # ≤10s-stale is fine — the liveness window is 30s
     now = datetime.now(timezone.utc)
     for req in rows:
         owner = req.get("claimed_by") or ""
