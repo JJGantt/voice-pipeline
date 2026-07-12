@@ -14,6 +14,7 @@ on screen via the Hammerspoon overlay HUD (see hud()).
 import asyncio
 import os
 import re
+import resource
 import signal
 import subprocess
 import sys
@@ -74,25 +75,46 @@ _expect_frames = threading.Event()
 _expect_frames.set()
 
 
+def _self_reexec(reason: str) -> None:
+    """Replace this process image in place (same PID) — a fresh process means a fresh FD table AND a fresh
+    CoreAudio HAL client, the one reliable recovery from a wedged audio stack or fd exhaustion, and it never
+    depends on launchd (whose KeepAlive respawn this macOS parks indefinitely). The restart skips ALL
+    cleanup, so a 'listening'/'working' pill open at the instant we bail would stay frozen on screen — clear
+    it SYNCHRONOUSLY first (startup also resets it as a backstop). os._exit(3) is the last resort if execv
+    itself fails; the worker's listener supervisor then kickstarts the job."""
+    log(f"self-heal: re-execing in place — {reason}")
+    try:
+        subprocess.run([HS_BIN, "-c", 'VoiceHUD("off")'],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+    except Exception:  # noqa: BLE001
+        pass
+    run_sh = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run.sh")
+    try:
+        os.execv(run_sh, [run_sh])   # same PID, fresh process image — launchd never consulted
+    except OSError:
+        os._exit(3)   # last resort; the worker's listener supervisor kickstarts the job
+
+
+def _raise_fd_limit() -> None:
+    """macOS ships a 256 soft fd limit; a descriptor leak (or just many concurrent sockets/models) reaches
+    it fast, and getaddrinfo then fails with a DNS-looking '[Errno 8] nodename nor servname' that masks the
+    real cause. Raise the soft limit toward the hard cap so any residual leak takes vastly longer to bite —
+    the belt to the self-heal's braces."""
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = min(hard, 8192)
+        if soft < target:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+            log(f"raised fd soft limit {soft} → {target} (hard {hard})")
+    except Exception as e:  # noqa: BLE001
+        log(f"could not raise fd limit: {e}")
+
+
 def _watchdog() -> None:
     while True:
         time.sleep(5)
         if _expect_frames.is_set() and time.monotonic() - _last_frame > 10:
-            log("no audio frames for >10s — CoreAudio stream wedged; re-execing in place")
-            # The restart skips ALL cleanup, so a 'listening'/'working' pill that was open at the instant
-            # the stream wedged (e.g. the Mac slept mid-capture) would stay frozen on screen — the
-            # 'listening' state has no self-timeout. Clear it SYNCHRONOUSLY (not the fire-and-forget
-            # hud()) so it lands before we restart. Restart's startup reset (below) is the backstop.
-            try:
-                subprocess.run([HS_BIN, "-c", 'VoiceHUD("off")'],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
-            except Exception:  # noqa: BLE001
-                pass
-            run_sh = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run.sh")
-            try:
-                os.execv(run_sh, [run_sh])   # same PID, fresh process image — launchd never consulted
-            except OSError:
-                os._exit(3)   # last resort; the worker's listener supervisor kickstarts the job
+            _self_reexec("no audio frames for >10s — CoreAudio input stream wedged")
 
 
 def _alive_beacon() -> None:
@@ -172,19 +194,36 @@ def _on_ptt_stop(*_):
 
 
 _wf_proc: subprocess.Popen | None = None   # current wakefree.py child — supervised, respawned on death
+_wf_deaths: list[float] = []               # monotonic times of recent rapid deaths → crash-loop detection
+WF_RAPID_S = 30            # a child that dies in under this never got healthy (a real session runs minutes)
+WF_STORM_N = 5            # this many rapid deaths in the window = the audio stack is wedged, not the child
+WF_STORM_WINDOW_S = 120
+WF_BACKOFF_MAX_S = 8
 
 
 def _spawn_wakefree() -> None:
     """Start wakefree.py and supervise it: a daemon thread blocks on wait() (event-driven, no polling)
     and respawns the child if it dies while wake-free mode is still on — e.g. its CoreAudio watchdog
-    self-exited on a wedged stream. Without this, a dead child silently took the Mac mic down for days."""
+    self-exited on a wedged stream. Without this, a dead child silently took the Mac mic down for days.
+
+    Self-heal: a persistently wedged CoreAudio subsystem kills the child within seconds, over and over —
+    respawning can't fix a wedge that lives in the audio stack, not the child. That crash-loop used to (a)
+    leak a log fd every spawn until the listener hit [Errno 24] and went fully deaf, and (b) spin ~hot. So
+    now we close the parent's log handle each spawn, back off exponentially on a fast loop, and after
+    WF_STORM_N rapid deaths escalate to the same in-place re-exec the mic watchdog uses — a fresh image
+    clears both the wedged HAL client and any fd pressure. A healthy run (>WF_RAPID_S) resets the counter."""
     global _wf_proc
+    started = time.monotonic()
+    wflog = None
     try:
         wflog = open(os.path.expanduser("~/repos/voice-pipeline/voice-id/wakefree.out.log"), "a")
         _wf_proc = subprocess.Popen([WAKEFREE_RUN], stdout=wflog, stderr=wflog)  # logged so capture/speaker-ID/inject is visible
     except Exception as e:  # noqa: BLE001
         log(f"failed to start wakefree: {e}")
         return
+    finally:
+        if wflog is not None:
+            wflog.close()   # the child inherited its own dup; the parent MUST NOT keep this fd (leaked one per respawn → [Errno 24])
 
     def _supervise(proc: subprocess.Popen) -> None:
         rc = proc.wait()
@@ -193,8 +232,20 @@ def _spawn_wakefree() -> None:
         if rc == 2:
             log("wakefree.py exited rc=2 (fatal config — missing key/exemplars); NOT respawning")
             return
-        log(f"wakefree.py died rc={rc} while wake-free is on — respawning")
-        time.sleep(1)                   # supervisor throttle: keeps a crash-loop from spinning hot
+        now = time.monotonic()
+        lifetime = now - started
+        _wf_deaths[:] = [t for t in _wf_deaths if now - t < WF_STORM_WINDOW_S]   # only deaths in the window count
+        if lifetime >= WF_RAPID_S:
+            _wf_deaths.clear()          # a healthy session clears the crash-loop history
+            backoff = 1
+        else:
+            _wf_deaths.append(now)
+            if len(_wf_deaths) >= WF_STORM_N:
+                _self_reexec(f"wakefree crash-loop ({WF_STORM_N} deaths in <{WF_STORM_WINDOW_S}s) — audio stack wedged, not the child")
+                return                  # unreachable: execv replaced the image
+            backoff = min(WF_BACKOFF_MAX_S, 2 ** len(_wf_deaths))
+        log(f"wakefree.py died rc={rc} after {lifetime:.0f}s while wake-free is on — respawning in {backoff}s")
+        time.sleep(backoff)
         if _wakefree.is_set() and proc is _wf_proc:
             _spawn_wakefree()
 
@@ -746,6 +797,7 @@ def main() -> int:
         print(f"FATAL: no GROQ_API_KEY and whisper.cpp not found ({WHISPER_BIN}).", file=sys.stderr)
         return 2
 
+    _raise_fd_limit()   # headroom before we open models, sockets, and the wakefree supervisor
     log(f"loading wake models: fast={WAKE_MODEL!r} power={WAKE_MODEL_POWER!r} (threshold {WAKE_THRESHOLD})…")
     oww = Model(wakeword_models=[WAKE_MODEL, WAKE_MODEL_POWER], inference_framework="onnx")
     log(f"listening — 'Hey Rhasspy' (fast/Haiku) or 'Hey Jarvis' (power/Opus)  (stt={stt}, hangover={HANGOVER_S}s)")
