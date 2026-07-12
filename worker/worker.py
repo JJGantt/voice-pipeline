@@ -268,31 +268,29 @@ ATTACH_DIRECTIVE = (
 # Sentinel the model emits to silently drop a turn (wake-word false positive). Matched loosely below.
 IGNORE_SENTINEL = "__IGNORE__"
 
-# Always-on voice listeners (ESP, Mac) occasionally false-trigger on noise/silence, so the transcript
-# can be a mishear, not a real request (a stray word, or a Whisper artifact like "thank you" from
-# silence). Appended to transcribed turns so the model can drop obvious noise instead of earnestly
-# answering it. Transcribed sources only — typed input is intentional and never gets this.
-WAKE_NOISE_DIRECTIVE = (
-    "\n\n[This text came from an always-on voice wake-word listener that frequently FALSE-TRIGGERS on "
-    "background noise or silence, so it is often a mis-transcription rather than a real instruction. This "
-    "system ONLY handles actual commands, requests, or questions you can act on. If the text is NOT a "
-    "genuine actionable request — that includes bare pleasantries or acknowledgements ('thank you', "
-    "'thanks', 'okay', 'you', 'bye', 'cool'), lone stray words ('speed'), filler, or anything nonsensical "
-    "or blatantly unrelated — then it is almost certainly a false trigger: do NOT respond, do NOT thank "
-    "them back, do NOT ask for clarification. Reply with EXACTLY "
-    f"'{IGNORE_SENTINEL}' and nothing else. BUT a clear, well-formed command or question is ALWAYS a real "
-    "request — even if it is identical to one you just handled (a deliberate retry), AND even if it is "
-    "preceded or surrounded by a garbled fragment or a misheard wake word (e.g. a stray 'aspie' / 'raspy' "
-    "at the start). In that case, mentally strip the junk and ACT on the real command — do NOT discard the "
-    "whole utterance. Because this is speech-to-text, individual WORDS are also often misheard as near-"
-    "homophones — correct them to the intended meaning using the conversation context (e.g. 'permit'→"
-    "'commit', 'lock'→'log', a word that phonetically matches an obvious action or a staged/logged/listed "
-    "item) instead of taking the garbled word literally or asking what they meant. "
-    f"Use '{IGNORE_SENTINEL}' ONLY when there is NO actionable request anywhere in the text. This also "
-    "covers YOU talking but NOT commanding — testing, narrating, thinking aloud, chatting, or explicitly "
-    f"saying you don't need anything done: for ALL of those, reply with EXACTLY '{IGNORE_SENTINEL}'. NEVER "
-    "explain that there's nothing to do or that it isn't a command (no 'this is background talk', no "
-    "'nothing to log') — that explanation gets read ALOUD, which is exactly what must not happen.]"
+# Always-on mics hear the WHOLE room — the TV, Jared talking to his cats, other people talking to or
+# near him — and speaker-ID can't tell "a command for the assistant" from "Jared said a sentence out
+# loud." Almost none of it is gibberish; it's real, grammatical speech that simply isn't ADDRESSED to
+# the assistant. So the gate is not "is this noise?" but "is this a command/question meant for ME?"
+# Appended to transcribed turns only — typed input is intentional and never gets this.
+ADDRESSING_DIRECTIVE = (
+    "\n\n[This text came from an always-on mic that hears the whole room — the TV, Jared talking to his "
+    "cats or to other people, others talking near him — so MOST of what reaches you was NOT said to you. "
+    "It is almost never gibberish; it is real, grammatical speech that simply isn't addressed to the "
+    "assistant. Act ONLY on an utterance that is clearly a command, request, or question directed at YOU. "
+    "If it reads as anything else — talking to a person or a pet, a reaction or an aside ('come on', 'eat "
+    "your food, idiots'), commentary, a snippet of TV or conversation, thinking aloud — reply with EXACTLY "
+    f"'{IGNORE_SENTINEL}' and nothing else. Being well-formed does NOT make it yours: a coherent sentence "
+    "aimed at someone else is still ignored. Tell-tales it is NOT for you: it addresses a third party "
+    "(names, 'you guys', pet talk, insults like 'idiots'), it's a reply within an ongoing conversation, or "
+    "it only glancingly resembles a command. Do NOT manufacture a command from ambient speech just because "
+    "a word happens to sound like an action or a staged/logged/listed item — that is exactly how room-talk "
+    "gets mis-executed (e.g. 'eat your food' is NOT 'commit the staged meal'). Lean HARD toward ignoring "
+    "when acting would cause a STATE CHANGE (logging, committing, deleting, editing): a missed real command "
+    "just costs a repeat, but a false one corrupts his data. ONLY when a word is plainly misheard WITHIN an "
+    "utterance already clearly aimed at you should you correct it to its intended meaning ('permit'→'commit', "
+    "'lock'→'log') and act. When you ignore, output ONLY the sentinel — NEVER explain that it wasn't a "
+    "command or that there's nothing to do; that explanation would be read ALOUD.]"
 )
 
 # Voice (ESP/Mac) turns: the worker speaks the final WRITTEN reply itself — programmatically, via the Pi
@@ -1420,7 +1418,7 @@ def process_request(db: Supabase, req: dict) -> None:
         push_activity(text[:260], "tool")  # direct push → instant activity bar; full width like the rest
 
     # Per-source prompt directives (ride only on the prompt handed to Claude, never shown in the thread):
-    #  · transcribed sources (ESP/Mac/quick-FAB) get false-positive awareness so noise mis-hears drop,
+    #  · transcribed sources (ESP/Mac/quick-FAB) get the addressing gate so room-talk not aimed at the agent drops,
     #  · the quick-add FAB additionally gets the terse fits-in-the-chip reply format.
     source = (req.get("source") or "").strip()
     quick = source == "web-quick"
@@ -1448,7 +1446,7 @@ def process_request(db: Supabase, req: dict) -> None:
                "occurred_at (YYYY-MM-DDTHH:MM:SS) to the logging tool explicitly rather than omitting it "
                "— the tool's own clock may not be wherever this was actually said/typed.]")
     if audio:
-        prompt += WAKE_NOISE_DIRECTIVE
+        prompt += ADDRESSING_DIRECTIVE
     if quick:
         prompt += QUICK_REPLY_DIRECTIVE
     if source in ("fly", "mac"):
