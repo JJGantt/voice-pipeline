@@ -196,6 +196,12 @@ HEARTBEAT_INTERVAL_S = 10.0
 IDLE_POLL_S = 15.0            # realtime subscribed — poll is just a missed-event backstop
 IDLE_POLL_DEGRADED_S = 2.0    # realtime down — polling is the only pickup path, stay snappy
 HEARTBEAT_FRESH_S = 30.0      # a higher-priority worker counts as "present" within this
+# Worker affinity: a LIVE hub context window stays pinned to the worker that owns it (the last worker to
+# claim), overriding priority, so the conversation + its machine-local context aren't lost to a needless
+# switch. Affinity releases only when the window resets (idle > session_reset_s / new day) or the owner goes
+# silent past this grace — longer than HEARTBEAT_FRESH_S so a brief owner hiccup can't cause a context-losing
+# switch, short enough that a genuinely-offline owner hands off promptly (then the new owner starts fresh).
+OWNER_GRACE_S = 90.0
 DEDUP_WINDOW_S = 10.0         # fallback only: 2 mics' enqueue times for rows that predate capture-window stamping
 DEDUP_TOL_S = 0.75            # pad each recording window by this (Fly↔Mac clock skew + ESP→Fly stream latency)
 SESSION_IDLE_RESET_S = 5 * 60       # default reset budget (5min idle); hub setting session_reset_s overrides
@@ -548,6 +554,50 @@ def higher_priority_present(db: Supabase) -> bool:
             if ts and (now - ts).total_seconds() <= HEARTBEAT_FRESH_S:
                 return True
     return False
+
+
+def context_owner(db: Supabase) -> str | None:
+    """The worker that owns the currently-LIVE hub context window, or None if there is no live window
+    (idle past the reset budget, or a new calendar day) or its owner is offline. Derived purely from the
+    shared voice_requests log — the worker that claimed the most recent request — so it needs no extra
+    state and every worker computes the same answer. This is what lets a live context stay on its owner
+    even when a higher-priority worker is available: only a reset or the owner going offline releases it.
+    (One tiny indexed lookup per claim attempt — a single ~60-byte row.)"""
+    rows = db.get(
+        "voice_requests",
+        "claimed_by=not.is.null&order=claimed_at.desc&limit=1&select=claimed_by,claimed_at",
+    )
+    if not rows:
+        return None
+    owner = rows[0].get("claimed_by")
+    claimed_at = _parse_ts(rows[0].get("claimed_at") or "")
+    if not owner or not claimed_at:
+        return None
+    now = datetime.now(timezone.utc)
+    # Same "is the window still live?" test the local session uses: idle budget + calendar-day rollover.
+    if (now - claimed_at).total_seconds() > session_reset_s():
+        return None
+    if claimed_at.astimezone().date() != now.astimezone().date():
+        return None
+    # A live context is only worth pinning if its owner can actually serve it — check the owner heartbeat.
+    for row in presence_rows(db):
+        if row.get("worker") == owner:
+            ts = _parse_ts(row.get("last_seen", ""))
+            if ts and (now - ts).total_seconds() <= OWNER_GRACE_S:
+                return owner
+            return None   # owner went offline → release affinity so a fallback can take over
+    return None
+
+
+def should_defer(db: Supabase) -> bool:
+    """Whether THIS worker should NOT claim right now. Affinity first: if a live context window is owned by
+    a DIFFERENT worker that is still online, defer to it so the conversation stays on one worker and keeps
+    its context — this OVERRIDES normal priority. If I own the live window, claim (continue my own context).
+    Otherwise (no live window, or the owner went offline) fall back to priority ordering."""
+    owner = context_owner(db)
+    if owner is not None:
+        return owner != WORKER_ID
+    return higher_priority_present(db)
 
 
 # --------------------------------------------------------------------------- #
@@ -1231,7 +1281,7 @@ def reclaim_stale(db: Supabase) -> dict | None:
 def claim_one(db: Supabase) -> dict | None:
     """Find one pending request and atomically claim it. Returns the row or None."""
     sweep_stuck_transcribing(db)
-    if higher_priority_present(db):
+    if should_defer(db):
         return None
 
     pending = db.get(
