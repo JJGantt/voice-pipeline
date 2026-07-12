@@ -342,6 +342,26 @@ AGENT_SYSTEM = (
 )
 
 
+# Jared changes this same data OUT OF BAND while you work — via the hub's own UI (an "add set" button,
+# inline edit/delete controls) and via other voice turns a DIFFERENT worker may handle with its own separate
+# memory (continuity is machine-local; the fast path has none at all). So the conversation you remember is
+# not a reliable mirror of the live data. Appended to BOTH framings so every path treats the data — what the
+# tools return — as ground truth, never memory.
+SHARED_STATE_NOTE = (
+    "IMPORTANT — you are NOT the only one changing this data. Jared edits it himself in real time: the hub "
+    "has on-screen buttons (including an 'add set' button) plus inline edit and delete controls, and some "
+    "turns are handled by a different machine that does not share your memory. So your conversation history "
+    "is NOT a reliable record of the current state — it may be stale, partial, or reset between turns. Never "
+    "assume the data is in whatever state your memory implies. Treat the DATA ITSELF, what the tools return, "
+    "as the only source of truth: when a current value or count matters, READ it fresh with a read tool "
+    "instead of trusting what you remember doing. When a request is additive — 'add another set', 'log one "
+    "more', 'add a fourth' — just perform that ONE addition against the current data; do NOT judge it "
+    "'already done' because you recall adding something earlier, and do NOT reconcile to a remembered target "
+    "count. And NEVER delete, revert, or 'correct' existing data to match what you expected — data that "
+    "differs from your memory is Jared's own manual change, not a mistake. Do exactly what the request asks."
+)
+
+
 # Govee lights the model can control — pulled from the auto-synced Supabase govee_devices table and
 # injected into the system prompt every turn, so the model acts on "the floor lamp" immediately
 # instead of burning a round-trip on a list tool. Cached in-process (30 min) to avoid a per-command DB hit.
@@ -1431,7 +1451,7 @@ def process_request(db: Supabase, req: dict) -> None:
 
     # Role framing first, then the live govee device list (when there are lights). Full-agent mode swaps the
     # locked-down hub framing for the unrestricted all-purpose framing.
-    sys_ctx = AGENT_SYSTEM if use_agent else HUB_SYSTEM
+    sys_ctx = (AGENT_SYSTEM if use_agent else HUB_SYSTEM) + "\n\n" + SHARED_STATE_NOTE
     govee = govee_context()
     if govee:
         sys_ctx += "\n\n" + govee
