@@ -572,12 +572,19 @@ def context_owner(db: Supabase) -> str | None:
     if not owner or not claimed_at:
         return None
     now = datetime.now(timezone.utc)
+    age = (now - claimed_at).total_seconds()
     # Same "is the window still live?" test the local session uses: idle budget + calendar-day rollover.
-    if (now - claimed_at).total_seconds() > session_reset_s():
+    if age > session_reset_s():
         return None
     if claimed_at.astimezone().date() != now.astimezone().date():
         return None
-    # A live context is only worth pinning if its owner can actually serve it — check the owner heartbeat.
+    # Liveness: a claim IS proof the owner was running. If it claimed within the grace window, treat the
+    # owner as alive WITHOUT a presence read — this survives a briefly-unavailable presence query (e.g. the
+    # Mac just woke and its worker_presence GET timed out), which otherwise let a waking higher-priority
+    # worker wrongly STEAL a live window from the owner that had handled a command seconds earlier.
+    if age <= OWNER_GRACE_S:
+        return owner
+    # Older claim (still inside the window): fall back to the heartbeat to confirm the owner is still up.
     for row in presence_rows(db):
         if row.get("worker") == owner:
             ts = _parse_ts(row.get("last_seen", ""))
