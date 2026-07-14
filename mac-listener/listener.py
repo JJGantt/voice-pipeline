@@ -494,8 +494,14 @@ class RealtimeFeedback:
                 ch.on_postgres_changes("UPDATE", callback=self._on_presence,
                                        schema="public", table="voice_presence")
                 await ch.subscribe(self._on_sub)
-                while self._sock.is_connected:
+                # A realtime socket can go HALF-OPEN (is_connected stays True while no events flow), which
+                # silently stops the mute + wake-free reactions until a manual restart — the same failure
+                # the Fly server hit. Don't trust is_connected forever: recycle the socket every ~5 min so a
+                # half-open one is torn down and rebuilt instead of staying deaf.
+                started = time.monotonic()
+                while self._sock.is_connected and (time.monotonic() - started) < 300.0:
                     await asyncio.sleep(1.0)
+                log("realtime feedback recycling socket (proactive half-open guard)")
             except Exception as e:  # noqa: BLE001
                 log(f"realtime feedback error: {e}; retrying in 5s")
             try:
