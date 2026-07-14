@@ -1015,6 +1015,13 @@ def _apply_setting(key, value) -> None:
         _load_voiceid_bg()   # refresh thresholds / voiceprint live
 
 
+# Durable settings-realtime: a Supabase realtime socket can go HALF-OPEN (is_connected stays True while no
+# events flow), which silently stranded the ESP mute for days. So the listener never trusts the socket alone
+# — it re-reads the flags on a short poll as a backstop AND proactively recycles the socket on a timer.
+SETTINGS_POLL_S = 20.0          # backstop re-read of the flags (catches a change realtime silently dropped)
+SETTINGS_SOCKET_MAX_S = 300.0   # recycle the realtime socket this often so a half-open one can't stay deaf
+
+
 async def _settings_listener() -> None:
     """Restore state from app_settings on boot, then react to hub changes live over realtime — so the
     ESP's mode survives server restarts and hub toggles even with the Mac off."""
@@ -1070,8 +1077,24 @@ async def _settings_listener() -> None:
             ch.on_postgres_changes("UPDATE", callback=_on_request, schema="public", table="voice_requests")
             await ch.subscribe()
             log.info("settings listener subscribed (app_settings + voice_presence + voice_requests realtime)")
-            while sock.is_connected:
-                await asyncio.sleep(1.0)
+            started = time.monotonic()
+            while sock.is_connected and (time.monotonic() - started) < SETTINGS_SOCKET_MAX_S:
+                await asyncio.sleep(SETTINGS_POLL_S)
+                # Backstop: re-read the flags and apply anything that drifted from our in-memory state —
+                # catches (and logs) a change realtime silently dropped, so a half-open socket can't leave
+                # the ESP mute / inject / wake-free stuck on a stale value.
+                try:
+                    s = _get_settings(["wakefree_enabled", "voice_muted", "wakefree_route", "voice_inject_mode"])
+                    for k, cur in (("voice_muted", _suppressed), ("voice_inject_mode", _inject),
+                                   ("wakefree_enabled", _wakefree)):
+                        if k in s and _truthy(s[k]) != cur:
+                            log.warning("settings backstop: realtime missed %s → applying from poll", k)
+                            _apply_setting(k, s[k])
+                    if "wakefree_route" in s and str(s["wakefree_route"]) != _wake_route:
+                        _apply_setting("wakefree_route", s["wakefree_route"])
+                except Exception as e:  # noqa: BLE001
+                    log.warning("settings backstop poll failed: %s", e)
+            log.info("settings listener recycling realtime socket (connected=%s)", sock.is_connected)
         except Exception as e:  # noqa: BLE001
             log.warning("settings listener error: %s; retry in 5s", e)
         try:
