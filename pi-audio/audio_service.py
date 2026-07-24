@@ -29,8 +29,9 @@ VOICE     = os.environ.get("KOKORO_VOICE", "af_heart")
 STREAM_RATE  = 24000     # Kokoro's native rate → no resample for speech; PipeWire upconverts to the HDMI's 48k
 STREAM_CHUNK = 600       # frames per pipe write (~25ms) — small so enqueued audio is picked up fast (low lag)
 
-# Toggle cache, mirrored from app_settings (boot fetch + realtime UPDATE). Default on.
-_toggles = {"audio_processing_sound": True, "audio_spoken_reply": True}
+# Toggle cache, mirrored from app_settings (boot fetch + realtime UPDATE). Spoken reply defaults OFF:
+# the TV is not used as a voice speaker (Jared's call), so replies stay silent unless explicitly turned on.
+_toggles = {"audio_processing_sound": True, "audio_spoken_reply": False}
 _hearing = False             # currently hearing Jared? the cue fires on the FALLING edge (he stopped)
 _hearing_clear = None        # timer that detects the falling edge once presence goes stale
 _kok = None                  # resident Kokoro-ONNX synthesizer
