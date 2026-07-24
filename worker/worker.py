@@ -200,6 +200,14 @@ HEARTBEAT_INTERVAL_S = 30.0
 IDLE_POLL_S = 60.0            # realtime subscribed — poll is just a missed-event backstop
 IDLE_POLL_DEGRADED_S = 2.0    # realtime down — polling is the only pickup path, stay snappy
 HEARTBEAT_FRESH_S = 90.0      # a higher-priority worker counts as "present" within this (≥3× the beat)
+# Standby stand-down: a worker that's deferring to a healthy higher-priority worker (normally the Mac)
+# does no useful work, so it drops to a much slower heartbeat + idle poll. Realtime still wakes it on any
+# real command, and it ramps straight back to the active cadence the instant the primary goes silent — so
+# the only cost is a slightly slower failover, which is fine (which worker claims doesn't matter).
+# STANDBY_HEARTBEAT_S MUST stay < HEARTBEAT_FRESH_S so a standing-by worker never looks dead to the workers
+# below it (which would let two fallbacks claim at once when the primary dies).
+STANDBY_HEARTBEAT_S = 60.0   # deferring → beat at 60s (still < 90s fresh) instead of 30s
+STANDBY_POLL_S = 120.0       # deferring → idle-poll every 120s (realtime carries real commands)
 # Worker affinity: a LIVE hub context window stays pinned to the worker that owns it (the last worker to
 # claim), overriding priority, so the conversation + its machine-local context aren't lost to a needless
 # switch. Affinity releases only when the window resets (idle > session_reset_s / new day) or the owner goes
@@ -528,6 +536,11 @@ def _parse_ts(s: str):
 # staleness — reading it on every claim iteration was just egress noise.
 _presence_cache = {"rows": None, "at": 0.0}
 PRESENCE_CACHE_S = 30.0
+
+# True while this worker is standing by (deferring to a healthy higher-priority worker). Set each claim
+# attempt in claim_one; read by the heartbeat thread and the main loop to pick the slow standby cadence.
+# A plain bool is safe here: one writer (the main loop), and the GIL makes the read/write atomic.
+_standby = False
 
 
 def presence_rows(db: Supabase) -> list:
@@ -1289,9 +1302,12 @@ def reclaim_stale(db: Supabase) -> dict | None:
 
 def claim_one(db: Supabase) -> dict | None:
     """Find one pending request and atomically claim it. Returns the row or None."""
+    global _standby
     sweep_stuck_transcribing(db)
     if should_defer(db):
+        _standby = True   # a higher-priority worker is handling things → stand down to the slow cadence
         return None
+    _standby = False      # I'm eligible to claim → run the active cadence
 
     pending = db.get(
         "voice_requests",
@@ -1757,7 +1773,8 @@ def _heartbeat_loop(stop_evt: threading.Event) -> None:
     the main loop. Otherwise its presence goes stale mid-task and a lower-priority worker poaches the
     user's follow-up — running it against a different machine/session and losing the conversation context.
     A rapid follow-up is the user tagging an extra thought onto the same thread, so it MUST queue on the
-    same worker and resume the same session. Fires immediately, then every HEARTBEAT_INTERVAL_S."""
+    same worker and resume the same session. Fires immediately, then every HEARTBEAT_INTERVAL_S (or the
+    slower STANDBY_HEARTBEAT_S while this worker is standing by)."""
     with httpx.Client(timeout=HTTP_TIMEOUT_S) as hb_client:
         hb_db = Supabase(hb_client)
         while not stop_evt.is_set():
@@ -1765,7 +1782,8 @@ def _heartbeat_loop(stop_evt: threading.Event) -> None:
                 heartbeat(hb_db)
             except Exception as e:  # noqa: BLE001
                 log(f"heartbeat thread error: {e}")
-            stop_evt.wait(HEARTBEAT_INTERVAL_S)
+            # Standing by → beat slowly (but still < HEARTBEAT_FRESH_S so we never look dead).
+            stop_evt.wait(STANDBY_HEARTBEAT_S if _standby else HEARTBEAT_INTERVAL_S)
 
 
 LISTENER_LABEL = "com.jaredgantt.voice-mac-listener"
@@ -1835,7 +1853,16 @@ def main() -> int:
                 # waker.wait wakes instantly on a realtime INSERT; the timeout is only the missed-event
                 # backstop — slow while the subscription is healthy, tight when realtime is down.
                 if not processed:
-                    waker.wait(IDLE_POLL_S if waker.healthy else IDLE_POLL_DEGRADED_S)
+                    # Cadence: realtime down → poll fast (it's the only pickup path); else standing by →
+                    # poll rarely (realtime wakes us on real commands, and we ramp back the instant the
+                    # primary goes silent); else the normal healthy backstop.
+                    if not waker.healthy:
+                        wait_s = IDLE_POLL_DEGRADED_S
+                    elif _standby:
+                        wait_s = STANDBY_POLL_S
+                    else:
+                        wait_s = IDLE_POLL_S
+                    waker.wait(wait_s)
         finally:
             hb_stop.set()
 
