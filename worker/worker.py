@@ -187,21 +187,25 @@ def ping_esp_led(state: str) -> None:
 ORCH_URL = os.environ.get("ORCH_URL", "http://localhost:7682")
 ORCH_TOKEN = os.environ.get("ORCH_TOKEN", "")
 
-# Timing
-HEARTBEAT_INTERVAL_S = 10.0
+# Timing. Realtime (the voice_requests INSERT subscription) is the instant pickup path; every poll here
+# is ONLY a backstop for when realtime misses or drops an event. So while the subscription is healthy the
+# cadence is deliberately slow, tightening (IDLE_POLL_DEGRADED_S) only when realtime is actually down.
+# Both the Mac primary and the Pi fallback run this same slow cadence on purpose: which worker ends up
+# claiming a request isn't worth polling hard for — realtime wakes whichever one should take it.
+HEARTBEAT_INTERVAL_S = 30.0
 # Idle-claim cadence. Realtime is the wake signal (INSERT → instant claim); the poll is only a
 # safety net, so while the subscription is healthy it can be slow — at 1s the three workers were
 # hammering Supabase with ~280k reads/day of empty [] (a real chunk of the free-plan egress quota).
-# When realtime is down/degraded the poll IS the pickup path, so it tightens to near the old cadence.
-IDLE_POLL_S = 15.0            # realtime subscribed — poll is just a missed-event backstop
+# When realtime is down/degraded the poll IS the pickup path, so it tightens to stay snappy.
+IDLE_POLL_S = 60.0            # realtime subscribed — poll is just a missed-event backstop
 IDLE_POLL_DEGRADED_S = 2.0    # realtime down — polling is the only pickup path, stay snappy
-HEARTBEAT_FRESH_S = 30.0      # a higher-priority worker counts as "present" within this
+HEARTBEAT_FRESH_S = 90.0      # a higher-priority worker counts as "present" within this (≥3× the beat)
 # Worker affinity: a LIVE hub context window stays pinned to the worker that owns it (the last worker to
 # claim), overriding priority, so the conversation + its machine-local context aren't lost to a needless
 # switch. Affinity releases only when the window resets (idle > session_reset_s / new day) or the owner goes
 # silent past this grace — longer than HEARTBEAT_FRESH_S so a brief owner hiccup can't cause a context-losing
 # switch, short enough that a genuinely-offline owner hands off promptly (then the new owner starts fresh).
-OWNER_GRACE_S = 90.0
+OWNER_GRACE_S = 150.0
 DEDUP_WINDOW_S = 10.0         # fallback only: 2 mics' enqueue times for rows that predate capture-window stamping
 DEDUP_TOL_S = 0.75            # pad each recording window by this (Fly↔Mac clock skew + ESP→Fly stream latency)
 SESSION_IDLE_RESET_S = 5 * 60       # default reset budget (5min idle); hub setting session_reset_s overrides
@@ -519,11 +523,11 @@ def _parse_ts(s: str):
             return None
 
 
-# worker_presence reads are cached briefly: heartbeats only update every HEARTBEAT_INTERVAL_S (10s),
-# so a fresher read returns identical data, and every consumer tolerates HEARTBEAT_FRESH_S (30s) of
+# worker_presence reads are cached briefly: heartbeats only update every HEARTBEAT_INTERVAL_S (30s),
+# so a fresher read returns identical data, and every consumer tolerates HEARTBEAT_FRESH_S (90s) of
 # staleness — reading it on every claim iteration was just egress noise.
 _presence_cache = {"rows": None, "at": 0.0}
-PRESENCE_CACHE_S = 10.0
+PRESENCE_CACHE_S = 30.0
 
 
 def presence_rows(db: Supabase) -> list:
@@ -1251,7 +1255,7 @@ def reclaim_stale(db: Supabase) -> dict | None:
     if not rows:
         return None
     presence = {r.get("worker"): _parse_ts(r.get("last_seen", ""))
-                for r in presence_rows(db)}   # ≤10s-stale is fine — the liveness window is 30s
+                for r in presence_rows(db)}   # ≤30s-stale is fine — the liveness window is 90s
     now = datetime.now(timezone.utc)
     for req in rows:
         owner = req.get("claimed_by") or ""

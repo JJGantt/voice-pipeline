@@ -23,8 +23,10 @@ export const config = {
   // Where Claude Code stores per-session transcripts.
   PROJECTS_DIR: process.env.CLAUDE_PROJECTS_DIR || path.join(HOME, '.claude/projects'),
 
-  // Polling intervals (ms).
-  FOCUS_POLL_MS: parseInt(process.env.FOCUS_POLL_MS || '2000', 10),
+  // Polling intervals (ms). FOCUS_POLL_MS is the DEGRADED focus cadence used only while the realtime
+  // subscription is down; while it's healthy focus.js backstops at 60s. A focus change is a user picking
+  // a session on the wall — fine to catch within ~10s when the instant realtime path is unavailable.
+  FOCUS_POLL_MS: parseInt(process.env.FOCUS_POLL_MS || '10000', 10),
   REGISTRY_POLL_MS: parseInt(process.env.REGISTRY_POLL_MS || '15000', 10),
 
   // pty default geometry.
