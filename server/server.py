@@ -1018,7 +1018,9 @@ def _apply_setting(key, value) -> None:
 # Durable settings-realtime: a Supabase realtime socket can go HALF-OPEN (is_connected stays True while no
 # events flow), which silently stranded the ESP mute for days. So the listener never trusts the socket alone
 # — it re-reads the flags on a short poll as a backstop AND proactively recycles the socket on a timer.
-SETTINGS_POLL_S = 20.0          # backstop re-read of the flags (catches a change realtime silently dropped)
+SETTINGS_POLL_S = 60.0          # backstop re-read of the flags (catches a change realtime silently dropped);
+                                # realtime applies changes instantly via _cb, so this is only the rare-miss
+                                # net, and SETTINGS_SOCKET_MAX_S recycles a half-open socket independently
 SETTINGS_SOCKET_MAX_S = 300.0   # recycle the realtime socket this often so a half-open one can't stay deaf
 
 

@@ -1853,13 +1853,14 @@ def main() -> int:
                 # waker.wait wakes instantly on a realtime INSERT; the timeout is only the missed-event
                 # backstop — slow while the subscription is healthy, tight when realtime is down.
                 if not processed:
-                    # Cadence: realtime down → poll fast (it's the only pickup path); else standing by →
-                    # poll rarely (realtime wakes us on real commands, and we ramp back the instant the
-                    # primary goes silent); else the normal healthy backstop.
-                    if not waker.healthy:
-                        wait_s = IDLE_POLL_DEGRADED_S
-                    elif _standby:
+                    # Cadence, standby FIRST: a standing-by worker polls rarely regardless of realtime
+                    # health — it isn't the one claiming, realtime wakes it on real commands, and it ramps
+                    # back the instant the primary goes silent (should_defer flips false). Only the ACTIVE
+                    # worker tightens to the degraded 2s poll when realtime drops; otherwise healthy backstop.
+                    if _standby:
                         wait_s = STANDBY_POLL_S
+                    elif not waker.healthy:
+                        wait_s = IDLE_POLL_DEGRADED_S
                     else:
                         wait_s = IDLE_POLL_S
                     waker.wait(wait_s)
