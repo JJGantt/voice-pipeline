@@ -53,7 +53,10 @@ FLOOR_SKU  = os.environ.get("FLOOR_SKU", "H6072")
 LAMP_MCAST = ("239.255.255.250", 4001)
 LAMP_RECV_PORT, LAMP_CMD_PORT = 4002, 4003
 LAMP_WORK  = (255, 120, 0)     # amber — a command is processing (Working)
-LAMP_ENABLED = os.environ.get("LAMP_ENABLED", "1") not in ("0", "false", "off", "no", "")
+# DISABLED for now (Jared's call): the working-indicator lamp no longer changes color while a command
+# is processing. All the lamp code below is left intact — re-enable by flipping this default back to "1"
+# (or setting LAMP_ENABLED=1 in the env). With this off, _lamp_worker never starts and _lamp_render no-ops.
+LAMP_ENABLED = os.environ.get("LAMP_ENABLED", "0") not in ("0", "false", "off", "no", "")
 _lamp_ip = None
 _lamp_scan_at = 0.0
 _lamp_working = False           # a voice_request is 'claimed' (processing) — set by on_request
