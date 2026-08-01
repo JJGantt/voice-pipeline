@@ -89,12 +89,70 @@ _expect_frames.set()
 WATCHDOG_EXIT_CODE = 3
 
 
+def _lid_closed() -> bool:
+    """True when the laptop lid is shut — see the listener's copy for why this gate exists. Checked only
+    when the watchdog is about to bail, and unreadable state counts as open."""
+    try:
+        out = subprocess.run(["/usr/sbin/ioreg", "-r", "-k", "AppleClamshellState", "-d", "4"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except Exception:  # noqa: BLE001
+        return False
+    return '"AppleClamshellState" = Yes' in out
+
+
+def _open_input_stream(frame: int):
+    """Open the capture stream, waiting out a closed lid instead of dying into a respawn loop — the
+    listener respawns this process on any exit, so an unhandled PortAudioError against a powered-down
+    HAL becomes a tight restart cycle. A PortAudioError with the lid OPEN is a real fault and still
+    propagates."""
+    waited = False
+    while True:
+        stream = sd.InputStream(samplerate=SR, channels=1, dtype="float32", blocksize=frame)
+        try:
+            stream.start()      # where a powered-down HAL actually fails; a second start() in `with` is a no-op
+        except sd.PortAudioError as exc:
+            stream.close()
+            if not _lid_closed():
+                raise
+            if not waited:
+                log(f"lid closed — CoreAudio won't bind an input stream ({exc}); waiting for it to open")
+                waited = True
+            time.sleep(5)
+            continue
+        if waited:
+            log("lid open — capture stream bound")
+        return stream
+
+
 def _watchdog() -> None:
+    """Exit for respawn on a wedged stream — but never while the lid is shut. The listener respawns this
+    process on rc=3, so a lid-closed exit loop is a two-process version of the same ~15s thrash that ran
+    all night on 2026-08-01 (`wakefree.py died rc=3 after 13s`, over and over). With the lid down there is
+    no working HAL to respawn onto; hold, and let the >10s test judge the stream once it opens.
+
+    `baseline` is the watchdog's own reference so _last_frame stays the honest mic-liveness signal that
+    _alive_beacon reports to the hub."""
+    lid_shut = False
+    baseline = time.monotonic()
     while True:
         time.sleep(5)
-        if _expect_frames.is_set() and time.monotonic() - _last_frame > 10:
-            log("no audio frames for >10s — CoreAudio stream wedged; exiting for respawn")
-            os._exit(WATCHDOG_EXIT_CODE)
+        if not _expect_frames.is_set():     # known-blocking work (Groq transcription) — reads legitimately pause
+            baseline = time.monotonic()
+            continue
+        baseline = max(baseline, _last_frame)
+        if time.monotonic() - baseline <= 10:
+            continue
+        if _lid_closed():
+            if not lid_shut:
+                log("lid closed — audio hardware is down, not a wedged stream; holding until it opens")
+                lid_shut = True
+            baseline = time.monotonic()     # re-arm, so the wedge test starts over when the lid opens
+            continue
+        if lid_shut:
+            log("lid open — audio hardware back; judging the stream from here")
+            lid_shut = False
+        log("no audio frames for >10s — CoreAudio stream wedged; exiting for respawn")
+        os._exit(WATCHDOG_EXIT_CODE)
 
 
 def _alive_beacon() -> None:
@@ -450,7 +508,7 @@ def main() -> int:
     jared_seen = False         # confirmed Jared at all this utterance?
     last_confirm = None        # wall-clock of the last confirm (send-suppression vs the other mic)
     paused_logged = False
-    with sd.InputStream(samplerate=SR, channels=1, dtype="float32", blocksize=frame) as stream:
+    with _open_input_stream(frame) as stream:
         _last_frame = time.monotonic()
         threading.Thread(target=_watchdog, daemon=True).start()
         threading.Thread(target=_alive_beacon, daemon=True).start()

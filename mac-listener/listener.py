@@ -111,11 +111,78 @@ def _raise_fd_limit() -> None:
         log(f"could not raise fd limit: {e}")
 
 
+def _lid_closed() -> bool:
+    """True when the laptop lid is shut. macOS powers the audio hardware down with the lid, but
+    `caffeinate` (the long-running terminal sessions) keeps this process scheduled — so frames stop for
+    a legitimate reason while we're still awake to misread it as a wedge. Consulted ONLY when the
+    watchdog is about to re-exec, so the healthy path never pays for the subprocess. Unreadable state
+    counts as open: self-healing a live stream is recoverable, refusing to self-heal is not."""
+    try:
+        out = subprocess.run(["/usr/sbin/ioreg", "-r", "-k", "AppleClamshellState", "-d", "4"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except Exception:  # noqa: BLE001
+        return False
+    return '"AppleClamshellState" = Yes' in out
+
+
+def _open_input_stream():
+    """Open the capture stream, waiting out a closed lid instead of dying into a respawn loop.
+
+    CoreAudio refuses to bind an input stream while the audio hardware is powered down, and the failure
+    is an unhandled PortAudioError — so launchd KeepAlive turns every attempt into a fresh Python plus a
+    wake-model load. That is the other half of the 2026-08-01 night: 1,436 of them, alongside the
+    watchdog's own re-execs. Waiting costs one ioreg every 5s. A PortAudioError with the lid OPEN is a
+    real fault and still propagates."""
+    waited = False
+    while True:
+        stream = sd.RawInputStream(samplerate=SAMPLE_RATE, blocksize=FRAME, dtype="int16", channels=1)
+        try:
+            stream.start()      # where a powered-down HAL actually fails; a second start() in `with` is a no-op
+        except sd.PortAudioError as exc:
+            stream.close()
+            if not _lid_closed():
+                raise
+            if not waited:
+                log(f"lid closed — CoreAudio won't bind an input stream ({exc}); waiting for it to open")
+                waited = True
+            time.sleep(5)
+            continue
+        if waited:
+            log("lid open — capture stream bound")
+        return stream
+
+
 def _watchdog() -> None:
+    """Re-exec on a wedged stream — but never while the lid is shut. A closed lid means no frames AND no
+    working HAL to bind a new stream to, so re-execing just wedges the replacement 10s later: that is the
+    ~15s loop that ran ~1,400 times overnight on 2026-08-01, burned the night on CPU, and flooded
+    Hammerspoon's IPC port until it crashed. Holding costs nothing — the mic is dead either way while the
+    lid is down — and the moment it opens, the same >10s test judges the stream, measured from the
+    reopening rather than from hours of powered-down silence.
+
+    `baseline` is the watchdog's own reference rather than _last_frame directly: _last_frame stays the
+    honest mic-liveness signal that _alive_beacon reports to the hub, so a lid-closed hold never tells
+    the hub the Mac mic is alive."""
+    lid_shut = False
+    baseline = time.monotonic()
     while True:
         time.sleep(5)
-        if _expect_frames.is_set() and time.monotonic() - _last_frame > 10:
-            _self_reexec("no audio frames for >10s — CoreAudio input stream wedged")
+        if not _expect_frames.is_set():     # known-blocking work (Groq transcription) — reads legitimately pause
+            baseline = time.monotonic()
+            continue
+        baseline = max(baseline, _last_frame)
+        if time.monotonic() - baseline <= 10:
+            continue
+        if _lid_closed():
+            if not lid_shut:
+                log("lid closed — audio hardware is down, not a wedged stream; holding until it opens")
+                lid_shut = True
+            baseline = time.monotonic()     # re-arm, so the wedge test starts over when the lid opens
+            continue
+        if lid_shut:
+            log("lid open — audio hardware back; judging the stream from here")
+            lid_shut = False
+        _self_reexec("no audio frames for >10s — CoreAudio input stream wedged")
 
 
 def _alive_beacon() -> None:
@@ -850,7 +917,7 @@ def main() -> int:
 
     global _last_frame
     yielded_logged = False
-    with sd.RawInputStream(samplerate=SAMPLE_RATE, blocksize=FRAME, dtype="int16", channels=1) as stream:
+    with _open_input_stream() as stream:
         _last_frame = time.monotonic()
         threading.Thread(target=_watchdog, daemon=True).start()
         threading.Thread(target=_alive_beacon, daemon=True).start()
