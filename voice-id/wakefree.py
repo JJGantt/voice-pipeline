@@ -41,6 +41,9 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "whisper-large-v3-turbo")
 HS_BIN = os.environ.get("HS_BIN", "/opt/homebrew/bin/hs")
+# Shared with the listener (mac-listener/listener.py) — both processes drive the one on-screen pill.
+HUD_STATE_FILE = os.path.expanduser("~/.cache/voice-mac-listener/hud-state")
+_hud_send_lock = threading.Lock()
 VOICE_DAEMON = os.path.expanduser("~/scripts/voice_daemon.sh")  # warm Kokoro TTS engine (pre-warmed at capture)
 JARED_VOICE_URL = os.environ.get("JARED_VOICE_URL", "https://jared-voice.fly.dev").rstrip("/")
 # 'Heard you' cue for inject mode: inject bypasses the hub/worker and hands off to the focused window, so
@@ -117,9 +120,26 @@ def log(msg: str) -> None:
 
 
 def hud(state: str) -> None:
+    """Drive the Hammerspoon overlay pill. Redundant states are dropped rather than sent, against the
+    SAME state file the listener writes — one pill, one state, whichever process last set it.
+
+    Hammerspoon's IPC port is not safe to flood: its error path logs back through the same port and
+    re-enters the runloop, so queued requests recurse instead of unwinding (it crashed that way on
+    2026-08-01). This process is respawned every ~15s while the audio stack is wedged, and each start
+    re-asserted the pill; on disk, because a fresh process would otherwise remember nothing."""
     try:
-        subprocess.Popen([HS_BIN, "-c", f'VoiceHUD("{state}")'],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with _hud_send_lock:
+            try:
+                with open(HUD_STATE_FILE) as fh:
+                    if fh.read().strip() == state:
+                        return
+            except OSError:
+                pass                                    # no record yet → send it
+            os.makedirs(os.path.dirname(HUD_STATE_FILE), exist_ok=True)
+            with open(HUD_STATE_FILE, "w") as fh:
+                fh.write(state)
+            subprocess.Popen([HS_BIN, "-c", f'VoiceHUD("{state}")'],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:  # noqa: BLE001
         pass
 

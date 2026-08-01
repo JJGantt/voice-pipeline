@@ -78,16 +78,17 @@ _expect_frames.set()
 def _self_reexec(reason: str) -> None:
     """Replace this process image in place (same PID) — a fresh process means a fresh FD table AND a fresh
     CoreAudio HAL client, the one reliable recovery from a wedged audio stack or fd exhaustion, and it never
-    depends on launchd (whose KeepAlive respawn this macOS parks indefinitely). The restart skips ALL
-    cleanup, so a 'listening'/'working' pill open at the instant we bail would stay frozen on screen — clear
-    it SYNCHRONOUSLY first (startup also resets it as a backstop). os._exit(3) is the last resort if execv
-    itself fails; the worker's listener supervisor then kickstarts the job."""
+    depends on launchd (whose KeepAlive respawn this macOS parks indefinitely). os._exit(3) is the last
+    resort if execv itself fails; the worker's listener supervisor then kickstarts the job.
+
+    Deliberately does NOT talk to Hammerspoon on the way out. This used to clear the HUD with a
+    subprocess.run(..., timeout=2), which SIGKILLs the `hs` client when Hammerspoon is slow to answer.
+    Hammerspoon then replies into a dead CFMessagePort, and its error path logs THROUGH that same port —
+    ipc_callback → logError → ipc_sendMessage → runloop → the next queued request, nested. During a
+    lid-closed wedge storm (~1,400 re-execs overnight on 2026-08-01) it recursed until the stack blew and
+    Hammerspoon died with EXC_BREAKPOINT. Startup's hud("off") clears any frozen pill instead — the
+    persisted HUD state means that clear still fires exactly once."""
     log(f"self-heal: re-execing in place — {reason}")
-    try:
-        subprocess.run([HS_BIN, "-c", 'VoiceHUD("off")'],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
-    except Exception:  # noqa: BLE001
-        pass
     run_sh = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run.sh")
     try:
         os.execv(run_sh, [run_sh])   # same PID, fresh process image — launchd never consulted
@@ -356,16 +357,36 @@ def log(msg: str) -> None:
 SPEAK_SH = os.path.expanduser("~/scripts/speak.sh")
 HS_BIN = os.environ.get("HS_BIN", "/opt/homebrew/bin/hs")   # Hammerspoon IPC CLI
 VOICE_DAEMON = os.path.expanduser("~/scripts/voice_daemon.sh")  # starts the warm Kokoro TTS engine
+# Last state we actually pushed to Hammerspoon. On DISK, not in memory: execv wipes memory, so an
+# in-process variable would forget the pill state on every self-heal and re-send the same clear.
+HUD_STATE_FILE = os.path.expanduser("~/.cache/voice-mac-listener/hud-state")
+_hud_send_lock = threading.Lock()
 
 
 def hud(state: str) -> None:
     """Drive the Hammerspoon overlay HUD (listening/working/done/error/off). Fire-and-forget so it
     never adds latency to the wake→capture path. The HUD is a screen-level canvas that shows over
     full-screen apps and through Focus/DnD — unlike the old osascript banner, which macOS silently
-    suppressed (attributed to Script Editor, killed in full-screen and Do-Not-Disturb)."""
+    suppressed (attributed to Script Editor, killed in full-screen and Do-Not-Disturb).
+
+    Redundant states are dropped rather than sent. Hammerspoon's IPC port is not safe to flood: its
+    error path logs back through the same port and re-enters the runloop, so a queue of requests
+    recurses instead of unwinding (it crashed that way on 2026-08-01). Nothing about the HUD needs a
+    repeat of a state Hammerspoon is already showing, and the dedupe is what keeps a wedged-audio
+    restart loop — one hud("off") per re-exec, every ~15s for hours — down to a single call."""
     try:
-        subprocess.Popen([HS_BIN, "-c", f'VoiceHUD("{state}")'],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with _hud_send_lock:
+            try:
+                with open(HUD_STATE_FILE) as fh:
+                    if fh.read().strip() == state:
+                        return
+            except OSError:
+                pass                                    # no record yet → send it
+            os.makedirs(os.path.dirname(HUD_STATE_FILE), exist_ok=True)
+            with open(HUD_STATE_FILE, "w") as fh:
+                fh.write(state)
+            subprocess.Popen([HS_BIN, "-c", f'VoiceHUD("{state}")'],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:  # noqa: BLE001
         pass
 
