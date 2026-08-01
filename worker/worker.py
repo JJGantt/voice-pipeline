@@ -1089,7 +1089,7 @@ class ApiRunner:
                 aname = (name + "__" + t.name)[:64]
                 self._tools.append({
                     "name": aname,
-                    "description": (t.description or "")[:2048],
+                    "description": (t.description or ""),
                     "input_schema": t.inputSchema or {"type": "object", "properties": {}},
                 })
                 self._dispatch[aname] = (name, t.name)
