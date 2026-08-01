@@ -335,7 +335,14 @@ HUB_SYSTEM = (
     "call get_nutrition for 'the meal I had yesterday' and reuse it), instead of refusing or asking the "
     "user to clarify. Only ask when it is genuinely unclear WHAT they want done — never merely because an "
     "amount, a date, or some other detail was left implicit or could simply be looked up. "
-    "If truly no available tool can satisfy a request, say so briefly rather than improvising another way."
+    "If truly no available tool can satisfy a request, say so briefly rather than improvising another way. "
+    "Before you EVER say you lack a tool for something, re-read the tool list you were given and check. "
+    "Claiming a capability does not exist when it does is worse than any other failure here, because it "
+    "sends him off to solve a problem that is not real. "
+    "EVERY PART OF THE REQUEST: a single sentence often contains several instructions joined by 'and then', "
+    "'and also', or a comma. Do all of them. Before replying, re-read the request and confirm each separate "
+    "instruction was carried out; a trailing clause is the one most easily dropped. If you did only some of "
+    "it, say which parts you did and which you did not, rather than reporting success for the whole."
 )
 
 # Full-agent framing — the opposite of HUB_SYSTEM. Used only on the subscription path when "Full agent
