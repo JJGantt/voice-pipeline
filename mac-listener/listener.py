@@ -416,6 +416,20 @@ def _write_setting(key: str, value: str) -> None:
         pass
 
 
+def _reconcile_settings() -> None:
+    """Re-read the mic-state hub settings and re-apply them. Recycling the realtime socket every ~5 min
+    reconnects, but it does NOT recover STATE from an UPDATE that arrived while the socket was down or
+    half-open — if the flip to wake-free-on was that missed event, the listener stays stuck off forever
+    (the 4.3-day 'Mac down'). Re-asserting the current DB values on every (re)connect self-heals that
+    within one recycle. set_wakefree / _apply_mute both early-return when already in state, so this is a
+    no-op in the normal case. Best-effort; runs off the realtime loop so the httpx reads never block it."""
+    try:
+        set_wakefree(_read_setting("wakefree_enabled"))
+        _apply_mute(_read_setting("voice_muted"))
+    except Exception as e:  # noqa: BLE001
+        log(f"settings reconcile error: {e}")
+
+
 def log(msg: str) -> None:
     print(f"{datetime.now(timezone.utc).isoformat()} [mac-listener] {msg}", flush=True)
 
@@ -582,6 +596,11 @@ class RealtimeFeedback:
                 ch.on_postgres_changes("UPDATE", callback=self._on_presence,
                                        schema="public", table="voice_presence")
                 await ch.subscribe(self._on_sub)
+                # Re-assert current DB state on every (re)connect: recycling reconnects, but a STATE-changing
+                # UPDATE that landed while the socket was down/half-open is lost — which stranded the mic
+                # wake-free-off for 4.3 days. Reconcile self-heals that within one recycle (off-thread so
+                # its blocking reads never stall the realtime loop).
+                threading.Thread(target=_reconcile_settings, daemon=True).start()
                 # A realtime socket can go HALF-OPEN (is_connected stays True while no events flow), which
                 # silently stops the mute + wake-free reactions until a manual restart — the same failure
                 # the Fly server hit. Don't trust is_connected forever: recycle the socket every ~5 min so a
