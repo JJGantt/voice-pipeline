@@ -1587,6 +1587,20 @@ def process_request(db: Supabase, req: dict) -> None:
 
     text = (result.get("text") or "").strip()
 
+    # Safety net: __ESCALATE__ is an INTERNAL routing signal and must NEVER reach the user. It leaks when a
+    # resumed hub session is polluted by a prior standard turn's escalate sentinel and the model — notably
+    # Opus on the brain route, which shares the hub session — mimics it. Re-run the request cleanly on Opus
+    # with NO resumed context (nothing to mimic) and reset the session so the pollution can't recur.
+    # TODO(proper fix): give the brain route its own session so it can never inherit a standard turn's __ESCALATE__.
+    if ("__escalate__" in text.lower()) or (re.sub(r"[^a-z]", "", text.lower()) == "escalate"):
+        log("result leaked __ESCALATE__ (session pollution) → clean Opus re-run (no resume) + session reset")
+        write_session(session_agent, "")                    # drop the polluted session
+        result = run_claude(prompt, None, on_event=_emit, system_append=sys_ctx,
+                            model="opus", allow_read=bool(att_paths))
+        if result.get("session_id"):
+            write_session(session_agent, result["session_id"])
+        text = (result.get("text") or "").strip()
+
     # Wake-word false positive: the model flagged the transcript as noise/mishear → drop it silently.
     # No user OR assistant turn is written, so the conversation stays clean; just clear the activity bar.
     if audio and ("__ignore__" in text.lower() or re.sub(r"[^a-z]", "", text.lower()) == "ignore"):
