@@ -197,7 +197,7 @@ HEARTBEAT_INTERVAL_S = 30.0
 # safety net, so while the subscription is healthy it can be slow — at 1s the three workers were
 # hammering Supabase with ~280k reads/day of empty [] (a real chunk of the free-plan egress quota).
 # When realtime is down/degraded the poll IS the pickup path, so it tightens to stay snappy.
-IDLE_POLL_S = 60.0            # realtime subscribed — poll is just a missed-event backstop
+IDLE_POLL_S = 15.0            # realtime subscribed — backstop poll; caps pickup lag if realtime half-opens between recycles
 IDLE_POLL_DEGRADED_S = 2.0    # realtime down — polling is the only pickup path, stay snappy
 HEARTBEAT_FRESH_S = 90.0      # a higher-priority worker counts as "present" within this (≥3× the beat)
 # Standby stand-down: a worker that's deferring to a healthy higher-priority worker (normally the Mac)
@@ -1734,8 +1734,15 @@ class RealtimeWaker:
                 ch.on_postgres_changes("INSERT", callback=self._on_insert,
                                        schema="public", table="voice_requests")
                 await ch.subscribe(self._on_sub)
-                while _running and self._sock.is_connected:
+                # Recycle the socket every ~5 min even while it still reports is_connected: a HALF-OPEN
+                # subscription stays "connected" but silently stops delivering INSERTs, stranding commands on
+                # the slow backstop poll (the ~60s pickup lag). Tear down + rebuild on a fixed cadence so
+                # events keep flowing — the same guard the Fly server, mac-listener, and litter watcher use.
+                started = time.monotonic()
+                while _running and self._sock.is_connected and (time.monotonic() - started) < 300.0:
                     await asyncio.sleep(1.0)
+                if _running and self._sock.is_connected:
+                    log("realtime waker recycling socket (proactive half-open guard)")
             except Exception as e:  # noqa: BLE001
                 log(f"realtime listener error: {e}; retrying in 5s (poll fallback active)")
             self.healthy = False   # disconnected (or never subscribed) → main loop tightens its poll
