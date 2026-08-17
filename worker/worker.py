@@ -253,9 +253,34 @@ POWER_DIRECTIVE = (
     "the meal's totals by summing the ingredients, so keep each component's macros accurate.]"
 )
 
-# Medium thinking: a mild nudge that contains the bare "think" keyword (the smallest extended-thinking
-# budget on `claude -p`), without the "ultrathink" maximum. Pairs with API effort="medium".
-MEDIUM_DIRECTIVE = "\n\n[Think it through before acting.]"
+# ---- Two-route model: 'standard' (Sonnet, decides for itself, hard-gated) | 'brain' (Opus + max think).
+# On the subscription path the standard route runs Sonnet with ONLY the SAFE tools below in its
+# --allowedTools; the gated ones (data WRITES needing real knowledge — nutrition, weight, workouts/sets,
+# the exercise catalog, nutrition targets, body measurements) are absent, so in `-p` mode Sonnet is
+# DENIED them and physically cannot corrupt data. It still SEES them in the schema, and per the escalate
+# directive hands the whole turn to Opus rather than claiming it can't. Reads + actuators it does itself.
+ALL_TOOLS = ["mcp__data", "mcp__voice", "mcp__govee-lights", "mcp__petlibro-feeder"]  # full toolset (Opus/brain)
+SAFE_TOOLS = [
+    "mcp__voice", "mcp__govee-lights", "mcp__petlibro-feeder",              # actuators + voice settings
+    "mcp__data__get_nutrition", "mcp__data__get_nutrition_targets", "mcp__data__get_workout",
+    "mcp__data__get_workout_catalog", "mcp__data__get_exercise_history", "mcp__data__get_weekly_volume",
+    "mcp__data__get_health_profile", "mcp__data__get_rep_watcher", "mcp__data__list_workouts",
+    "mcp__data__list_staged", "mcp__data__reload_wall",                     # all reads; NO writes
+]
+
+# Escalation: Sonnet emits this (mirrors IGNORE_SENTINEL) when a request needs a gated write tool; the
+# dispatch then re-runs the whole turn on Opus + max thinking. Appended to every standard-route turn.
+ESCALATE_SENTINEL = "__ESCALATE__"
+ESCALATE_DIRECTIVE = (
+    "\n\n[You are the fast first responder. You can see the full toolset, but the data-WRITE tools — "
+    "logging or editing nutrition, weight, workouts/sets, the exercise catalog, nutrition targets, or "
+    "body measurements — are handled by a more capable model, not you, because they need careful "
+    "knowledge (nutrition values, muscle maps, maintenance math). You CAN read anything (get_*/list_*) "
+    "and drive the lights, feeder, TV, and voice settings yourself, and you should. If fulfilling the "
+    "request needs any of those gated WRITE tools, do NOT attempt it and do NOT say you can't — reply "
+    f"with EXACTLY '{ESCALATE_SENTINEL}' and nothing else, and it is handed to the capable model. "
+    "Handle everything else yourself.]"
+)
 
 # Photo turns (attachments on the request): the photos are downloaded locally, their paths ride the
 # prompt, and Read is allowed so the model can view them. The critical framing: however many photos
@@ -842,7 +867,7 @@ def write_mcp_config() -> str:
 
 def run_claude(transcript: str, resume_session_id: str | None, on_event=None, system_append: str = "",
                model: str = HUB_MODEL, agent: bool = False, cwd: str | None = None,
-               allow_read: bool = False) -> dict:
+               allow_read: bool = False, allowed_tools: "list | None" = None) -> dict:
     """Run `claude -p` headless and STREAM the stream-json output, parsing events as they arrive.
 
     on_event(kind, payload) fires live during the run so progress can be surfaced — currently
@@ -870,10 +895,10 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
     if agent:
         cmd += ["--dangerously-skip-permissions"]   # all native tools execute; MCP tools still present
     else:
-        allowed = ["mcp__data", "mcp__voice", "mcp__govee-lights", "mcp__petlibro-feeder"]
+        allowed = list(allowed_tools) if allowed_tools is not None else list(ALL_TOOLS)
         if allow_read:
             allowed.append("Read")   # photo turns only: Read is how the CLI views image files
-        cmd += ["--allowedTools", *allowed]   # MCP-only otherwise; built-ins denied
+        cmd += ["--allowedTools", *allowed]   # a tool not listed is DENIED (not prompted) in -p mode
     if system_append:
         cmd += ["--append-system-prompt", system_append]
     timeout_s = AGENT_TIMEOUT_S if agent else CLAUDE_TIMEOUT_S
@@ -1183,26 +1208,6 @@ class ApiRunner:
 API = ApiRunner()
 
 
-def chatbox_route(db: Supabase) -> str:
-    """Route for the typed chat box ONLY: 'fast' (efficiency), 'power' (accuracy), or 'custom'. Default
-    accuracy. The two FAB buttons and the two wake words carry their own tier and ignore this."""
-    rows = db.get("app_settings", "key=eq.chatbox_route&select=value")
-    if rows and rows[0].get("value") in ("fast", "power", "custom"):
-        return rows[0]["value"]
-    return "power"
-
-
-def custom_config(db: Supabase) -> dict:
-    """The 'custom' route's knobs (hub Settings → Custom): model (haiku|sonnet|opus), thinking level
-    (none|medium|max), and runner (local subscription | api). Sane fallbacks if unset."""
-    rows = db.get("app_settings", "key=in.(custom_model,custom_think,custom_runner)&select=key,value")
-    s = {r["key"]: r["value"] for r in rows} if isinstance(rows, list) else {}
-    model = s.get("custom_model") if s.get("custom_model") in ("haiku", "sonnet", "opus") else "sonnet"
-    think = s.get("custom_think") if s.get("custom_think") in ("none", "medium", "max") else "medium"
-    runner = s.get("custom_runner") if s.get("custom_runner") in ("local", "api") else "local"
-    return {"model": model, "think": think, "runner": runner}
-
-
 def get_focus(db: Supabase) -> str:
     rows = db.get("voice_focus", "id=eq.1&select=focus")
     if rows and isinstance(rows, list) and rows[0].get("focus"):
@@ -1486,15 +1491,15 @@ def process_request(db: Supabase, req: dict) -> None:
     if source in ("fly", "mac"):
         prompt += VOICE_REPLY_DIRECTIVE   # one past-tense line; spoken by the Pi audio service + phone push
 
-    # Tier (set by the hub's two FAB buttons): 'fast' = the sparkle button (simple, unambiguous
-    # tool routing → Haiku, no thinking); 'power' = the brain button (precision macro estimates →
-    # Opus + max thinking via POWER_DIRECTIVE). Anything else (typed card, ESP voice) → HUB_MODEL.
-    # Resolve the route. Buttons + wake words set the tier directly; the typed chat box has none, so it
-    # follows the chat-box route setting. TWO routes only: fast (efficiency) | power (accuracy).
-    tier = (req.get("tier") or "").strip()
-    # Photo attachments (storage object names riding the request) pin the route: vision happens via the
-    # CLI's Read tool, so photos ALWAYS ride the subscription path — power tier (Opus + thinking, which
-    # nutrition estimation wants anyway), NEVER the API.
+    # ---- Route resolution: TWO routes (the old fast/power/custom multi-model flow is retired).
+    #  · standard = Sonnet decides for itself, hard-gated to the safe toolset; a request needing a gated
+    #    WRITE tool escalates the whole turn to Opus. The default for everything, incl. ALL ambient voice.
+    #  · brain    = straight to Opus + max thinking (the deliberate big gun; the phone brain button).
+    # Legacy tiers map on so nothing in flight breaks during cutover: power→brain, everything else→standard.
+    tier = (req.get("tier") or "").strip().lower()
+    tier = "brain" if tier in ("brain", "power") else "standard"
+    # Photos ride the subscription path (vision via the CLI Read tool) on Opus + thinking, which nutrition
+    # estimation wants anyway — never the API.
     attachments = req.get("attachments") or []
     if isinstance(attachments, str):
         try:
@@ -1502,32 +1507,18 @@ def process_request(db: Supabase, req: dict) -> None:
         except Exception:  # noqa: BLE001
             attachments = []
     if attachments:
-        tier = "power"
-    if tier not in ("fast", "power", "custom"):
-        tier = chatbox_route(db)
-    think = False        # API extended-thinking on/off
-    effort = "high"      # API thinking depth when think=True ("medium" | "high")
-    runner = ""          # "" = the tier's default device; "local"|"api" only when custom forces it
-    if tier == "custom":
-        cfg = custom_config(db)
-        model, runner = cfg["model"], cfg["runner"]
-        if cfg["think"] == "max":           # maximum → ultrathink + high effort
-            think = True; effort = "high"
-            prompt += POWER_DIRECTIVE        # ultrathink (matters most on the subscription path)
-        elif cfg["think"] == "medium":      # medium → a mild think nudge + medium effort
-            think = True; effort = "medium"
-            prompt += MEDIUM_DIRECTIVE
-        # 'none' → think stays False
-    elif tier == "power":
+        tier = "brain"
+    think = False        # API extended-thinking (Fly path only)
+    effort = "high"
+    if tier == "brain":
         model = "opus"; think = True
         prompt += POWER_DIRECTIVE
-    else:
-        model = "haiku"
-    # Full-agent mode applies only to the subscription path it runs on: power, or custom-local. Never fast
-    # (API/Haiku) and never Fly (no subscription / API-only). When on, the run is an unrestricted Claude Code
-    # agent in agent_cwd; otherwise the locked-down hub assistant.
-    use_agent = ag["mode"] and WORKER_ID != "fly" and (tier == "power" or (tier == "custom" and runner == "local"))
-    log(f"route={tier} → model={model} think={think}{(' runner=' + runner) if runner else ''}{' AGENT' if use_agent else ''}")
+    else:                                # standard → Sonnet first; the dispatch escalates to Opus if needed
+        model = "sonnet"
+    # Full-agent mode (unrestricted Claude Code agent) is a deliberate power path → brain only, subscription
+    # only (never Fly).
+    use_agent = ag["mode"] and WORKER_ID != "fly" and tier == "brain"
+    log(f"route={tier} → model={model} think={think}{' AGENT' if use_agent else ''}")
     ping_esp_led("blink")   # working — the ESP light blinks for EVERY command, not just ESP-sourced ones
     push_activity(transcript[:240], "working")   # bottom-strip: the prompt being worked — fills full width like the result
 
@@ -1538,8 +1529,8 @@ def process_request(db: Supabase, req: dict) -> None:
     if govee:
         sys_ctx += "\n\n" + govee
     # Photo turns: pull the attachment objects local so Read can view them, and put the paths + the
-    # ONE-item framing on the prompt. (attachments forced tier='power' above, so the dispatch below
-    # lands on run_claude — except Fly, intercepted first.)
+    # ONE-item framing on the prompt. (attachments forced tier='brain' above, so the dispatch below
+    # lands on run_claude with Opus — except Fly, intercepted first.)
     att_tmp, att_paths = None, []
     if attachments and WORKER_ID != "fly":
         att_tmp, att_paths = fetch_attachments(attachments)
@@ -1550,45 +1541,38 @@ def process_request(db: Supabase, req: dict) -> None:
             prompt += ("\n\n[The user attached photo(s), but they could not be retrieved — tell them "
                        "that briefly instead of guessing at the contents.]")
 
-    # Two routes, two strategies (see ARCHITECTURE.md):
-    #  · EFFICIENCY (fast)  → clean API agent (MCP-only, Haiku), fastest device. On API error, fall back
-    #    to the free subscription so Raspy never breaks.
-    #  · ACCURACY  (power)  → subscription `claude -p` (Opus + thinking) on Mac → Pi. On Fly there's no
-    #    subscription login, so accuracy uses the API there with the same model + thinking.
+    # Dispatch. brain → subscription Opus + max thinking. standard → subscription Sonnet with ONLY the
+    # safe toolset; if Sonnet escalates (a gated write is needed) we re-run the SAME turn on Opus + max
+    # thinking with the full toolset, letting Opus choose the whole path. Fly (Mac+Pi down) has no
+    # subscription, so it runs Opus on the API for both routes — never a gated Sonnet there.
     if attachments and WORKER_ID == "fly":
-        # Photos ride the subscription path only (vision via Read; the API bills money). No subscription
-        # login on Fly, so a photo request that lands here (Mac AND Pi down) is refused, not run on the
-        # API — the same rule as custom-local: local means local.
+        # Photos are subscription-only (vision via Read; the API bills money). Reaching Fly means Mac AND
+        # Pi are down → refuse, don't run on the API. local means local.
         log("photo request reached Fly (Mac+Pi down) — refusing the API; photos are subscription-only")
         result = {"ok": False, "text": "",
                   "result": "(photo request — no subscription worker up; not run on the API)",
                   "raw_error": "no-subscription-worker", "session_id": None}
-    elif tier == "custom":
-        # Custom route honors the chosen runner. 'api' = Anthropic API directly. 'local' = the free
-        # subscription (claude -p on Mac/Pi) and it STAYS local — NEVER a silent API fallback (that bills
-        # money the user explicitly opted out of). On Fly there's no subscription, so a 'local' command
-        # that somehow lands there (only when both Mac AND Pi are down) is refused, not run on the API.
-        if runner == "api":
-            result = API.run(prompt, system_append=sys_ctx, on_event=_emit, model=model, think=think, effort=effort)
-        elif WORKER_ID == "fly":
-            log("custom-local reached Fly (Mac+Pi down) — refusing the API; local means local")
-            result = {"ok": False, "text": "",
-                      "result": "(local route — no subscription worker up; not run on the API)",
-                      "raw_error": "no-subscription-worker", "session_id": None}
-        else:
-            result = run_claude(prompt, resume_id, on_event=_emit, system_append=sys_ctx, model=model,
-                                agent=use_agent, cwd=ag["cwd"])
-    elif tier == "fast":
-        result = API.run(prompt, system_append=sys_ctx, on_event=_emit, model=model, think=False)
-        if not result.get("ok"):
-            log(f"fast API failed ({result.get('raw_error')}); falling back to subscription")
-            result = run_claude(prompt, resume_id, on_event=_emit, system_append=sys_ctx, model=model)
     elif WORKER_ID == "fly":
-        result = API.run(prompt, system_append=sys_ctx, on_event=_emit, model=model, think=True)  # Fly: no subscription
+        # Fly last resort: no subscription → Opus on the API for BOTH routes. No gated Sonnet here (the
+        # ApiRunner exposes every tool ungated, so Sonnet would bypass the hard gate); Opus is the safe,
+        # capable choice, and Fly is rare enough the speed win doesn't matter.
+        if tier != "brain":
+            prompt += POWER_DIRECTIVE
+        result = API.run(prompt, system_append=sys_ctx, on_event=_emit, model="opus", think=True, effort=effort)
+    elif tier == "brain":
+        result = run_claude(prompt, resume_id, on_event=_emit, system_append=sys_ctx, model="opus",
+                            agent=use_agent, cwd=ag["cwd"], allow_read=bool(att_paths))
     else:
-        result = run_claude(prompt, resume_id, on_event=_emit, system_append=sys_ctx, model=model,
-                            agent=use_agent, cwd=ag["cwd"],
-                            allow_read=bool(att_paths))  # subscription, free; Read only on photo turns
+        # standard: Sonnet, safe toolset only (gated writes DENIED, so it can't corrupt data). It handles
+        # reads + actuators itself; a gated need → __ESCALATE__ → we re-run the original turn on Opus.
+        result = run_claude(prompt + ESCALATE_DIRECTIVE, resume_id, on_event=_emit, system_append=sys_ctx,
+                            model="sonnet", allowed_tools=SAFE_TOOLS)
+        st = (result.get("text") or "").strip().lower()
+        if ("__escalate__" in st) or (re.sub(r"[^a-z]", "", st) == "escalate"):
+            log("standard → __ESCALATE__ → re-running on Opus + max thinking (full toolset)")
+            push_activity(transcript[:240], "working")   # keep the working indicator up across the hop
+            result = run_claude(prompt + POWER_DIRECTIVE, resume_id, on_event=_emit, system_append=sys_ctx,
+                                model="opus", allow_read=bool(att_paths))
 
     if att_tmp:
         shutil.rmtree(att_tmp, ignore_errors=True)   # staged photos served their turn
