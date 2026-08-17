@@ -815,6 +815,39 @@ def should_reset_session(state: dict | None, agent: bool = False) -> bool:
     return False
 
 
+def recent_context(db: Supabase) -> str:
+    """Replay the CURRENT hub conversation into a FRESH claude run instead of using --resume. We keep our
+    own clean transcript in voice_messages (each turn's user prompt + final assistant reply), so a fresh
+    process gets exactly the conversation and NONE of the CLI-session baggage — tool schemas, thinking
+    blocks, the __ESCALATE__ sentinel — that let the two models cross-contaminate one shared session.
+    Bounded by the SAME rule the old session used: back to the last idle gap (> session_reset_s) or a
+    calendar-day rollover. Tool RESULTS are deliberately omitted — a follow-up that needs live data just
+    re-fetches with a tool (the fresh run has them all)."""
+    try:
+        rows = db.get("voice_messages",
+                      "focus=eq.hub&mode=eq.hub&role=in.(user,assistant)&done=eq.true"
+                      "&order=created_at.desc&limit=40&select=role,text,created_at")
+    except Exception:  # noqa: BLE001
+        return ""
+    if not rows:
+        return ""
+    budget = session_reset_s()
+    now = datetime.now(timezone.utc)
+    kept, prev = [], now
+    for r in rows:                       # newest → oldest, stop at the session boundary
+        ts = _parse_ts(r.get("created_at") or "")
+        if (not ts or (prev - ts).total_seconds() > budget
+                or ts.astimezone().date() != now.astimezone().date()):
+            break
+        kept.append(r); prev = ts
+    lines = [f"{'You' if r.get('role') == 'user' else 'Raspy'}: {(r.get('text') or '').strip()}"
+             for r in reversed(kept) if (r.get('text') or '').strip()]
+    if not lines:
+        return ""
+    return ("[Recent conversation so far — context only; tool RESULTS are not included, so call a tool "
+            "if you need current data:\n" + "\n".join(lines) + "]\n\n")
+
+
 # --------------------------------------------------------------------------- #
 # claude headless invocation
 # --------------------------------------------------------------------------- #
@@ -1427,17 +1460,25 @@ def process_request(db: Supabase, req: dict) -> None:
     # (The user turn is written AFTER the model runs — deferred so a wake-word false positive that the
     # model drops never appears in the conversation. See below.)
 
-    # Session management — hub mode and full-agent mode keep SEPARATE, persisted contexts; switching modes
-    # just changes which one this request resumes.
+    # Context. Full-agent (coding) mode keeps a real CLI --resume session — its context (open files, long
+    # tool chains) can't be reconstructed from replies. The HUB conversation does NOT use --resume: each
+    # turn is a FRESH process handed the recent transcript (recent_context), so the two models never share a
+    # session and can't cross-contaminate. Only agent mode reads/writes a persisted session id.
     ag = agent_settings()
-    session_agent = ag["mode"] and WORKER_ID != "fly"   # full-agent mode → its own session, manual reset only
-    state = read_session(session_agent)
-    if should_reset_session(state, agent=session_agent):
-        resume_id = None
-        log(f"{'agent' if session_agent else 'hub'} session: starting FRESH (reset rule fired)")
+    session_agent = ag["mode"] and WORKER_ID != "fly"
+    ctx = ""
+    if session_agent:
+        state = read_session(True)
+        if should_reset_session(state, agent=True):
+            resume_id = None
+            log("agent session: starting FRESH (reset rule fired)")
+        else:
+            resume_id = state["session_id"]
+            log(f"agent session: resuming {resume_id}")
     else:
-        resume_id = state["session_id"]
-        log(f"{'agent' if session_agent else 'hub'} session: resuming {resume_id}")
+        resume_id = None
+        ctx = recent_context(db)
+        log(f"hub: fresh run + {len(ctx)} chars injected conversation" if ctx else "hub: fresh run (no prior context)")
 
     # Surface tool calls live by pushing them straight to the hub's activity bar (transient — not
     # stored in voice_messages, so they never appear in the conversation thread).
@@ -1491,36 +1532,21 @@ def process_request(db: Supabase, req: dict) -> None:
     if source in ("fly", "mac"):
         prompt += VOICE_REPLY_DIRECTIVE   # one past-tense line; spoken by the Pi audio service + phone push
 
-    # ---- Route resolution: TWO routes (the old fast/power/custom multi-model flow is retired).
-    #  · standard = Sonnet decides for itself, hard-gated to the safe toolset; a request needing a gated
-    #    WRITE tool escalates the whole turn to Opus. The default for everything, incl. ALL ambient voice.
-    #  · brain    = straight to Opus + max thinking (the deliberate big gun; the phone brain button).
-    # Legacy tiers map on so nothing in flight breaks during cutover: power→brain, everything else→standard.
-    tier = (req.get("tier") or "").strip().lower()
-    tier = "brain" if tier in ("brain", "power") else "standard"
-    # Photos ride the subscription path (vision via the CLI Read tool) on Opus + thinking, which nutrition
-    # estimation wants anyway — never the API.
+    # ---- ONE dynamic route. Every hub command goes to Sonnet (safe tools + escalate); a request that needs
+    # a gated WRITE tool escalates to a FRESH Opus (full tools). Photos skip straight to Opus (vision via the
+    # CLI Read tool; Sonnet would just escalate anyway). Full-agent mode is the unrestricted coding agent on
+    # its own --resume session. No user-facing model/route choice anymore — the model is chosen per turn.
     attachments = req.get("attachments") or []
     if isinstance(attachments, str):
         try:
             attachments = json.loads(attachments)
         except Exception:  # noqa: BLE001
             attachments = []
-    if attachments:
-        tier = "brain"
-    think = False        # API extended-thinking (Fly path only)
-    effort = "high"
-    if tier == "brain":
-        model = "opus"; think = True
-        prompt += POWER_DIRECTIVE
-    else:                                # standard → Sonnet first; the dispatch escalates to Opus if needed
-        model = "sonnet"
-    # Full-agent mode (unrestricted Claude Code agent) is a deliberate power path → brain only, subscription
-    # only (never Fly).
-    use_agent = ag["mode"] and WORKER_ID != "fly" and tier == "brain"
-    log(f"route={tier} → model={model} think={think}{' AGENT' if use_agent else ''}")
+    effort = "high"      # API thinking depth on the Fly path
+    use_agent = session_agent   # full-agent (coding) mode → the unrestricted agent, on its own session
+    log(f"route={'agent' if use_agent else ('photo→opus' if attachments else 'dynamic sonnet→opus')} src={source}")
     ping_esp_led("blink")   # working — the ESP light blinks for EVERY command, not just ESP-sourced ones
-    push_activity(transcript[:240], "working")   # bottom-strip: the prompt being worked — fills full width like the result
+    push_activity(transcript[:240], "working")   # bottom-strip: the prompt being worked
 
     # Role framing first, then the live govee device list (when there are lights). Full-agent mode swaps the
     # locked-down hub framing for the unrestricted all-purpose framing.
@@ -1528,9 +1554,8 @@ def process_request(db: Supabase, req: dict) -> None:
     govee = govee_context()
     if govee:
         sys_ctx += "\n\n" + govee
-    # Photo turns: pull the attachment objects local so Read can view them, and put the paths + the
-    # ONE-item framing on the prompt. (attachments forced tier='brain' above, so the dispatch below
-    # lands on run_claude with Opus — except Fly, intercepted first.)
+    # Photo turns: pull the attachment objects local so Read can view them, and put the paths + the ONE-item
+    # framing on the prompt. Photos go straight to Opus in the dispatch below (except Fly, intercepted first).
     att_tmp, att_paths = None, []
     if attachments and WORKER_ID != "fly":
         att_tmp, att_paths = fetch_attachments(attachments)
@@ -1541,64 +1566,62 @@ def process_request(db: Supabase, req: dict) -> None:
             prompt += ("\n\n[The user attached photo(s), but they could not be retrieved — tell them "
                        "that briefly instead of guessing at the contents.]")
 
-    # Dispatch. brain → subscription Opus + max thinking. standard → subscription Sonnet with ONLY the
-    # safe toolset; if Sonnet escalates (a gated write is needed) we re-run the SAME turn on Opus + max
-    # thinking with the full toolset, letting Opus choose the whole path. Fly (Mac+Pi down) has no
-    # subscription, so it runs Opus on the API for both routes — never a gated Sonnet there.
-    if attachments and WORKER_ID == "fly":
-        # Photos are subscription-only (vision via Read; the API bills money). Reaching Fly means Mac AND
-        # Pi are down → refuse, don't run on the API. local means local.
+    # Dispatch — one dynamic route. `ctx` (the replayed hub conversation) rides on the FRESH run; there is no
+    # --resume for hub turns, so the two models never share a session. agent → the unrestricted coding agent
+    # (its own --resume session). Fly (Mac+Pi down) → Opus on the API. Photos → Opus (vision via Read).
+    # Otherwise: Sonnet with the safe toolset; a gated need (or a Sonnet error) → re-run on a FRESH Opus.
+    hub_prompt = ctx + prompt   # ctx is "" in agent mode (uses --resume) or when there's no live conversation
+    if use_agent:
+        result = run_claude(prompt, resume_id, on_event=_emit, system_append=sys_ctx, model="opus",
+                            agent=True, cwd=ag["cwd"], allow_read=bool(att_paths))
+    elif attachments and WORKER_ID == "fly":
+        # Photos are subscription-only (vision via Read; the API bills money). Reaching Fly means Mac AND Pi
+        # are down → refuse, don't run on the API. local means local.
         log("photo request reached Fly (Mac+Pi down) — refusing the API; photos are subscription-only")
         result = {"ok": False, "text": "",
                   "result": "(photo request — no subscription worker up; not run on the API)",
                   "raw_error": "no-subscription-worker", "session_id": None}
     elif WORKER_ID == "fly":
-        # Fly last resort: no subscription → Opus on the API for BOTH routes. No gated Sonnet here (the
-        # ApiRunner exposes every tool ungated, so Sonnet would bypass the hard gate); Opus is the safe,
-        # capable choice, and Fly is rare enough the speed win doesn't matter.
-        if tier != "brain":
-            prompt += POWER_DIRECTIVE
-        result = API.run(prompt, system_append=sys_ctx, on_event=_emit, model="opus", think=True, effort=effort)
-    elif tier == "brain":
-        result = run_claude(prompt, resume_id, on_event=_emit, system_append=sys_ctx, model="opus",
-                            agent=use_agent, cwd=ag["cwd"], allow_read=bool(att_paths))
+        # Fly last resort: no subscription → Opus on the API (the ApiRunner is ungated; Opus is the safe
+        # choice, and Fly is rare enough the speed win doesn't matter).
+        result = API.run(hub_prompt + POWER_DIRECTIVE, system_append=sys_ctx, on_event=_emit,
+                         model="opus", think=True, effort=effort)
+    elif attachments:
+        # Photos → straight to Opus (vision needs the capable model + Read; Sonnet would only escalate).
+        result = run_claude(hub_prompt + POWER_DIRECTIVE, None, on_event=_emit, system_append=sys_ctx,
+                            model="opus", allow_read=bool(att_paths))
     else:
-        # standard: Sonnet, safe toolset only (gated writes DENIED, so it can't corrupt data). It handles
-        # reads + actuators itself; a gated need → __ESCALATE__ → we re-run the original turn on Opus.
-        result = run_claude(prompt + ESCALATE_DIRECTIVE, resume_id, on_event=_emit, system_append=sys_ctx,
+        # Sonnet, safe toolset only (gated writes DENIED, so it can't corrupt data). It handles reads +
+        # actuators itself; a gated need → __ESCALATE__ → re-run the turn on a FRESH Opus with the full tools.
+        result = run_claude(hub_prompt + ESCALATE_DIRECTIVE, None, on_event=_emit, system_append=sys_ctx,
                             model="sonnet", allowed_tools=SAFE_TOOLS)
         st = (result.get("text") or "").strip().lower()
         escalate = ("__escalate__" in st) or (re.sub(r"[^a-z]", "", st) == "escalate")
-        # Hand off to Opus on a gated need OR if Sonnet errored — so a worker whose subscription can't
-        # serve Sonnet still COMPLETES the command on Opus instead of dropping it (safety net + escalation).
+        # Escalate on a gated need OR a Sonnet error (a worker whose subscription can't serve Sonnet still
+        # completes the command on Opus instead of dropping it).
         if escalate or not result.get("ok"):
             reason = "__ESCALATE__" if escalate else f"sonnet error ({result.get('raw_error')})"
-            log(f"standard → Opus + max thinking (full toolset): {reason}")
+            log(f"dynamic → Opus (full toolset): {reason}")
             push_activity(transcript[:240], "working")   # keep the working indicator up across the hop
-            result = run_claude(prompt + POWER_DIRECTIVE, resume_id, on_event=_emit, system_append=sys_ctx,
+            result = run_claude(hub_prompt + POWER_DIRECTIVE, None, on_event=_emit, system_append=sys_ctx,
                                 model="opus", allow_read=bool(att_paths))
 
     if att_tmp:
         shutil.rmtree(att_tmp, ignore_errors=True)   # staged photos served their turn
 
-    if result.get("session_id"):
-        write_session(session_agent, result["session_id"])
-        log(f"captured session_id {result['session_id']}")
+    if result.get("session_id") and session_agent:   # only full-agent mode keeps a CLI session; hub replays ctx
+        write_session(True, result["session_id"])
+        log(f"captured agent session_id {result['session_id']}")
 
     text = (result.get("text") or "").strip()
 
-    # Safety net: __ESCALATE__ is an INTERNAL routing signal and must NEVER reach the user. It leaks when a
-    # resumed hub session is polluted by a prior standard turn's escalate sentinel and the model — notably
-    # Opus on the brain route, which shares the hub session — mimics it. Re-run the request cleanly on Opus
-    # with NO resumed context (nothing to mimic) and reset the session so the pollution can't recur.
-    # TODO(proper fix): give the brain route its own session so it can never inherit a standard turn's __ESCALATE__.
+    # Safety net: __ESCALATE__ is an INTERNAL signal and must NEVER reach the user. Fresh hub runs + a clean
+    # replayed transcript make it nearly impossible now (the two models no longer share a session), but as a
+    # backstop, re-run on a fresh Opus with NO context at all — nothing to mimic.
     if ("__escalate__" in text.lower()) or (re.sub(r"[^a-z]", "", text.lower()) == "escalate"):
-        log("result leaked __ESCALATE__ (session pollution) → clean Opus re-run (no resume) + session reset")
-        write_session(session_agent, "")                    # drop the polluted session
+        log("result leaked __ESCALATE__ → clean Opus re-run (no context)")
         result = run_claude(prompt, None, on_event=_emit, system_append=sys_ctx,
                             model="opus", allow_read=bool(att_paths))
-        if result.get("session_id"):
-            write_session(session_agent, result["session_id"])
         text = (result.get("text") or "").strip()
 
     # Wake-word false positive: the model flagged the transcript as noise/mishear → drop it silently.
