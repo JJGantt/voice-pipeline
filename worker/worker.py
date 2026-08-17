@@ -947,6 +947,7 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
     timed_out = {"v": False}
     t_spawn = t_init = t_first = None   # timing seams: spawn → MCP-ready (system init) → first model token
     n_tools = 0
+    denied_gated = False   # set if a tool OUTSIDE allowed_tools was attempted (auto-denied) → caller escalates
 
     # Subscription path: `claude -p` must use the logged-in Claude subscription, not an API key. If
     # ANTHROPIC_API_KEY is in the env (it is, so the SDK path can use it), the CLI silently bills the
@@ -1017,9 +1018,17 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
                         assistant_chunks.append(block.get("text", ""))
                     elif block.get("type") == "tool_use":
                         n_tools += 1
+                        tname = block.get("name", "")
+                        # A tool call OUTSIDE the allowlist is auto-DENIED in -p mode. On the gated Sonnet
+                        # run that means it reached for a gated write instead of emitting the escalate
+                        # sentinel — flag it so the caller escalates to Opus (which HAS the tool) rather than
+                        # letting Sonnet report "I don't have permission" to the user.
+                        if allowed_tools is not None and tname and not any(
+                                tname == a or tname.startswith(a + "__") for a in allowed_tools):
+                            denied_gated = True
                         if on_event:
                             try:
-                                on_event("tool", {"name": block.get("name", ""), "input": block.get("input")})
+                                on_event("tool", {"name": tname, "input": block.get("input")})
                             except Exception:  # noqa: BLE001
                                 pass
                 if ev.get("session_id"):
@@ -1058,6 +1067,7 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
             "result": result_text,
             "ok": raw_error is None and bool(text),
             "raw_error": raw_error,
+            "denied_gated": denied_gated,
         }
     except Exception as e:  # noqa: BLE001
         if proc is not None:
@@ -1597,10 +1607,11 @@ def process_request(db: Supabase, req: dict) -> None:
                             model="sonnet", allowed_tools=SAFE_TOOLS)
         st = (result.get("text") or "").strip().lower()
         escalate = ("__escalate__" in st) or (re.sub(r"[^a-z]", "", st) == "escalate")
-        # Escalate on a gated need OR a Sonnet error (a worker whose subscription can't serve Sonnet still
-        # completes the command on Opus instead of dropping it).
-        if escalate or not result.get("ok"):
-            reason = "__ESCALATE__" if escalate else f"sonnet error ({result.get('raw_error')})"
+        denied = bool(result.get("denied_gated"))   # Sonnet reached for a gated tool (auto-denied) → escalate
+        # Escalate on a gated need (the sentinel OR a denied gated-tool attempt) or a Sonnet error (a worker
+        # whose subscription can't serve Sonnet still completes the command on Opus instead of dropping it).
+        if escalate or denied or not result.get("ok"):
+            reason = "__ESCALATE__" if escalate else ("gated-tool attempt (denied)" if denied else f"sonnet error ({result.get('raw_error')})")
             log(f"dynamic → Opus (full toolset): {reason}")
             push_activity(transcript[:240], "working")   # keep the working indicator up across the hop
             result = run_claude(hub_prompt + POWER_DIRECTIVE, None, on_event=_emit, system_append=sys_ctx,
