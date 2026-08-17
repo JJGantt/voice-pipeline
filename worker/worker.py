@@ -1568,8 +1568,12 @@ def process_request(db: Supabase, req: dict) -> None:
         result = run_claude(prompt + ESCALATE_DIRECTIVE, resume_id, on_event=_emit, system_append=sys_ctx,
                             model="sonnet", allowed_tools=SAFE_TOOLS)
         st = (result.get("text") or "").strip().lower()
-        if ("__escalate__" in st) or (re.sub(r"[^a-z]", "", st) == "escalate"):
-            log("standard → __ESCALATE__ → re-running on Opus + max thinking (full toolset)")
+        escalate = ("__escalate__" in st) or (re.sub(r"[^a-z]", "", st) == "escalate")
+        # Hand off to Opus on a gated need OR if Sonnet errored — so a worker whose subscription can't
+        # serve Sonnet still COMPLETES the command on Opus instead of dropping it (safety net + escalation).
+        if escalate or not result.get("ok"):
+            reason = "__ESCALATE__" if escalate else f"sonnet error ({result.get('raw_error')})"
+            log(f"standard → Opus + max thinking (full toolset): {reason}")
             push_activity(transcript[:240], "working")   # keep the working indicator up across the hop
             result = run_claude(prompt + POWER_DIRECTIVE, resume_id, on_event=_emit, system_append=sys_ctx,
                                 model="opus", allow_read=bool(att_paths))
