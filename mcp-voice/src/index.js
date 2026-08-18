@@ -6,7 +6,7 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { getRouting, setModel, setThinking, setRunner, setAlwaysOn, setInjectMode } from './routing.js';
+import { getRouting, setAlwaysOn, setInjectMode } from './routing.js';
 
 const server = new Server({ name: 'voice', version: '1.0.0' }, { capabilities: { tools: {} } });
 
@@ -15,38 +15,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'get_routing',
       description:
-        "Report how the conversational agent is currently routed: the model (haiku/sonnet/opus), thinking level (none/medium/maximum), runner (local subscription vs Anthropic API), and whether ALWAYS-ON voice is on (the hands-free, no-wake-word mode — also called 'always on', 'AO', or 'wake-free'; all the same thing). Use this when Jared asks what model/thinking/routing is in effect or whether always-on is enabled.",
+        "Report how the conversational voice agent is routed and its live voice modes. The route is now DYNAMIC: a fast model (Sonnet) handles simple turns and automatically escalates to the most capable model (Opus, max thinking) for anything needing careful data writes — there is no manual model/thinking/runner choice anymore. Also reports whether ALWAYS-ON voice is on (the hands-free, no-wake-word mode — also called 'always on', 'AO', or 'wake-free'; all the same thing) and whether voice-inject mode is on. Use this when Jared asks what model/routing is in effect or whether always-on is enabled.",
       inputSchema: { type: 'object', properties: {} },
-    },
-    {
-      name: 'set_model',
-      description:
-        "Set which Claude model the conversational agent uses: 'haiku', 'sonnet', or 'opus'. This activates the Custom route so it takes effect immediately for voice and the chat box.",
-      inputSchema: {
-        type: 'object',
-        properties: { model: { type: 'string', description: 'haiku | sonnet | opus' } },
-        required: ['model'],
-      },
-    },
-    {
-      name: 'set_thinking',
-      description:
-        "Set the agent's thinking level: 'none' (no extended thinking), 'medium' (moderate), or 'maximum' (deepest — injects ultrathink). Activates the Custom route so it takes effect immediately.",
-      inputSchema: {
-        type: 'object',
-        properties: { level: { type: 'string', description: 'none | medium | maximum' } },
-        required: ['level'],
-      },
-    },
-    {
-      name: 'set_runner',
-      description:
-        "Set where the agent runs: 'local' (the free Claude subscription via claude -p on Mac/Pi) or 'api' (the Anthropic Messages API). Activates the Custom route so it takes effect immediately.",
-      inputSchema: {
-        type: 'object',
-        properties: { runner: { type: 'string', description: 'local | api' } },
-        required: ['runner'],
-      },
     },
     {
       name: 'set_inject_mode',
@@ -82,15 +52,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     if (name === 'get_routing') {
       return text(JSON.stringify(await getRouting(), null, 2));
-    }
-    if (name === 'set_model') {
-      return text(await setModel(a.model));
-    }
-    if (name === 'set_thinking') {
-      return text(await setThinking(a.level));
-    }
-    if (name === 'set_runner') {
-      return text(await setRunner(a.runner));
     }
     if (name === 'set_always_on') {
       return text(await setAlwaysOn(a.on));
