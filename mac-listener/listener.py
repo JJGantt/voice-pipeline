@@ -227,15 +227,6 @@ def _ping_esp_wakefree(on: bool) -> None:
         pass
 
 
-def _ping_esp_route(tier: str) -> None:
-    """Bridge a wake-free route change (Efficiency/Accuracy) to the ESP so its speaker-ID captures run on
-    the same tier as the Mac's — one system, congruent. (The Mac's own wakefree.py reads the route live.)"""
-    try:
-        httpx.get(f"{JARED_VOICE_URL}/wakefree-route", params={"v": tier}, timeout=5)
-    except Exception:  # noqa: BLE001
-        pass
-
-
 def _apply_mute(on: bool) -> None:
     """Apply the global mute EVERYWHERE: this Mac (listener mic / wakefree) AND the ESP. One explicit
     command in flight = every source goes deaf. The ESP gets it two ways: an instant HTTP ping AND the
@@ -642,10 +633,6 @@ class RealtimeFeedback:
             set_wakefree(truthy)
         elif key == "voice_muted":      # global mute set by any explicit input (PTT / FAB)
             _apply_mute(truthy)
-        elif key == "wakefree_route":   # bridge the wake-free route to the ESP so its tier MATCHES the Mac
-            v = str(rec.get("value"))   # pass the real route through — never downgrade custom/power to fast
-            tier = v if v in ("power", "custom") else "fast"
-            threading.Thread(target=_ping_esp_route, args=(tier,), daemon=True).start()
         elif key == "voice_inject_mode":   # hands-free: Mac-mic speech → focused window (ESP off)
             set_inject_mode(truthy)
         elif key == "voice_speak_replies":   # read the final reply aloud (independent of inject mode)

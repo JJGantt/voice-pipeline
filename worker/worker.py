@@ -240,7 +240,7 @@ QUICK_REPLY_DIRECTIVE = (
     "in under 7 words.]"
 )
 
-# Power tier (the hub's "brain" button): maximum-precision path for hard estimates — typically a
+# Power/precision directive (the Opus escalation path): maximum-precision for hard estimates — typically a
 # restaurant dish whose ingredients/macros are unknown. Routed to Opus, and this directive both asks
 # for careful decomposition AND contains the "ultrathink" keyword, which is how `claude -p` unlocks
 # its largest extended-thinking budget (there is no CLI flag for it).
@@ -253,19 +253,23 @@ POWER_DIRECTIVE = (
     "the meal's totals by summing the ingredients, so keep each component's macros accurate.]"
 )
 
-# ---- Two-route model: 'standard' (Sonnet, decides for itself, hard-gated) | 'brain' (Opus + max think).
-# On the subscription path the standard route runs Sonnet with ONLY the SAFE tools below in its
-# --allowedTools; the gated ones (data WRITES needing real knowledge — nutrition, weight, workouts/sets,
-# the exercise catalog, nutrition targets, body measurements) are absent, so in `-p` mode Sonnet is
-# DENIED them and physically cannot corrupt data. It still SEES them in the schema, and per the escalate
-# directive hands the whole turn to Opus rather than claiming it can't. Reads + actuators it does itself.
-ALL_TOOLS = ["mcp__data", "mcp__voice", "mcp__govee-lights", "mcp__petlibro-feeder"]  # full toolset (Opus/brain)
+# ---- Dynamic route. Sonnet is the fast first responder, given ONLY the SAFE tools below in its
+# --allowedTools; the gated tools (data WRITES that need real knowledge — nutrition, weight, workouts/sets,
+# the exercise catalog, nutrition targets, body measurements) are absent, so in `-p` mode Sonnet is DENIED
+# them and physically cannot corrupt that data. It still SEES them in the schema and, per the escalate
+# directive, hands the whole turn to a fresh Opus rather than claiming it can't. Reads, actuators, and the
+# low-stakes writes that need no domain knowledge (reminders, lists, notes) it handles itself.
+ALL_TOOLS = ["mcp__data", "mcp__voice", "mcp__govee-lights", "mcp__petlibro-feeder"]  # full toolset (Opus)
 SAFE_TOOLS = [
     "mcp__voice", "mcp__govee-lights", "mcp__petlibro-feeder",              # actuators + voice settings
     "mcp__data__get_nutrition", "mcp__data__get_nutrition_targets", "mcp__data__get_workout",
     "mcp__data__get_workout_catalog", "mcp__data__get_exercise_history", "mcp__data__get_weekly_volume",
     "mcp__data__get_health_profile", "mcp__data__get_rep_watcher", "mcp__data__list_workouts",
-    "mcp__data__list_staged", "mcp__data__reload_wall",                     # all reads; NO writes
+    "mcp__data__list_staged", "mcp__data__reload_wall",                     # reads + the wall reload
+    # reminders / lists / notes: low-stakes writes needing no domain knowledge → handled on the fast path
+    "mcp__data__get_reminders", "mcp__data__create_reminder", "mcp__data__complete_reminder",
+    "mcp__data__get_lists", "mcp__data__add_to_list", "mcp__data__complete_list_item",
+    "mcp__data__get_notes", "mcp__data__create_note",
 ]
 
 # Escalation: Sonnet emits this (mirrors IGNORE_SENTINEL) when a request needs a gated write tool; the
@@ -275,8 +279,9 @@ ESCALATE_DIRECTIVE = (
     "\n\n[You are the fast first responder. You can see the full toolset, but the data-WRITE tools — "
     "logging or editing nutrition, weight, workouts/sets, the exercise catalog, nutrition targets, or "
     "body measurements — are handled by a more capable model, not you, because they need careful "
-    "knowledge (nutrition values, muscle maps, maintenance math). You CAN read anything (get_*/list_*) "
-    "and drive the lights, feeder, TV, and voice settings yourself, and you should. If fulfilling the "
+    "knowledge (nutrition values, muscle maps, maintenance math). You CAN read anything (get_*/list_*), "
+    "manage reminders, lists, and notes, and drive the lights, feeder, TV, and voice settings yourself, "
+    "and you should. If fulfilling the "
     "request needs any of those gated WRITE tools, do NOT attempt it and do NOT say you can't — reply "
     f"with EXACTLY '{ESCALATE_SENTINEL}' and nothing else, and it is handed to the capable model. "
     "Handle everything else yourself.]"
@@ -1318,7 +1323,7 @@ def reclaim_stale(db: Supabase) -> dict | None:
     rows = db.get(
         "voice_requests",
         "status=eq.claimed&order=created_at.asc&limit=5"
-        "&select=id,transcript,source,tier,claimed_by,claimed_at,created_at",
+        "&select=id,transcript,source,claimed_by,claimed_at,created_at",
     )
     if not rows:
         return None
@@ -1366,7 +1371,7 @@ def claim_one(db: Supabase) -> dict | None:
 
     pending = db.get(
         "voice_requests",
-        "status=eq.pending&order=created_at.asc&limit=1&select=id,transcript,source,tier",
+        "status=eq.pending&order=created_at.asc&limit=1&select=id,transcript,source",
     )
     if not pending:
         return reclaim_stale(db)
