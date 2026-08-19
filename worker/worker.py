@@ -887,11 +887,18 @@ def fetch_attachments(paths: list) -> tuple[str | None, list[str]]:
     return tmpdir, local
 
 
+# The current command's audio-recording START time (voice_requests.capture_start), set by handle() per
+# command. The data MCP's now() uses it as the default timestamp so a voice-logged SET lands at when Jared
+# actually spoke — his rest-clock reference — not ~30s later when the command finishes the pipeline.
+_cmd_ts_override = None
+
+
 def write_mcp_config() -> str:
     env = {"SUPABASE_URL": SUPABASE_URL, "SUPABASE_KEY": SUPABASE_KEY}
+    data_env = {**env, "DATA_TS_OVERRIDE": _cmd_ts_override} if _cmd_ts_override else env
     cfg = {
         "mcpServers": {
-            "data": {"command": "node", "args": [DATA_MCP_JS], "env": env},
+            "data": {"command": "node", "args": [DATA_MCP_JS], "env": data_env},
             "voice": {"command": "node", "args": [VOICE_MCP_JS], "env": env},
             "govee-lights": {"command": GOVEE_PY, "args": [GOVEE_MCP_PY], "env": env},
             "petlibro-feeder": {"command": PETLIBRO_PY, "args": [PETLIBRO_MCP_PY], "env": env},
@@ -1427,6 +1434,12 @@ def process_request(db: Supabase, req: dict) -> None:
     rid = req["id"]
     transcript = req.get("transcript") or ""
     log(f"claimed request {rid}: {transcript[:80]!r}")
+
+    # Timestamp carry-through: the data MCP defaults every write's timestamp to when the audio recording
+    # STARTED (not ~30s later at pipeline end), so a voice-logged set lands at Jared's rest-clock moment.
+    # Only for audio captures (typed/web commands have no capture_start → real wall clock).
+    global _cmd_ts_override
+    _cmd_ts_override = (req.get("capture_start") or "").strip() or None
 
     # Manual context reset from the hub UI: drop the CURRENT mode's session so the next command starts
     # fresh — full-agent mode resets its own context, hub mode its own (whichever you're in). The status-hub
