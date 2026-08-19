@@ -124,10 +124,12 @@ void loop() {
   int samples = bytesRead / sizeof(int32_t);
 
   // INMP441 outputs 24-bit data left-justified in the 32-bit slot (RIGHT channel
-  // at 32-bit). Shift down by 10 to a well-levelled 16-bit sample with headroom
-  // (no clipping on loud/close speech), then clamp.
+  // at 32-bit). Shift down by 12: >>10 left ~64x too much gain, so loud/close speech
+  // railed the int16 range (peak clamped at 32767) and destroyed the speaker-ID match.
+  // The Fly server re-gains (GAIN) and peak-normalizes before ECAPA/Whisper, so a
+  // quieter CLEAN signal is strictly better than a loud clipped one. Then clamp.
   for (int i = 0; i < samples; i++) {
-    int32_t v = i2sBuf[i] >> 10;
+    int32_t v = i2sBuf[i] >> 12;
     if (v > 32767) v = 32767;
     else if (v < -32768) v = -32768;
     pcmBuf[i] = (int16_t)v;
