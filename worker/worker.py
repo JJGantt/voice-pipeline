@@ -266,10 +266,10 @@ SAFE_TOOLS = [
     "mcp__data__get_workout_catalog", "mcp__data__get_exercise_history", "mcp__data__get_weekly_volume",
     "mcp__data__get_health_profile", "mcp__data__get_rep_watcher", "mcp__data__list_workouts",
     "mcp__data__list_staged", "mcp__data__reload_wall",                     # reads + the wall reload
-    # reminders / lists / notes: low-stakes writes needing no domain knowledge → handled on the fast path
-    "mcp__data__get_reminders", "mcp__data__create_reminder", "mcp__data__complete_reminder",
-    "mcp__data__get_lists", "mcp__data__add_to_list", "mcp__data__complete_list_item",
-    "mcp__data__get_notes", "mcp__data__create_note",
+    # reminders / lists / notes (incl. deletes): low-stakes writes needing no domain knowledge → fast path
+    "mcp__data__get_reminders", "mcp__data__create_reminder", "mcp__data__complete_reminder", "mcp__data__delete_reminder",
+    "mcp__data__get_lists", "mcp__data__add_to_list", "mcp__data__complete_list_item", "mcp__data__remove_from_list", "mcp__data__delete_list",
+    "mcp__data__get_notes", "mcp__data__create_note", "mcp__data__delete_note",
 ]
 
 # Escalation: Sonnet emits this (mirrors IGNORE_SENTINEL) when a request needs a gated write tool; the
