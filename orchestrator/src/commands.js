@@ -6,14 +6,18 @@
 // the same terminal twice.
 //
 // Two guards, because this ends in "run a shell command on the desk":
-//   - the target path must be a repo THIS process published (repos.js owns that list) — a bad or
-//     stale queue row can't `cd` anywhere else on disk;
+//   - the target path must be a directory THIS process published (repos.js owns that list) — a bad
+//     or stale queue row can't `cd` anywhere else on disk;
 //   - commands older than COMMAND_TTL_S expire unrun, so a Mac that was asleep doesn't wake up and
 //     open every terminal that was queued in the meantime.
+//
+// Launching also pre-accepts the workspace-trust prompt for the target (see trust.js), since a
+// session stuck on that modal is indistinguishable from one that never started.
 import { config } from './config.js';
 import { pendingCommands, claimCommand, finishCommand } from './supabase.js';
 import { watchTable } from './realtime.js';
 import { isKnownRepo } from './repos.js';
+import { ensureTrusted } from './trust.js';
 import { openFreshTab } from './applescript.js';
 
 let timer = null;
@@ -23,10 +27,13 @@ async function run(cmd) {
   if (cmd.kind !== 'open_session') throw new Error(`unknown kind ${cmd.kind}`);
   const target = String((cmd.payload || {}).path || '');
   if (!target) throw new Error('no path in payload');
-  if (!isKnownRepo(target)) throw new Error(`not a known repo: ${target}`);
+  if (!isKnownRepo(target)) throw new Error(`not a known project: ${target}`);
   const name = String((cmd.payload || {}).name || '').trim() || null;
+  // Otherwise the session opens straight onto "Do you trust the files in this folder?" and waits
+  // for a click nobody is there to make — the launch looks like it worked and is actually stuck.
+  const trust = ensureTrusted(target);
   const result = await openFreshTab(target, name);
-  console.log(`[commands] opened session in ${target} (${result})`);
+  console.log(`[commands] opened session in ${target} (${result}, trust: ${trust})`);
   return result;
 }
 
