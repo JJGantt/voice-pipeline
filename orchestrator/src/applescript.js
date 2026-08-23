@@ -1,10 +1,12 @@
 // AppleScript / lsof glue for finding and manipulating Terminal.app desk tabs.
 //
-// Two behaviors the orchestrator drives:
+// Three behaviors the orchestrator drives:
 //   1. closeTabForTty(tty): close the single Terminal tab bound to a tty.
 //   2. reopenDeskTab(cwd, id): re-open a desk tab and `claude --resume <id>`
 //      "right where it was" — Cmd-T into the front window if Terminal already
 //      has one, otherwise launch Terminal and run there.
+//   3. openFreshTab(cwd, name): the same tab-opening, but starting a NEW
+//      remote-controlled session — what the hub's repo picker fires.
 //
 // Read-only helpers (enumerateTtys, ttyForSession) are SAFE to call anytime.
 import { execFile } from 'node:child_process';
@@ -125,50 +127,56 @@ export async function closeTabForTty(tty) {
   return result === 'closed';
 }
 
-// Re-open a desk tab and resume the session "right where it was".
-// If Terminal has a front window: Cmd-T to make a new tab there, then run
-// `cd <cwd>; claude --resume <id>` in that front window. Otherwise launch
-// Terminal and run the command in a fresh window.
-export async function reopenDeskTab(cwd, id) {
-  const claude = config.CLAUDE_BIN;
-  // Build the shell command. AppleScript string-escape: backslash + quote.
-  const shellCmd = `cd ${shQuote(cwd)}; ${shQuote(claude)} --resume ${shQuote(id)}`;
+// Run a shell command in a new Terminal tab, falling back to a new window.
+//
+// Terminal.app has no scriptable "new tab" — the only way is a Cmd-T keystroke through System
+// Events, which needs ACCESSIBILITY permission. The interactive shell inherits Terminal.app's
+// grant, but this daemon is spawned by launchd and has none, so from here the keystroke fails with
+// "osascript is not allowed to send keystrokes (1002)". A plain `do script` with no `in` clause
+// opens a new WINDOW and needs only Automation permission, which the daemon does have.
+//
+// So: try the tab, and on any failure open a window instead. Either way the caller gets a live
+// shell running the command, which is all that matters.
+async function runInNewTerminal(shellCmd) {
+  // AppleScript string-escape: backslash + quote.
   const escaped = shellCmd.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-
-  const script = `
-    set didLaunch to false
-    tell application "System Events"
-      set termRunning to (exists process "Terminal")
-    end tell
-    if not termRunning then
-      tell application "Terminal" to activate
-      delay 0.6
-      set didLaunch to true
-    end if
-    tell application "Terminal"
+  const newWindow = () => osascript(`tell application "Terminal"
       activate
-      if (count of windows) is 0 then
-        -- no window: a plain "do script" opens a new window and runs there.
-        do script "${escaped}"
-        return "newwindow"
-      end if
+      do script "${escaped}"
     end tell
-    if didLaunch then
-      -- Terminal was just launched and already has a window with a shell;
-      -- run in that front window rather than spawning a second one.
-      tell application "Terminal" to do script "${escaped}" in front window
-      return "launched"
-    else
-      -- Terminal already had a window: open a fresh tab via Cmd-T, then run
-      -- in the (now front) window.
-      tell application "Terminal" to activate
+    return "newwindow"`).then(() => 'newwindow');
+
+  // Nothing to make a tab in — one call, one window.
+  const running = await osascript('tell application "System Events" to (exists process "Terminal")')
+    .catch(() => 'false');
+  if (running !== 'true') return newWindow();
+  const windows = await osascript('tell application "Terminal" to count windows').catch(() => '0');
+  if (parseInt(windows, 10) === 0) return newWindow();
+
+  try {
+    await osascript(`tell application "Terminal" to activate
+      delay 0.2
       tell application "System Events" to keystroke "t" using command down
       delay 0.4
-      tell application "Terminal" to do script "${escaped}" in front window
-      return "newtab"
-    end if
-  `;
-  return osascript(script);
+      tell application "Terminal" to do script "${escaped}" in front window`);
+    return 'newtab';
+  } catch (e) {
+    console.warn('[applescript] tab failed (%s) — opening a window instead', e.message.trim().split('\n').pop());
+    return newWindow();
+  }
+}
+
+// Re-open a desk tab and resume the session "right where it was".
+export async function reopenDeskTab(cwd, id) {
+  return runInNewTerminal(`cd ${shQuote(cwd)}; ${shQuote(config.CLAUDE_BIN)} --resume ${shQuote(id)}`);
+}
+
+// Start a FRESH session in `cwd` with Remote Control on, named after the repo so it's identifiable
+// in the Claude app's session list. This is what the hub's repo picker fires: the Mac opens a
+// terminal, the session registers itself for remote control, and the phone picks it up from there.
+export async function openFreshTab(cwd, name) {
+  const rc = name ? ` --remote-control ${shQuote(name)}` : ' --remote-control';
+  return runInNewTerminal(`cd ${shQuote(cwd)}; ${shQuote(config.CLAUDE_BIN)}${rc}`);
 }
 
 // ---- util -----------------------------------------------------------------

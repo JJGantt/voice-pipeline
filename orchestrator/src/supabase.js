@@ -53,3 +53,69 @@ export async function pruneSessions(keepIds) {
   });
   if (!res.ok) throw new Error(`pruneSessions ${res.status}: ${await res.text()}`);
 }
+
+// ---- desk control (hub repo picker) ---------------------------------------
+
+// Upsert the scanned repo rows (merge-duplicates on the path PK).
+export async function upsertRepos(rows) {
+  if (!rows.length) return;
+  const res = await fetch(`${base()}/repos?on_conflict=path`, {
+    method: 'POST',
+    headers: headers({ Prefer: 'resolution=merge-duplicates,return=minimal' }),
+    body: JSON.stringify(rows),
+  });
+  if (!res.ok) throw new Error(`upsertRepos ${res.status}: ${await res.text()}`);
+}
+
+// Delete repo rows for anything that has left the scanned roots.
+export async function pruneRepos(keepPaths) {
+  const list = keepPaths.map((p) => `"${p}"`).join(',');
+  const filter = keepPaths.length ? `path=not.in.(${list})` : 'path=neq.__none__';
+  const res = await fetch(`${base()}/repos?${filter}`, {
+    method: 'DELETE',
+    headers: headers({ Prefer: 'return=minimal' }),
+  });
+  if (!res.ok) throw new Error(`pruneRepos ${res.status}: ${await res.text()}`);
+}
+
+// Oldest-first pending commands.
+export async function pendingCommands() {
+  const res = await fetch(`${base()}/desk_commands?status=eq.pending&select=*&order=created.asc`, {
+    headers: headers(),
+  });
+  if (!res.ok) throw new Error(`pendingCommands ${res.status}: ${await res.text()}`);
+  return res.json();
+}
+
+// Claim a command by flipping pending -> running. The status filter makes this a compare-and-swap:
+// an empty result means someone else got there first, so the caller must skip it.
+export async function claimCommand(id) {
+  const res = await fetch(`${base()}/desk_commands?id=eq.${encodeURIComponent(id)}&status=eq.pending`, {
+    method: 'PATCH',
+    headers: headers({ Prefer: 'return=representation' }),
+    body: JSON.stringify({ status: 'running', updated: new Date().toISOString() }),
+  });
+  if (!res.ok) throw new Error(`claimCommand ${res.status}: ${await res.text()}`);
+  const rows = await res.json();
+  return rows.length > 0;
+}
+
+// Terminal state for a command: done | error | expired (+ a human-readable detail).
+export async function finishCommand(id, status, detail) {
+  const res = await fetch(`${base()}/desk_commands?id=eq.${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    headers: headers({ Prefer: 'return=minimal' }),
+    body: JSON.stringify({ status, detail: detail ? String(detail).slice(0, 500) : null, updated: new Date().toISOString() }),
+  });
+  if (!res.ok) throw new Error(`finishCommand ${res.status}: ${await res.text()}`);
+}
+
+// Heartbeat so the hub can tell whether the Mac is awake and able to launch anything.
+export async function heartbeatDesk(worker, info) {
+  const res = await fetch(`${base()}/worker_presence?on_conflict=worker`, {
+    method: 'POST',
+    headers: headers({ Prefer: 'resolution=merge-duplicates,return=minimal' }),
+    body: JSON.stringify([{ worker, last_seen: new Date().toISOString(), info: info || {} }]),
+  });
+  if (!res.ok) throw new Error(`heartbeatDesk ${res.status}: ${await res.text()}`);
+}

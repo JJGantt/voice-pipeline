@@ -28,6 +28,11 @@ export const config = {
   // a session on the wall — fine to catch within ~10s when the instant realtime path is unavailable.
   FOCUS_POLL_MS: parseInt(process.env.FOCUS_POLL_MS || '10000', 10),
   REGISTRY_POLL_MS: parseInt(process.env.REGISTRY_POLL_MS || '15000', 10),
+  // Desk control (hub repo picker → new Claude session here). Repo scan is local git work, so 60s
+  // is plenty; the command queue is realtime-driven with a slow poll backstop.
+  REPO_POLL_MS: parseInt(process.env.REPO_POLL_MS || '60000', 10),
+  COMMAND_POLL_MS: parseInt(process.env.COMMAND_POLL_MS || '30000', 10),
+  PRESENCE_MS: parseInt(process.env.PRESENCE_MS || '30000', 10),
 
   // pty default geometry.
   PTY_COLS: parseInt(process.env.PTY_COLS || '200', 10),
@@ -35,6 +40,13 @@ export const config = {
 
   // How many sessions to surface in the registry.
   REGISTRY_LIMIT: parseInt(process.env.REGISTRY_LIMIT || '5', 10),
+
+  // Roots scanned for git repos, ':'-separated. Only direct children are considered — deep scanning
+  // would drag in vendored checkouts under node_modules.
+  REPO_ROOTS: (process.env.REPO_ROOTS || path.join(HOME, 'repos')).split(':').filter(Boolean),
+  // A queued launch is only wanted for about a minute. If the Mac was asleep when the hub enqueued
+  // it, waking up to a burst of terminal windows is worse than dropping them — those expire.
+  COMMAND_TTL_S: parseInt(process.env.COMMAND_TTL_S || '120', 10),
 };
 
 // terminal_url advertised to the TV/Pi when a real session is active. wss via Tailscale Serve

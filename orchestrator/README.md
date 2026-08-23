@@ -40,8 +40,13 @@ launchctl load ~/Library/LaunchAgents/com.jaredgantt.voice-orchestrator.plist
 | `MAC_HOST`        | `Jareds-MacBook-Air.local`                         |
 | `ORCH_TOKEN`      | `REDACTED`             |
 | `CLAUDE_BIN`      | `/Users/jaredgantt/.local/bin/claude`              |
-| `FOCUS_POLL_MS`   | `2000`                                             |
+| `FOCUS_POLL_MS`   | `10000` (realtime backstop; 60s while it's healthy) |
 | `REGISTRY_POLL_MS`| `15000`                                            |
+| `REPO_ROOTS`      | `~/repos` (':'-separated)                          |
+| `REPO_POLL_MS`    | `60000`                                            |
+| `COMMAND_POLL_MS` | `30000` (realtime backstop)                        |
+| `COMMAND_TTL_S`   | `120`                                              |
+| `PRESENCE_MS`     | `30000`                                            |
 | `PTY_COLS`/`PTY_ROWS` | `200` / `50`                                   |
 | `REGISTRY_LIMIT`  | `5`                                                |
 

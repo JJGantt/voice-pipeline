@@ -1,0 +1,67 @@
+// Self-healing Supabase realtime subscription.
+//
+// supabase-js does NOT reliably recover a channel once it lands in CHANNEL_ERROR / TIMED_OUT /
+// CLOSED (seen here after the Mac sleeps or a Cloudflare blip): it just sits there, so callers
+// fall back to their tight poll cadence forever (this was ~20k wasted reads/day on the focus row).
+// So on any non-SUBSCRIBED state we tear the channel down and resubscribe with a capped backoff,
+// mirroring the worker's RealtimeWaker. `epoch` invalidates a dead channel's late callbacks so a
+// teardown can't schedule a duplicate rebuild.
+//
+// Callers poll as a missed-event backstop and use isHealthy() to pick a slow or tight cadence.
+import { createClient } from '@supabase/supabase-js';
+import { config } from './config.js';
+
+const BACKOFF_START_MS = 3000;
+const BACKOFF_MAX_MS = 30000;
+
+export function watchTable({ channel: channelName, table, event = '*', onChange, tag }) {
+  let supa = null;
+  let channel = null;
+  let resubTimer = null;
+  let epoch = 0;
+  let backoffMs = BACKOFF_START_MS;
+  let healthy = false;
+  const log = tag || table;
+
+  const scheduleRebuild = () => {
+    if (resubTimer) return; // a rebuild is already pending
+    resubTimer = setTimeout(() => {
+      resubTimer = null;
+      epoch += 1; // invalidate the dead channel's callbacks before tearing it down
+      try { if (channel) supa.removeChannel(channel); } catch { /* ignore */ }
+      channel = null;
+      subscribe();
+    }, backoffMs);
+    backoffMs = Math.min(backoffMs * 2, BACKOFF_MAX_MS);
+  };
+
+  const subscribe = () => {
+    const myEpoch = epoch;
+    try {
+      if (!supa) supa = createClient(config.SUPABASE_URL, config.SUPABASE_KEY);
+      channel = supa
+        .channel(channelName)
+        .on('postgres_changes', { event, schema: 'public', table }, (payload) => onChange(payload))
+        .subscribe((status) => {
+          if (myEpoch !== epoch) return; // stale channel, already rebuilt
+          healthy = status === 'SUBSCRIBED';
+          console.log(`[${log}] realtime:`, status);
+          if (healthy) backoffMs = BACKOFF_START_MS; // recovered — reset the backoff
+          else scheduleRebuild();
+        });
+    } catch (e) {
+      console.error(`[${log}] realtime unavailable (polling only):`, e.message);
+      healthy = false;
+      scheduleRebuild();
+    }
+  };
+  subscribe();
+
+  return {
+    isHealthy: () => healthy,
+    stop() {
+      if (resubTimer) clearTimeout(resubTimer);
+      try { if (channel) supa.removeChannel(channel); } catch { /* ignore */ }
+    },
+  };
+}

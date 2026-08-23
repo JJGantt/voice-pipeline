@@ -7,13 +7,16 @@
 //   POST /inject   ({text,submit?}) write text (and optional Enter) to active pty
 //   GET  /health   ok
 //
-// Background loops: focus watcher (voice_focus id=1) + session registry.
+// Background loops: focus watcher (voice_focus id=1) + session registry + desk control
+// (publish ~/repos to Supabase, drain the hub's launch queue).
 import http from 'node:http';
 import { WebSocketServer } from 'ws';
 import { config } from './config.js';
 import { attachClient, handleClientMessage, inject, hasActive } from './pty.js';
 import { startFocusWatcher } from './focus.js';
 import { startRegistry } from './registry.js';
+import { startRepos } from './repos.js';
+import { startCommands } from './commands.js';
 
 // ---- auth -----------------------------------------------------------------
 
@@ -114,7 +117,7 @@ wss.on('connection', (ws) => {
 function preflight() {
   if (!config.SUPABASE_KEY) {
     console.error(
-      '[orchestrator] WARNING: SUPABASE_KEY is empty — focus watcher & registry will fail. Set it in the environment.'
+      '[orchestrator] WARNING: SUPABASE_KEY is empty — focus watcher, registry & desk control will fail. Set it in the environment.'
     );
   }
 }
@@ -124,6 +127,8 @@ server.listen(config.PORT, '0.0.0.0', () => {
   console.log(`[orchestrator] listening on 0.0.0.0:${config.PORT}`);
   startFocusWatcher();
   startRegistry();
+  startRepos();
+  startCommands();
 });
 
 // Graceful-ish shutdown for launchd.

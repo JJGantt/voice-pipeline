@@ -3,10 +3,10 @@
 //                            running `claude --resume <id>`, advertise terminal_url.
 //   focus = 'hub'         -> kill the pty, re-open the desk tab for whatever
 //                            was last focused, clear terminal_url.
-// A realtime subscription reconciles the instant the row changes (faster than the old 2s poll ever
-// was); polling survives only as a missed-event backstop — 60s while the subscription is healthy,
-// FOCUS_POLL_MS when it isn't. The always-2s poll was ~43k Supabase reads/day of unchanged rows.
-import { createClient } from '@supabase/supabase-js';
+// A realtime subscription (watchTable, which handles the resubscribe dance) reconciles the instant
+// the row changes; polling survives only as a missed-event backstop — 60s while the subscription is
+// healthy, FOCUS_POLL_MS when it isn't. The always-2s poll was ~43k Supabase reads/day of unchanged rows.
+import { watchTable } from './realtime.js';
 import { config, terminalUrl } from './config.js';
 import { getFocus, patchFocus } from './supabase.js';
 import { cwdFromSessionFile } from './sessions.js';
@@ -106,8 +106,6 @@ async function tick() {
   }
 }
 
-let rtHealthy = false; // voice_focus subscription live → the poll is only a backstop
-
 export function startFocusWatcher() {
   // Initialize currentFocus to whatever's there now WITHOUT acting, so a
   // daemon restart while a session is focused doesn't immediately re-spawn.
@@ -116,66 +114,16 @@ export function startFocusWatcher() {
 
   // Realtime: any change to the focus row reconciles immediately. Our own patchFocus writes echo
   // back as events too — harmless, reconcile() is idempotent against currentFocus.
-  //
-  // supabase-js does NOT reliably recover a channel once it lands in CHANNEL_ERROR / TIMED_OUT / CLOSED
-  // (seen here after the Mac sleeps or a Cloudflare blip): it just sits there, so rtHealthy stays false
-  // and the backstop below polls at the tight FOCUS_POLL_MS indefinitely (this was ~20k reads/day). So on
-  // any non-SUBSCRIBED state we tear the channel down and resubscribe with a capped backoff — mirroring
-  // the worker's RealtimeWaker — so it climbs back to SUBSCRIBED and the 60s backstop. `epoch` invalidates
-  // a dead channel's late callbacks so teardown can't schedule a duplicate rebuild.
-  let supa = null;
-  let channel = null;
-  let resubTimer = null;
-  let epoch = 0;
-  let backoffMs = 3000;
-  const BACKOFF_MAX_MS = 30000;
+  const rt = watchTable({ channel: 'orch-focus', table: 'voice_focus', onChange: tick, tag: 'focus' });
 
-  const scheduleRebuild = () => {
-    if (resubTimer) return; // a rebuild is already pending
-    resubTimer = setTimeout(() => {
-      resubTimer = null;
-      epoch += 1; // invalidate the dead channel's callbacks before tearing it down
-      try { if (channel) supa.removeChannel(channel); } catch { /* ignore */ }
-      channel = null;
-      subscribe();
-    }, backoffMs);
-    backoffMs = Math.min(backoffMs * 2, BACKOFF_MAX_MS);
-  };
-
-  const subscribe = () => {
-    const myEpoch = epoch;
-    try {
-      if (!supa) supa = createClient(config.SUPABASE_URL, config.SUPABASE_KEY);
-      channel = supa
-        .channel('orch-focus')
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'voice_focus' }, tick)
-        .subscribe((status) => {
-          if (myEpoch !== epoch) return; // stale channel, already rebuilt
-          rtHealthy = status === 'SUBSCRIBED';
-          console.log('[focus] realtime:', status);
-          if (status === 'SUBSCRIBED') {
-            backoffMs = 3000; // recovered — reset the backoff
-          } else {
-            scheduleRebuild();
-          }
-        });
-    } catch (e) {
-      console.error('[focus] realtime unavailable (polling at FOCUS_POLL_MS):', e.message);
-      rtHealthy = false;
-      scheduleRebuild();
-    }
-  };
-  subscribe();
-
-  // Adaptive backstop: a setTimeout chain (not setInterval) so the cadence follows rtHealthy.
+  // Adaptive backstop: a setTimeout chain (not setInterval) so the cadence follows realtime health.
   const loop = () => {
     tick();
-    timer = setTimeout(loop, rtHealthy ? 60000 : config.FOCUS_POLL_MS);
+    timer = setTimeout(loop, rt.isHealthy() ? 60000 : config.FOCUS_POLL_MS);
   };
   timer = setTimeout(loop, config.FOCUS_POLL_MS);
   return () => {
     if (timer) clearTimeout(timer);
-    if (resubTimer) clearTimeout(resubTimer);
-    try { if (channel) supa.removeChannel(channel); } catch { /* ignore */ }
+    rt.stop();
   };
 }
