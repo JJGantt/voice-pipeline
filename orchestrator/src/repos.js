@@ -1,12 +1,17 @@
-// Repo publisher + desk presence.
+// Project publisher + desk presence.
 //
 // The hub server runs on Fly and can't see this filesystem, so the picker it renders has to be
-// published from here: every REPO_POLL_MS, scan the configured roots for git checkouts and upsert
-// what's there (path, branch, dirty, HEAD date) into `repos`.
+// published from here: every REPO_POLL_MS, scan the configured roots and upsert what's there into
+// `repos`.
+//
+// Every DIRECTORY counts, not just git checkouts. Filtering on `.git` hid some of the most active
+// work here — several large working directories are deliberately not repos, and neither are
+// various research dirs, but they're exactly what you'd want to open a session in. So git is
+// decoration: branch + dirty when the directory happens to be a repo, absent when it isn't.
 //
 // Writes are change-gated for the same reason registry.js gates its own: the scan is local and
 // free, the round-trip isn't, and this set changes a few times a week at most. `dirty` and
-// `last_commit` DO move during a work session, which is the point — the picker shows them.
+// `last_active` DO move during a work session, which is the point — the picker shows them.
 //
 // Presence is separate and unconditional (PRESENCE_MS into worker_presence as 'desk'), so the hub
 // can grey out the launch buttons when the Mac is asleep rather than queue a command nobody runs.
@@ -41,19 +46,29 @@ async function git(dir, args) {
   return stdout;
 }
 
+// `last_active` is the HEAD commit date for a repo and the directory's own mtime otherwise — same
+// question either way ("when did I last touch this"), and it keeps the picker's ordering sane for
+// the non-repo projects that would otherwise sort last forever.
 async function inspect(dir) {
   const name = path.basename(dir);
-  let last_commit = null;
+  const isRepo = fs.existsSync(path.join(dir, '.git'));
+  let last_active = null;
   let dirty = false;
-  try { last_commit = (await git(dir, ['log', '-1', '--format=%cI'])).trim() || null; }
-  catch { /* no commits yet, or not a readable repo */ }
-  try { dirty = (await git(dir, ['status', '--porcelain'])).trim().length > 0; }
-  catch { /* leave clean */ }
-  return { path: dir, name, branch: branchOf(dir), dirty, last_commit, updated: new Date().toISOString() };
+  if (isRepo) {
+    try { last_active = (await git(dir, ['log', '-1', '--format=%cI'])).trim() || null; }
+    catch { /* no commits yet, or not a readable repo */ }
+    try { dirty = (await git(dir, ['status', '--porcelain'])).trim().length > 0; }
+    catch { /* leave clean */ }
+  }
+  if (!last_active) {
+    try { last_active = fs.statSync(dir).mtime.toISOString(); } catch { /* leave null */ }
+  }
+  return { path: dir, name, branch: isRepo ? branchOf(dir) : null, dirty, last_active,
+    updated: new Date().toISOString() };
 }
 
-// Direct children of each root that are git checkouts. Deep recursion would drag in vendored
-// checkouts under node_modules, and every repo worth opening lives one level down.
+// Direct children of each root. Deep recursion would drag in vendored checkouts under
+// node_modules, and everything worth opening a session in lives one level down.
 function scanRoots() {
   const found = [];
   for (const root of config.REPO_ROOTS) {
@@ -62,8 +77,7 @@ function scanRoots() {
     catch { continue; }  // root doesn't exist on this machine — fine
     for (const e of entries) {
       if (!e.isDirectory() || e.name.startsWith('.')) continue;
-      const dir = path.join(root, e.name);
-      if (fs.existsSync(path.join(dir, '.git'))) found.push(dir);
+      found.push(path.join(root, e.name));
     }
   }
   return found.sort();
@@ -73,13 +87,13 @@ function needsWrite(rows) {
   if (!lastWritten || rows.length !== lastWritten.length) return true;
   for (let i = 0; i < rows.length; i++) {
     const a = rows[i], b = lastWritten[i];
-    if (a.path !== b.path || a.branch !== b.branch || a.dirty !== b.dirty || a.last_commit !== b.last_commit) return true;
+    if (a.path !== b.path || a.branch !== b.branch || a.dirty !== b.dirty || a.last_active !== b.last_active) return true;
   }
   return false;
 }
 
-// Is `p` one of the repos we published? The command runner re-checks every launch target against
-// this, so a bad or stale row in the queue can't turn into `cd` anywhere on the disk.
+// Is `p` one of the directories we published? The command runner re-checks every launch target
+// against this, so a bad or stale row in the queue can't turn into `cd` anywhere on the disk.
 export function isKnownRepo(p) {
   return !!(lastWritten || []).find((r) => r.path === p);
 }
@@ -93,7 +107,7 @@ async function tick() {
     if (needsWrite(rows)) {
       await upsertRepos(rows);
       await pruneRepos(rows.map((r) => r.path));
-      console.log(`[repos] published ${rows.length} repos`);
+      console.log(`[repos] published ${rows.length} projects`);
     }
     lastWritten = rows;   // always refresh the launch allow-list, even when no write was needed
   } catch (e) {
