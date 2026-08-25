@@ -1756,7 +1756,7 @@ class RealtimeWaker:
         self._started = True
         self._loop = asyncio.new_event_loop()
         threading.Thread(target=self._run, name="rt-waker", daemon=True).start()
-        log("realtime listener starting (event-driven claim on voice_requests INSERT)")
+        log("realtime listener starting (event-driven claim on voice_requests → pending)")
 
     def _run(self) -> None:
         asyncio.set_event_loop(self._loop)
@@ -1776,7 +1776,9 @@ class RealtimeWaker:
                                                  auto_reconnect=True)
                 await self._sock.connect()
                 ch = self._sock.channel("voice-worker")
-                ch.on_postgres_changes("INSERT", callback=self._on_insert,
+                # "*" (not INSERT) — and ONE binding, not two: realtime-py is unreliable with two
+                # bindings on the same table (same note in mac-listener/listener.py).
+                ch.on_postgres_changes("*", callback=self._on_change,
                                        schema="public", table="voice_requests")
                 await ch.subscribe(self._on_sub)
                 # Recycle the socket every ~5 min even while it still reports is_connected: a HALF-OPEN
@@ -1799,15 +1801,31 @@ class RealtimeWaker:
             if _running:
                 await asyncio.sleep(5.0)
 
-    def _on_insert(self, _payload) -> None:
-        self.event.set()  # a command was enqueued → wake the main loop now
+    def _on_change(self, payload) -> None:
+        """Wake on any voice_requests change that leaves a row CLAIMABLE (status 'pending').
+
+        Binding INSERT alone missed every real command. BOTH capture paths (ESP `server.py` and Mac
+        `wakefree.py`) insert a placeholder row as 'transcribing' the instant the capture closes, then
+        UPDATE it to 'pending' when the transcript lands. So the INSERT woke the worker with nothing
+        yet to claim, and the UPDATE that actually made it claimable fired no event it listened for —
+        every command then waited out the full IDLE_POLL_S backstop. Measured: a consistent 14-16s of
+        dead air between "transcribed" and "claimed" on three consecutive commands.
+
+        Filtered to 'pending' so the worker's own claimed/done writes can't wake it in a loop.
+        """
+        try:
+            rec = (payload.get("data") or {}).get("record") or {}
+        except AttributeError:
+            return
+        if str(rec.get("status") or "") == "pending":
+            self.event.set()
 
     def _on_sub(self, state, err=None) -> None:
         self.healthy = "SUBSCRIBED" in str(state).upper()   # any other state (TIMED_OUT/CLOSED/ERROR) → degraded poll
         log(f"realtime subscription: {state}{(' err=' + str(err)) if err else ''}")
 
     def wait(self, timeout: float) -> bool:
-        """Block until an INSERT wakes us (instant) or `timeout` elapses (poll fallback)."""
+        """Block until a row goes 'pending' (instant) or `timeout` elapses (poll fallback)."""
         fired = self.event.wait(timeout)
         self.event.clear()
         return fired
