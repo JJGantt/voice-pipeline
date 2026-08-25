@@ -362,6 +362,7 @@ async def connection(ws):
     last_check = 0.0                # monotonic time the last check was launched
     miss = 0                        # consecutive non-confirming checks since the last confirm
     jared_seen = False              # have we confirmed Jared at all this capture?
+    mute_flush = False              # mute landed mid-capture on audio worth keeping → close it, don't bin it
     last_confirm = None             # wall-clock of the last confirm (send-suppression vs the other mic)
 
     async for msg in ws:
@@ -388,17 +389,34 @@ async def connection(ws):
 
             if _suppressed or _inject:    # push-to-talk mute OR inject mode (Mac-only) → ESP drops everything
                 if capturing:
-                    log.info("capture ABORTED mid-utterance (%.1fs in) by %s",
-                             time.monotonic() - started, "mute" if _suppressed else "inject")
-                    if check_task is not None:
-                        check_task.cancel()
-                        check_task = None
-                    capturing = False
-                    utterance = bytearray()
-                    oww.reset()
-                    _led_capturing = False
-                    await _render_led(ws)
-                continue
+                    # The mute exists so the ESP doesn't ALSO capture the dictation you're about to
+                    # start — that argument covers audio recorded AFTER the mute, and only that.
+                    # Whatever was recorded BEFORE it is a separate, already-spoken utterance, so
+                    # finalize it through the normal close path instead of binning it. Only a capture
+                    # that never earned the right to be sent is still discarded: speaker-gated audio
+                    # that never confirmed you (noise/TV), or one too short to transcribe.
+                    _sg = _wakefree and _enc is not None and _bank is not None and _enroll_left == 0
+                    _dur = len(utterance) / 2 / SAMPLE_RATE
+                    if (jared_seen or not _sg) and _dur >= MIN_UTTERANCE_S:
+                        log.info("capture FLUSHED at %s (%.1fs, %s) — finalizing, not discarding",
+                                 "mute" if _suppressed else "inject", _dur,
+                                 "speaker-confirmed" if _sg else "wake-word")
+                        mute_flush = True      # consumed by the capture branch below → close, reason='mute-flush'
+                    else:
+                        log.info("capture ABORTED mid-utterance (%.1fs in) by %s — %s",
+                                 _dur, "mute" if _suppressed else "inject",
+                                 "never confirmed you" if _sg else "too short")
+                        if check_task is not None:
+                            check_task.cancel()
+                            check_task = None
+                        capturing = False
+                        utterance = bytearray()
+                        oww.reset()
+                        _led_capturing = False
+                        await _render_led(ws)
+                        continue
+                else:
+                    continue
 
             if not capturing:
                 preroll.extend(raw)
@@ -437,7 +455,8 @@ async def connection(ws):
                     else:
                         log.info("wake! tier=%s (fast=%.2f power=%.2f)", wake_tier, fast_score, power_score)
             else:
-                utterance.extend(raw)
+                if not mute_flush:
+                    utterance.extend(raw)   # post-mute audio is the dictation — never append it
                 now = time.monotonic()
                 elapsed = now - started
                 hang = _vpause if _wakefree else SILENCE_HANGOVER_S
@@ -449,7 +468,9 @@ async def connection(ws):
                 close = False
                 reason = ""
                 is_noise = False           # True → never confirmed you (drop without enqueue)
-                if speaker_gated:
+                if mute_flush:
+                    close, reason, mute_flush = True, "mute-flush", False
+                elif speaker_gated:
                     audio_s = len(utterance) / 2 / SAMPLE_RATE - seed_len_s   # POST-trigger audio only — the
                     # pre-roll must NOT count toward VAD_FIRST_CHECK_S / VAD_NO_JARED_ABORT_S (that inflation is
                     # what made the earlier pre-roll abort captures before they could confirm you)
