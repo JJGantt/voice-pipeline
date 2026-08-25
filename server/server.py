@@ -121,7 +121,9 @@ LONG_UTTERANCE_WARN_S = 300.0  # warn if a single capture runs this long
 # you've been absent (no confirmed-Jared window) for the hangover. Tune from the logged vad/endpoint lines.
 VAD_WINDOW_S = 2.0           # trailing audio fed to ECAPA per check
 VAD_CHECK_EVERY_S = 0.7      # re-score cadence while capturing
-VAD_ABSENT_MISSES = 2       # close only after this many CONSECUTIVE non-confirming checks (event-based, not a
+VAD_ABSENT_MISSES = 1       # EXPERIMENT 2026-08-25: was 2. Mirrors the Mac (voice-id/wakefree.py) —
+                            # the two mics must endpoint identically or the same sentence gets cut
+                            # differently depending on which one heard it. Revert both together.
                             # timer that races the cadence and clips you between words)
 VAD_FIRST_CHECK_S = 1.8      # wait for this much audio before the first check
 VAD_NO_JARED_ABORT_S = 3.5  # never confirmed you within this much audio → it's noise/TV, drop cheap

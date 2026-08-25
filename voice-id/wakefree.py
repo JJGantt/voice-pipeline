@@ -66,7 +66,12 @@ VAD_CHECK_EVERY_S = 0.7      # re-score cadence while capturing
 VAD_FIRST_CHECK_S = 1.4      # min audio before the first check (the close Mac mic confirms fast)
 VAD_NO_JARED_ABORT_S = 3.5  # never confirmed within this much audio → not Jared, drop
 KEEPALIVE_MARGIN = 0.16      # hysteresis: once confirmed, stay locked unless match falls to ~not-you/silence
-ABSENT_MISSES = 2            # close only after this many CONSECUTIVE non-confirming checks — event-based, NOT a
+ABSENT_MISSES = 1            # EXPERIMENT 2026-08-25: was 2. Closing on the FIRST non-confirm ends a
+                             # capture as soon as you stop, instead of holding it open through the
+                             # pause and recording whatever follows. Measured over 2140 captures:
+                             # saves a mean 2.3s overall (p90 7.4s) but only ~1.1s on command-shaped
+                             # ones, against ~6% of typical commands being truncated mid-sentence.
+                             # Revert to 2 if real commands start getting cut.
                              # timer that can race the check cadence and cut you off between words
 
 # Push-to-talk coordination: Hammerspoon sends SIGUSR1 (pause) / SIGUSR2 (resume) while you dictate to
