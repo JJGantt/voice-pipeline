@@ -559,7 +559,12 @@ async def connection(ws):
                     # Send-suppression (shared presence): if the OTHER mic still has you — heard you within
                     # 1.5s and at least as recently as this ESP did — this capture is a PARTIAL. Drop it; that
                     # mic will send the complete one. (Mac is primary: ESP yields ties via the −0.3s margin.)
-                    other = await _other_heard_jared()
+                    #
+                    # EXCEPT on a mute flush. The mute is GLOBAL — it silenced the other mic in the same
+                    # instant (the Mac just logs "paused (push-to-talk)" and bins its buffer), so the
+                    # "complete one" this would yield to is never coming and the utterance is lost by both.
+                    # Yielding is only correct while the other mic is still live to finish the job.
+                    other = None if reason == "mute-flush" else await _other_heard_jared()
                     if other is not None and last_confirm is not None:
                         _n = datetime.now(timezone.utc)
                         if (_n - other).total_seconds() <= 1.5 and other >= last_confirm - timedelta(seconds=0.3):
