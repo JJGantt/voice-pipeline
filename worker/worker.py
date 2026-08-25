@@ -1172,11 +1172,21 @@ class ApiRunner:
         self._stack = AsyncExitStack()
         for name, cmd, args in specs:
             params = StdioServerParameters(command=cmd, args=args, env=env)
-            read, write = await self._stack.enter_async_context(stdio_client(params))
-            session = await self._stack.enter_async_context(ClientSession(read, write))
-            await session.initialize()
+            try:
+                read, write = await self._stack.enter_async_context(stdio_client(params))
+                session = await self._stack.enter_async_context(ClientSession(read, write))
+                await session.initialize()
+                tools = (await session.list_tools()).tools
+            except Exception as e:  # noqa: BLE001
+                # One MCP server that won't start must NOT take the whole runner down — `claude -p`
+                # tolerates a dead server and so must we. Observed: the Pi's petlibro venv was missing
+                # the `mcp` package, and that single ImportError failed EVERY command with
+                # "Connection closed" and bounced it to Opus. A broken feeder should cost you the
+                # feeder, not the fast path.
+                log(f"api agent: MCP server {name!r} failed to start ({e}) — continuing without it")
+                continue
             self._sessions[name] = session
-            for t in (await session.list_tools()).tools:
+            for t in tools:
                 aname = (name + "__" + t.name)[:64]
                 self._tools.append({
                     "name": aname,
