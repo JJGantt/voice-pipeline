@@ -255,13 +255,19 @@ def set_mac_mic(on: bool) -> None:
     (otherwise the puck would hear and act on everything you dictate)."""
     if on == _mic_on.is_set():
         return
+    # Cleared FIRST so the supervisor sees the new state and won't respawn the kill below.
     (_mic_on.set if on else _mic_on.clear)()
     _recompute_capture()
     if _wakefree.is_set():
-        # Resume only if the global mute isn't also holding it — otherwise we'd un-pause mid-dictation.
-        sig = "-USR1" if not on else ("-USR2" if not _muted.is_set() else None)
-        if sig:
-            subprocess.Popen(["pkill", sig, "-f", "wakefree.py"],
+        if on:
+            if _wf_proc is None or _wf_proc.poll() is not None:
+                _spawn_wakefree()
+        else:
+            # Stop the child outright rather than USR1-pausing it: the pause signal races the child's
+            # handler installation, and Python's DEFAULT SIGUSR1 action is to terminate — signalling a
+            # just-spawned child killed it (rc=-30) and the supervisor respawned it LISTENING. Killing
+            # is also what "mic off" should mean: the mic is fully released, not held muted.
+            subprocess.Popen(["pkill", "-f", "wakefree.py"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     log(f"mac mic {'ON' if on else 'OFF'} (mac_mic_enabled) — ESP unaffected")
 
@@ -308,8 +314,8 @@ def _spawn_wakefree() -> None:
 
     def _supervise(proc: subprocess.Popen) -> None:
         rc = proc.wait()
-        if not (_wakefree.is_set() and proc is _wf_proc):
-            return                      # deliberate stop (mode off) or an already-superseded child
+        if not (_wakefree.is_set() and _mic_on.is_set() and proc is _wf_proc):
+            return                      # deliberate stop (mode off / mic off) or a superseded child
         if rc == 2:
             log("wakefree.py exited rc=2 (fatal config — missing key/exemplars); NOT respawning")
             return
@@ -339,10 +345,10 @@ def set_wakefree(on: bool) -> None:
     if on and not _wakefree.is_set():
         _wakefree.set(); _recompute_capture()
         log("wake-free ON — yielding mic, starting wakefree.py (+ ESP)")
-        _spawn_wakefree()
-        if not _mic_on.is_set():   # mic switched off → the fresh child must start paused, not listening
-            subprocess.Popen(["pkill", "-USR1", "-f", "wakefree.py"],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if _mic_on.is_set():
+            _spawn_wakefree()
+        else:
+            log("  …but mac_mic_enabled=0 — not starting wakefree.py; the ESP carries wake-free alone")
         # Pin the TTS engine warm for the whole session (don't let it idle-exit between commands and
         # cold-reload), and warm it now so the first command isn't delayed.
         _pin_tts(True); warm_tts()
@@ -444,9 +450,11 @@ def _reconcile_settings() -> None:
     within one recycle. set_wakefree / _apply_mute both early-return when already in state, so this is a
     no-op in the normal case. Best-effort; runs off the realtime loop so the httpx reads never block it."""
     try:
+        # mac_mic_enabled FIRST: set_wakefree consults it, so reading it last made every restart
+        # spawn wakefree.py (a ~1 GB ECAPA load) only to kill it 0.7s later.
+        set_mac_mic(_read_setting("mac_mic_enabled", default=True))
         set_wakefree(_read_setting("wakefree_enabled"))
         _apply_mute(_read_setting("voice_muted"))
-        set_mac_mic(_read_setting("mac_mic_enabled", default=True))
     except Exception as e:  # noqa: BLE001
         log(f"settings reconcile error: {e}")
 
@@ -940,6 +948,9 @@ def main() -> int:
     # Push-to-talk takes the mic via signals; wake-free takes it via the hub toggle. Capture iff neither.
     signal.signal(signal.SIGUSR1, _on_ptt_start)
     signal.signal(signal.SIGUSR2, _on_ptt_stop)
+    # mac_mic_enabled BEFORE wake-free: set_wakefree consults it, so applying it after made boot spawn
+    # wakefree.py (a ~1 GB ECAPA load) only to kill it moments later.
+    set_mac_mic(_read_setting("mac_mic_enabled", default=True))
     if _read_setting("wakefree_enabled"):  # apply persisted hub toggle at boot; live flips via RealtimeFeedback
         set_wakefree(True)
     set_inject_mode(_read_setting("voice_inject_mode"))  # apply persisted inject toggle (forces wake-free on if set)
