@@ -959,7 +959,6 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
     timed_out = {"v": False}
     t_spawn = t_init = t_first = None   # timing seams: spawn → MCP-ready (system init) → first model token
     n_tools = 0
-    denied_gated = False   # set if a tool OUTSIDE allowed_tools was attempted (auto-denied) → caller escalates
 
     # Subscription path: `claude -p` must use the logged-in Claude subscription, not an API key. If
     # ANTHROPIC_API_KEY is in the env (it is, so the SDK path can use it), the CLI silently bills the
@@ -1031,13 +1030,6 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
                     elif block.get("type") == "tool_use":
                         n_tools += 1
                         tname = block.get("name", "")
-                        # A tool call OUTSIDE the allowlist is auto-DENIED in -p mode. On the gated Sonnet
-                        # run that means it reached for a gated write instead of emitting the escalate
-                        # sentinel — flag it so the caller escalates to Opus (which HAS the tool) rather than
-                        # letting Sonnet report "I don't have permission" to the user.
-                        if allowed_tools is not None and tname and not any(
-                                tname == a or tname.startswith(a + "__") for a in allowed_tools):
-                            denied_gated = True
                         if on_event:
                             try:
                                 on_event("tool", {"name": tname, "input": block.get("input")})
@@ -1079,7 +1071,6 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
             "result": result_text,
             "ok": raw_error is None and bool(text),
             "raw_error": raw_error,
-            "denied_gated": denied_gated,
         }
     except Exception as e:  # noqa: BLE001
         if proc is not None:
@@ -1124,7 +1115,25 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
 # It's a real agentic loop, not one-shot — the model can chain sequential tool calls and always ends
 # with a user-facing text reply. MCP servers are started ONCE (warm stdio sessions) and their schemas
 # are inlined with the prompt, so a turn is one round-trip (+ tool round-trips), no spin-up per request.
-API_MODEL_IDS = {"haiku": "claude-haiku-4-5", "sonnet": "claude-sonnet-4-6", "opus": "claude-opus-4-8"}
+API_MODEL_IDS = {"haiku": "claude-haiku-4-5", "sonnet": "claude-sonnet-5", "opus": "claude-opus-5"}
+
+
+def _api_allowed_names(allowed):
+    """SAFE_TOOLS is CLI-shaped — "mcp__data__get_workout", or "mcp__voice" for a whole server. The api
+    runner names tools "<server>__<tool>" and uses shorter server prefixes. Translate one into the other,
+    returning (whole servers allowed, individual tools allowed)."""
+    alias = {"govee-lights": "govee", "petlibro-feeder": "petlibro"}
+    servers, exact = set(), set()
+    for entry in allowed:
+        parts = entry.split("__")
+        if len(parts) < 2 or parts[0] != "mcp":
+            continue
+        srv = alias.get(parts[1], parts[1])
+        if len(parts) == 2:
+            servers.add(srv)                                  # every tool on this server
+        else:
+            exact.add(srv + "__" + "__".join(parts[2:]))
+    return servers, exact
 
 
 class ApiRunner:
@@ -1132,6 +1141,7 @@ class ApiRunner:
         self._loop = None
         self._client = None
         self._stack = None        # AsyncExitStack holding the warm MCP stdio sessions
+        self._last_allowed = None  # toolset of the previous turn; a change invalidates the history
         self._sessions = {}       # server name -> mcp ClientSession
         self._tools = []          # Anthropic tool schemas (only the MCP tools)
         self._dispatch = {}       # anthropic tool name -> (server, real MCP tool name)
@@ -1158,6 +1168,7 @@ class ApiRunner:
         if os.path.exists(DATA_MCP_JS):  specs.append(("data", "node", [DATA_MCP_JS]))
         if os.path.exists(VOICE_MCP_JS): specs.append(("voice", "node", [VOICE_MCP_JS]))
         if os.path.exists(GOVEE_MCP_PY): specs.append(("govee", GOVEE_PY, [GOVEE_MCP_PY]))
+        if os.path.exists(PETLIBRO_MCP_PY): specs.append(("petlibro", PETLIBRO_PY, [PETLIBRO_MCP_PY]))
         self._stack = AsyncExitStack()
         for name, cmd, args in specs:
             params = StdioServerParameters(command=cmd, args=args, env=env)
@@ -1195,7 +1206,7 @@ class ApiRunner:
         except Exception as e:  # noqa: BLE001
             return f"tool error: {e}"
 
-    async def _run(self, prompt, system, model, think, on_event, effort="high"):
+    async def _run(self, prompt, system, model, think, on_event, effort="high", allowed=None):
         await self._ensure()
         self._messages.append({"role": "user", "content": prompt})
         # Cache the stable prefix — the tool schemas (~10k tokens) + system — for 1 hour, so warm hits
@@ -1205,8 +1216,16 @@ class ApiRunner:
         # stays byte-identical across commands. 1h TTL survives the gaps between voice commands.
         sys_param = ([{"type": "text", "text": system,
                        "cache_control": {"type": "ephemeral", "ttl": "1h"}}] if system else system)
+        # Gate by what the model is HANDED, not by refusing it later: on the fast path only SAFE_TOOLS
+        # reach `tools=`, so a gated write isn't denied — it doesn't exist to be called. Same safety
+        # property `--allowedTools` gave the `-p` path, enforced one step earlier.
+        tools = self._tools
+        if allowed is not None:
+            _srv, _exact = _api_allowed_names(allowed)
+            tools = [t for t in self._tools
+                     if t["name"].split("__", 1)[0] in _srv or t["name"] in _exact]
         kwargs = dict(model=API_MODEL_IDS.get(model, model), system=sys_param,
-                      tools=self._tools, messages=self._messages,
+                      tools=tools, messages=self._messages,
                       max_tokens=8000 if think else 1024,
                       extra_headers={"anthropic-beta": "extended-cache-ttl-2025-04-11"})
         if think:  # adaptive thinking (budget_tokens is rejected on 4.8); effort sets the depth
@@ -1244,16 +1263,20 @@ class ApiRunner:
         return {"session_id": None, "text": final_text.strip(), "result": final_text.strip(),
                 "ok": bool(final_text.strip()), "raw_error": None}
 
-    def run(self, transcript, system_append="", on_event=None, model="haiku", think=False, effort="high") -> dict:
+    def run(self, transcript, system_append="", on_event=None, model="haiku", think=False, effort="high",
+            allowed=None) -> dict:
         self._start_loop()
         now = time.monotonic()
         today = datetime.now().astimezone().date()
-        if self._messages and (now - self._last > session_reset_s() or self._day != today):
+        # A toolset change also resets: replayed tool_use blocks would reference tools no longer in
+        # `tools=`, and the cached prefix is keyed on the schema list anyway.
+        if self._messages and (now - self._last > session_reset_s() or self._day != today
+                               or allowed != self._last_allowed):
             self.reset()
-        self._last, self._day = now, today
+        self._last, self._day, self._last_allowed = now, today, allowed
         try:
             fut = asyncio.run_coroutine_threadsafe(
-                self._run(transcript, system_append, model, think, on_event, effort), self._loop)
+                self._run(transcript, system_append, model, think, on_event, effort, allowed), self._loop)
             return fut.result(timeout=CLAUDE_TIMEOUT_S + 30)
         except Exception as e:  # noqa: BLE001 — never wedge the worker
             self.reset()
@@ -1635,21 +1658,31 @@ def process_request(db: Supabase, req: dict) -> None:
         result = run_claude(hub_prompt + POWER_DIRECTIVE, None, on_event=_emit, system_append=sys_ctx,
                             model="opus", allow_read=bool(att_paths))
     else:
-        # Sonnet, safe toolset only (gated writes DENIED, so it can't corrupt data). It handles reads +
-        # actuators itself; a gated need → __ESCALATE__ → re-run the turn on a FRESH Opus with the full tools.
-        result = run_claude(hub_prompt + ESCALATE_DIRECTIVE, None, on_event=_emit, system_append=sys_ctx,
-                            model="sonnet", allowed_tools=SAFE_TOOLS)
+        # FAST PATH — Sonnet on the WARM api runner, safe toolset only. Not `claude -p`: that spawns the
+        # CLI and four stdio MCP servers per command, which measured 3.6s on the Pi (~42% of a simple
+        # turn) before the model saw a single token. The api runner holds those MCP sessions open and
+        # prompt-caches the schema prefix for an hour, so the spawn cost disappears. Billed to the API
+        # (~1c/turn); the escalation below stays on the subscription, where the money actually is.
+        result = API.run(hub_prompt + ESCALATE_DIRECTIVE, system_append=sys_ctx, on_event=_emit,
+                         model="sonnet", allowed=SAFE_TOOLS)
         st = (result.get("text") or "").strip().lower()
         escalate = ("__escalate__" in st) or (re.sub(r"[^a-z]", "", st) == "escalate")
-        denied = bool(result.get("denied_gated"))   # Sonnet reached for a gated tool (auto-denied) → escalate
-        # Escalate on a gated need (the sentinel OR a denied gated-tool attempt) or a Sonnet error (a worker
-        # whose subscription can't serve Sonnet still completes the command on Opus instead of dropping it).
-        if escalate or denied or not result.get("ok"):
-            reason = "__ESCALATE__" if escalate else ("gated-tool attempt (denied)" if denied else f"sonnet error ({result.get('raw_error')})")
+        # Escalate on a gated need (the sentinel) or an error — a fast-path failure still has to complete
+        # the command on Opus rather than drop it. (There is no denied-tool signal to check any more: the
+        # gated tools are absent from `tools=`, so they can't be attempted at all.)
+        if escalate or not result.get("ok"):
+            reason = "__ESCALATE__" if escalate else f"api sonnet error ({result.get('raw_error')})"
             log(f"dynamic → Opus (full toolset): {reason}")
             push_activity(transcript[:240], "working")   # keep the working indicator up across the hop
+            # Escalation runs on the SUBSCRIPTION: these turns are rare and already slow, so the CLI cold
+            # start is noise here, and Opus is the expensive one to bill. Mac and Pi both have it; Fly is
+            # intercepted earlier. If the subscription run fails anyway, finish on the API rather than drop.
             result = run_claude(hub_prompt + POWER_DIRECTIVE, None, on_event=_emit, system_append=sys_ctx,
                                 model="opus", allow_read=bool(att_paths))
+            if not result.get("ok"):
+                log(f"subscription Opus failed ({result.get('raw_error')}) — completing on the API")
+                result = API.run(hub_prompt + POWER_DIRECTIVE, system_append=sys_ctx, on_event=_emit,
+                                 model="opus", think=True, effort=effort)
 
     if att_tmp:
         shutil.rmtree(att_tmp, ignore_errors=True)   # staged photos served their turn
