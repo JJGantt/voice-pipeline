@@ -55,6 +55,8 @@ MIN_UTTER_S = 0.4      # ignore sub-0.4s "utterances" (just the wake tail)
 # also fires instantly via SIGUSR (Hammerspoon) and propagates to the ESP by writing the flag.
 WAKEFREE_RUN = os.path.expanduser("~/repos/voice-pipeline/voice-id/run-wakefree.sh")
 _muted = threading.Event()      # set = global voice_muted (an explicit command is being captured)
+_mic_on = threading.Event()     # clear = THIS Mac's mic is off (app_settings.mac_mic_enabled); ESP unaffected
+_mic_on.set()                   # default ON — a missing/unreadable setting must never silently deafen the Mac
 _wakefree = threading.Event()   # set = wake-free mode on
 _capture = threading.Event()    # set = the listener should own the mic (wake-word)
 _capture.set()
@@ -204,7 +206,7 @@ def _alive_beacon() -> None:
 
 
 def _recompute_capture() -> None:
-    (_capture.clear if (_muted.is_set() or _wakefree.is_set()) else _capture.set)()
+    (_capture.clear if (_muted.is_set() or _wakefree.is_set() or not _mic_on.is_set()) else _capture.set)()
 
 
 JARED_VOICE_URL = os.environ.get("JARED_VOICE_URL", "https://jared-voice.fly.dev").rstrip("/")
@@ -242,6 +244,26 @@ def _apply_mute(on: bool) -> None:
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     threading.Thread(target=_ping_esp_capture, args=(on,), daemon=True).start()
     threading.Thread(target=_write_setting, args=("voice_muted", "1" if on else "0"), daemon=True).start()
+
+
+def set_mac_mic(on: bool) -> None:
+    """Mac-mic-only kill switch (app_settings.mac_mic_enabled). Silences THIS Mac — the wake-word loop
+    and wakefree.py — while the ESP stays fully live, so the puck can be exercised in isolation.
+
+    Deliberately NOT voice_muted: that flag is global and deafens every source, and push-to-talk owns
+    it. This one is per-device and leaves that plumbing untouched, so dictating still mutes the ESP
+    (otherwise the puck would hear and act on everything you dictate)."""
+    if on == _mic_on.is_set():
+        return
+    (_mic_on.set if on else _mic_on.clear)()
+    _recompute_capture()
+    if _wakefree.is_set():
+        # Resume only if the global mute isn't also holding it — otherwise we'd un-pause mid-dictation.
+        sig = "-USR1" if not on else ("-USR2" if not _muted.is_set() else None)
+        if sig:
+            subprocess.Popen(["pkill", sig, "-f", "wakefree.py"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    log(f"mac mic {'ON' if on else 'OFF'} (mac_mic_enabled) — ESP unaffected")
 
 
 def _on_ptt_start(*_):   # Hammerspoon double-tap → global mute (Mac instant + ESP via /capture)
@@ -318,6 +340,9 @@ def set_wakefree(on: bool) -> None:
         _wakefree.set(); _recompute_capture()
         log("wake-free ON — yielding mic, starting wakefree.py (+ ESP)")
         _spawn_wakefree()
+        if not _mic_on.is_set():   # mic switched off → the fresh child must start paused, not listening
+            subprocess.Popen(["pkill", "-USR1", "-f", "wakefree.py"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         # Pin the TTS engine warm for the whole session (don't let it idle-exit between commands and
         # cold-reload), and warm it now so the first command isn't delayed.
         _pin_tts(True); warm_tts()
@@ -383,15 +408,19 @@ def set_speak_replies(on: bool) -> None:
         log("speak replies OFF — replies stay silent")
 
 
-def _read_setting(key: str) -> bool:
+def _read_setting(key: str, default: bool = False) -> bool:
+    """`default` is returned when the row is absent OR unreadable — so a switch that must fail SAFE
+    (mac_mic_enabled) isn't silently flipped off by a missing row or a blip in connectivity."""
     try:
         r = httpx.get(f"{SUPABASE_URL}/rest/v1/app_settings",
                       params={"key": f"eq.{key}", "select": "value"},
                       headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=8)
         rows = r.json()
-        return bool(rows) and str(rows[0].get("value")) not in ("0", "false", "off", "no", "", "None")
+        if not rows:
+            return default
+        return str(rows[0].get("value")) not in ("0", "false", "off", "no", "", "None")
     except Exception:  # noqa: BLE001
-        return False
+        return default
 
 
 def _write_setting(key: str, value: str) -> None:
@@ -417,6 +446,7 @@ def _reconcile_settings() -> None:
     try:
         set_wakefree(_read_setting("wakefree_enabled"))
         _apply_mute(_read_setting("voice_muted"))
+        set_mac_mic(_read_setting("mac_mic_enabled", default=True))
     except Exception as e:  # noqa: BLE001
         log(f"settings reconcile error: {e}")
 
@@ -633,6 +663,8 @@ class RealtimeFeedback:
             set_wakefree(truthy)
         elif key == "voice_muted":      # global mute set by any explicit input (PTT / FAB)
             _apply_mute(truthy)
+        elif key == "mac_mic_enabled":     # per-device: silence THIS Mac's mic, ESP stays live
+            set_mac_mic(truthy)
         elif key == "voice_inject_mode":   # hands-free: Mac-mic speech → focused window (ESP off)
             set_inject_mode(truthy)
         elif key == "voice_speak_replies":   # read the final reply aloud (independent of inject mode)
