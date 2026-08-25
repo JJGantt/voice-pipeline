@@ -32,8 +32,10 @@ async function run(cmd) {
   // Otherwise the session opens straight onto "Do you trust the files in this folder?" and waits
   // for a click nobody is there to make — the launch looks like it worked and is actually stuck.
   const trust = ensureTrusted(target);
-  const result = await openFreshTab(target, name);
-  console.log(`[commands] opened session in ${target} (${result}, trust: ${trust})`);
+  const prompt = String((cmd.payload || {}).prompt || '').trim() || null;
+  const result = await openFreshTab(target, name, prompt);
+  console.log(`[commands] opened session in ${target} (${result}, trust: ${trust}`
+    + `${prompt ? `, prompt: "${prompt.slice(0, 60)}"` : ''})`);
   return result;
 }
 

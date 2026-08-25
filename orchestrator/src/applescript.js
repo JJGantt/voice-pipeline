@@ -174,9 +174,13 @@ export async function reopenDeskTab(cwd, id) {
 // Start a FRESH session in `cwd` with Remote Control on, named after the repo so it's identifiable
 // in the Claude app's session list. This is what the hub's repo picker fires: the Mac opens a
 // terminal, the session registers itself for remote control, and the phone picks it up from there.
-export async function openFreshTab(cwd, name) {
+// `prompt` (optional) becomes the session's FIRST message: `claude` takes a positional prompt, so the
+// dictated text is handed over at launch rather than typed in afterwards. shQuote is what makes that
+// safe — the prompt is arbitrary dictated speech and never gets to be shell syntax.
+export async function openFreshTab(cwd, name, prompt) {
   const rc = name ? ` --remote-control ${shQuote(name)}` : ' --remote-control';
-  return runInNewTerminal(`cd ${shQuote(cwd)}; ${shQuote(config.CLAUDE_BIN)}${rc}`);
+  const first = prompt ? ` ${shQuote(prompt)}` : '';
+  return runInNewTerminal(`cd ${shQuote(cwd)}; ${shQuote(config.CLAUDE_BIN)}${rc}${first}`);
 }
 
 // ---- util -----------------------------------------------------------------
