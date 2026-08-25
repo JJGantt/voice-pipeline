@@ -1264,8 +1264,14 @@ class ApiRunner:
                 "ok": bool(final_text.strip()), "raw_error": None}
 
     def run(self, transcript, system_append="", on_event=None, model="haiku", think=False, effort="high",
-            allowed=None) -> dict:
+            allowed=None, fresh=False) -> dict:
+        """`fresh` drops this runner's own message history before the turn. Hub turns MUST set it: the
+        caller already prepends the replayed conversation (`ctx`) to the prompt, so keeping an internal
+        history too sends every exchange twice and grows uncached input ~2.2k tokens per turn. It also
+        keeps the documented hub contract — fresh runs over a bounded replayed window, not a session."""
         self._start_loop()
+        if fresh:
+            self.reset()
         now = time.monotonic()
         today = datetime.now().astimezone().date()
         # A toolset change also resets: replayed tool_use blocks would reference tools no longer in
@@ -1652,7 +1658,7 @@ def process_request(db: Supabase, req: dict) -> None:
         # Fly last resort: no subscription → Opus on the API (the ApiRunner is ungated; Opus is the safe
         # choice, and Fly is rare enough the speed win doesn't matter).
         result = API.run(hub_prompt + POWER_DIRECTIVE, system_append=sys_ctx, on_event=_emit,
-                         model="opus", think=True, effort=effort)
+                         model="opus", think=True, effort=effort, fresh=True)
     elif attachments:
         # Photos → straight to Opus (vision needs the capable model + Read; Sonnet would only escalate).
         result = run_claude(hub_prompt + POWER_DIRECTIVE, None, on_event=_emit, system_append=sys_ctx,
@@ -1664,7 +1670,7 @@ def process_request(db: Supabase, req: dict) -> None:
         # prompt-caches the schema prefix for an hour, so the spawn cost disappears. Billed to the API
         # (~1c/turn); the escalation below stays on the subscription, where the money actually is.
         result = API.run(hub_prompt + ESCALATE_DIRECTIVE, system_append=sys_ctx, on_event=_emit,
-                         model="sonnet", allowed=SAFE_TOOLS)
+                         model="sonnet", allowed=SAFE_TOOLS, fresh=True)
         st = (result.get("text") or "").strip().lower()
         escalate = ("__escalate__" in st) or (re.sub(r"[^a-z]", "", st) == "escalate")
         # Escalate on a gated need (the sentinel) or an error — a fast-path failure still has to complete
@@ -1682,7 +1688,7 @@ def process_request(db: Supabase, req: dict) -> None:
             if not result.get("ok"):
                 log(f"subscription Opus failed ({result.get('raw_error')}) — completing on the API")
                 result = API.run(hub_prompt + POWER_DIRECTIVE, system_append=sys_ctx, on_event=_emit,
-                                 model="opus", think=True, effort=effort)
+                                 model="opus", think=True, effort=effort, fresh=True)
 
     if att_tmp:
         shutil.rmtree(att_tmp, ignore_errors=True)   # staged photos served their turn
