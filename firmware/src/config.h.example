@@ -1,9 +1,11 @@
 #pragma once
 // Copy to config.h and fill in. config.h is gitignored.
 
-// --- WiFi ---
-#define WIFI_SSID      "your-ssid"
-#define WIFI_PASSWORD  "your-password"
+// --- WiFi (both are tried; WiFiMulti joins whichever is strongest where the puck sits) ---
+#define WIFI_SSID          "your-ssid"
+#define WIFI_PASSWORD      "your-password"
+#define WIFI_SSID_ALT      "your-extender-ssid"      // extender
+#define WIFI_PASSWORD_ALT  "your-extender-password"
 
 // --- Server (Fly voice backend) ---
 #define WS_HOST  "jared-voice.fly.dev"

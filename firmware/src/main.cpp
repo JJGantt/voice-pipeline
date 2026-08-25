@@ -4,6 +4,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiMulti.h>
 #include <WebSocketsClient.h>
 #include <driver/i2s.h>
 #include "config.h"
@@ -15,6 +16,7 @@ static const int FRAME_SAMPLES = 1280;          // 80 ms — matches the backend
 static const int LED_PIN = 2;                   // onboard blue LED (single color)
 
 WebSocketsClient ws;
+WiFiMulti wifiMulti;
 bool wsConnected = false;
 
 int32_t i2sBuf[FRAME_SAMPLES];                  // raw 32-bit slots from the INMP441
@@ -82,11 +84,15 @@ void setup() {
 
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);          // disable modem power-save — the #1 cause of periodic streaming drops
-  WiFi.setAutoReconnect(true);   // rejoin the AP automatically if the link drops
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  // Both the router and the extender are registered; WiFiMulti scans and joins whichever is
+  // STRONGEST from where the puck actually sits, so moving it doesn't need a reflash. The mic
+  // streams ~256 kbps, so a solid client link matters more than the extender's backhaul headroom.
+  wifiMulti.addAP(WIFI_SSID, WIFI_PASSWORD);
+  wifiMulti.addAP(WIFI_SSID_ALT, WIFI_PASSWORD_ALT);
   Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) { delay(300); Serial.print("."); }
-  Serial.printf("\nConnected to WiFi  %s  (RSSI %d dBm)\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  while (wifiMulti.run() != WL_CONNECTED) { delay(300); Serial.print("."); }
+  Serial.printf("\nConnected to \"%s\"  %s  (RSSI %d dBm)\n",
+                WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
 
   setupI2S();
 
@@ -110,13 +116,14 @@ void loop() {
   if (WiFi.status() != WL_CONNECTED) {
     if (now - lastWifiTry > 5000) {        // throttle reconnect attempts while the AP is unreachable
       lastWifiTry = now;
-      Serial.println("WiFi dropped — reconnecting");
-      WiFi.reconnect();
+      Serial.println("WiFi dropped — rescanning");
+      wifiMulti.run();           // re-scan, not WiFi.reconnect(): the strongest AP may have changed
     }
   } else if (now - lastRssi > 30000) {     // report signal strength so it's visible in `fly logs`
     lastRssi = now;
-    Serial.printf("WiFi RSSI %d dBm  ws=%s\n", WiFi.RSSI(), wsConnected ? "up" : "down");
-    if (wsConnected) ws.sendTXT(String("RSSI ") + WiFi.RSSI());
+    Serial.printf("WiFi \"%s\" RSSI %d dBm  ws=%s\n", WiFi.SSID().c_str(), WiFi.RSSI(), wsConnected ? "up" : "down");
+    // Shaped to slot into the server's "device %s %s dBm" log line, which appends the units.
+    if (wsConnected) ws.sendTXT("RSSI on " + WiFi.SSID() + ": " + String(WiFi.RSSI()));
   }
 
   size_t bytesRead = 0;
