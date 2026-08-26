@@ -108,7 +108,16 @@ async function reconcileSessions() {
       const rows = await sb(`desk_sessions?id=eq.${encodeURIComponent(name)}&select=*`);
       row = rows?.[0] || null;
     } catch {}
-    const tail = row?.transcript_path ? readTail(row.transcript_path) : { working: false, lastReply: null, bytes: 0 };
+    // Self-healing: a session with no recorded transcript — the initial lookup missed it, or the
+    // session predates this code — adopts one here rather than staying permanently unresumable.
+    let tpath = row?.transcript_path || null;
+    let cid = row?.claude_session_id || null;
+    if (!tpath) {
+      const repoName = row?.repo || name.replace(/^hub-/, '').replace(/-[^-]*$/, '');
+      const found = await findTranscript(path.join(REPO_ROOT, repoName), 0, { attempts: 1, delayMs: 0 });
+      if (found) { tpath = found.path; cid = found.id; console.log(`[pi-desk] adopted transcript ${found.id} for ${name}`); }
+    }
+    const tail = tpath ? readTail(tpath) : { working: false, lastReply: null, bytes: 0 };
     residents.push({ name, working: tail.working, bytes: tail.bytes, row });
 
     try {
@@ -119,8 +128,8 @@ async function reconcileSessions() {
         body: JSON.stringify([{
           id: name, worker: WORKER, status: 'resident',
           repo: row?.repo || name.replace(/^hub-/, '').replace(/-[^-]*$/, ''),
-          claude_session_id: row?.claude_session_id || null,
-          transcript_path: row?.transcript_path || null,
+          claude_session_id: cid,
+          transcript_path: tpath,
           last_reply: tail.lastReply ? tail.lastReply.slice(0, 2000) : row?.last_reply || null,
           last_seen: new Date().toISOString(),
         }]),

@@ -30,8 +30,12 @@ function projectDir(cwd) {
  * Matched by mtime rather than by asking Claude, because there is no way to ask: the id is generated
  * inside the process. `since` bounds it to files created after the launch, so a long-lived transcript
  * in the same directory can never be mistaken for the new one.
+ *
+ * The window is generous (90s) because Claude Code takes a while to come up on a Pi and writes its
+ * transcript only once it does. A 10s window silently produced sessions with no recorded id — which
+ * looks like nothing at all going wrong until you try to resume one and find you cannot.
  */
-export function findTranscript(cwd, since, { attempts = 20, delayMs = 500 } = {}) {
+export function findTranscript(cwd, since, { attempts = 90, delayMs = 1000 } = {}) {
   const dir = projectDir(cwd);
   return new Promise((resolve) => {
     let n = 0;
