@@ -338,7 +338,12 @@ async function run(cmd) {
     const rows0 = await sb(`desk_sessions?id=eq.${encodeURIComponent(target)}&select=transcript_path`);
     const tp = rows0?.[0]?.transcript_path || null;
     if (tp) {
-      await exec('tmux', ['send-keys', '-t', target, WRAP_UP.replace(/\n/g, ' '), 'Enter'], { timeout: 10000 }).catch(() => {});
+      // Text and Enter as SEPARATE send-keys calls. Combined, tmux types the text but the Enter does
+      // not submit it — the prompt sits in the composer unsent and the session never wraps up, while
+      // everything looks like it worked. (Same trap as pasting a login code.)
+      await exec('tmux', ['send-keys', '-t', target, WRAP_UP.replace(/\n/g, ' ')], { timeout: 10000 }).catch(() => {});
+      await new Promise((r) => setTimeout(r, 600));
+      await exec('tmux', ['send-keys', '-t', target, 'Enter'], { timeout: 10000 }).catch(() => {});
       console.log(`[pi-desk] ${target}: wrapping up…`);
       // Give it real time — committing, pushing and writing docs is minutes of work, not seconds.
       const deadline = Date.now() + WRAP_UP_MS;
