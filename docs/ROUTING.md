@@ -64,15 +64,15 @@ It carries only what the model cannot work out from the text itself:
 1. the audio is room-wide, so most of what arrives was not said to the assistant;
 2. the reply is read aloud, so an ignore must be the bare `__IGNORE__` sentinel and nothing else;
 3. a machine named in a dispatch ("the Mac agent", "the Pi") is a **destination**, not a third party.
-4. development talk naming no destination is him speaking to a session already open on his phone —
+4. development talk naming no destination is him speaking to a session already open elsewhere —
    which has heard him already, through its own channel.
 
-Point 4 is the one that cost something. The mic hears Jared talking OUT LOUD to Claude sessions on
-his phone all day, and those utterances are real imperatives — "explain why you didn't deploy it".
-Sounding like a command is not evidence a command is for this channel, and `follow_up` therefore
-requires an explicit handoff phrase ("send a follow-up", "tell it to") rather than treating any
-continuation as one. Without that, a sentence aimed at a session on the phone gets forwarded a
-second time to a different session that has no idea what it refers to.
+Point 4 is the one that cost something, and the rule is STRUCTURAL — it is not about what the words
+mean. Any sentence can be a dispatch or not, depending only on whether Jared handed it over, so
+`follow_up` requires an explicit handoff phrase ("send a follow-up", "tell it to") and judges nothing
+by subject matter. Listing example sentences that are "not for you" is the wrong shape of instruction
+and was removed: it teaches that certain CONTENT is never a dispatch, when the same words forwarded
+deliberately are exactly that.
 
 **Keep it that short.** Anything that helps the model spot noise, or argues about what a mistake
 would cost, misfires on dictated development work — which rambles, names a machine, and is the most
