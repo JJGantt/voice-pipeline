@@ -1729,7 +1729,11 @@ def process_request(db: Supabase, req: dict) -> None:
         if escalate or not result.get("ok"):
             reason = "__ESCALATE__" if escalate else f"api sonnet error ({result.get('raw_error')})"
             log(f"dynamic → Opus (full toolset): {reason}")
-            push_activity(transcript[:240], "working")   # keep the working indicator up across the hop
+            # Surface the hop itself: the bottom activity bar shows "escalated to Opus" and keeps an OPUS
+            # chip up for the rest of the run, so a turn that quietly changed models is visible on the wall
+            # instead of looking like an unexplained pause between the prompt and the first Opus tool call.
+            push_activity("Escalated to Opus — " + ("needs a full-access tool" if escalate
+                                                    else "fast path failed"), "escalate")
             # Escalation runs on the SUBSCRIPTION: these turns are rare and already slow, so the CLI cold
             # start is noise here, and Opus is the expensive one to bill. Mac and Pi both have it; Fly is
             # intercepted earlier. If the subscription run fails anyway, finish on the API rather than drop.
@@ -1754,6 +1758,7 @@ def process_request(db: Supabase, req: dict) -> None:
     # backstop, re-run on a fresh Opus with NO context at all — nothing to mimic.
     if ("__escalate__" in text.lower()) or (re.sub(r"[^a-z]", "", text.lower()) == "escalate"):
         log("result leaked __ESCALATE__ → clean Opus re-run (no context)")
+        push_activity("Escalated to Opus — retry without context", "escalate")
         result = run_claude(prompt, None, on_event=_emit, system_append=sys_ctx,
                             model="opus", allow_read=bool(att_paths))
         text = (result.get("text") or "").strip()

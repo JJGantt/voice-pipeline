@@ -69,6 +69,19 @@ A hand-maintained list of exact tool-name strings rots. It has, twice:
 exist, and data tools absent from the list. It cannot repair anything — it makes the rot audible
 instead of silent. **When adding a tool to data-layer, check that log line.**
 
+## The escalation is visible on the wall
+
+An escalation used to be invisible: the bottom activity bar showed the prompt, then a pause, then
+Opus's first tool call — indistinguishable from a slow turn. So the hop pushes its own activity frame
+(`push_activity(..., "escalate")` → the hub's `/api/voice-activity`), and the bar shows it as its own
+row *and* lights an `OPUS` chip that stays up for the rest of the command, since the later tool rows
+overwrite the text. Both escalation paths send it: the `__ESCALATE__` sentinel and the fast-path
+error fallback, plus the `__ESCALATE__`-leak re-run.
+
+Photo turns go straight to Opus without ever touching Sonnet, so they are not an escalation and send
+no such frame. The hub coerces any unknown activity state to `tool`, so a new state has to be added
+there (`server.js`) as well as in the bar (`voiceagent.js`, `tv.js`) — see the hub's HUB-INTERNALS §4.
+
 ## The addressing directive
 
 Transcribed turns (never typed ones) get `ADDRESSING_DIRECTIVE` appended. The mic is always on and
