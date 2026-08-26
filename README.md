@@ -36,3 +36,9 @@ accepted, so existing firmware keeps working until it's updated to send the toke
 - Copy `src/config.h.example` → `src/config.h`, fill WiFi + server + I2S mic pins.
 - Build/flash: `~/.platformio/penv/bin/pio run -t upload` from `firmware/`.
 - It's a dumb pump: reads the I2S mic and streams PCM continuously. No on-device logic.
+
+## How a turn is routed
+
+`docs/ROUTING.md` — the path from a transcript to an action, which tools the fast Sonnet
+path may use, and why `SAFE_TOOLS` must stay an allow list rather than a deny list
+(converting it silently disables escalation and breaks nutrition logging).

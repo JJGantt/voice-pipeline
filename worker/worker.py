@@ -262,7 +262,9 @@ POWER_DIRECTIVE = (
 # low-stakes writes that need no domain knowledge (reminders, lists, notes) it handles itself.
 ALL_TOOLS = ["mcp__data", "mcp__voice", "mcp__govee-lights", "mcp__petlibro-feeder"]  # full toolset (Opus)
 
-# Sonnet's allow list. It MUST be an allow list, not a deny list, and the difference is load-bearing:
+# Sonnet's allow list.  ⚠️  See docs/ROUTING.md before changing this.
+#
+# It MUST be an allow list, not a deny list, and the difference is load-bearing:
 # a tool omitted from --allowedTools stays VISIBLE in the schema and is refused only when called, so
 # Sonnet sees log_nutrition, recognises it needs it, and escalates. --disallowedTools instead removes
 # the tool from the schema outright — Sonnet cannot see it, has nothing to escalate about, and
@@ -304,7 +306,9 @@ def validate_safe_tools(mcp_js: str) -> None:
         src = pathlib.Path(mcp_js).read_text(errors="ignore")
     except OSError:
         return  # the MCP build is not readable from here; not worth failing startup over
-    real = set(re.findall(r"name:\s*'([a-z_]+)'", src))
+    # Tool definitions only. A looser pattern also matches the server name in the mcpServers
+    # block ("data"), which is not a tool and shows up as a phantom every startup.
+    real = {n for n in re.findall(r"\{\s*name:\s*'([a-z_]+)'\s*,\s*description:", src)}
     if not real:
         return
     listed = {t.split("__")[-1] for t in SAFE_TOOLS if t.startswith("mcp__data__")}
