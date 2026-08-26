@@ -9,6 +9,11 @@
 //
 // Callers poll as a missed-event backstop and use isHealthy() to pick a slow or tight cadence.
 import { createClient } from '@supabase/supabase-js';
+// An explicit WebSocket, not the runtime's. Node only gained a native WebSocket in 22, and this
+// module also runs on the Pi, which is on 20 — there supabase-js finds no transport, reports
+// "realtime unavailable" and silently leaves every caller polling forever. data-layer's client has
+// always passed this for the same reason. Harmless on Node 22+, which simply uses it instead.
+import ws from 'ws';
 import { config } from './config.js';
 
 const BACKOFF_START_MS = 3000;
@@ -38,7 +43,7 @@ export function watchTable({ channel: channelName, table, event = '*', onChange,
   const subscribe = () => {
     const myEpoch = epoch;
     try {
-      if (!supa) supa = createClient(config.SUPABASE_URL, config.SUPABASE_KEY);
+      if (!supa) supa = createClient(config.SUPABASE_URL, config.SUPABASE_KEY, { realtime: { transport: ws } });
       channel = supa
         .channel(channelName)
         .on('postgres_changes', { event, schema: 'public', table }, (payload) => onChange(payload))
