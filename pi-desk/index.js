@@ -83,6 +83,57 @@ async function heartbeat() {
   } catch (e) { console.error('[pi-desk] heartbeat:', e.message); }
 }
 
+// ---- live sessions --------------------------------------------------------
+// Publish what is actually running, and delete what is not. Nothing closed sessions before this:
+// every launch left a tmux session holding a Claude process, forever, on a machine with 8GB of RAM.
+//
+// tmux is the source of truth rather than a list this process keeps, because this process restarts
+// and tmux does not — sessions started before the last restart are still real and must still appear.
+// A session counts as ALIVE only if a claude process is running inside it; tmux keeps the shell alive
+// after claude exits, so "the session exists" is not the same question as "work is happening".
+async function reconcileSessions() {
+  let live = [];
+  try {
+    const { stdout } = await exec('tmux', ['list-sessions', '-F', '#{session_name}'], { timeout: 10000 });
+    const names = stdout.split('\n').map((n) => n.trim()).filter((n) => n.startsWith('hub-'));
+    for (const name of names) {
+      let alive = false;
+      try {
+        // Panes in this session whose command is claude. Empty output = the shell outlived claude.
+        const { stdout: panes } = await exec('tmux',
+          ['list-panes', '-t', name, '-F', '#{pane_current_command}'], { timeout: 10000 });
+        alive = panes.split('\n').some((c) => c.trim() === 'claude');
+      } catch { alive = false; }
+      if (alive) live.push(name);
+      else {
+        // A husk: tmux session with no claude in it. Kill it rather than leave it to accumulate.
+        try { await exec('tmux', ['kill-session', '-t', name], { timeout: 10000 }); } catch {}
+        console.log(`[pi-desk] reaped finished session ${name}`);
+      }
+    }
+  } catch { /* no server running = no sessions, which is a valid state, not an error */ }
+
+  try {
+    const rows = await sb(`desk_sessions?worker=eq.${WORKER}&select=id`);
+    const known = new Set((rows || []).map((r) => r.id));
+    for (const id of live) {
+      if (known.has(id)) {
+        await sb(`desk_sessions?id=eq.${encodeURIComponent(id)}`, {
+          method: 'PATCH', headers: { Prefer: 'return=minimal' },
+          body: JSON.stringify({ last_seen: new Date().toISOString() }),
+        });
+      }
+      known.delete(id);
+    }
+    // Whatever is still in `known` is published but no longer running — drop it. Deleting rather than
+    // tombstoning keeps "select from desk_sessions" honest for anything using it as an indicator.
+    for (const gone of known) {
+      await sb(`desk_sessions?id=eq.${encodeURIComponent(gone)}`, { method: 'DELETE', headers: { Prefer: 'return=minimal' } });
+      console.log(`[pi-desk] session ended: ${gone}`);
+    }
+  } catch (e) { console.error('[pi-desk] reconcile:', e.message); }
+}
+
 async function macIsAwake() {
   try {
     const rows = await sb('worker_presence?worker=eq.desk&select=last_seen');
@@ -166,6 +217,15 @@ const finish = (id, status, detail) =>
   }).catch((e) => console.error('[pi-desk] finish:', e.message));
 
 async function run(cmd) {
+  // Closing a session is a command like any other, so it can be driven from anywhere the queue
+  // reaches — a voice command, the hub, an MCP tool — not only from a shell on this machine.
+  if (cmd.kind === 'end_session') {
+    const target = String((cmd.payload || {}).session || '').trim();
+    if (!/^hub-[A-Za-z0-9._-]+$/.test(target)) throw new Error(`unusable session name: ${target}`);
+    await exec('tmux', ['kill-session', '-t', target], { timeout: 10000 });
+    await sb(`desk_sessions?id=eq.${encodeURIComponent(target)}`, { method: 'DELETE', headers: { Prefer: 'return=minimal' } }).catch(() => {});
+    return `ended ${target}`;
+  }
   if (cmd.kind !== 'open_session') throw new Error(`unknown kind ${cmd.kind}`);
   const payload = cmd.payload || {};
   const name = safeName(payload.name);
@@ -178,6 +238,15 @@ async function run(cmd) {
   const trust = ensureTrusted(dir);
   const prompt = [warning, String(payload.prompt || '').trim()].filter(Boolean).join('\n\n');
   const session = launch(dir, name, prompt);
+  // Publish immediately rather than waiting for the next reconcile tick — the indicator should light
+  // up when the work starts, not up to a poll later.
+  try {
+    await sb('desk_sessions?on_conflict=id', {
+      method: 'POST', headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
+      body: JSON.stringify([{ id: session, worker: WORKER, repo: name,
+                              prompt: String(payload.prompt || '').trim().slice(0, 500) || null }]),
+    });
+  } catch (e) { console.error('[pi-desk] publish:', e.message); }
   return `tmux ${session} in ${dir}${prompt ? ' with a prompt' : ''}${warning ? ' (stale checkout)' : ''} (trust: ${trust})`;
 }
 
@@ -226,3 +295,5 @@ heartbeat();
 setInterval(heartbeat, PRESENCE_MS);
 drain();
 setInterval(drain, POLL_MS);
+reconcileSessions();
+setInterval(reconcileSessions, PRESENCE_MS);
