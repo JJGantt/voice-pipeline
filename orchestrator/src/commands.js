@@ -13,6 +13,7 @@
 //
 // Launching also pre-accepts the workspace-trust prompt for the target (see trust.js), since a
 // session stuck on that modal is indistinguishable from one that never started.
+import os from 'node:os';
 import { config } from './config.js';
 import { pendingCommands, claimCommand, finishCommand } from './supabase.js';
 import { watchTable } from './realtime.js';
@@ -25,10 +26,21 @@ let draining = false;
 
 async function run(cmd) {
   if (cmd.kind !== 'open_session') throw new Error(`unknown kind ${cmd.kind}`);
-  const target = String((cmd.payload || {}).path || '');
-  if (!target) throw new Error('no path in payload');
-  if (!isKnownRepo(target)) throw new Error(`not a known project: ${target}`);
-  const name = String((cmd.payload || {}).name || '').trim() || null;
+  const rawPath = String((cmd.payload || {}).path || '');
+  const rawName = String((cmd.payload || {}).name || '').trim();
+  if (!rawPath) throw new Error('no path in payload');
+
+  // ROOT: a request that named no project, or one nothing matched. It opens in the home directory,
+  // from which every repo is reachable, rather than being refused — a dispatched request that lands
+  // somewhere useful beats one that does not land at all.
+  //
+  // It bypasses isKnownRepo deliberately, and safely: the home directory is not attacker-supplied,
+  // it is this branch's own constant. The check exists so a crafted queue row cannot `cd` anywhere
+  // on disk, and a fixed path chosen here cannot.
+  const isRoot = rawName === 'root' || rawPath === '~';
+  const target = isRoot ? os.homedir() : rawPath;
+  if (!isRoot && !isKnownRepo(target)) throw new Error(`not a known project: ${target}`);
+  const name = isRoot ? 'root' : (rawName || null);
   // Otherwise the session opens straight onto "Do you trust the files in this folder?" and waits
   // for a click nobody is there to make — the launch looks like it worked and is actually stuck.
   const trust = ensureTrusted(target);
