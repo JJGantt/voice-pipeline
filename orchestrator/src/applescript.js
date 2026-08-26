@@ -199,14 +199,19 @@ export async function reopenDeskTab(cwd, id) {
   return runInNewTerminal(`cd ${shQuote(cwd)}; ${shQuote(config.CLAUDE_BIN)} --resume ${shQuote(id)}`);
 }
 
-// Start a FRESH session in `cwd` with Remote Control on, named after the repo so it's identifiable
-// in the Claude app's session list. This is what the hub's repo picker fires: the Mac opens a
+// Start a FRESH session in `cwd` with Remote Control on, named after the repo (plus a unique
+// suffix) so it's identifiable in the Claude app's session list. This is what the hub's repo picker fires: the Mac opens a
 // terminal, the session registers itself for remote control, and the phone picks it up from there.
 // `prompt` (optional) becomes the session's FIRST message: `claude` takes a positional prompt, so the
 // dictated text is handed over at launch rather than typed in afterwards. shQuote is what makes that
 // safe — the prompt is arbitrary dictated speech and never gets to be shell syntax.
 export async function openFreshTab(cwd, name, prompt) {
-  const rc = name ? ` --remote-control ${shQuote(name)}` : ' --remote-control';
+  // The Remote Control name is an IDENTITY in the Claude app, so it has to be unique per SESSION,
+  // not per repo. Named after the repo alone, two sessions on status-hub both register as
+  // "status-hub" and the app lists two entries claiming to be the same session. Bare
+  // `--remote-control` already auto-generates a unique name, so only the named path needs a suffix.
+  const rcName = name ? `${name}-${Date.now().toString(36)}` : '';
+  const rc = rcName ? ` --remote-control ${shQuote(rcName)}` : ' --remote-control';
   const first = prompt ? ` ${shQuote(prompt)}` : '';
   return runInNewTerminal(`cd ${shQuote(cwd)}; ${shQuote(config.CLAUDE_BIN)}${rc}${first}`);
 }

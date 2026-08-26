@@ -276,6 +276,10 @@ async function ensureRepo(name) {
 // ---- launching ------------------------------------------------------------
 function launch(dir, name, prompt, resumeId = null) {
   const session = `hub-${name}-${Date.now().toString(36)}`;
+  // The Remote Control name is an IDENTITY in the Claude app and must be unique per SESSION. The
+  // tmux name already carries a timestamp suffix for exactly that reason, so the RC name reuses it
+  // rather than passing the bare repo — which made every session on a repo register as that repo.
+  const rcName = session.slice(4);
   const here = path.dirname(new URL(import.meta.url).pathname);
   const launcher = path.join(here, 'launch.sh');
 
@@ -287,7 +291,7 @@ function launch(dir, name, prompt, resumeId = null) {
     fs.writeFileSync(promptFile, prompt, { mode: 0o600 });
   }
 
-  const args = ['new-session', '-d', '-s', session, '-c', dir, launcher, dir, name, promptFile, resumeId || ''];
+  const args = ['new-session', '-d', '-s', session, '-c', dir, launcher, dir, rcName, promptFile, resumeId || ''];
   const child = spawn('tmux', args, { detached: true, stdio: 'ignore' });
   child.unref();
   return session;
