@@ -14,7 +14,11 @@
 // Launching also pre-accepts the workspace-trust prompt for the target (see trust.js), since a
 // session stuck on that modal is indistinguishable from one that never started.
 import os from 'node:os';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { config } from './config.js';
+
+const exec = promisify(execFile);
 import { pendingCommands, claimCommand, finishCommand, upsertDeskSession, deskSession } from './supabase.js';
 import { watchTable } from './realtime.js';
 import { isKnownRepo } from './repos.js';
@@ -56,7 +60,23 @@ async function run(cmd) {
   // Otherwise the session opens straight onto "Do you trust the files in this folder?" and waits
   // for a click nobody is there to make — the launch looks like it worked and is actually stuck.
   const trust = ensureTrusted(target);
-  const prompt = String((cmd.payload || {}).prompt || '').trim() || null;
+  // Pull before opening. Another machine, or a GitHub Action, has very likely pushed since this
+  // checkout was last touched, and a session that starts on a stale tree writes against the wrong
+  // base. Non-fatal: a checkout that cannot fast-forward (local changes, diverged) still opens, and
+  // the warning rides along in the prompt so the session knows rather than silently building on it.
+  let staleWarning = null;
+  if (!isRoot) {
+    try {
+      await exec('git', ['-C', target, 'fetch', '--all', '--prune'], { timeout: 120000 });
+      await exec('git', ['-C', target, 'pull', '--ff-only'], { timeout: 120000 });
+    } catch (e) {
+      const msg = String(e.stderr || e.message || '').split('\n')[0].slice(0, 200);
+      console.warn(`[commands] pull failed in ${target}: ${msg}`);
+      staleWarning = `NOTE: this checkout could not be fast-forwarded (${msg}). Check git status and reconcile with origin before making changes.`;
+    }
+  }
+  const spoken = String((cmd.payload || {}).prompt || '').trim();
+  const prompt = [staleWarning, spoken].filter(Boolean).join('\n\n') || null;
   const raw = await openFreshTab(target, name, prompt);
   // openFreshTab reports "<how>\t<tty>"; the tty is the handle a later follow-up addresses.
   const [how, tty] = String(raw).split('\t');
