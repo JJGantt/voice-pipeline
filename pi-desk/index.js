@@ -22,6 +22,9 @@ import { promisify } from 'node:util';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+// Shared with the Mac orchestrator rather than copied: it only writes ~/.claude.json and has nothing
+// platform-specific in it, and two copies of "which keys make a project entry complete" would drift.
+import { ensureTrusted } from '../orchestrator/src/trust.js';
 
 const exec = promisify(execFile);
 
@@ -162,9 +165,13 @@ async function run(cmd) {
   if (!name) throw new Error(`unusable project name: ${JSON.stringify(payload.name)}`);
 
   const { dir, warning } = await ensureRepo(name);
+  // Without this the session opens onto "Do you trust the files in this folder?" and waits for a
+  // click nobody is there to make — the launch looks like it worked and is actually stuck. Matters
+  // more here than on the Mac: a freshly cloned repo has never been seen before by definition.
+  const trust = ensureTrusted(dir);
   const prompt = [warning, String(payload.prompt || '').trim()].filter(Boolean).join('\n\n');
   const session = launch(dir, name, prompt);
-  return `tmux ${session} in ${dir}${prompt ? ' with a prompt' : ''}${warning ? ' (stale checkout)' : ''}`;
+  return `tmux ${session} in ${dir}${prompt ? ' with a prompt' : ''}${warning ? ' (stale checkout)' : ''} (trust: ${trust})`;
 }
 
 let draining = false;
