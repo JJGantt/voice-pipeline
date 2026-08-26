@@ -119,3 +119,24 @@ export async function heartbeatDesk(worker, info) {
   });
   if (!res.ok) throw new Error(`heartbeatDesk ${res.status}: ${await res.text()}`);
 }
+
+// ---- desk sessions -------------------------------------------------------
+// The Mac publishes what it has open for the same two reasons the Pi does: the sessions panel needs
+// to show it, and a follow-up resolves its target through command_id. `transcript_path` carries the
+// tab's tty here rather than a file — it is the same idea, the handle needed to reach the session
+// again, and the column already existed.
+export async function upsertDeskSession(row) {
+  const res = await fetch(`${base()}/desk_sessions?on_conflict=id`, {
+    method: 'POST',
+    headers: headers({ Prefer: 'resolution=merge-duplicates,return=minimal' }),
+    body: JSON.stringify([{ ...row, last_seen: new Date().toISOString() }]),
+  });
+  if (!res.ok) throw new Error(`upsertDeskSession ${res.status}: ${await res.text()}`);
+}
+
+export async function deskSession(id) {
+  const res = await fetch(`${base()}/desk_sessions?id=eq.${encodeURIComponent(id)}&select=*`, { headers: headers() });
+  if (!res.ok) return null;
+  const rows = await res.json();
+  return rows[0] || null;
+}

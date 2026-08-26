@@ -318,7 +318,7 @@ const finish = (id, status, detail) =>
  * for (it is generated inside the process), so it is recovered by finding the transcript Claude Code
  * writes at startup — the filename IS the id.
  */
-async function startSession({ name, prompt, resumeId = null }) {
+async function startSession({ name, prompt, resumeId = null, commandId = null }) {
   const { dir, warning } = await ensureRepo(name);
   // Without this the session opens onto "Do you trust the files in this folder?" and waits for a
   // click nobody is there to make. Matters most on a fresh clone, which by definition is unseen.
@@ -330,7 +330,9 @@ async function startSession({ name, prompt, resumeId = null }) {
   // Published immediately so the indicator lights up when work starts, not a poll later.
   await sb('desk_sessions?on_conflict=id', {
     method: 'POST', headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
-    body: JSON.stringify([{ id: session, worker: WORKER, repo: name, status: 'resident',
+    // command_id is what lets a follow-up find this session: the dispatch that created it is the
+    // only durable handle the caller had at the time, since the session did not exist yet.
+    body: JSON.stringify([{ id: session, worker: WORKER, repo: name, status: 'resident', command_id: commandId,
                             prompt: String(prompt || '').trim().slice(0, 500) || null }]),
   }).catch((e) => console.error('[pi-desk] publish:', e.message));
 
@@ -352,6 +354,20 @@ async function startSession({ name, prompt, resumeId = null }) {
 async function run(cmd) {
   // Closing a session is a command like any other, so it can be driven from anywhere the queue
   // reaches — a voice command, the hub, an MCP tool — not only from a shell on this machine.
+  // Type a follow-up into a session that is already running. Not a new session: the point is to add
+  // to the conversation that is already there, with all of its context.
+  if (cmd.kind === 'follow_up') {
+    const target = String((cmd.payload || {}).session || '').trim();
+    const prompt = String((cmd.payload || {}).prompt || '').trim();
+    if (!/^hub-[A-Za-z0-9._-]+$/.test(target)) throw new Error(`unusable session name: ${target}`);
+    if (!prompt) throw new Error('no prompt to send');
+    // Text and Enter as SEPARATE calls — combined, tmux types the text without submitting it.
+    await exec('tmux', ['send-keys', '-t', target, prompt], { timeout: 15000 });
+    await new Promise((r) => setTimeout(r, 600));
+    await exec('tmux', ['send-keys', '-t', target, 'Enter'], { timeout: 10000 });
+    return `sent ${prompt.length} chars to ${target}`;
+  }
+
   if (cmd.kind === 'end_session') {
     const target = String((cmd.payload || {}).session || '').trim();
     if (!/^hub-[A-Za-z0-9._-]+$/.test(target)) throw new Error(`unusable session name: ${target}`);
@@ -395,7 +411,7 @@ async function run(cmd) {
     const row = rows?.[0];
     if (!row) throw new Error(`no such session: ${id}`);
     if (!row.claude_session_id) throw new Error(`${id} has no recorded claude session id — cannot resume`);
-    return startSession({ name: row.repo, prompt: (cmd.payload || {}).prompt || '', resumeId: row.claude_session_id });
+    return startSession({ name: row.repo, prompt: (cmd.payload || {}).prompt || '', resumeId: row.claude_session_id, commandId: cmd.id });
   }
 
   if (cmd.kind !== 'open_session') throw new Error(`unknown kind ${cmd.kind}`);
@@ -415,7 +431,7 @@ async function run(cmd) {
     });
     return `queued behind ${residents.length} resident session(s)`;
   }
-  return startSession({ name, prompt: payload.prompt });
+  return startSession({ name, prompt: payload.prompt, commandId: cmd.id });
 }
 
 let draining = false;

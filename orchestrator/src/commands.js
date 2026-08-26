@@ -15,16 +15,28 @@
 // session stuck on that modal is indistinguishable from one that never started.
 import os from 'node:os';
 import { config } from './config.js';
-import { pendingCommands, claimCommand, finishCommand } from './supabase.js';
+import { pendingCommands, claimCommand, finishCommand, upsertDeskSession, deskSession } from './supabase.js';
 import { watchTable } from './realtime.js';
 import { isKnownRepo } from './repos.js';
 import { ensureTrusted } from './trust.js';
-import { openFreshTab } from './applescript.js';
+import { openFreshTab, sendToTty } from './applescript.js';
 
 let timer = null;
 let draining = false;
 
 async function run(cmd) {
+  // Type a follow-up into a session this machine already has open, addressed by its tab's tty.
+  if (cmd.kind === 'follow_up') {
+    const session = String((cmd.payload || {}).session || '').trim();
+    const prompt = String((cmd.payload || {}).prompt || '').trim();
+    if (!prompt) throw new Error('no prompt to send');
+    const row = await deskSession(session);
+    const tty = row && row.transcript_path;
+    if (!tty) throw new Error(`no terminal recorded for ${session}`);
+    await sendToTty(tty, prompt);
+    return `sent ${prompt.length} chars to ${tty}`;
+  }
+
   if (cmd.kind !== 'open_session') throw new Error(`unknown kind ${cmd.kind}`);
   const rawPath = String((cmd.payload || {}).path || '');
   const rawName = String((cmd.payload || {}).name || '').trim();
@@ -45,10 +57,22 @@ async function run(cmd) {
   // for a click nobody is there to make — the launch looks like it worked and is actually stuck.
   const trust = ensureTrusted(target);
   const prompt = String((cmd.payload || {}).prompt || '').trim() || null;
-  const result = await openFreshTab(target, name, prompt);
-  console.log(`[commands] opened session in ${target} (${result}, trust: ${trust}`
+  const raw = await openFreshTab(target, name, prompt);
+  // openFreshTab reports "<how>\t<tty>"; the tty is the handle a later follow-up addresses.
+  const [how, tty] = String(raw).split('\t');
+  console.log(`[commands] opened session in ${target} (${how}${tty ? `, tty ${tty}` : ''}, trust: ${trust}`
     + `${prompt ? `, prompt: "${prompt.slice(0, 60)}"` : ''})`);
-  return result;
+
+  // Publish it. Until now the Mac published nothing, so a Mac session was invisible to the sessions
+  // panel and unreachable by follow_up — which resolves a dispatch through desk_sessions.command_id.
+  try {
+    await upsertDeskSession({
+      id: `mac-${cmd.id.slice(0, 8)}`, worker: 'desk', repo: name || 'root',
+      status: 'resident', command_id: cmd.id, transcript_path: tty || null,
+      prompt: prompt ? prompt.slice(0, 500) : null,
+    });
+  } catch (e) { console.error('[commands] publish:', e.message); }
+  return how;
 }
 
 async function drain() {

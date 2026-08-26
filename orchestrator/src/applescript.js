@@ -137,14 +137,39 @@ export async function closeTabForTty(tty) {
 //
 // So: try the tab, and on any failure open a window instead. Either way the caller gets a live
 // shell running the command, which is all that matters.
+/**
+ * Type text into an already-running session, addressed by the tty of its tab.
+ *
+ * The tty is the only stable handle a Terminal tab has: tab indexes shift as tabs open and close, and
+ * "front window" is whatever Jared last clicked — which is exactly the mistake to avoid, since a
+ * dictated follow-up landing in the wrong terminal is worse than one that fails.
+ */
+export async function sendToTty(tty, text) {
+  const escaped = String(text).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  return osascript(`tell application "Terminal"
+      set found to false
+      repeat with w in windows
+        repeat with t in tabs of w
+          if tty of t is "${tty}" then
+            do script "${escaped}" in t
+            set found to true
+          end if
+        end repeat
+      end repeat
+      if not found then error "no tab with tty ${tty}"
+    end tell
+    return "sent"`);
+}
+
 async function runInNewTerminal(shellCmd) {
   // AppleScript string-escape: backslash + quote.
   const escaped = shellCmd.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  // The tty comes back with the result so the session can be addressed later for follow-ups.
   const newWindow = () => osascript(`tell application "Terminal"
       activate
-      do script "${escaped}"
-    end tell
-    return "newwindow"`).then(() => 'newwindow');
+      set t to do script "${escaped}"
+      return tty of t
+    end tell`).then((tty) => `newwindow\t${String(tty).trim()}`);
 
   // Nothing to make a tab in — one call, one window.
   const running = await osascript('tell application "System Events" to (exists process "Terminal")')
@@ -154,12 +179,15 @@ async function runInNewTerminal(shellCmd) {
   if (parseInt(windows, 10) === 0) return newWindow();
 
   try {
-    await osascript(`tell application "Terminal" to activate
+    const tty = await osascript(`tell application "Terminal" to activate
       delay 0.2
       tell application "System Events" to keystroke "t" using command down
       delay 0.4
-      tell application "Terminal" to do script "${escaped}" in front window`);
-    return 'newtab';
+      tell application "Terminal"
+        set t to do script "${escaped}" in front window
+        return tty of t
+      end tell`);
+    return `newtab\t${String(tty).trim()}`;
   } catch (e) {
     console.warn('[applescript] tab failed (%s) — opening a window instead', e.message.trim().split('\n').pop());
     return newWindow();
