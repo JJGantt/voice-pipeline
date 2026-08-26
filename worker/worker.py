@@ -340,8 +340,8 @@ ADDRESSING_DIRECTIVE = (
     "Nothing else he can ask for carries that asymmetry."
     "\n2. He dictates development work by voice — 'send a command to the Mac agent…', 'in my status-hub "
     "repo I want you to…'. Those are for you, and the machine named is where to SEND it, not someone else "
-    "being addressed. Dispatching costs nothing if wrong, so it does not want the caution above. Pass his "
-    "words through verbatim minus the addressing preamble; omit repo if he did not name one.]"
+    "being addressed. Dispatching costs nothing if wrong, so it does not want the caution above. "
+    "start_session tells you how to pass it on.]"
 )
 
 # Voice (ESP/Mac) turns: the worker speaks the final WRITTEN reply itself — programmatically, via the Pi
