@@ -12,6 +12,13 @@
 //   3. ANTHROPIC_API_KEY is stripped before launching (see launch.sh). Claude Code prefers it over
 //      CLAUDE_CODE_OAUTH_TOKEN, so leaving it set silently bills the API instead of the subscription.
 //
+// MACHINE PREREQUISITE: `gh auth setup-git` must have been run on this host. `gh repo clone` carries
+// its own auth, so the first clone of a project succeeds either way — but a later `git pull` is plain
+// git over HTTPS, and with no credential helper it tries to PROMPT for a username. In a daemon with
+// no terminal that fails instantly ("could not read Username for 'https://github.com'"), so every
+// session after the first would quietly run against a stale tree. The pull failure is non-fatal here
+// by design (the warning reaches the prompt), which is exactly how this was found rather than missed.
+//
 // ROUTING. A command is for the Pi when either:
 //   - payload.target === 'pi'                     (the hub decided — explicit)
 //   - it has no target AND the Mac's presence is stale   (nobody else is going to take it)
