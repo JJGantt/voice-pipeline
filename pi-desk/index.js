@@ -310,19 +310,34 @@ const finish = (id, status, detail) =>
  * writes at startup — the filename IS the id.
  */
 async function startSession({ name, prompt, resumeId = null }) {
-  // Capacity check happens HERE rather than at launch, so a request that cannot run right now becomes
-  // a queued row instead of being dropped or forced through.
-  const live = await liveSessions();
-  const residents = live.filter((l) => l.alive);
-  if (residents.length >= RESIDENT_MAX) {
-    const id = randomUUID();
-    await sb('desk_queue', {
-      method: 'POST', headers: { Prefer: 'return=minimal' },
-      body: JSON.stringify([{ id, worker: WORKER, repo: name, prompt: String(payload.prompt || '').trim() || null }]),
+  const { dir, warning } = await ensureRepo(name);
+  // Without this the session opens onto "Do you trust the files in this folder?" and waits for a
+  // click nobody is there to make. Matters most on a fresh clone, which by definition is unseen.
+  const trust = ensureTrusted(dir);
+  const full = [warning, String(prompt || '').trim()].filter(Boolean).join('\n\n');
+  const startedAt = Date.now() - 1000;   // slack: the transcript may be stamped just before
+  const session = launch(dir, name, full, resumeId);
+
+  // Published immediately so the indicator lights up when work starts, not a poll later.
+  await sb('desk_sessions?on_conflict=id', {
+    method: 'POST', headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
+    body: JSON.stringify([{ id: session, worker: WORKER, repo: name, status: 'resident',
+                            prompt: String(prompt || '').trim().slice(0, 500) || null }]),
+  }).catch((e) => console.error('[pi-desk] publish:', e.message));
+
+  // Backfilled once Claude has written its transcript. Async on purpose — the caller should not wait
+  // on filesystem polling to learn that the launch happened.
+  findTranscript(dir, startedAt).then((t) => {
+    if (!t) return console.error(`[pi-desk] no transcript for ${session} — it will not be resumable`);
+    console.log(`[pi-desk] ${session} -> claude session ${t.id}`);
+    return sb(`desk_sessions?id=eq.${encodeURIComponent(session)}`, {
+      method: 'PATCH', headers: { Prefer: 'return=minimal' },
+      body: JSON.stringify({ claude_session_id: t.id, transcript_path: t.path }),
     });
-    return `queued behind ${residents.length} resident session(s)`;
-  }
-  return startSession({ name, prompt: payload.prompt });
+  }).catch((e) => console.error('[pi-desk] transcript:', e.message));
+
+  return `tmux ${session} in ${dir}${full ? ' with a prompt' : ''}${resumeId ? ' (resumed)' : ''}`
+    + `${warning ? ' (stale checkout)' : ''} (trust: ${trust})`;
 }
 
 async function run(cmd) {
@@ -379,23 +394,19 @@ async function run(cmd) {
   const name = safeName(payload.name);
   if (!name) throw new Error(`unusable project name: ${JSON.stringify(payload.name)}`);
 
-  const { dir, warning } = await ensureRepo(name);
-  // Without this the session opens onto "Do you trust the files in this folder?" and waits for a
-  // click nobody is there to make — the launch looks like it worked and is actually stuck. Matters
-  // more here than on the Mac: a freshly cloned repo has never been seen before by definition.
-  const trust = ensureTrusted(dir);
-  const prompt = [warning, String(payload.prompt || '').trim()].filter(Boolean).join('\n\n');
-  const session = launch(dir, name, prompt);
-  // Publish immediately rather than waiting for the next reconcile tick — the indicator should light
-  // up when the work starts, not up to a poll later.
-  try {
-    await sb('desk_sessions?on_conflict=id', {
-      method: 'POST', headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
-      body: JSON.stringify([{ id: session, worker: WORKER, repo: name,
-                              prompt: String(payload.prompt || '').trim().slice(0, 500) || null }]),
+  // Capacity is checked HERE, not inside startSession, so a request that cannot run right now becomes
+  // a queued row rather than being dropped or forced onto a full machine. Resumes and the queue
+  // runner call startSession directly and are deliberately not gated by this.
+  const residents = (await liveSessions()).filter((l) => l.alive);
+  if (residents.length >= RESIDENT_MAX) {
+    await sb('desk_queue', {
+      method: 'POST', headers: { Prefer: 'return=minimal' },
+      body: JSON.stringify([{ id: randomUUID(), worker: WORKER, repo: name,
+                              prompt: String(payload.prompt || '').trim() || null }]),
     });
-  } catch (e) { console.error('[pi-desk] publish:', e.message); }
-  return `tmux ${session} in ${dir}${prompt ? ' with a prompt' : ''}${warning ? ' (stale checkout)' : ''} (trust: ${trust})`;
+    return `queued behind ${residents.length} resident session(s)`;
+  }
+  return startSession({ name, prompt: payload.prompt });
 }
 
 let draining = false;
