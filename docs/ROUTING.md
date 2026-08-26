@@ -64,6 +64,15 @@ It carries only what the model cannot work out from the text itself:
 1. the audio is room-wide, so most of what arrives was not said to the assistant;
 2. the reply is read aloud, so an ignore must be the bare `__IGNORE__` sentinel and nothing else;
 3. a machine named in a dispatch ("the Mac agent", "the Pi") is a **destination**, not a third party.
+4. development talk naming no destination is him speaking to a session already open on his phone —
+   which has heard him already, through its own channel.
+
+Point 4 is the one that cost something. The mic hears Jared talking OUT LOUD to Claude sessions on
+his phone all day, and those utterances are real imperatives — "explain why you didn't deploy it".
+Sounding like a command is not evidence a command is for this channel, and `follow_up` therefore
+requires an explicit handoff phrase ("send a follow-up", "tell it to") rather than treating any
+continuation as one. Without that, a sentence aimed at a session on the phone gets forwarded a
+second time to a different session that has no idea what it refers to.
 
 **Keep it that short.** Anything that helps the model spot noise, or argues about what a mistake
 would cost, misfires on dictated development work — which rambles, names a machine, and is the most

@@ -372,7 +372,7 @@ ADDRESSING_DIRECTIVE = (
     "is read aloud."
     "\n\nOne parsing note: when he dictates development work — 'send a command to the Mac agent…', 'in "
     "my status-hub repo I want you to…' — the machine he names is where to SEND the work, not someone "
-    "else being addressed instead of you. Those are for you.]"
+    "else being addressed instead of you. Those are for you. Development talk that names NO destination — 'explain why you didn't deploy it', 'now push that' — is him speaking to a session already open on his phone, which has heard him already. That is not for you.]"
 )
 
 # Voice (ESP/Mac) turns: the worker speaks the final WRITTEN reply itself — programmatically, via the Pi
