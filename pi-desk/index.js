@@ -296,6 +296,17 @@ const REPORT_DIRECTIVE =
   + 'you did — that is how Jared reads the outcome on his phone. Then answer normally here as '
   + 'well: the report is an extra artifact, never a replacement for replying.]';
 
+// Type into a session that is already running.
+//
+// Text and Enter as SEPARATE send-keys calls. Combined, tmux types the text but the Enter does not
+// submit it — the prompt sits in the composer unsent while everything looks like it worked.
+async function typeInto(target, prompt) {
+  await exec('tmux', ['send-keys', '-t', target, prompt], { timeout: 15000 });
+  await new Promise((r) => setTimeout(r, 600));
+  await exec('tmux', ['send-keys', '-t', target, 'Enter'], { timeout: 10000 });
+  return `sent ${prompt.length} chars to ${target}`;
+}
+
 // ---- launching ------------------------------------------------------------
 function launch(dir, name, prompt, resumeId = null) {
   const session = `hub-${name}-${Date.now().toString(36)}`;
@@ -392,11 +403,7 @@ async function run(cmd) {
     const prompt = String((cmd.payload || {}).prompt || '').trim();
     if (!/^hub-[A-Za-z0-9._-]+$/.test(target)) throw new Error(`unusable session name: ${target}`);
     if (!prompt) throw new Error('no prompt to send');
-    // Text and Enter as SEPARATE calls — combined, tmux types the text without submitting it.
-    await exec('tmux', ['send-keys', '-t', target, prompt], { timeout: 15000 });
-    await new Promise((r) => setTimeout(r, 600));
-    await exec('tmux', ['send-keys', '-t', target, 'Enter'], { timeout: 10000 });
-    return `sent ${prompt.length} chars to ${target}`;
+    return typeInto(target, prompt);
   }
 
   if (cmd.kind === 'end_session') {
@@ -424,6 +431,16 @@ async function run(cmd) {
     const rows = await sb(`desk_sessions?id=eq.${encodeURIComponent(id)}&select=*`);
     const row = rows?.[0];
     if (!row) throw new Error(`no such session: ${id}`);
+    // Already running? Then "resume" means "talk to it". `claude --resume` on a LIVE session does not
+    // reattach — it starts a second process replaying the same transcript, so the conversation forks
+    // into two copies with one id, and a follow-up typed into one is invisible to the other. Whoever
+    // is watching the original sees their message vanish.
+    const alreadyUp = (await liveSessions()).some((l) => l.name === id && l.alive);
+    if (alreadyUp) {
+      const prompt = String((cmd.payload || {}).prompt || '').trim();
+      if (!prompt) return `${id} is already running`;
+      return `${id} was already running — ${await typeInto(id, prompt)}`;
+    }
     if (!row.claude_session_id) throw new Error(`${id} has no recorded claude session id — cannot resume`);
     return startSession({ name: row.repo, prompt: (cmd.payload || {}).prompt || '', resumeId: row.claude_session_id, commandId: cmd.id, report: (cmd.payload || {}).report === true });
   }
