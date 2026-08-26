@@ -65,13 +65,6 @@ It carries only what the model cannot work out from the text itself:
 2. the reply is read aloud, so an ignore must be the bare `__IGNORE__` sentinel and nothing else;
 3. a machine named in a dispatch ("the Mac agent", "the Pi") is a **destination**, not a third party.
 
-**Keep it that short.** Two things do not belong in it, and both actively hurt:
-
-- **Heuristics for spotting noise** ("rambling", "thinking aloud", "addresses a third party").
-  Dictating development work is rambling by nature and names a machine, so these fire hardest on the
-  requests most expensive to lose.
-- **Invented cost arguments** ("a missed command only costs a repeat"). A dropped 90-second dictated
-  request is a real loss, and a wrong dispatch is real mess. Made-up asymmetries bias the decision
-  with numbers nobody checked.
-
-State facts the model cannot observe. Leave it the judgements it can make itself.
+**Keep it that short.** Anything that helps the model spot noise, or argues about what a mistake
+would cost, misfires on dictated development work — which rambles, names a machine, and is the most
+expensive thing to lose. State facts it cannot observe; leave it the judgements it can make itself.
