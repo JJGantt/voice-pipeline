@@ -266,10 +266,18 @@ SAFE_TOOLS = [
     "mcp__data__get_workout_catalog", "mcp__data__get_exercise_history", "mcp__data__get_weekly_volume",
     "mcp__data__get_health_profile", "mcp__data__get_rep_watcher", "mcp__data__list_workouts",
     "mcp__data__list_staged", "mcp__data__reload_wall",                     # reads + the wall reload
-    # reminders / lists / notes (incl. deletes): low-stakes writes needing no domain knowledge → fast path
-    "mcp__data__get_reminders", "mcp__data__create_reminder", "mcp__data__complete_reminder", "mcp__data__delete_reminder",
-    "mcp__data__get_lists", "mcp__data__add_to_list", "mcp__data__complete_list_item", "mcp__data__remove_from_list", "mcp__data__delete_list",
+    # lists / notes (incl. deletes): low-stakes writes needing no domain knowledge → fast path.
+    # NOTE: reminders are no longer their own tools — a reminder is a list item with a due date
+    # (data-layer migration 00056), so get_due/set_due cover what create_reminder used to.
+    "mcp__data__get_due", "mcp__data__set_due",
+    "mcp__data__get_lists", "mcp__data__add_to_list", "mcp__data__remove_from_list", "mcp__data__delete_list",
     "mcp__data__get_notes", "mcp__data__create_note", "mcp__data__delete_note",
+    "mcp__data__set_list_emoji",
+    # Dispatching work to a machine. Safe for the fast path on purpose: it starts a SESSION, it does
+    # not itself change any data — the session that opens is a full agent with its own judgement, and
+    # making Jared wait for an Opus escalation just to relay a request would defeat the point.
+    "mcp__data__list_repos", "mcp__data__start_session", "mcp__data__get_sessions",
+    "mcp__data__resume_session", "mcp__data__end_session",
 ]
 
 # Escalation: Sonnet emits this (mirrors IGNORE_SENTINEL) when a request needs a gated write tool; the
@@ -332,7 +340,21 @@ ADDRESSING_DIRECTIVE = (
     "just costs a repeat, but a false one corrupts his data. ONLY when a word is plainly misheard WITHIN an "
     "utterance already clearly aimed at you should you correct it to its intended meaning ('permit'→'commit', "
     "'lock'→'log') and act. When you ignore, output ONLY the sentinel — NEVER explain that it wasn't a "
-    "command or that there's nothing to do; that explanation would be read ALOUD.]"
+    "command or that there's nothing to do; that explanation would be read ALOUD."
+    "\n\nONE IMPORTANT EXCEPTION — dictating work to a project. Jared dispatches development work by "
+    "voice: 'send a command to the Mac agent…', 'in my status-hub repo, I want you to…', 'have the Pi "
+    "look at…'. These are ALWAYS for you, and they are the one case where the tell-tales above mislead: "
+    "\n- They are LONG and they RAMBLE. He is composing a feature request out loud, so expect restarts, "
+    "'uh', self-corrections and asides ('by the way', 'or whatever'). Length and messiness are NOT "
+    "evidence against it here — they are what dictation sounds like. Do not mistake it for thinking aloud."
+    "\n- They NAME A THIRD PARTY ('the Mac agent', 'the Pi', 'the agent') as the RECIPIENT of relayed "
+    "work. That is not someone else being addressed instead of you; it is you being told where to send it."
+    "\n- The state-change caution does NOT apply. start_session corrupts nothing — it opens a session "
+    "that is itself a careful agent. A missed dispatch wastes a minute of his speech and is far worse "
+    "here than a spurious one."
+    "\nWhen you recognise one: call start_session, pass the request through VERBATIM minus the addressing "
+    "preamble, and if no project is named or you cannot tell which, OMIT repo rather than refusing — it "
+    "opens at the root and finds its own way. Never answer these yourself and never ask which repo.]"
 )
 
 # Voice (ESP/Mac) turns: the worker speaks the final WRITTEN reply itself — programmatically, via the Pi
