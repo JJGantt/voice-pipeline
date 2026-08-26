@@ -210,7 +210,7 @@ async function runQueue(residents) {
   } catch { return; }
 
   try {
-    const detail = await startSession({ name: next.repo, prompt: next.prompt });
+    const detail = await startSession({ name: next.repo, prompt: next.prompt, report: next.report === true });
     console.log(`[pi-desk] from queue -> ${detail}`);
   } catch (e) {
     console.error('[pi-desk] queued launch failed:', e.message);
@@ -273,10 +273,13 @@ async function ensureRepo(name) {
   }
 }
 
-// Every DISPATCHED session publishes a write-up when it finishes. This rides in the prompt rather
-// than living in CLAUDE.md deliberately: it should apply to work sent from the phone or by voice,
-// not to a session Jared opens by hand at the keyboard, which has no business filing reports at
-// him. Turning it off later is one flag on the command, not an edit to a shared file.
+// Appended only when a dispatch ASKED for a write-up (`report` on the command payload, set by the
+// voice tool when Jared says so). Reports are opt-in because most dispatched work just needs
+// doing, and a page about a one-line change is noise.
+//
+// It rides in the prompt rather than living in CLAUDE.md so it can be per-request at all: a file
+// both machines share applies to every session, including the ones Jared opens by hand at the
+// keyboard, which have no business filing reports at him.
 const REPORT_DIRECTIVE =
   '[When you have finished this work, call the publish_report tool with an HTML write-up of what '
   + 'you did — that is how Jared reads the outcome on his phone. Then answer normally here as '
@@ -331,14 +334,16 @@ const finish = (id, status, detail) =>
  * for (it is generated inside the process), so it is recovered by finding the transcript Claude Code
  * writes at startup — the filename IS the id.
  */
-async function startSession({ name, prompt, resumeId = null, commandId = null }) {
+async function startSession({ name, prompt, resumeId = null, commandId = null, report = false }) {
   const { dir, warning } = await ensureRepo(name);
   // Without this the session opens onto "Do you trust the files in this folder?" and waits for a
   // click nobody is there to make. Matters most on a fresh clone, which by definition is unseen.
   const trust = ensureTrusted(dir);
   const spoken = String(prompt || '').trim();
-  // No prompt means a bare session opened to work in; there is nothing to report on yet.
-  const full = [warning, spoken, spoken ? REPORT_DIRECTIVE : null].filter(Boolean).join('\n\n');
+  // The directive rides along ONLY when this dispatch asked for a write-up. Most work just needs
+  // doing, and a report on a one-line change is noise — so it is opt-in, set by the voice tool
+  // when Jared actually asks. A bare session with no prompt has nothing to report on either way.
+  const full = [warning, spoken, (report && spoken) ? REPORT_DIRECTIVE : null].filter(Boolean).join('\n\n');
   const startedAt = Date.now() - 1000;   // slack: the transcript may be stamped just before
   const session = launch(dir, name, full, resumeId);
 
@@ -426,7 +431,7 @@ async function run(cmd) {
     const row = rows?.[0];
     if (!row) throw new Error(`no such session: ${id}`);
     if (!row.claude_session_id) throw new Error(`${id} has no recorded claude session id — cannot resume`);
-    return startSession({ name: row.repo, prompt: (cmd.payload || {}).prompt || '', resumeId: row.claude_session_id, commandId: cmd.id });
+    return startSession({ name: row.repo, prompt: (cmd.payload || {}).prompt || '', resumeId: row.claude_session_id, commandId: cmd.id, report: (cmd.payload || {}).report === true });
   }
 
   if (cmd.kind !== 'open_session') throw new Error(`unknown kind ${cmd.kind}`);
@@ -442,11 +447,12 @@ async function run(cmd) {
     await sb('desk_queue', {
       method: 'POST', headers: { Prefer: 'return=minimal' },
       body: JSON.stringify([{ id: randomUUID(), worker: WORKER, repo: name,
-                              prompt: String(payload.prompt || '').trim() || null }]),
+                              prompt: String(payload.prompt || '').trim() || null,
+                              report: payload.report === true }]),
     });
     return `queued behind ${residents.length} resident session(s)`;
   }
-  return startSession({ name, prompt: payload.prompt, commandId: cmd.id });
+  return startSession({ name, prompt: payload.prompt, commandId: cmd.id, report: payload.report === true });
 }
 
 let draining = false;
