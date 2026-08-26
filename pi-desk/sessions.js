@@ -114,6 +114,32 @@ export async function liveSessions() {
 }
 
 /**
+ * What a session is told to do before it is closed.
+ *
+ * Closing must not mean "stop mid-sentence". Work here moves between machines through GitHub, so a
+ * session that vanishes with uncommitted changes leaves the next machine — or the next session on
+ * this one — looking at a checkout that disagrees with origin, with no record of why. Wrapping up is
+ * therefore part of closing, not a courtesy.
+ */
+export const WRAP_UP = [
+  'Wrap up and finish cleanly — this session is being closed.',
+  '',
+  '1. If you were mid-task, finish or reach a safe stopping point. Do not start anything new.',
+  '2. Commit everything worth keeping, with a message that explains WHY, and push it.',
+  '3. Update the docs in this repo to match what you changed. Another machine will pick this up',
+  '   with no memory of this conversation — the repo is the only thing you share with it.',
+  '4. If something is unfinished, say so plainly in the docs or the TODO, so it is not lost.',
+  '',
+  'Then reply with exactly: WRAPPED',
+].join('\n');
+
+/** Has the session finished wrapping up? Its own word for it, in its own transcript. */
+export function isWrapped(transcriptPath) {
+  const { lastReply, working } = readTail(transcriptPath);
+  return !working && !!lastReply && /\bWRAPPED\b/.test(lastReply);
+}
+
+/**
  * Close a session so it can be resumed later.
  *
  * Sends the shell's own exit path rather than `tmux kill-session`, which is a SIGKILL: a hard kill

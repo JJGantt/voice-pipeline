@@ -33,7 +33,7 @@ import { randomUUID } from 'node:crypto';
 // Shared with the Mac orchestrator rather than copied: it only writes ~/.claude.json and has nothing
 // platform-specific in it, and two copies of "which keys make a project entry complete" would drift.
 import { ensureTrusted } from '../orchestrator/src/trust.js';
-import { findTranscript, readTail, liveSessions, evict, pickEviction } from './sessions.js';
+import { findTranscript, readTail, liveSessions, evict, pickEviction, WRAP_UP, isWrapped } from './sessions.js';
 
 const exec = promisify(execFile);
 
@@ -48,6 +48,9 @@ const MAC_STALE_S = Number(process.env.MAC_STALE_S || 90);
 // A queued command older than this is not worth running: the moment has passed, and opening a
 // session for a request made an hour ago is worse than doing nothing.
 const COMMAND_TTL_S = Number(process.env.COMMAND_TTL_S || 120);
+// How long a session gets to commit, push and update docs before it is closed regardless. Generous
+// on purpose: this is real work, and cutting it short is the thing wrapping up exists to prevent.
+const WRAP_UP_MS = Number(process.env.WRAP_UP_MS || 10 * 60 * 1000);
 const WORKER = 'pi-desk';
 // A MEMORY bound: sessions cost ~334MB each whether or not they are doing anything.
 const RESIDENT_MAX = Number(process.env.RESIDENT_MAX || 3);
@@ -217,11 +220,22 @@ async function macIsAwake() {
 // both the directory under ~/repos and the GitHub repo. Validated because it reaches a shell.
 function safeName(name) {
   const n = String(name || '').trim();
+  if (!n) return ROOT;   // no project named — the home directory is the default, not an error
   return /^[A-Za-z0-9._-]+$/.test(n) && n !== '.' && n !== '..' ? n : null;
 }
 
-/** Clone if absent, pull if present. Returns { dir, warning }. */
+/** The home directory, for work that is not about one project. */
+const ROOT = 'root';
+
+/**
+ * Clone if absent, pull if present. Returns { dir, warning }.
+ *
+ * `root` is not a repo: it is the home directory, which is where a request that names no project
+ * lands. That is the useful fallback — a command the router could not pin to a repo still gets sent
+ * somewhere it can act, rather than being refused.
+ */
 async function ensureRepo(name) {
+  if (!name || name === ROOT) return { dir: os.homedir(), warning: null };
   const dir = path.join(REPO_ROOT, name);
   fs.mkdirSync(REPO_ROOT, { recursive: true });
 
@@ -314,9 +328,23 @@ async function run(cmd) {
   if (cmd.kind === 'end_session') {
     const target = String((cmd.payload || {}).session || '').trim();
     if (!/^hub-[A-Za-z0-9._-]+$/.test(target)) throw new Error(`unusable session name: ${target}`);
-    // Graceful, not kill-session: a SIGKILL mid-tool-call can leave a repo half-edited and lose
-    // whatever the transcript had not flushed — and the transcript is the thing that makes this
-    // resumable at all.
+    // Closing is a REQUEST TO FINISH, not a kill. The session is told to commit, push and bring the
+    // docs up to date first, because work moves between machines through GitHub — a session that
+    // vanishes with uncommitted changes strands the next machine on a checkout that disagrees with
+    // origin. Only then is it closed.
+    const rows0 = await sb(`desk_sessions?id=eq.${encodeURIComponent(target)}&select=transcript_path`);
+    const tp = rows0?.[0]?.transcript_path || null;
+    if (tp) {
+      await exec('tmux', ['send-keys', '-t', target, WRAP_UP.replace(/\n/g, ' '), 'Enter'], { timeout: 10000 }).catch(() => {});
+      console.log(`[pi-desk] ${target}: wrapping up…`);
+      // Give it real time — committing, pushing and writing docs is minutes of work, not seconds.
+      const deadline = Date.now() + WRAP_UP_MS;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 5000));
+        if (isWrapped(tp)) { console.log(`[pi-desk] ${target}: wrapped`); break; }
+      }
+      if (!isWrapped(tp)) console.error(`[pi-desk] ${target}: wrap-up did not confirm in time — closing anyway`);
+    }
     await evict(target);
     // PARKED, not deleted. Closing a session frees the machine; it does not throw the work away. The
     // row keeps the transcript id so it can be resumed with full context, and only an explicit
