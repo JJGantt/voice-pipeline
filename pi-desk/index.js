@@ -29,9 +29,11 @@ import { promisify } from 'node:util';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 // Shared with the Mac orchestrator rather than copied: it only writes ~/.claude.json and has nothing
 // platform-specific in it, and two copies of "which keys make a project entry complete" would drift.
 import { ensureTrusted } from '../orchestrator/src/trust.js';
+import { findTranscript, readTail, liveSessions, evict, pickEviction } from './sessions.js';
 
 const exec = promisify(execFile);
 
@@ -47,6 +49,10 @@ const MAC_STALE_S = Number(process.env.MAC_STALE_S || 90);
 // session for a request made an hour ago is worse than doing nothing.
 const COMMAND_TTL_S = Number(process.env.COMMAND_TTL_S || 120);
 const WORKER = 'pi-desk';
+// A MEMORY bound: sessions cost ~334MB each whether or not they are doing anything.
+const RESIDENT_MAX = Number(process.env.RESIDENT_MAX || 3);
+// A CPU bound: four ARM cores, and two sessions both running a build contend badly.
+const WORKING_MAX = Number(process.env.WORKING_MAX || 2);
 
 if (!SUPABASE_KEY) {
   console.error('[pi-desk] SUPABASE_KEY is not set — refusing to start.');
@@ -84,58 +90,104 @@ async function heartbeat() {
 }
 
 // ---- live sessions --------------------------------------------------------
-// Publish what is actually running, and delete what is not. Nothing closed sessions before this:
-// every launch left a tmux session holding a Claude process, forever, on a machine with 8GB of RAM.
-//
-// tmux is the source of truth rather than a list this process keeps, because this process restarts
-// and tmux does not — sessions started before the last restart are still real and must still appear.
-// A session counts as ALIVE only if a claude process is running inside it; tmux keeps the shell alive
-// after claude exits, so "the session exists" is not the same question as "work is happening".
+// Publish what is running and reap what is not, then run the queue. tmux is the source of truth
+// rather than a list this process keeps, because this process restarts and tmux does not.
 async function reconcileSessions() {
-  let live = [];
-  try {
-    const { stdout } = await exec('tmux', ['list-sessions', '-F', '#{session_name}'], { timeout: 10000 });
-    const names = stdout.split('\n').map((n) => n.trim()).filter((n) => n.startsWith('hub-'));
-    for (const name of names) {
-      let alive = false;
-      try {
-        // Panes in this session whose command is claude. Empty output = the shell outlived claude.
-        const { stdout: panes } = await exec('tmux',
-          ['list-panes', '-t', name, '-F', '#{pane_current_command}'], { timeout: 10000 });
-        alive = panes.split('\n').some((c) => c.trim() === 'claude');
-      } catch { alive = false; }
-      if (alive) live.push(name);
-      else {
-        // A husk: tmux session with no claude in it. Kill it rather than leave it to accumulate.
-        try { await exec('tmux', ['kill-session', '-t', name], { timeout: 10000 }); } catch {}
-        console.log(`[pi-desk] reaped finished session ${name}`);
-      }
-    }
-  } catch { /* no server running = no sessions, which is a valid state, not an error */ }
+  const live = await liveSessions();
+  const residents = [];
 
-  try {
-    const rows = await sb(`desk_sessions?worker=eq.${WORKER}&select=id`);
-    const known = new Set((rows || []).map((r) => r.id));
-    for (const id of live) {
-      // UPSERT, not patch-if-known. Patching only what the table already had meant a session tmux was
-      // running but the table had never seen — one started before this code existed, or after the row
-      // was lost — stayed invisible forever, which makes "tmux is the source of truth" a false claim.
+  for (const { name, alive } of live) {
+    if (!alive) {
+      // A husk: tmux session whose claude has exited. These are what accumulate, one per launch.
+      try { await exec('tmux', ['kill-session', '-t', name], { timeout: 10000 }); } catch {}
+      console.log(`[pi-desk] reaped finished session ${name}`);
+      continue;
+    }
+    let row = null;
+    try {
+      const rows = await sb(`desk_sessions?id=eq.${encodeURIComponent(name)}&select=*`);
+      row = rows?.[0] || null;
+    } catch {}
+    const tail = row?.transcript_path ? readTail(row.transcript_path) : { working: false, lastReply: null, bytes: 0 };
+    residents.push({ name, working: tail.working, bytes: tail.bytes, row });
+
+    try {
       await sb('desk_sessions?on_conflict=id', {
         method: 'POST', headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
-        // Repo comes out of the session name for a row being adopted rather than launched; the name
-        // is hub-<repo>-<suffix> and the suffix is base36 with no dashes, so the last one splits it.
-        body: JSON.stringify([{ id, worker: WORKER, repo: id.replace(/^hub-/, '').replace(/-[^-]*$/, ''),
-                                last_seen: new Date().toISOString() }]),
+        // Upsert, not patch-if-known: a session tmux is running that the table never saw must still
+        // appear, or "tmux is the source of truth" is not true.
+        body: JSON.stringify([{
+          id: name, worker: WORKER, status: 'resident',
+          repo: row?.repo || name.replace(/^hub-/, '').replace(/-[^-]*$/, ''),
+          claude_session_id: row?.claude_session_id || null,
+          transcript_path: row?.transcript_path || null,
+          last_reply: tail.lastReply ? tail.lastReply.slice(0, 2000) : row?.last_reply || null,
+          last_seen: new Date().toISOString(),
+        }]),
       });
-      known.delete(id);
+    } catch (e) { console.error('[pi-desk] publish:', e.message); }
+  }
+
+  // Rows we publish that tmux no longer has: mark evicted rather than delete, so the transcript stays
+  // reachable and the session can be resumed. Only genuinely forgotten sessions are deleted, and only
+  // when Jared says so.
+  try {
+    const rows = await sb(`desk_sessions?worker=eq.${WORKER}&status=eq.resident&select=id`);
+    const liveNames = new Set(residents.map((r) => r.name));
+    for (const r of rows || []) {
+      if (liveNames.has(r.id)) continue;
+      await sb(`desk_sessions?id=eq.${encodeURIComponent(r.id)}`, {
+        method: 'PATCH', headers: { Prefer: 'return=minimal' },
+        body: JSON.stringify({ status: 'evicted', ended: new Date().toISOString() }),
+      });
+      console.log(`[pi-desk] session left residency: ${r.id}`);
     }
-    // Whatever is still in `known` is published but no longer running — drop it. Deleting rather than
-    // tombstoning keeps "select from desk_sessions" honest for anything using it as an indicator.
-    for (const gone of known) {
-      await sb(`desk_sessions?id=eq.${encodeURIComponent(gone)}`, { method: 'DELETE', headers: { Prefer: 'return=minimal' } });
-      console.log(`[pi-desk] session ended: ${gone}`);
-    }
-  } catch (e) { console.error('[pi-desk] reconcile:', e.message); }
+  } catch (e) { console.error('[pi-desk] sweep:', e.message); }
+
+  await runQueue(residents);
+}
+
+// ---- the queue ------------------------------------------------------------
+// Deliberately not desk_commands: those expire, because a command queued while a machine slept should
+// not fire hours later. A queued SESSION is the opposite — it is waiting on purpose, and must never
+// expire. It waits as long as it takes for a slot.
+async function runQueue(residents) {
+  let queued;
+  try { queued = await sb(`desk_queue?worker=eq.${WORKER}&claimed=is.null&select=*&order=created.asc&limit=1`); }
+  catch { return; }
+  const next = queued?.[0];
+  if (!next) return;
+
+  const working = residents.filter((r) => r.working).length;
+  if (working >= WORKING_MAX) return;          // CPU bound: let the busy ones finish first
+
+  if (residents.length >= RESIDENT_MAX) {      // memory bound: someone has to go
+    const victim = pickEviction(residents);
+    if (!victim) return;                       // everything resident is mid-turn — wait, don't kill
+    console.log(`[pi-desk] evicting ${victim.name} to make room for ${next.repo}`);
+    await evict(victim.name);
+    await sb(`desk_sessions?id=eq.${encodeURIComponent(victim.name)}`, {
+      method: 'PATCH', headers: { Prefer: 'return=minimal' },
+      body: JSON.stringify({ status: 'evicted', ended: new Date().toISOString() }),
+    }).catch(() => {});
+  }
+
+  // Claim before launching so two ticks cannot both take the same queued item.
+  try {
+    const claimed = await sb(`desk_queue?id=eq.${encodeURIComponent(next.id)}&claimed=is.null`, {
+      method: 'PATCH', headers: { Prefer: 'return=representation' },
+      body: JSON.stringify({ claimed: new Date().toISOString() }),
+    });
+    if (!Array.isArray(claimed) || !claimed.length) return;
+  } catch { return; }
+
+  try {
+    const detail = await startSession({ name: next.repo, prompt: next.prompt });
+    console.log(`[pi-desk] from queue -> ${detail}`);
+  } catch (e) {
+    console.error('[pi-desk] queued launch failed:', e.message);
+  }
+  await sb(`desk_queue?id=eq.${encodeURIComponent(next.id)}`, { method: 'DELETE', headers: { Prefer: 'return=minimal' } }).catch(() => {});
 }
 
 async function macIsAwake() {
@@ -183,7 +235,7 @@ async function ensureRepo(name) {
 }
 
 // ---- launching ------------------------------------------------------------
-function launch(dir, name, prompt) {
+function launch(dir, name, prompt, resumeId = null) {
   const session = `hub-${name}-${Date.now().toString(36)}`;
   const here = path.dirname(new URL(import.meta.url).pathname);
   const launcher = path.join(here, 'launch.sh');
@@ -196,7 +248,7 @@ function launch(dir, name, prompt) {
     fs.writeFileSync(promptFile, prompt, { mode: 0o600 });
   }
 
-  const args = ['new-session', '-d', '-s', session, '-c', dir, launcher, dir, name, promptFile];
+  const args = ['new-session', '-d', '-s', session, '-c', dir, launcher, dir, name, promptFile, resumeId || ''];
   const child = spawn('tmux', args, { detached: true, stdio: 'ignore' });
   child.unref();
   return session;
@@ -220,6 +272,29 @@ const finish = (id, status, detail) =>
     body: JSON.stringify({ status, detail: String(detail || '').slice(0, 500), updated: new Date().toISOString() }),
   }).catch((e) => console.error('[pi-desk] finish:', e.message));
 
+/**
+ * Launch a session and record everything needed to bring it back later.
+ *
+ * The Claude session id is the point: without it, closing a session destroys it. It cannot be asked
+ * for (it is generated inside the process), so it is recovered by finding the transcript Claude Code
+ * writes at startup — the filename IS the id.
+ */
+async function startSession({ name, prompt, resumeId = null }) {
+  // Capacity check happens HERE rather than at launch, so a request that cannot run right now becomes
+  // a queued row instead of being dropped or forced through.
+  const live = await liveSessions();
+  const residents = live.filter((l) => l.alive);
+  if (residents.length >= RESIDENT_MAX) {
+    const id = randomUUID();
+    await sb('desk_queue', {
+      method: 'POST', headers: { Prefer: 'return=minimal' },
+      body: JSON.stringify([{ id, worker: WORKER, repo: name, prompt: String(payload.prompt || '').trim() || null }]),
+    });
+    return `queued behind ${residents.length} resident session(s)`;
+  }
+  return startSession({ name, prompt: payload.prompt });
+}
+
 async function run(cmd) {
   // Closing a session is a command like any other, so it can be driven from anywhere the queue
   // reaches — a voice command, the hub, an MCP tool — not only from a shell on this machine.
@@ -230,6 +305,17 @@ async function run(cmd) {
     await sb(`desk_sessions?id=eq.${encodeURIComponent(target)}`, { method: 'DELETE', headers: { Prefer: 'return=minimal' } }).catch(() => {});
     return `ended ${target}`;
   }
+  // Bring an evicted session back with its full context. `claude --resume <id>` replays the
+  // transcript, which is why the id had to be recorded when the session first started.
+  if (cmd.kind === 'resume_session') {
+    const id = String((cmd.payload || {}).session || '').trim();
+    const rows = await sb(`desk_sessions?id=eq.${encodeURIComponent(id)}&select=*`);
+    const row = rows?.[0];
+    if (!row) throw new Error(`no such session: ${id}`);
+    if (!row.claude_session_id) throw new Error(`${id} has no recorded claude session id — cannot resume`);
+    return startSession({ name: row.repo, prompt: (cmd.payload || {}).prompt || '', resumeId: row.claude_session_id });
+  }
+
   if (cmd.kind !== 'open_session') throw new Error(`unknown kind ${cmd.kind}`);
   const payload = cmd.payload || {};
   const name = safeName(payload.name);

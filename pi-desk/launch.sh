@@ -7,7 +7,7 @@
 # apostrophes and newlines in it — and threading that through tmux's command string is a quoting
 # problem with no safe answer. Reading it here means it is never shell syntax at any point.
 set -uo pipefail
-DIR="$1"; NAME="$2"; PROMPT_FILE="${3:-}"
+DIR="$1"; NAME="$2"; PROMPT_FILE="${3:-}"; RESUME_ID="${4:-}"
 
 cd "$DIR" || exit 1
 
@@ -32,9 +32,14 @@ unset CLAUDE_CODE_OAUTH_TOKEN
 # the Pi's settings were pinned to sonnet for months without that being anyone's intent.
 MODEL="${PI_DESK_MODEL:-opus}"
 
+# Resuming replays the recorded conversation, so an evicted session comes back knowing everything it
+# knew. The id was captured at first launch from the transcript filename.
+RESUME=()
+[ -n "$RESUME_ID" ] && RESUME=(--resume "$RESUME_ID")
+
 if [ -n "$PROMPT_FILE" ] && [ -s "$PROMPT_FILE" ]; then
   PROMPT="$(cat "$PROMPT_FILE")"
   rm -f "$PROMPT_FILE"
-  exec claude --model "$MODEL" --remote-control "$NAME" "$PROMPT"
+  exec claude --model "$MODEL" "${RESUME[@]}" --remote-control "$NAME" "$PROMPT"
 fi
-exec claude --model "$MODEL" --remote-control "$NAME"
+exec claude --model "$MODEL" "${RESUME[@]}" --remote-control "$NAME"
