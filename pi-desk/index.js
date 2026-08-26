@@ -174,6 +174,9 @@ async function reconcileSessions() {
           repo: row?.repo || name.replace(/^hub-/, '').replace(/-[^-]*$/, ''),
           claude_session_id: cid,
           transcript_path: tpath,
+          // Carried through explicitly: this is a merge-duplicates upsert, so any column it sends
+          // overwrites. Omitting the label would blank it on the very next reconcile tick.
+          label: row?.label || null,
           last_reply: tail.lastReply ? tail.lastReply.slice(0, 2000) : row?.last_reply || null,
           last_seen: new Date().toISOString(),
         }]),
@@ -244,7 +247,7 @@ async function runQueue(residents) {
   } catch { return; }
 
   try {
-    const detail = await startSession({ name: next.repo, prompt: next.prompt, report: next.report === true });
+    const detail = await startSession({ name: next.repo, prompt: next.prompt, report: next.report === true, label: next.label || null });
     console.log(`[pi-desk] from queue -> ${detail}`);
   } catch (e) {
     console.error('[pi-desk] queued launch failed:', e.message);
@@ -379,7 +382,7 @@ const finish = (id, status, detail) =>
  * for (it is generated inside the process), so it is recovered by finding the transcript Claude Code
  * writes at startup — the filename IS the id.
  */
-async function startSession({ name, prompt, resumeId = null, commandId = null, report = false }) {
+async function startSession({ name, prompt, resumeId = null, commandId = null, report = false, label = null }) {
   const { dir, warning } = await ensureRepo(name);
   // Without this the session opens onto "Do you trust the files in this folder?" and waits for a
   // click nobody is there to make. Matters most on a fresh clone, which by definition is unseen.
@@ -398,6 +401,7 @@ async function startSession({ name, prompt, resumeId = null, commandId = null, r
     // command_id is what lets a follow-up find this session: the dispatch that created it is the
     // only durable handle the caller had at the time, since the session did not exist yet.
     body: JSON.stringify([{ id: session, worker: WORKER, repo: name, status: 'resident', command_id: commandId,
+                            label: label || null,
                             prompt: String(prompt || '').trim().slice(0, 500) || null }]),
   }).catch((e) => console.error('[pi-desk] publish:', e.message));
 
@@ -483,13 +487,14 @@ async function run(cmd) {
       method: 'POST', headers: { Prefer: 'return=minimal' },
       body: JSON.stringify([{ id: randomUUID(), worker: WORKER, repo: name,
                               prompt: String(payload.prompt || '').trim() || null,
-                              report: payload.report === true }]),
+                              report: payload.report === true,
+                              label: payload.label || null }]),
     });
     return residents.length >= RESIDENT_MAX
       ? `queued behind ${residents.length} resident session(s)`
       : `queued — only ${freeMb}MB free, need ${MIN_FREE_MB}MB to start one safely`;
   }
-  return startSession({ name, prompt: payload.prompt, commandId: cmd.id, report: payload.report === true });
+  return startSession({ name, prompt: payload.prompt, commandId: cmd.id, report: payload.report === true, label: payload.label || null });
 }
 
 let draining = false;

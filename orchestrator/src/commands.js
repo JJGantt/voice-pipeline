@@ -102,6 +102,7 @@ async function run(cmd) {
     await upsertDeskSession({
       id: `mac-${cmd.id.slice(0, 8)}`, worker: 'desk', repo: name || 'root',
       status: 'resident', command_id: cmd.id, transcript_path: tty || null,
+      label: (cmd.payload || {}).label || null,
       prompt: prompt ? prompt.slice(0, 500) : null,
     });
   } catch (e) { console.error('[commands] publish:', e.message); }
