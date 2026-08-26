@@ -11,10 +11,21 @@ DIR="$1"; NAME="$2"; PROMPT_FILE="${3:-}"
 
 cd "$DIR" || exit 1
 
-# Claude Code prefers ANTHROPIC_API_KEY over CLAUDE_CODE_OAUTH_TOKEN when both are present, which
-# would silently bill the API instead of the subscription. Verified by experiment: poisoning the API
-# key breaks Claude even with a valid OAuth token beside it. worker.py strips it for the same reason.
+# Neither env credential may reach a session. There is a precedence chain, and each link shadows the
+# one below it: ANTHROPIC_API_KEY > CLAUDE_CODE_OAUTH_TOKEN > the real login in ~/.claude/.credentials.json.
+#
+#   - ANTHROPIC_API_KEY silently bills the API instead of the subscription (worker.py strips it too;
+#     verified by poisoning it — Claude broke even with a valid OAuth token beside it).
+#   - CLAUDE_CODE_OAUTH_TOKEN is a headless/CI credential. It authenticates API calls fine, so a
+#     session looks healthy, but it does NOT carry the claude.ai account linkage — so
+#     `--remote-control` never registers and the session never appears in Claude Code. `/status`
+#     reports "Session kind: interactive" and nothing else looks wrong, which is what made this
+#     take a while to find.
+#
+# Stripping both leaves the interactive login as the credential, which is the only one that supports
+# Remote Control. `claude /login` must therefore have been run on this host at least once.
 unset ANTHROPIC_API_KEY
+unset CLAUDE_CODE_OAUTH_TOKEN
 
 # Model named explicitly rather than left to settings. A session started here runs unattended on a
 # machine nobody is watching, so it should not silently inherit whatever the config happens to say —
