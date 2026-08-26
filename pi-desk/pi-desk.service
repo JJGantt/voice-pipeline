@@ -10,6 +10,11 @@ WorkingDirectory=/home/jaredgantt/voice-pipeline/pi-desk
 ExecStart=/home/jaredgantt/voice-pipeline/pi-desk/run.sh
 Restart=always
 RestartSec=5
+# Kill ONLY this daemon on stop, never its descendants. systemd defaults to KillMode=control-group,
+# which kills every process in the cgroup — and the tmux server is a child of this process despite
+# being spawned detached. That meant restarting the daemon destroyed every session it was managing,
+# silently, on every deploy. Sessions must outlive their supervisor; that is the point of tmux.
+KillMode=process
 Environment=HOME=/home/jaredgantt
 # tmux and gh live in /usr/bin; claude in /usr/local/bin.
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
