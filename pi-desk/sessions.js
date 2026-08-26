@@ -95,12 +95,17 @@ export function readTail(transcriptPath) {
 export async function liveSessions() {
   let names = [];
   try {
-    const { stdout } = await exec('tmux', ['list-sessions', '-F', '#{session_name}'], { timeout: 10000 });
-    names = stdout.split('\n').map((n) => n.trim()).filter((n) => n.startsWith('hub-'));
+    // session_created is the ONE authoritative start time. The database row's `started` is not: a row
+    // can be deleted and recreated, which resets it to now and then wrongly excludes the session's own
+    // (older) transcript from adoption. tmux knows when the session actually began.
+    const { stdout } = await exec('tmux', ['list-sessions', '-F', '#{session_name}\t#{session_created}'], { timeout: 10000 });
+    names = stdout.split('\n').map((l) => l.trim()).filter(Boolean)
+      .map((l) => { const [n, c] = l.split('\t'); return { n, created: Number(c) * 1000 || 0 }; })
+      .filter((x) => x.n.startsWith('hub-'));
   } catch { return []; }   // no server running is a valid state, not an error
 
   const out = [];
-  for (const name of names) {
+  for (const { n: name, created } of names) {
     let alive = false;
     try {
       const { stdout: panes } = await exec('tmux', ['list-panes', '-t', name, '-F', '#{pane_current_command}'], { timeout: 10000 });
@@ -108,7 +113,7 @@ export async function liveSessions() {
       // question from "claude is in it". Only the latter counts as live.
       alive = panes.split('\n').some((c) => c.trim() === 'claude');
     } catch { alive = false; }
-    out.push({ name, alive });
+    out.push({ name, alive, created });
   }
   return out;
 }

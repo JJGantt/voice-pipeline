@@ -99,7 +99,7 @@ async function reconcileSessions() {
   const live = await liveSessions();
   const residents = [];
 
-  for (const { name, alive } of live) {
+  for (const { name, alive, created } of live) {
     if (!alive) {
       // A husk: tmux session whose claude has exited. These are what accumulate, one per launch.
       try { await exec('tmux', ['kill-session', '-t', name], { timeout: 10000 }); } catch {}
@@ -117,11 +117,14 @@ async function reconcileSessions() {
     let cid = row?.claude_session_id || null;
     if (!tpath) {
       const repoName = row?.repo || name.replace(/^hub-/, '').replace(/-[^-]*$/, '');
-      // Bounded by when THIS session started, never "newest in the directory". Unbounded, a session
-      // whose own transcript had not appeared yet adopted its predecessor's — and resuming it would
-      // then restore a different conversation entirely, which is worse than not resuming at all.
-      const since = row?.started ? new Date(row.started).getTime() - 5000 : null;
-      const found = since ? await findTranscript(path.join(REPO_ROOT, repoName), since, { attempts: 1, delayMs: 0 }) : null;
+      // A root session lives in the home directory, not under REPO_ROOT — joining REPO_ROOT with
+      // 'root' pointed at a directory that does not exist, so root sessions never adopted anything.
+      const cwd = repoName === ROOT ? os.homedir() : path.join(REPO_ROOT, repoName);
+      // Bounded by when THIS session actually started (tmux's own clock, not the row's), never
+      // "newest in the directory". Unbounded, a session whose transcript had not appeared yet adopted
+      // its predecessor's — and resuming it would restore a different conversation entirely.
+      const since = created ? created - 5000 : null;
+      const found = since ? await findTranscript(cwd, since, { attempts: 1, delayMs: 0 }) : null;
       if (found) { tpath = found.path; cid = found.id; console.log(`[pi-desk] adopted transcript ${found.id} for ${name}`); }
     }
     const tail = tpath ? readTail(tpath) : { working: false, lastReply: null, bytes: 0 };
