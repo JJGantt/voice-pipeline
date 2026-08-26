@@ -62,6 +62,20 @@ const COMMAND_TTL_S = Number(process.env.COMMAND_TTL_S || 120);
 const WORKER = 'pi-desk';
 // A MEMORY bound: sessions cost ~334MB each whether or not they are doing anything.
 const RESIDENT_MAX = Number(process.env.RESIDENT_MAX || 3);
+// Capacity is not only a count. This Pi also drives the wall display, and Chromium is the process
+// that loses an out-of-memory fight — the kernel OOM-killed its renderer twice on 2026-08-26 while
+// sessions sat inside the residency cap, leaving the screen on 'Aw, Snap' with nothing technically
+// over its limit. A session costs ~350-420MB, so refusing to launch below this floor keeps enough
+// headroom that starting one cannot take the display down. Below it, work queues rather than fails.
+const MIN_FREE_MB = Number(process.env.PI_DESK_MIN_FREE_MB || 900);
+
+/** MemAvailable in MB — the kernel's own estimate of what is actually reclaimable, not `free`. */
+function memAvailableMb() {
+  try {
+    const m = fs.readFileSync('/proc/meminfo', 'utf8').match(/^MemAvailable:\s+(\d+) kB/m);
+    return m ? Math.round(Number(m[1]) / 1024) : Infinity;   // unreadable → never block on it
+  } catch { return Infinity; }
+}
 // A CPU bound: four ARM cores, and two sessions both running a build contend badly.
 const WORKING_MAX = Number(process.env.WORKING_MAX || 2);
 
@@ -199,6 +213,15 @@ async function runQueue(residents) {
 
   const working = residents.filter((r) => r.working).length;
   if (working >= WORKING_MAX) return;          // CPU bound: let the busy ones finish first
+
+  // Under the memory floor with a free slot means the machine is short for some other reason — the
+  // display, a build, anything. Evicting a session would not help (the slot is not what is missing)
+  // and launching into it is how the wall display gets OOM-killed. Wait; the queue never expires.
+  const freeMb = memAvailableMb();
+  if (freeMb < MIN_FREE_MB && residents.length < RESIDENT_MAX) {
+    console.log(`[pi-desk] holding queue: ${freeMb}MB free, need ${MIN_FREE_MB}MB`);
+    return;
+  }
 
   if (residents.length >= RESIDENT_MAX) {      // memory bound: someone has to go
     const victim = pickEviction(residents);
@@ -454,14 +477,17 @@ async function run(cmd) {
   // a queued row rather than being dropped or forced onto a full machine. Resumes and the queue
   // runner call startSession directly and are deliberately not gated by this.
   const residents = (await liveSessions()).filter((l) => l.alive);
-  if (residents.length >= RESIDENT_MAX) {
+  const freeMb = memAvailableMb();
+  if (residents.length >= RESIDENT_MAX || freeMb < MIN_FREE_MB) {
     await sb('desk_queue', {
       method: 'POST', headers: { Prefer: 'return=minimal' },
       body: JSON.stringify([{ id: randomUUID(), worker: WORKER, repo: name,
                               prompt: String(payload.prompt || '').trim() || null,
                               report: payload.report === true }]),
     });
-    return `queued behind ${residents.length} resident session(s)`;
+    return residents.length >= RESIDENT_MAX
+      ? `queued behind ${residents.length} resident session(s)`
+      : `queued — only ${freeMb}MB free, need ${MIN_FREE_MB}MB to start one safely`;
   }
   return startSession({ name, prompt: payload.prompt, commandId: cmd.id, report: payload.report === true });
 }
