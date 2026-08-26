@@ -33,7 +33,7 @@ import { randomUUID } from 'node:crypto';
 // Shared with the Mac orchestrator rather than copied: it only writes ~/.claude.json and has nothing
 // platform-specific in it, and two copies of "which keys make a project entry complete" would drift.
 import { ensureTrusted } from '../orchestrator/src/trust.js';
-import { findTranscript, readTail, liveSessions, evict, pickEviction, WRAP_UP, isWrapped } from './sessions.js';
+import { findTranscript, readTail, liveSessions, evict, pickEviction } from './sessions.js';
 // The same self-healing subscription the Mac's orchestrator uses. Shared rather than reimplemented:
 // its header documents a hard-won lesson — supabase-js does not reliably recover a dead channel, and
 // callers that fall back to a tight poll burn ~20k reads a day without noticing.
@@ -59,7 +59,6 @@ const MAC_STALE_S = Number(process.env.MAC_STALE_S || 90);
 const COMMAND_TTL_S = Number(process.env.COMMAND_TTL_S || 120);
 // How long a session gets to commit, push and update docs before it is closed regardless. Generous
 // on purpose: this is real work, and cutting it short is the thing wrapping up exists to prevent.
-const WRAP_UP_MS = Number(process.env.WRAP_UP_MS || 10 * 60 * 1000);
 const WORKER = 'pi-desk';
 // A MEMORY bound: sessions cost ~334MB each whether or not they are doing anything.
 const RESIDENT_MAX = Number(process.env.RESIDENT_MAX || 3);
@@ -108,6 +107,16 @@ async function reconcileSessions() {
   const live = await liveSessions();
   const residents = [];
 
+  // Transcript ids already spoken for. Adoption picks the newest transcript created after a launch,
+  // and two launches close together in one directory could otherwise both land on the same file —
+  // which is exactly how two root sessions ended up recording one claude id and burning two slots on
+  // a single conversation.
+  const claimed = new Set();
+  try {
+    const rows = await sb('desk_sessions?claude_session_id=not.is.null&select=claude_session_id');
+    for (const r of rows || []) claimed.add(r.claude_session_id);
+  } catch {}
+
   for (const { name, alive, created } of live) {
     if (!alive) {
       // A husk: tmux session whose claude has exited. These are what accumulate, one per launch.
@@ -133,11 +142,13 @@ async function reconcileSessions() {
       // "newest in the directory". Unbounded, a session whose transcript had not appeared yet adopted
       // its predecessor's — and resuming it would restore a different conversation entirely.
       const since = created ? created - 5000 : null;
-      const found = since ? await findTranscript(cwd, since, { attempts: 1, delayMs: 0 }) : null;
-      if (found) { tpath = found.path; cid = found.id; console.log(`[pi-desk] adopted transcript ${found.id} for ${name}`); }
+      const found = since ? await findTranscript(cwd, since, { attempts: 1, delayMs: 0, taken: claimed }) : null;
+      if (found) { tpath = found.path; cid = found.id; claimed.add(found.id); console.log(`[pi-desk] adopted transcript ${found.id} for ${name}`); }
     }
-    const tail = tpath ? readTail(tpath) : { working: false, lastReply: null, bytes: 0 };
-    residents.push({ name, working: tail.working, bytes: tail.bytes, row });
+    const tail = tpath ? readTail(tpath) : { working: false, lastReply: null, bytes: 0, lastActivity: 0 };
+    // lastActivity is what eviction sorts on. A session with no transcript reports 0 and therefore
+    // sorts first — correct, since a session nothing can be read from is the least costly to lose.
+    residents.push({ name, working: tail.working, bytes: tail.bytes, lastActivity: tail.lastActivity, row });
 
     try {
       await sb('desk_sessions?on_conflict=id', {
@@ -392,27 +403,10 @@ async function run(cmd) {
     const target = String((cmd.payload || {}).session || '').trim();
     if (!/^hub-[A-Za-z0-9._-]+$/.test(target)) throw new Error(`unusable session name: ${target}`);
     // Closing is a REQUEST TO FINISH, not a kill. The session is told to commit, push and bring the
-    // docs up to date first, because work moves between machines through GitHub — a session that
-    // vanishes with uncommitted changes strands the next machine on a checkout that disagrees with
-    // origin. Only then is it closed.
-    const rows0 = await sb(`desk_sessions?id=eq.${encodeURIComponent(target)}&select=transcript_path`);
-    const tp = rows0?.[0]?.transcript_path || null;
-    if (tp) {
-      // Text and Enter as SEPARATE send-keys calls. Combined, tmux types the text but the Enter does
-      // not submit it — the prompt sits in the composer unsent and the session never wraps up, while
-      // everything looks like it worked. (Same trap as pasting a login code.)
-      await exec('tmux', ['send-keys', '-t', target, WRAP_UP.replace(/\n/g, ' ')], { timeout: 10000 }).catch(() => {});
-      await new Promise((r) => setTimeout(r, 600));
-      await exec('tmux', ['send-keys', '-t', target, 'Enter'], { timeout: 10000 }).catch(() => {});
-      console.log(`[pi-desk] ${target}: wrapping up…`);
-      // Give it real time — committing, pushing and writing docs is minutes of work, not seconds.
-      const deadline = Date.now() + WRAP_UP_MS;
-      while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 5000));
-        if (isWrapped(tp)) { console.log(`[pi-desk] ${target}: wrapped`); break; }
-      }
-      if (!isWrapped(tp)) console.error(`[pi-desk] ${target}: wrap-up did not confirm in time — closing anyway`);
-    }
+    // No wrap-up handshake before closing. Every session already works under a standing rule to
+    // commit and push after each logical change, so a session is safe to close at any moment by
+    // construction — asking it to wrap up first only delayed freeing the machine by up to ten
+    // minutes, and made a capacity problem wait on a model finishing a sentence.
     await evict(target);
     // PARKED, not deleted. Closing a session frees the machine; it does not throw the work away. The
     // row keeps the transcript id so it can be resumed with full context, and only an explicit

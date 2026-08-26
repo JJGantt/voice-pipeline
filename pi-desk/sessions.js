@@ -27,15 +27,23 @@ function projectDir(cwd) {
 /**
  * The transcript Claude Code just started for a session in `cwd`.
  *
- * Matched by mtime rather than by asking Claude, because there is no way to ask: the id is generated
- * inside the process. `since` bounds it to files created after the launch, so a long-lived transcript
- * in the same directory can never be mistaken for the new one.
+ * Matched by BIRTH TIME rather than by asking Claude, because there is no way to ask: the id is
+ * generated inside the process.
+ *
+ * It used to match on mtime, and that produced two sessions sharing one transcript. mtime bounds
+ * nothing while a session is alive: an older session that is still being written keeps a fresh mtime
+ * forever, so a second session launched in the same directory adopted the first one's file and both
+ * rows recorded the same claude id. Two slots, one conversation. Birth time cannot do that — a
+ * transcript created before this launch is not this launch's, however recently it was touched.
+ *
+ * `taken` excludes ids already claimed by a live session, which closes the same hole from the other
+ * side if two launches ever land inside one filesystem timestamp.
  *
  * The window is generous (90s) because Claude Code takes a while to come up on a Pi and writes its
  * transcript only once it does. A 10s window silently produced sessions with no recorded id — which
  * looks like nothing at all going wrong until you try to resume one and find you cannot.
  */
-export function findTranscript(cwd, since, { attempts = 90, delayMs = 1000 } = {}) {
+export function findTranscript(cwd, since, { attempts = 90, delayMs = 1000, taken = new Set() } = {}) {
   const dir = projectDir(cwd);
   return new Promise((resolve) => {
     let n = 0;
@@ -43,7 +51,8 @@ export function findTranscript(cwd, since, { attempts = 90, delayMs = 1000 } = {
       try {
         const hit = fs.readdirSync(dir)
           .filter((f) => f.endsWith('.jsonl'))
-          .map((f) => ({ f, p: path.join(dir, f), m: fs.statSync(path.join(dir, f)).mtimeMs }))
+          .filter((f) => !taken.has(f.replace(/\.jsonl$/, '')))
+          .map((f) => ({ f, p: path.join(dir, f), m: fs.statSync(path.join(dir, f)).birthtimeMs }))
           .filter((x) => x.m >= since)
           .sort((a, b) => b.m - a.m)[0];
         if (hit) return resolve({ id: hit.f.replace(/\.jsonl$/, ''), path: hit.p });
@@ -66,7 +75,7 @@ export function findTranscript(cwd, since, { attempts = 90, delayMs = 1000 } = {
 export function readTail(transcriptPath) {
   let lines;
   try { lines = fs.readFileSync(transcriptPath, 'utf8').split('\n'); }
-  catch { return { working: false, lastReply: null, turns: 0, bytes: 0 }; }
+  catch { return { working: false, lastReply: null, turns: 0, bytes: 0, lastActivity: 0 }; }
 
   let lastRole = null, lastReply = null, turns = 0;
   for (const line of lines) {
@@ -85,10 +94,13 @@ export function readTail(transcriptPath) {
       }
     }
   }
-  let bytes = 0;
-  try { bytes = fs.statSync(transcriptPath).size; } catch {}
+  // mtime is the last time anything was written to this conversation — the recency signal eviction
+  // sorts on. Read from the file rather than from the parsed turns because a transcript's timestamps
+  // are not guaranteed to be present on every record type.
+  let bytes = 0, lastActivity = 0;
+  try { const st = fs.statSync(transcriptPath); bytes = st.size; lastActivity = st.mtimeMs; } catch {}
   // A trailing user turn means Claude has been asked something and has not answered yet.
-  return { working: lastRole === 'user', lastReply, turns, bytes };
+  return { working: lastRole === 'user', lastReply, turns, bytes, lastActivity };
 }
 
 /** tmux sessions this daemon owns, and whether a claude process is actually inside each. */
@@ -119,32 +131,6 @@ export async function liveSessions() {
 }
 
 /**
- * What a session is told to do before it is closed.
- *
- * Closing must not mean "stop mid-sentence". Work here moves between machines through GitHub, so a
- * session that vanishes with uncommitted changes leaves the next machine — or the next session on
- * this one — looking at a checkout that disagrees with origin, with no record of why. Wrapping up is
- * therefore part of closing, not a courtesy.
- */
-export const WRAP_UP = [
-  'Wrap up and finish cleanly — this session is being closed.',
-  '',
-  '1. If you were mid-task, finish or reach a safe stopping point. Do not start anything new.',
-  '2. Commit everything worth keeping, with a message that explains WHY, and push it.',
-  '3. Update the docs in this repo to match what you changed. Another machine will pick this up',
-  '   with no memory of this conversation — the repo is the only thing you share with it.',
-  '4. If something is unfinished, say so plainly in the docs or the TODO, so it is not lost.',
-  '',
-  'Then reply with exactly: WRAPPED',
-].join('\n');
-
-/** Has the session finished wrapping up? Its own word for it, in its own transcript. */
-export function isWrapped(transcriptPath) {
-  const { lastReply, working } = readTail(transcriptPath);
-  return !working && !!lastReply && /\bWRAPPED\b/.test(lastReply);
-}
-
-/**
  * Close a session so it can be resumed later.
  *
  * Sends the shell's own exit path rather than `tmux kill-session`, which is a SIGKILL: a hard kill
@@ -165,12 +151,21 @@ export async function evict(name) {
 /**
  * Which resident session to evict to make room, or null if none may be.
  *
- * Never a working one — that is the whole point of reading transcripts. Among idle candidates, the
- * SMALLEST transcript goes first: resuming re-sends the conversation, so evicting a long session and
- * bringing it back costs materially more than evicting a short one. Cheapest to restore, first out.
+ * RECENCY, and nothing else. The least recently active session goes first.
+ *
+ * This used to sort by transcript size — cheapest to resume, since resuming re-sends the
+ * conversation. That optimised for the wrong thing and cost a live session: a short transcript is
+ * usually the conversation just started, and a long one is usually an old finished job, so
+ * "cheapest to restore" and "least likely to be wanted" point in opposite directions. A ten-hour-old
+ * session that had said its work was deployed was protected, and the one Jared was mid-conversation
+ * with was killed, because it was 66KB smaller.
+ *
+ * Never a working one either — that check remains, but it is weak on its own: `working` means a turn
+ * is in flight, and between a reply and the next message a live conversation is indistinguishable
+ * from an abandoned one. Recency is what actually separates them.
  */
 export function pickEviction(residents) {
   const idle = residents.filter((r) => !r.working);
   if (!idle.length) return null;
-  return idle.slice().sort((a, b) => (a.bytes || 0) - (b.bytes || 0))[0];
+  return idle.slice().sort((a, b) => (a.lastActivity || 0) - (b.lastActivity || 0))[0];
 }
