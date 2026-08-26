@@ -205,7 +205,7 @@ export async function reopenDeskTab(cwd, id) {
 // `prompt` (optional) becomes the session's FIRST message: `claude` takes a positional prompt, so the
 // dictated text is handed over at launch rather than typed in afterwards. shQuote is what makes that
 // safe — the prompt is arbitrary dictated speech and never gets to be shell syntax.
-export async function openFreshTab(cwd, name, prompt) {
+export async function openFreshTab(cwd, name, prompt, sessionId = null) {
   // The Remote Control name is an IDENTITY in the Claude app, so it has to be unique per SESSION,
   // not per repo. Named after the repo alone, two sessions on status-hub both register as
   // "status-hub" and the app lists two entries claiming to be the same session. Bare
@@ -213,7 +213,10 @@ export async function openFreshTab(cwd, name, prompt) {
   const rcName = name ? `${name}-${Date.now().toString(36)}` : '';
   const rc = rcName ? ` --remote-control ${shQuote(rcName)}` : ' --remote-control';
   const first = prompt ? ` ${shQuote(prompt)}` : '';
-  return runInNewTerminal(`cd ${shQuote(cwd)}; ${shQuote(config.CLAUDE_BIN)}${rc}${first}`);
+  // The session's own id, exported for the command so the data MCP — a child of claude, which
+  // inherits this environment — can attribute a published report to the session that wrote it.
+  const env = sessionId ? `HUB_SESSION_ID=${shQuote(sessionId)} ` : '';
+  return runInNewTerminal(`cd ${shQuote(cwd)}; ${env}${shQuote(config.CLAUDE_BIN)}${rc}${first}`);
 }
 
 // ---- util -----------------------------------------------------------------

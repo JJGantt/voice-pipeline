@@ -25,6 +25,15 @@ import { isKnownRepo } from './repos.js';
 import { ensureTrusted } from './trust.js';
 import { openFreshTab, sendToTty } from './applescript.js';
 
+// Every DISPATCHED session publishes a write-up when it finishes. This rides in the prompt rather
+// than living in CLAUDE.md deliberately: it should apply to work sent from the phone or by voice,
+// not to a session Jared opens by hand at the keyboard, which has no business filing reports at
+// him. Turning it off later is one flag on the command, not an edit to a shared file.
+const REPORT_DIRECTIVE =
+  '[When you have finished this work, call the publish_report tool with an HTML write-up of what '
+  + 'you did — that is how Jared reads the outcome on his phone. Then answer normally here as '
+  + 'well: the report is an extra artifact, never a replacement for replying.]';
+
 let timer = null;
 let draining = false;
 
@@ -76,8 +85,8 @@ async function run(cmd) {
     }
   }
   const spoken = String((cmd.payload || {}).prompt || '').trim();
-  const prompt = [staleWarning, spoken].filter(Boolean).join('\n\n') || null;
-  const raw = await openFreshTab(target, name, prompt);
+  const prompt = [staleWarning, spoken, spoken ? REPORT_DIRECTIVE : null].filter(Boolean).join('\n\n') || null;
+  const raw = await openFreshTab(target, name, prompt, `mac-${cmd.id.slice(0, 8)}`);
   // openFreshTab reports "<how>\t<tty>"; the tty is the handle a later follow-up addresses.
   const [how, tty] = String(raw).split('\t');
   console.log(`[commands] opened session in ${target} (${how}${tty ? `, tty ${tty}` : ''}, trust: ${trust}`

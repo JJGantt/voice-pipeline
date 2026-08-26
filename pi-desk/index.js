@@ -273,6 +273,15 @@ async function ensureRepo(name) {
   }
 }
 
+// Every DISPATCHED session publishes a write-up when it finishes. This rides in the prompt rather
+// than living in CLAUDE.md deliberately: it should apply to work sent from the phone or by voice,
+// not to a session Jared opens by hand at the keyboard, which has no business filing reports at
+// him. Turning it off later is one flag on the command, not an edit to a shared file.
+const REPORT_DIRECTIVE =
+  '[When you have finished this work, call the publish_report tool with an HTML write-up of what '
+  + 'you did — that is how Jared reads the outcome on his phone. Then answer normally here as '
+  + 'well: the report is an extra artifact, never a replacement for replying.]';
+
 // ---- launching ------------------------------------------------------------
 function launch(dir, name, prompt, resumeId = null) {
   const session = `hub-${name}-${Date.now().toString(36)}`;
@@ -291,7 +300,7 @@ function launch(dir, name, prompt, resumeId = null) {
     fs.writeFileSync(promptFile, prompt, { mode: 0o600 });
   }
 
-  const args = ['new-session', '-d', '-s', session, '-c', dir, launcher, dir, rcName, promptFile, resumeId || ''];
+  const args = ['new-session', '-d', '-s', session, '-c', dir, launcher, dir, rcName, promptFile, resumeId || '', session];
   const child = spawn('tmux', args, { detached: true, stdio: 'ignore' });
   child.unref();
   return session;
@@ -327,7 +336,9 @@ async function startSession({ name, prompt, resumeId = null, commandId = null })
   // Without this the session opens onto "Do you trust the files in this folder?" and waits for a
   // click nobody is there to make. Matters most on a fresh clone, which by definition is unseen.
   const trust = ensureTrusted(dir);
-  const full = [warning, String(prompt || '').trim()].filter(Boolean).join('\n\n');
+  const spoken = String(prompt || '').trim();
+  // No prompt means a bare session opened to work in; there is nothing to report on yet.
+  const full = [warning, spoken, spoken ? REPORT_DIRECTIVE : null].filter(Boolean).join('\n\n');
   const startedAt = Date.now() - 1000;   // slack: the transcript may be stamped just before
   const session = launch(dir, name, full, resumeId);
 

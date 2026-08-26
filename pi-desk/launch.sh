@@ -7,7 +7,12 @@
 # apostrophes and newlines in it — and threading that through tmux's command string is a quoting
 # problem with no safe answer. Reading it here means it is never shell syntax at any point.
 set -uo pipefail
-DIR="$1"; NAME="$2"; PROMPT_FILE="${3:-}"; RESUME_ID="${4:-}"
+DIR="$1"; NAME="$2"; PROMPT_FILE="${3:-}"; RESUME_ID="${4:-}"; SESSION_ID="${5:-}"
+
+# The session's own id, so a report it publishes can say which session wrote it. The data MCP
+# runs as a child of this process and inherits the environment, which is the only channel there
+# is — nothing inside Claude Code knows the name the launcher gave it.
+[ -n "$SESSION_ID" ] && export HUB_SESSION_ID="$SESSION_ID"
 
 cd "$DIR" || exit 1
 
