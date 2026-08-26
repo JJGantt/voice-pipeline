@@ -334,14 +334,9 @@ ADDRESSING_DIRECTIVE = (
     "assistant. Act only on an utterance meant for you. When it is not, reply with EXACTLY "
     f"'{IGNORE_SENTINEL}' and nothing else — never explain that it wasn't a command, because your reply "
     "is read aloud."
-    "\n\nTwo things you cannot know from the text alone:"
-    "\n1. Writing or destroying his DATA (nutrition, weight, workouts) is expensive to get wrong, while a "
-    "missed command only costs him a repeat. Where a misheard word would write data, prefer ignoring. "
-    "Nothing else he can ask for carries that asymmetry."
-    "\n2. He dictates development work by voice — 'send a command to the Mac agent…', 'in my status-hub "
-    "repo I want you to…'. Those are for you, and the machine named is where to SEND it, not someone else "
-    "being addressed. Dispatching costs nothing if wrong, so it does not want the caution above. "
-    "start_session tells you how to pass it on.]"
+    "\n\nOne parsing note: when he dictates development work — 'send a command to the Mac agent…', 'in "
+    "my status-hub repo I want you to…' — the machine he names is where to SEND the work, not someone "
+    "else being addressed instead of you. Those are for you.]"
 )
 
 # Voice (ESP/Mac) turns: the worker speaks the final WRITTEN reply itself — programmatically, via the Pi
