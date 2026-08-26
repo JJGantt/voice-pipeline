@@ -314,9 +314,18 @@ async function run(cmd) {
   if (cmd.kind === 'end_session') {
     const target = String((cmd.payload || {}).session || '').trim();
     if (!/^hub-[A-Za-z0-9._-]+$/.test(target)) throw new Error(`unusable session name: ${target}`);
-    await exec('tmux', ['kill-session', '-t', target], { timeout: 10000 });
-    await sb(`desk_sessions?id=eq.${encodeURIComponent(target)}`, { method: 'DELETE', headers: { Prefer: 'return=minimal' } }).catch(() => {});
-    return `ended ${target}`;
+    // Graceful, not kill-session: a SIGKILL mid-tool-call can leave a repo half-edited and lose
+    // whatever the transcript had not flushed — and the transcript is the thing that makes this
+    // resumable at all.
+    await evict(target);
+    // PARKED, not deleted. Closing a session frees the machine; it does not throw the work away. The
+    // row keeps the transcript id so it can be resumed with full context, and only an explicit
+    // "forget" removes it.
+    await sb(`desk_sessions?id=eq.${encodeURIComponent(target)}`, {
+      method: 'PATCH', headers: { Prefer: 'return=minimal' },
+      body: JSON.stringify({ status: 'evicted', ended: new Date().toISOString() }),
+    }).catch(() => {});
+    return `parked ${target} (resumable)`;
   }
   // Bring an evicted session back with its full context. `claude --resume <id>` replays the
   // transcript, which is why the id had to be recorded when the session first started.
