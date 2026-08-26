@@ -53,8 +53,11 @@ async function sb(p, init) {
   // `...init` must come FIRST: spreading it last let a caller's own `headers` (the Prefer ones)
   // replace the computed object wholesale, stripping apikey/Authorization and 401ing every write.
   const res = await fetch(rest(p), { ...init, headers: headers(init?.headers) });
-  if (!res.ok) throw new Error(`${p} ${res.status}: ${(await res.text()).slice(0, 160)}`);
-  return res.status === 204 ? null : res.json();
+  const text = await res.text();
+  if (!res.ok) throw new Error(`${p} ${res.status}: ${text.slice(0, 160)}`);
+  // `Prefer: return=minimal` answers 201 with an EMPTY body, not 204, so keying the skip on the
+  // status code alone left JSON.parse choking on ''. Parse only when there is something to parse.
+  return text ? JSON.parse(text) : null;
 }
 
 // ---- presence -------------------------------------------------------------
