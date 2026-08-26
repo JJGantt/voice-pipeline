@@ -52,6 +52,12 @@ async function drain() {
         }
         continue;
       }
+      // Not ours: another machine is meant to run this. Without this check the Mac claims every
+      // pending row the instant it appears — including ones the hub explicitly routed to the Pi —
+      // and the Pi's consumer never sees them. Absent target means "whoever is here", which is the
+      // Mac while it is awake.
+      const target = (cmd.payload || {}).target;
+      if (target && target !== 'mac') continue;
       if (!(await claimCommand(cmd.id))) continue;   // someone else took it
       try {
         await finishCommand(cmd.id, 'done', await run(cmd));
