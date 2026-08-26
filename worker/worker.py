@@ -29,6 +29,7 @@ Design notes:
 import asyncio
 import json
 import os
+import pathlib
 import re
 import shutil
 import signal
@@ -261,28 +262,59 @@ POWER_DIRECTIVE = (
 # low-stakes writes that need no domain knowledge (reminders, lists, notes) it handles itself.
 ALL_TOOLS = ["mcp__data", "mcp__voice", "mcp__govee-lights", "mcp__petlibro-feeder"]  # full toolset (Opus)
 
-# Sonnet gets the SAME toolset, minus a short deny list. This used to be an allow list naming every
-# permitted tool, and it rotted: it is a hand-maintained set of exact strings with no link to the
-# tools that actually exist, so data-layer could add, rename or delete tools and nothing here noticed.
-# It was still naming create_reminder and complete_list_item months after those were removed, and it
-# silently gated out every new tool — including the session tools, which is why dispatching work by
-# voice could not work no matter how the request was phrased.
+# Sonnet's allow list. It MUST be an allow list, not a deny list, and the difference is load-bearing:
+# a tool omitted from --allowedTools stays VISIBLE in the schema and is refused only when called, so
+# Sonnet sees log_nutrition, recognises it needs it, and escalates. --disallowedTools instead removes
+# the tool from the schema outright — Sonnet cannot see it, has nothing to escalate about, and
+# truthfully reports that nutrition logging "isn't available". That regression shipped and broke
+# logging until it was caught, so: do not "simplify" this into a deny list.
 #
-# Inverted, the failure mode inverts too. A NEW tool is available to the fast path by default, which
-# is the common case and the safe one; only a genuinely dangerous tool needs a line here, which is
-# rare and obvious when you write it. A stale entry now means one tool is needlessly gated rather
-# than the whole feature being invisible.
-GATED_TOOLS = [
-    # Data WRITES that need real domain knowledge — nutrition values, muscle maps, maintenance math.
-    # Sonnet is DENIED these in `-p` mode, sees them in the schema, and escalates the turn to Opus.
-    "mcp__data__log_nutrition", "mcp__data__delete_nutrition_entry", "mcp__data__stage_meal",
-    "mcp__data__edit_staged", "mcp__data__remove_staged", "mcp__data__commit_staged",
-    "mcp__data__subtract_leftovers", "mcp__data__set_nutrition_targets",
-    "mcp__data__log_weight", "mcp__data__set_height",
-    "mcp__data__log_set", "mcp__data__update_set", "mcp__data__remove_set",
-    "mcp__data__upsert_catalog_exercise", "mcp__data__set_rep_watcher", "mcp__data__clear_rep_watcher",
+# The cost is that this list has to be maintained by hand and can rot. validate_safe_tools() below
+# makes that loud instead of silent.
+SAFE_TOOLS = [
+    "mcp__voice", "mcp__govee-lights", "mcp__petlibro-feeder",              # actuators + voice settings
+    "mcp__data__get_nutrition", "mcp__data__get_nutrition_targets", "mcp__data__get_workout",
+    "mcp__data__get_workout_catalog", "mcp__data__get_exercise_history", "mcp__data__get_weekly_volume",
+    "mcp__data__get_health_profile", "mcp__data__get_rep_watcher", "mcp__data__list_workouts",
+    "mcp__data__list_staged", "mcp__data__reload_wall",                     # reads + the wall reload
+    # lists / notes / dated items: low-stakes writes needing no domain knowledge → fast path.
+    # Reminders are not separate tools any more — a reminder is a list item with a due date (00056).
+    "mcp__data__get_due", "mcp__data__set_due", "mcp__data__set_list_emoji",
+    "mcp__data__get_lists", "mcp__data__add_to_list", "mcp__data__remove_from_list", "mcp__data__delete_list",
+    "mcp__data__get_notes", "mcp__data__create_note", "mcp__data__delete_note",
+    # Dispatching work to a machine: starts a SESSION, changes no data itself.
+    "mcp__data__list_repos", "mcp__data__start_session", "mcp__data__get_sessions",
+    "mcp__data__resume_session", "mcp__data__end_session",
 ]
-SAFE_TOOLS = ALL_TOOLS   # everything, with GATED_TOOLS denied alongside
+
+def validate_safe_tools(mcp_js: str) -> None:
+    """Warn about SAFE_TOOLS entries that no longer exist in the data MCP.
+
+    The allow list is maintained by hand — it has to be, because omitting a tool is what makes it
+    visible-but-denied and therefore escalatable. The danger is that it drifts: data-layer renames or
+    removes a tool and nothing here notices. It was still naming create_reminder and
+    complete_list_item months after those were deleted, and it silently gated out every tool added
+    since, which is why dispatching work by voice could not work at all.
+
+    This does not fix the list, only make its rot audible. A name that no longer exists is dead
+    weight; a data tool that exists but is listed nowhere is either deliberately gated or forgotten,
+    and only the log can tell you which.
+    """
+    try:
+        src = pathlib.Path(mcp_js).read_text(errors="ignore")
+    except OSError:
+        return  # the MCP build is not readable from here; not worth failing startup over
+    real = set(re.findall(r"name:\s*'([a-z_]+)'", src))
+    if not real:
+        return
+    listed = {t.split("__")[-1] for t in SAFE_TOOLS if t.startswith("mcp__data__")}
+    dead = sorted(listed - real)
+    if dead:
+        log(f"[tools] SAFE_TOOLS names {len(dead)} tool(s) that no longer exist: {', '.join(dead)}")
+    ungated = sorted(real - listed)
+    if ungated:
+        log(f"[tools] not on the fast path (gated or forgotten): {', '.join(ungated)}")
+
 
 # Escalation: Sonnet emits this (mirrors IGNORE_SENTINEL) when a request needs a gated write tool; the
 # dispatch then re-runs the whole turn on Opus + max thinking. Appended to every standard-route turn.
@@ -948,10 +980,6 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
         if allow_read:
             allowed.append("Read")   # photo turns only: Read is how the CLI views image files
         cmd += ["--allowedTools", *allowed]   # a tool not listed is DENIED (not prompted) in -p mode
-        # The fast path allows the whole toolset and denies the gated few, so a newly added tool is
-        # usable immediately instead of being invisible until someone remembers to list it.
-        if allowed is SAFE_TOOLS or allowed == SAFE_TOOLS:
-            cmd += ["--disallowedTools", *GATED_TOOLS]
     if system_append:
         cmd += ["--append-system-prompt", system_append]
     timeout_s = AGENT_TIMEOUT_S if agent else CLAUDE_TIMEOUT_S
@@ -1982,6 +2010,7 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _handle_signal)
 
     log(f"starting (priority={WORKER_PRIORITY}, state_dir={STATE_DIR}, once={once})")
+    validate_safe_tools(DATA_MCP_JS)
 
     with httpx.Client(timeout=HTTP_TIMEOUT_S) as client:
         db = Supabase(client)
