@@ -34,6 +34,10 @@ import { randomUUID } from 'node:crypto';
 // platform-specific in it, and two copies of "which keys make a project entry complete" would drift.
 import { ensureTrusted } from '../orchestrator/src/trust.js';
 import { findTranscript, readTail, liveSessions, evict, pickEviction, WRAP_UP, isWrapped } from './sessions.js';
+// The same self-healing subscription the Mac's orchestrator uses. Shared rather than reimplemented:
+// its header documents a hard-won lesson — supabase-js does not reliably recover a dead channel, and
+// callers that fall back to a tight poll burn ~20k reads a day without noticing.
+import { watchTable } from '../orchestrator/src/realtime.js';
 
 const exec = promisify(execFile);
 
@@ -41,7 +45,12 @@ const SUPABASE_URL = process.env.SUPABASE_URL || 'https://felyggqjjhltwokdfhop.s
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const GITHUB_OWNER = process.env.GITHUB_OWNER || 'JJGantt';
 const REPO_ROOT = process.env.REPO_ROOT || path.join(os.homedir(), 'repos');
-const POLL_MS = Number(process.env.POLL_MS || 3000);
+// BACKSTOP ONLY. Commands arrive over realtime; this exists for the window where the subscription is
+// down. Polling every 3s was ~28,800 reads a day that almost always found nothing — the exact waste
+// realtime.js was written to eliminate, reintroduced by taking a shortcut here.
+const POLL_MS = Number(process.env.POLL_MS || 300000);
+// Used only while realtime is unhealthy, so a command still lands within seconds when it matters.
+const POLL_DEGRADED_MS = Number(process.env.POLL_DEGRADED_MS || 5000);
 const PRESENCE_MS = Number(process.env.PRESENCE_MS || 30000);
 // Matches the hub's DESK_STALE_S. Below this the Mac is considered awake and owns untargeted work.
 const MAC_STALE_S = Number(process.env.MAC_STALE_S || 90);
@@ -452,7 +461,20 @@ async function drain() {
 console.log(`[pi-desk] watching desk_commands (repos in ${REPO_ROOT}, owner ${GITHUB_OWNER})`);
 heartbeat();
 setInterval(heartbeat, PRESENCE_MS);
+// Realtime is the primary path: a command inserted anywhere reaches this within a moment, rather
+// than waiting out a poll interval. Both INSERT (a new command) and UPDATE (a queued row released)
+// matter, so the subscription is not narrowed to inserts.
+const rt = watchTable({ channel: 'pi-desk-commands', table: 'desk_commands', event: '*', onChange: drain, tag: 'pi-desk' });
+
 drain();
-setInterval(drain, POLL_MS);
+// The backstop stretches out while realtime is healthy and tightens when it is not, so a subscription
+// that dies silently degrades to slow-but-working instead of stopping altogether.
+let pollTimer = null;
+const pollLoop = () => {
+  drain().catch(() => {});
+  pollTimer = setTimeout(pollLoop, rt.isHealthy && rt.isHealthy() ? POLL_MS : POLL_DEGRADED_MS);
+};
+pollTimer = setTimeout(pollLoop, POLL_DEGRADED_MS);
+
 reconcileSessions();
 setInterval(reconcileSessions, PRESENCE_MS);
