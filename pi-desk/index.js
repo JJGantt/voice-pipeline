@@ -117,12 +117,16 @@ async function reconcileSessions() {
     const rows = await sb(`desk_sessions?worker=eq.${WORKER}&select=id`);
     const known = new Set((rows || []).map((r) => r.id));
     for (const id of live) {
-      if (known.has(id)) {
-        await sb(`desk_sessions?id=eq.${encodeURIComponent(id)}`, {
-          method: 'PATCH', headers: { Prefer: 'return=minimal' },
-          body: JSON.stringify({ last_seen: new Date().toISOString() }),
-        });
-      }
+      // UPSERT, not patch-if-known. Patching only what the table already had meant a session tmux was
+      // running but the table had never seen — one started before this code existed, or after the row
+      // was lost — stayed invisible forever, which makes "tmux is the source of truth" a false claim.
+      await sb('desk_sessions?on_conflict=id', {
+        method: 'POST', headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
+        // Repo comes out of the session name for a row being adopted rather than launched; the name
+        // is hub-<repo>-<suffix> and the suffix is base36 with no dashes, so the last one splits it.
+        body: JSON.stringify([{ id, worker: WORKER, repo: id.replace(/^hub-/, '').replace(/-[^-]*$/, ''),
+                                last_seen: new Date().toISOString() }]),
+      });
       known.delete(id);
     }
     // Whatever is still in `known` is published but no longer running — drop it. Deleting rather than
