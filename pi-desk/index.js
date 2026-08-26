@@ -50,7 +50,9 @@ const headers = (extra = {}) => ({
 });
 
 async function sb(p, init) {
-  const res = await fetch(rest(p), { headers: headers(init?.headers), ...init });
+  // `...init` must come FIRST: spreading it last let a caller's own `headers` (the Prefer ones)
+  // replace the computed object wholesale, stripping apikey/Authorization and 401ing every write.
+  const res = await fetch(rest(p), { ...init, headers: headers(init?.headers) });
   if (!res.ok) throw new Error(`${p} ${res.status}: ${(await res.text()).slice(0, 160)}`);
   return res.status === 204 ? null : res.json();
 }
