@@ -260,25 +260,29 @@ POWER_DIRECTIVE = (
 # directive, hands the whole turn to a fresh Opus rather than claiming it can't. Reads, actuators, and the
 # low-stakes writes that need no domain knowledge (reminders, lists, notes) it handles itself.
 ALL_TOOLS = ["mcp__data", "mcp__voice", "mcp__govee-lights", "mcp__petlibro-feeder"]  # full toolset (Opus)
-SAFE_TOOLS = [
-    "mcp__voice", "mcp__govee-lights", "mcp__petlibro-feeder",              # actuators + voice settings
-    "mcp__data__get_nutrition", "mcp__data__get_nutrition_targets", "mcp__data__get_workout",
-    "mcp__data__get_workout_catalog", "mcp__data__get_exercise_history", "mcp__data__get_weekly_volume",
-    "mcp__data__get_health_profile", "mcp__data__get_rep_watcher", "mcp__data__list_workouts",
-    "mcp__data__list_staged", "mcp__data__reload_wall",                     # reads + the wall reload
-    # lists / notes (incl. deletes): low-stakes writes needing no domain knowledge → fast path.
-    # NOTE: reminders are no longer their own tools — a reminder is a list item with a due date
-    # (data-layer migration 00056), so get_due/set_due cover what create_reminder used to.
-    "mcp__data__get_due", "mcp__data__set_due",
-    "mcp__data__get_lists", "mcp__data__add_to_list", "mcp__data__remove_from_list", "mcp__data__delete_list",
-    "mcp__data__get_notes", "mcp__data__create_note", "mcp__data__delete_note",
-    "mcp__data__set_list_emoji",
-    # Dispatching work to a machine. Safe for the fast path on purpose: it starts a SESSION, it does
-    # not itself change any data — the session that opens is a full agent with its own judgement, and
-    # making Jared wait for an Opus escalation just to relay a request would defeat the point.
-    "mcp__data__list_repos", "mcp__data__start_session", "mcp__data__get_sessions",
-    "mcp__data__resume_session", "mcp__data__end_session",
+
+# Sonnet gets the SAME toolset, minus a short deny list. This used to be an allow list naming every
+# permitted tool, and it rotted: it is a hand-maintained set of exact strings with no link to the
+# tools that actually exist, so data-layer could add, rename or delete tools and nothing here noticed.
+# It was still naming create_reminder and complete_list_item months after those were removed, and it
+# silently gated out every new tool — including the session tools, which is why dispatching work by
+# voice could not work no matter how the request was phrased.
+#
+# Inverted, the failure mode inverts too. A NEW tool is available to the fast path by default, which
+# is the common case and the safe one; only a genuinely dangerous tool needs a line here, which is
+# rare and obvious when you write it. A stale entry now means one tool is needlessly gated rather
+# than the whole feature being invisible.
+GATED_TOOLS = [
+    # Data WRITES that need real domain knowledge — nutrition values, muscle maps, maintenance math.
+    # Sonnet is DENIED these in `-p` mode, sees them in the schema, and escalates the turn to Opus.
+    "mcp__data__log_nutrition", "mcp__data__delete_nutrition_entry", "mcp__data__stage_meal",
+    "mcp__data__edit_staged", "mcp__data__remove_staged", "mcp__data__commit_staged",
+    "mcp__data__subtract_leftovers", "mcp__data__set_nutrition_targets",
+    "mcp__data__log_weight", "mcp__data__set_height",
+    "mcp__data__log_set", "mcp__data__update_set", "mcp__data__remove_set",
+    "mcp__data__upsert_catalog_exercise", "mcp__data__set_rep_watcher", "mcp__data__clear_rep_watcher",
 ]
+SAFE_TOOLS = ALL_TOOLS   # everything, with GATED_TOOLS denied alongside
 
 # Escalation: Sonnet emits this (mirrors IGNORE_SENTINEL) when a request needs a gated write tool; the
 # dispatch then re-runs the whole turn on Opus + max thinking. Appended to every standard-route turn.
@@ -336,22 +340,29 @@ ADDRESSING_DIRECTIVE = (
     "it only glancingly resembles a command. Do NOT manufacture a command from ambient speech just because "
     "a word happens to sound like an action or a staged/logged/listed item — that is exactly how room-talk "
     "gets mis-executed (e.g. 'eat your food' is NOT 'commit the staged meal'). Lean HARD toward ignoring "
-    "when acting would cause a STATE CHANGE (logging, committing, deleting, editing): a missed real command "
-    "just costs a repeat, but a false one corrupts his data. ONLY when a word is plainly misheard WITHIN an "
+    "when acting would write or destroy DATA — nutrition, weight, workouts, deleting or editing records: "
+    "a missed real command just costs a repeat, but a false one corrupts his data. That caution is about "
+    "his DATA specifically, not about action in general: starting a session, reading anything, or "
+    "adjusting a light are all cheaply undone and do not warrant the same suspicion. Use the tools you "
+    "have and your own judgement about what each one would actually cost if you got it wrong. ONLY when "
+    "a word is plainly misheard WITHIN an "
     "utterance already clearly aimed at you should you correct it to its intended meaning ('permit'→'commit', "
     "'lock'→'log') and act. When you ignore, output ONLY the sentinel — NEVER explain that it wasn't a "
     "command or that there's nothing to do; that explanation would be read ALOUD."
     "\n\nONE IMPORTANT EXCEPTION — dictating work to a project. Jared dispatches development work by "
-    "voice: 'send a command to the Mac agent…', 'in my status-hub repo, I want you to…', 'have the Pi "
-    "look at…'. These are ALWAYS for you, and they are the one case where the tell-tales above mislead: "
+    "voice. The canonical opener is 'SEND A COMMAND TO …' or 'SEND THIS TO …' ('send a command to the "
+    "Mac agent…', 'send this to the Pi…'), but treat any clear instruction to relay work the same way: "
+    "'in my status-hub repo, I want you to…', 'have the Pi look at…', 'tell the Mac agent to…'. "
+    "These are ALWAYS for you, and they are the one case where the tell-tales above actively mislead:"
     "\n- They are LONG and they RAMBLE. He is composing a feature request out loud, so expect restarts, "
     "'uh', self-corrections and asides ('by the way', 'or whatever'). Length and messiness are NOT "
-    "evidence against it here — they are what dictation sounds like. Do not mistake it for thinking aloud."
-    "\n- They NAME A THIRD PARTY ('the Mac agent', 'the Pi', 'the agent') as the RECIPIENT of relayed "
-    "work. That is not someone else being addressed instead of you; it is you being told where to send it."
+    "evidence against it here — they are what dictation sounds like."
+    "\n- They NAME A MACHINE OR AGENT ('the Mac agent', 'the Pi', 'the agent') as the RECIPIENT of "
+    "relayed work. That is not a third party being addressed instead of you; it is you being told where "
+    "to send it."
     "\n- The state-change caution does NOT apply. start_session corrupts nothing — it opens a session "
-    "that is itself a careful agent. A missed dispatch wastes a minute of his speech and is far worse "
-    "here than a spurious one."
+    "that is itself a careful agent. A missed dispatch throws away a minute of his speech; a spurious "
+    "one costs almost nothing. The asymmetry runs the OPPOSITE way from logging nutrition."
     "\nWhen you recognise one: call start_session, pass the request through VERBATIM minus the addressing "
     "preamble, and if no project is named or you cannot tell which, OMIT repo rather than refusing — it "
     "opens at the root and finds its own way. Never answer these yourself and never ask which repo.]"
@@ -966,6 +977,10 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
         if allow_read:
             allowed.append("Read")   # photo turns only: Read is how the CLI views image files
         cmd += ["--allowedTools", *allowed]   # a tool not listed is DENIED (not prompted) in -p mode
+        # The fast path allows the whole toolset and denies the gated few, so a newly added tool is
+        # usable immediately instead of being invisible until someone remembers to list it.
+        if allowed is SAFE_TOOLS or allowed == SAFE_TOOLS:
+            cmd += ["--disallowedTools", *GATED_TOOLS]
     if system_append:
         cmd += ["--append-system-prompt", system_append]
     timeout_s = AGENT_TIMEOUT_S if agent else CLAUDE_TIMEOUT_S
