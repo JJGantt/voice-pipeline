@@ -114,7 +114,11 @@ async function reconcileSessions() {
     let cid = row?.claude_session_id || null;
     if (!tpath) {
       const repoName = row?.repo || name.replace(/^hub-/, '').replace(/-[^-]*$/, '');
-      const found = await findTranscript(path.join(REPO_ROOT, repoName), 0, { attempts: 1, delayMs: 0 });
+      // Bounded by when THIS session started, never "newest in the directory". Unbounded, a session
+      // whose own transcript had not appeared yet adopted its predecessor's — and resuming it would
+      // then restore a different conversation entirely, which is worse than not resuming at all.
+      const since = row?.started ? new Date(row.started).getTime() - 5000 : null;
+      const found = since ? await findTranscript(path.join(REPO_ROOT, repoName), since, { attempts: 1, delayMs: 0 }) : null;
       if (found) { tpath = found.path; cid = found.id; console.log(`[pi-desk] adopted transcript ${found.id} for ${name}`); }
     }
     const tail = tpath ? readTail(tpath) : { working: false, lastReply: null, bytes: 0 };
