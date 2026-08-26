@@ -73,26 +73,6 @@ Already registered for interactive Claude sessions in `~/.claude.json` under
 `src/index.js`, env `{SUPABASE_URL, SUPABASE_KEY}`), alongside the existing
 `data` server.
 
-**Worker note:** the voice-pipeline worker that spawns Claude with
-`--mcp-config` should include this server too, so worker-spawned sessions can
-list/switch focus. Add an entry like:
-
-```json
-{
-  "mcpServers": {
-    "voice": {
-      "type": "stdio",
-      "command": "node",
-      "args": ["/Users/jaredgantt/repos/voice-pipeline/mcp-voice/src/index.js"],
-      "env": {
-        "SUPABASE_URL": "https://felyggqjjhltwokdfhop.supabase.co",
-        "SUPABASE_KEY": "<service_role key>"
-      }
-    }
-  }
-}
-```
-
-The parent/orchestrator wires the worker's `--mcp-config`; this repo is not
-deployed automatically.
-```
+The worker also attaches it to every Claude run it spawns, from `VOICE_MCP_JS`
+(`worker/worker.py` writes the `--mcp-config` file), so a voice turn can speak
+and switch focus. On Fly it is copied into the image by `server/assemble.sh`.

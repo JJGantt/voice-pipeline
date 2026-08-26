@@ -113,6 +113,10 @@ commit it.
 - `src/applescript.js` — lsof→tty, Terminal tab enumerate/close/reopen.
 - `src/sessions.js` — session-file parsing + registry scan (pure helpers + FS).
 - `src/registry.js` — registry publish loop.
+- `src/repos.js` — the `~/repos` scan that publishes the `repos` table.
+- `src/commands.js` — the `desk_commands` consumer: opens a Terminal in a project.
+- `src/trust.js` — pre-accepts the workspace-trust prompt (shared with `pi-desk`).
+- `src/realtime.js` — the self-healing Supabase subscription (shared with `pi-desk`).
 - `src/supabase.js` — PostgREST helpers (get/patch focus, upsert/prune sessions).
 - `src/config.js` — env config.
 - `com.jaredgantt.voice-orchestrator.plist` — sample launchd agent.

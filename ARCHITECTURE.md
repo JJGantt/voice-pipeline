@@ -1,89 +1,61 @@
 # Voice / Hub Agent — Architecture
 
-The canonical definition of how the hub agent works. **There are exactly two routes.** Every way of
-talking to the agent resolves to one of them. If a change would add a third behavior, it's wrong —
-fix it back to two.
-
-## The two routes
-
-| | **Efficiency** | **Accuracy** |
-|---|---|---|
-| Goal | raw speed | correctness (slow is fine) |
-| Model | Haiku | Opus + heavy thinking |
-| Engine | **Messages API** (`ApiRunner`) — only the MCP tools, no Claude Code overhead | **subscription `claude -p`** (`run_claude`) |
-| Devices | whichever is fastest (Mac / Pi / Fly — device-agnostic) | Mac → Pi → Fly. Fly has no subscription, so it uses the **API** with the same model + thinking |
-| Billing | API credits (pennies/turn) | free (subscription) on Mac/Pi; API on Fly only |
-
-That's it. Two routes, two execution strategies in the worker (`ApiRunner` and `run_claude`). Nothing else.
-
-## How you reach each route
-
-Every input is thin — it only captures the request and **enqueues one row** to Supabase
-`voice_requests` `{transcript, source, tier}`. The worker reads `tier` and picks the route.
-
-| Input | Route | tier |
-|---|---|---|
-| ✦ Sparkle button (web FAB) | Efficiency | `fast` |
-| "hey_rhasspy" wake word (ESP + Mac mic) | Efficiency | `fast` |
-| 🧠 Brain button (web FAB) | Accuracy | `power` |
-| "hey_jarvis" wake word (ESP + Mac mic) | Accuracy | `power` |
-| Typed chat box (web) | **per the chat-box setting** | resolved from `app_settings.chatbox_route` (default `power`) |
-
-The buttons and wake words mirror each other. The **only** input without a fixed tier is the typed
-chat box, and it follows the one remaining setting (`chatbox_route` = `fast` | `power`). That setting
-governs *only* the chat box now — nothing else.
+The always-on machinery: who captures speech, who processes it, and how every surface stays in step.
+How a single turn is *routed* once it reaches the worker is `docs/ROUTING.md`; `CLAUDE.md` is what to
+know before editing anything here.
 
 ## The pieces (modular boundaries)
 
 ```
 INPUTS (capture + enqueue only — no model logic):
-  status-hub web UI: 2 FAB buttons + typed box     ─┐
-  ESP mic (jared-voice server): 2 wake words        ─┤→ Supabase voice_requests {transcript, source, tier}
-  Mac mic (mac-listener): 2 wake words              ─┘
+  status-hub web UI: the voice FAB + typed box     ─┐
+  ESP mic (jared-voice server): wake word           ─┤→ Supabase voice_requests {transcript, source}
+  Mac mic (mac-listener / wakefree.py)              ─┘
                                                         │
-WORKER (voice-pipeline/worker/worker.py — the ONE brain):
-  claims a request, resolves the route, runs it, writes the reply to voice_messages
-    tier == fast   → ApiRunner   (Messages API, Haiku, MCP-only)        [+ subscription fallback on error]
-    tier == power  → run_claude  (subscription claude -p, Opus+thinking) [Fly: ApiRunner think=True]
+WORKER (worker/worker.py — the ONE brain):
+  claims a request, runs it, writes the reply to voice_messages
+    hub turn      → Sonnet on SAFE_TOOLS, escalating to a fresh Opus run (docs/ROUTING.md)
+    full-agent    → the unrestricted Claude Code agent in `agent_cwd`, its own persistent session
                                                         │
-TOOLS (the only capabilities — shared by both routes):  data · voice · govee   (MCP, stdio)
+TOOLS (the only capabilities): data · voice · govee   (MCP, stdio)
 SOURCE OF TRUTH:  Supabase (felyggqjjhltwokdfhop)
 
-DEVICES:
-  Mac  — primary worker, has the Claude subscription (claude -p). launchd: com.jaredgantt.voice-worker
-  Pi   — fallback worker (WORKER_PRIORITY=mac,pi). aarch64, active host.
-  Fly  — cloud fallback, bundled into the jared-voice server image (server/, WORKER_ID=fly). No subscription → accuracy route uses the API there.
+DEVICES (claim order pi → mac → fly):
+  Pi   — first claimer (systemd voice-worker.service). Also runs pi-desk, the desk-command consumer.
+  Mac  — fallback (launchd com.jaredgantt.voice-worker). Has the Claude subscription, like the Pi.
+  Fly  — last resort, bundled into the jared-voice server image (server/, WORKER_ID=fly).
 ```
+
+Inputs are thin by design: they capture and enqueue one row, and nothing about which device heard the
+command survives into how it is processed.
 
 ## Worker execution strategies
 
-- **`ApiRunner`** (efficiency): direct `anthropic` Messages API. Warm MCP stdio sessions started once;
-  tool schemas inlined with the prompt; full agentic loop (sequential tool calls → final reply). No
-  built-in Claude Code tools, so nothing to hallucinate or discover. The stable prefix (tool schemas +
-  system, ~8k tokens) is **prompt-cached for 1 hour** (`cache_control ttl:1h` + the `extended-cache-ttl`
-  beta), so warm commands pay ~10% on that prefix — what makes always-on / wake-free affordable.
-- **`run_claude`** (accuracy): headless `claude -p` on the subscription (no API billing). Opus, with
-  the `POWER_DIRECTIVE` (careful decomposition + `ultrathink` to unlock max thinking).
+- **`run_claude`** — headless `claude -p` on the **subscription** (no API billing). This is the path
+  on the Mac and the Pi. It streams `stream-json`, so tool calls surface live on the activity bar.
+- **`ApiRunner`** — the direct `anthropic` Messages API, used on Fly, which has no subscription
+  login. Warm MCP stdio sessions started once, tool schemas inlined with the prompt, full agentic
+  loop, no built-in Claude Code tools. The stable prefix (schemas + system, ~8k tokens) is
+  **prompt-cached for 1 hour** (`cache_control ttl:1h` + the `extended-cache-ttl` beta), which is
+  what makes always-on affordable.
 
-There is no third strategy. The old warm-Agent-SDK path (`SdkRunner`) was removed — it used the
-`claude_code` preset (the bloat) and didn't belong to either route.
+Photo turns are subscription-only: the CLI's `Read` tool is how a model views an image file, so a
+photo request that reaches Fly is refused rather than run blind.
 
 ## Device fallback
 
-- **Worker claim priority** is `WORKER_PRIORITY` (default `mac,pi`): the highest-priority worker with a
-  fresh heartbeat claims; others defer. Mac → Pi today.
-- **Fly** is the last resort, bundled into the jared-voice server image (built from `server/` by
-  `assemble.sh`; runs `worker.py` as `WORKER_ID=fly`, deferring to Mac/Pi). Its accuracy route uses the
-  API (`ApiRunner` with thinking) since there's no subscription there.
-
-### Known gaps (don't pretend these are done)
-- Fast route picks a device by **priority**, not a true "fastest-wins" race. Priority is a proxy for now.
-- The Fly fallback worker is not deployed.
-
-## The chat-box setting (`chatbox_route`)
-
-`app_settings.chatbox_route` ∈ `{fast, power}`, default `power`. Set in the hub Settings panel. Applies
-**only** to the typed chat box. The two buttons and the wake words carry their own tier and ignore it.
+- **Worker claim priority** is `WORKER_PRIORITY`, and `worker/run.sh` sets it to **`pi,mac,fly`** on
+  every machine that launches through it: the highest-priority worker with a fresh heartbeat claims
+  and the others defer, so the **Pi takes a command whenever it is up** and the Mac is the fallback.
+  That is deliberate — a session started by voice must outlive the laptop closing. `worker.py`'s own
+  in-file default (`mac,pi`) is only what applies if something starts it without `run.sh`. Claiming
+  is an atomic `PATCH ... status=eq.pending`, so it is safe even when two workers race.
+- **Worker affinity** overrides priority while a hub context window is live: the window stays pinned
+  to the worker that owns it, so a conversation and its machine-local context aren't lost to a
+  needless switch. Affinity releases when the window resets or the owner goes silent past
+  `OWNER_GRACE_S`.
+- A deferring worker drops to a **slower heartbeat and poll** (still inside `HEARTBEAT_FRESH_S`, so it
+  never looks dead to the workers below it) and ramps back up when the primary goes quiet.
 
 ## Feedback is universal — never scoped to which input captured the command
 
@@ -160,7 +132,7 @@ reload between them. Turning wake-free off removes the pin and the daemon idle-e
 
 A toggleable always-listening mode: no wake word — you just talk, and your **voice** is the gate. It's
 a **global** mode (`app_settings.wakefree_enabled`), congruent across every listener: ON → no wake
-word, every source (Mac *and* ESP) gates on Jared's voice; OFF → the two wake words everywhere.
+word, every source (Mac *and* ESP) gates on Jared's voice; OFF → the wake word everywhere.
 
 - **Speaker ID + one shared voiceprint.** ECAPA-TDNN. `enroll.py` saves a bank of per-phrase embeddings
   (`exemplars.npy`) **and uploads it to `app_settings.voiceprint`** so the ESP/Fly server uses the exact
@@ -170,36 +142,29 @@ word, every source (Mac *and* ESP) gates on Jared's voice; OFF → the two wake 
   slices of one monologue.
 - **Capture — same logic on both ends.** Segment on speech energy → end on a ~2s pause
   (`wakefree_pause_s`) → trim silence → verify the speaker on the whole utterance → only then transcribe
-  (Groq) + enqueue `voice_requests {tier: wakefree_route}`. The TV / other people are filtered for free (never
+  (Groq) + enqueue a `voice_requests` row. The TV / other people are filtered for free (never
   transcribed); the worker's `__IGNORE__` directive drops any of *your* speech that isn't a command.
   - **Mac:** `voice-id/wakefree.py` (ECAPA local, on-demand).
   - **ESP:** the `jared-voice` Fly server runs the same ECAPA + the shared voiceprint (lazy-loaded on
     turn-on; the box is **2 GB** for it) and captures on energy instead of openWakeWord while on.
-- **Route (Efficiency / Accuracy).** The wake-*word* path picks the route per-utterance from which word
-  fired (`Hey Rhasspy` → fast/Haiku, `Hey Jarvis` → power/Opus). Wake-free has no wake word to
-  disambiguate, so it runs on **one configurable route**, `app_settings.wakefree_route` ∈ `{fast, power}`
-  (default `fast`), set in the hub. `wakefree.py` reads it live per command; the listener bridges changes
-  to the ESP (`jared-voice/wakefree-route?v=…`). It is a mode, not per-command — flip it to send the
-  whole wake-free session to Opus.
 
 ### State lives in the DB — every host reads it itself (the Mac is NOT the source of truth)
 `app_settings` (written by the hub) is the single source of truth. **Fly is the always-on host that
 runs the ESP precisely because the Mac is intermittent**, so the Fly server reads its own state
 straight from `app_settings` — on boot AND live via its own realtime subscription (`_settings_listener`
 in `server.py`): `wakefree_enabled` (→ load ECAPA + capture mode), `voice_muted` (→ global mute),
-`wakefree_route`, `voiceid_threshold`/`wakefree_pause_s`/`voiceprint`. A server restart or a sleeping
-Mac can no longer strand the ESP in the wrong mode — it restores itself from the DB.
+`voice_inject_mode`, `voiceid_threshold`/`wakefree_pause_s`/`voiceprint`. A server restart or a
+sleeping Mac cannot strand the ESP in the wrong mode — it restores itself from the DB.
 - The Mac listener still mirrors these to the ESP over HTTP (`/wakefree-on|off`, `/capture-off|on`,
   `/wakefree-route`) as a **redundant fast-path**, and still does the Mac-local work (mic handoff,
   start/stop `wakefree.py`). But that bridge is no longer load-bearing — if the Mac is off, Fly already
   has the state. (The LED is likewise host-independent: the worker that drives it fails over Mac→Pi→Fly.)
-- `wakefree.py` (Mac) reads `wakefree_route` live per command; the worker maps `tier` → model.
 
 ### Global mute — any explicit input deafens every always-on listener
-An **explicit, hard-coded-route** command (push-to-talk dictation, or a hub FAB button) silences every
-*auto-routing* listener while it's in flight, so nothing else captures or re-routes it. One shared flag,
+An explicit command — push-to-talk dictation, or the hub's voice FAB — silences every always-on
+listener while it is in flight, so nothing else captures the same speech. One shared flag,
 `app_settings.voice_muted`:
-- **Set by:** the FAB buttons (web, while recording) and push-to-talk (Hammerspoon).
+- **Set by:** the voice FAB (web, while recording) and push-to-talk (Hammerspoon).
 - **Respected by:** the Mac listener (mutes its mic / pauses `wakefree.py`) and the ESP (the listener
   pings `jared-voice/capture-off|on`; the server drops all audio, 90s safety auto-clear).
 Push-to-talk also fires an instant Mac SIGUSR; the FAB reaches the listener via realtime. Either way
@@ -218,11 +183,12 @@ bridges to the ESP over HTTP).
 
 | key | default | read by |
 |---|---|---|
-| `chatbox_route` | `power` | worker — route for the typed chat box only |
-| `session_reset_s` | `300` | worker — idle seconds before the hub conversation resets (was 2h) |
-| `wakefree_enabled` | `0` | listener — global wake-free on/off (mic handoff + ESP bridge) |
-| `wakefree_route` | `fast` | wakefree (live) + ESP server — Efficiency/Accuracy route for wake-free commands |
-| `voice_muted` | `0` | listener + ESP — global mute (set by FAB / push-to-talk) |
+| `session_reset_s` | `300` | worker — idle seconds before the hub conversation resets |
+| `wakefree_enabled` | `0` | listener + ESP server — global wake-free on/off (mic handoff + ESP bridge) |
+| `voice_muted` | `0` | listener + ESP — global mute (set by the FAB / push-to-talk) |
+| `voice_inject_mode` | `0` | listener + ESP — Mac mic pastes into the focused window; the ESP goes deaf |
+| `agent_mode` / `agent_cwd` | `0` | worker — full-agent (coding) mode and its working directory |
+| `synth_on_mac` | `0` | worker — synthesize the reply on the Mac and ship PCM to the Pi to play |
 | `voiceid_threshold` | `0.30` | wakefree + ESP server — "it's Jared" cosine threshold |
 | `wakefree_pause_s` | `2.0` | wakefree + ESP server — trailing-silence that ends an utterance |
 | `voiceprint` | — | wakefree (local) + ESP server — base64 ECAPA exemplar bank (uploaded by `enroll.py`) |

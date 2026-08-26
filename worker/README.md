@@ -5,29 +5,35 @@ through a headless `claude -p` session on the **Claude subscription** (no API
 key), with the `data` MCP attached, then writes the conversation back to Supabase
 (`voice_messages`) for a live display.
 
-The same `worker.py` runs on the **Mac** (`WORKER_ID=mac`) and later the **Pi**
-(`WORKER_ID=pi`). Only the priority ordering differs.
+The same `worker.py` runs on the **Pi** (`WORKER_ID=pi`), the **Mac** (`WORKER_ID=mac`) and inside
+the `jared-voice` Fly image (`WORKER_ID=fly`); only `WORKER_ID` differs. How a claimed turn is
+routed once it gets here is `../docs/ROUTING.md`.
 
 ## What it does (per loop iteration)
 
-1. **Heartbeat** — every 10s, upsert `worker_presence` `{worker, last_seen, info:{}}`.
-2. **Claim (serialized, never concurrent)** — poll the oldest `pending` request.
-   - **Priority gate:** if any worker ranked *higher* than me in `WORKER_PRIORITY`
-     has a `last_seen` within 30s, skip and let them take it.
+1. **Heartbeat** — every `HEARTBEAT_INTERVAL_S` (30s), upsert `worker_presence`
+   `{worker, last_seen, info:{}}`. A deferring worker drops to 60s, which stays
+   inside `HEARTBEAT_FRESH_S` so it never looks dead to the workers below it.
+2. **Claim (serialized, never concurrent)** — woken by a Supabase realtime INSERT
+   on `voice_requests`; the poll below is only a backstop.
+   - **Priority gate:** if any worker ranked *higher* in `WORKER_PRIORITY` has a
+     `last_seen` within `HEARTBEAT_FRESH_S` (90s), skip and let them take it.
+   - **Affinity override:** a live hub context window stays pinned to the worker
+     that owns it, even against priority, until the window resets or the owner
+     goes silent past `OWNER_GRACE_S` — a needless switch loses the conversation.
    - **Atomic claim:** `PATCH ...&status=eq.pending` → `claimed`. If the returned
      representation is empty, someone else won the race — skip.
 3. **Process** the claimed request:
-   - Read the `voice_focus` singleton. **Phase 1 only handles `focus == 'hub'`.**
-     If focus is anything else (a specific Mac session id), the request is
-     released back to `pending` and skipped — never crashes. See Phase-2 TODO.
+   - Read the `voice_focus` singleton. `focus == 'hub'` runs here; any other value
+     names a live Mac session, and the transcript is injected into that session's
+     pty through the orchestrator (`ORCH_URL`) instead of running a fresh turn.
    - Write the user turn to `voice_messages`.
-   - Manage the shared **hub session** (resume vs. fresh — see reset rule below).
-   - Run `claude -p` headless with the `data` MCP, parse `stream-json`, capture
-     the `session_id` and the final assistant text.
+   - Manage the hub session (resume vs. fresh — see the reset rule below).
+   - Run the turn, parse `stream-json`, capture the `session_id` and the final text.
    - Write the assistant turn to `voice_messages` and mark the request `done`
      (or `error` on any failure).
-4. Idle-poll every ~1s; drains the queue fast when busy. Clean shutdown on
-   SIGINT/SIGTERM (finishes the current iteration, then exits).
+4. Idle-poll every `IDLE_POLL_S` (15s), tightening to 2s only while realtime is
+   down and 120s while deferring. Clean shutdown on SIGINT/SIGTERM.
 
 ## Environment variables
 
@@ -35,12 +41,16 @@ The same `worker.py` runs on the **Mac** (`WORKER_ID=mac`) and later the **Pi**
 |-----|---------|-------|
 | `SUPABASE_URL` | `https://felyggqjjhltwokdfhop.supabase.co` | |
 | `SUPABASE_KEY` | *(required, no default)* | **Must be the service_role key** — it bypasses RLS and needs full read/write on `voice_requests`, `voice_messages`, `worker_presence`, `voice_focus`. The anon key will NOT work. |
-| `WORKER_ID` | `mac` | Also `pi`. Identifies this worker in the queue + presence. |
-| `WORKER_PRIORITY` | `mac,pi` | Ordered, highest first. A worker only claims if no higher-priority worker has a fresh heartbeat. |
-| `STATE_DIR` | `~/.voice-worker` | Stores `hub_session.json` (session id + last activity). |
+| `WORKER_ID` | `mac` | Also `pi`, `fly`. Identifies this worker in the queue + presence. |
+| `WORKER_PRIORITY` | `pi,mac,fly` (from `run.sh`) | Ordered, highest first. A worker only claims if no higher-priority worker has a fresh heartbeat. `worker.py`'s in-file default is `mac,pi`, which only applies if something starts it without `run.sh`. |
+| `STATE_DIR` | `~/.voice-worker` | Stores `hub_session.json` and `agent_session.json` (session id + last activity). |
 | `CLAUDE_BIN` | `claude` | Path to the Claude Code CLI. |
-| `DATA_MCP_JS` | `/Users/jaredgantt/repos/data-layer/dist/mcp.js` | The built data MCP server entrypoint. |
-| `CLAUDE_TIMEOUT_S` | `300` | Max seconds for a single headless `claude` run. |
+| `DATA_MCP_JS` | `~/repos/data-layer/dist/mcp.js` | The **built** data MCP entrypoint — a source change there does nothing until `npm run build`. |
+| `VOICE_MCP_JS` | `~/repos/voice-pipeline/mcp-voice/src/index.js` | The voice MCP (`say`, `set_focus`, `list_sessions`). |
+| `GOVEE_MCP_PY` / `GOVEE_PY` | `~/repos/govee-mcp/govee_mcp.py`, `python3.11` | The lights MCP and the interpreter that has its deps. |
+| `ORCH_URL` / `ORCH_TOKEN` | `http://localhost:7682` | The Mac orchestrator, for injecting into a focused session. |
+| `CLAUDE_TIMEOUT_S` | `300` | Max seconds for a single hub run. |
+| `AGENT_TIMEOUT_S` | `900` | Full-agent (coding) runs get a longer leash. |
 
 ### Where to get the service key
 
@@ -53,7 +63,7 @@ the `SUPABASE_KEY` env var only** — it does not read those files at runtime.
 ## Running
 
 ```bash
-# Mac (default priority puts mac first)
+# Mac
 SUPABASE_KEY=<service-role-key> ./run.sh
 
 # Pi (same code; just change the worker id)
@@ -63,81 +73,53 @@ WORKER_ID=pi SUPABASE_KEY=<service-role-key> ./run.sh
 SUPABASE_KEY=<service-role-key> ./run.sh --once
 ```
 
-`run.sh` auto-selects a Python that has `httpx`: it prefers the voice-pipeline
-server venv (`server/.venv`), then Homebrew `python3.11`, then plain `python3`.
-The system `python3` (3.14) does **not** have `httpx` installed.
+`run.sh` auto-selects a Python that has `httpx`: the dedicated worker venv
+(`../.venv-worker`, which is what the Pi uses), then the server venv
+(`server/.venv`), then Homebrew `python3.11`, then plain `python3`. The system
+`python3` does **not** have `httpx` installed.
 
-Make sure `ANTHROPIC_API_KEY` is **unset** in the worker's environment so
-`claude` uses the subscription rather than billing the API.
+`run.sh` loads a gitignored `.env` beside it, and `run_claude()` strips
+`ANTHROPIC_API_KEY` from the subprocess it spawns — the CLI prefers that key over
+the subscription login and would silently bill the API.
 
-### Mac → Pi priority
+### Pi → Mac priority
 
-With `WORKER_PRIORITY=mac,pi` (the default on both machines):
-- The **Mac** never defers (nothing is ranked above it).
-- The **Pi** checks `worker_presence` before claiming; if the Mac's heartbeat is
-  within 30s, the Pi defers. If the Mac is asleep/offline (no fresh heartbeat),
-  the Pi takes over automatically. When the Mac comes back, it resumes claiming
-  and the Pi defers again.
+`run.sh` sets `WORKER_PRIORITY=pi,mac,fly`, so the **Pi claims whenever it is up**
+and the Mac is the fallback. That inversion is the point: work started by voice
+can be long-running, and closing the laptop must not kill it.
 
-This gives seamless failover with no coordination beyond the shared presence
-table — and it's safe even if both run, because the claim PATCH is atomic
-(`status=eq.pending` guard + `return=representation` race check).
+Each worker checks `worker_presence` before claiming and defers to any
+higher-priority worker whose heartbeat is fresh. Failover needs no coordination
+beyond that shared table, and is safe even if two claim at once, because the
+PATCH is atomic (`status=eq.pending` guard + `return=representation` race check).
 
 ## Hub-session reset rule
 
-The shared "hub" conversation is one continuous `claude` session, reused via
-`--resume <session_id>` stored in `STATE_DIR/hub_session.json`. It is **reset**
-(started fresh, no `--resume`) when any of these hold:
+Hub mode and full-agent mode keep **separate**, independently-persisted sessions
+(`hub_session.json` / `agent_session.json` in `STATE_DIR`). Flipping the
+`agent_mode` toggle changes which one a request resumes; it never clobbers the
+other's context.
+
+The hub window is **reset** (started fresh) when any of these hold:
 
 - no stored session id yet, **or**
-- last activity was more than **2 hours** ago, **or**
-- last activity was on a **different calendar day** than now.
+- last activity was longer ago than `app_settings.session_reset_s` (default
+  **300s**), **or**
+- last activity was on a **different calendar day** than now, **or**
+- the hub enqueued the `__RESET_CONTEXT__` sentinel ("Reset context").
 
-Otherwise the existing session is resumed so context carries across commands.
-After every successful run the captured `session_id` + `last_activity` are
-re-written.
+The agent session resets only on that manual reset.
 
-## allowedTools / permission finding (blast-radius note)
+## allowedTools (blast-radius note)
 
-The voice path runs `claude -p` with:
+A hub turn runs `claude -p` with an **explicit list** of MCP tool names in
+`--allowedTools`, plus `--strict-mcp-config --mcp-config <tmpfile>` — never
+`Bash`, `Edit` or `Write`. `Read` is added only for photo turns, which is how the
+CLI views an image file. In headless `-p` mode a tool not in the list is
+**denied, not prompted**, so a run never hangs on a permission dialog — and that
+denial is what escalation is built on. Which names go in which list, and why it
+must never become `--disallowedTools`, is `../docs/ROUTING.md`.
 
-```
---allowedTools "mcp__data" --strict-mcp-config --mcp-config <tmpfile>
-```
-
-`--allowedTools "mcp__data"` prefix-matches **all** `mcp__data__*` tools and
-nothing else — no `Bash`, `Edit`, `Read`, or `Write`. This bounds the blast
-radius of an arbitrary voice command to data operations only.
-
-**Verified empirically (2026-06-19):** in headless `-p` mode, a tool not in
-`--allowedTools` is **denied, not prompted**, so the run never hangs on a
-permission dialog. A data-reading prompt loaded the MCP
-(`mcp_servers: [{name: data}]`), called `mcp__data__list_reminders`
-successfully (`is_error: None`), and returned a real answer — with no prompt and
-no need for `--permission-mode acceptEdits`. So `--allowedTools "mcp__data"`
-alone is sufficient. (If a future change ever surfaces a prompt for MCP tools,
-the fallback to try is adding `--permission-mode acceptEdits`.)
-
-Note: on accounts with many MCP tools the model may reach a data tool via the
-built-in `ToolSearch` deferred-tool mechanism first; that still resolves to the
-allowed `mcp__data__*` tool and runs fine.
-
-## Phase-2 TODO: `focus != 'hub'` routing
-
-`voice_focus.focus` can point at a specific **Mac session id** instead of
-`'hub'`, meaning "send this command into that live session" rather than the
-shared hub conversation. Phase 1 does **not** implement that — when focus is not
-`'hub'`, `process_request()` releases the request back to `pending` and returns
-(so it isn't lost and the worker doesn't crash).
-
-Phase 2 will need to: resolve the focused session id, deliver the transcript to
-that running session (e.g. via the session's own resume/IPC channel rather than
-the hub session), and stream its output back into `voice_messages` under that
-focus. Until then, set `voice_focus.focus = 'hub'` for the worker to act.
-
-## Streaming (nice-to-have, not in v1)
-
-v1 writes the assistant turn once, after the run completes. Incrementally
-updating the `voice_messages` row as `stream-json` arrives (for a token-by-token
-live display) is a future enhancement — the parsing loop in `run_claude()`
-already iterates the stream events, so it's the natural hook point.
+Full-agent mode is the opposite shape: `--dangerously-skip-permissions` in
+`agent_cwd`, every native tool live. It exists for dictated coding work and is
+gated behind the `agent_mode` setting.

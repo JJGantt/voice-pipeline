@@ -14,10 +14,13 @@ ESP32 (I2S mic) ──wss://jared-voice.fly.dev/ws/audio──▶  Fly: jared-vo
 
 ## server/ (Fly app `jared-voice`)
 - WebSocket server, openWakeWord, Groq STT. Always-on 1GB machine.
-- Config via env: `GROQ_API_KEY` (secret), `WAKE_MODEL` (default `hey_jarvis`),
+- Config via env: `GROQ_API_KEY` (secret), `WAKE_MODEL` (default `hey_rhasspy`),
   `WAKE_THRESHOLD`, `GROQ_MODEL`, `SUPABASE_URL` + `SUPABASE_ANON_KEY` (where
   transcripts enqueue), `VOICE_DEVICE_TOKEN` (optional ws auth — see below).
-- Deploy: `fly deploy` from `server/`. Set the key: `fly secrets set GROQ_API_KEY=...`.
+- Deploy: `./assemble.sh && flyctl deploy --now -a jared-voice`, from `server/`. The assemble step
+  is not optional — most of that directory is copied in from elsewhere (`CLAUDE.md`). Set the key:
+  `fly secrets set GROQ_API_KEY=...`.
+- The same image also runs the **fallback worker** and the Govee inventory sync (`entrypoint.sh`).
 
 ### The handoff seam
 `handle_transcript(text)` logs the transcript and, if `SUPABASE_URL` and
@@ -37,8 +40,12 @@ accepted, so existing firmware keeps working until it's updated to send the toke
 - Build/flash: `~/.platformio/penv/bin/pio run -t upload` from `firmware/`.
 - It's a dumb pump: reads the I2S mic and streams PCM continuously. No on-device logic.
 
-## How a turn is routed
+## Where the rest of it is documented
 
-`docs/ROUTING.md` — the path from a transcript to an action, which tools the fast Sonnet
-path may use, and why `SAFE_TOOLS` must stay an allow list rather than a deny list
-(converting it silently disables escalation and breaks nutrition logging).
+- `CLAUDE.md` — what to know before editing: the build context under `server/`, the API-key trap,
+  what is dead.
+- `docs/ROUTING.md` — the path from a transcript to an action, which tools the fast Sonnet path may
+  use, and why `SAFE_TOOLS` must stay an allow list rather than a deny list.
+- `ARCHITECTURE.md` — the always-on machinery: workers and failover, wake-free capture, speaker ID,
+  the feedback channels, and the `app_settings` catalog.
+- Per-directory READMEs in `worker/`, `orchestrator/`, `mcp-voice/`, `voice-id/`.

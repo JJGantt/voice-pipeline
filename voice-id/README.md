@@ -37,7 +37,7 @@ exemplars) and a permissive threshold (the TV tops out ~0.20, so 0.30 still clea
 ## Wake-free flow
 
 `wakefree.py`: energy-segment → ~2s pause (`wakefree_pause_s`) → trim → **verify speaker** → Groq
-transcribe → enqueue `voice_requests {source: mac, tier: fast}`. The TV/other people are dropped before
+transcribe → enqueue `voice_requests {source: mac}`. The TV/other people are dropped before
 transcription. Toggled by `app_settings.wakefree_enabled`; the Mac listener owns the mic handoff
 (push-to-talk > wake-free > wake-word). See `../ARCHITECTURE.md` → "Wake-free mode".
 
