@@ -74,34 +74,41 @@ escalate a to-do add because the previous minute had been about food. The direct
 from the current instruction alone; if escalations for lights and list adds reappear, that clause is
 what regressed.
 
-## What the split is for — measured, because the obvious answer is wrong
+## What the split is for — and which half costs money
 
-It is **not that Sonnet is meaningfully faster**. Measured on the Mac, subscription path, `claude -p
---output-format json`, three runs each, API time only (CLI startup excluded):
+**The fast path is the METERED one.** Sonnet runs on the warm `ApiRunner` (~1c/turn) on every machine;
+the escalation runs Opus through `claude -p` on the **subscription**, where tokens are free. That is
+the opposite way round from the intuition that escalating to the bigger model costs more — escalation
+moves a turn OFF the meter.
+
+So the reasons the split exists, in the order they hold:
+
+1. **What the fast path can REACH.** The allow list is a correctness gate — a tool that would have to
+   invent a number is simply not in the schema Sonnet is handed, so it cannot quietly write one.
+   Nothing to do with models or money.
+2. **Money, on the common case.** Every ordinary turn is billed, so the cheap model runs it. The
+   expensive model only ever runs where tokens are free.
+3. **Speed — from the RUNNER, not the model.** The warm runner is what avoids `claude -p` spawning
+   the CLI and four stdio MCP servers per command: 3.6s on the Pi, ~42% of a simple turn, before the
+   model sees a token.
+
+The model choice contributes almost nothing to speed, which is worth knowing before anyone "optimises"
+it. Measured on the Mac, same runner for both (`claude -p --output-format json`, three runs, API time
+only):
 
 | | short voice reply | ~490-token answer |
 |---|---|---|
 | Sonnet | 6.7 / 7.9 / 10.4s | 7.5s |
 | Opus | 6.4 / 8.0 / 8.6s | 10.5s |
 
-On a short reply — which is every voice turn — the two are indistinguishable: the run-to-run spread is
-wider than the gap, and Opus won one of the three. Sonnet only pulls ahead once an answer is long
+On a short reply — which is every voice turn — they are indistinguishable: the run-to-run spread is
+wider than the gap, and Opus won one of the three runs. Sonnet only pulls ahead once an answer is long
 (~63 tok/s vs ~47), and voice answers never are.
 
-So the justifications, in the order they actually hold:
-
-1. **What the fast path can REACH.** The allow list is a correctness gate — a tool that would have to
-   invent a number is simply not in the schema Sonnet is handed, so it cannot quietly write one. This
-   is the real reason, and it is about tools, not models.
-2. **Cost on Fly.** `ApiRunner` bills per token. The Mac and Pi run on the subscription and pay
-   nothing marginal, so this saves money on exactly one of the three workers.
-3. **Speed.** Barely, and only on long answers.
-
-The corollary matters more than the ranking: an escalated turn **re-runs the whole thing on Opus**, so
-a gated command pays a full Sonnet turn *and* a full Opus turn. That doubling dwarfs any per-token
-difference between the models — which is why anything that does not need the gate belongs on the fast
-path, and why the fix for speed, if one is ever wanted, is to continue an escalated turn rather than
-restart it.
+What escalation does cost is **time**: the whole turn is re-run, so a gated command pays a full API
+Sonnet turn, then a CLI cold start, then a full Opus turn. It does not cost double money — the second
+half is the free half. That is why anything not needing the gate belongs on the fast path, and why the
+fix for latency, if one is ever wanted, is to continue an escalated turn rather than restart it.
 
 ## Keeping the list honest
 

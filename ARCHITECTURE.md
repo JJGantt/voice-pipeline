@@ -31,13 +31,25 @@ command survives into how it is processed.
 
 ## Worker execution strategies
 
-- **`run_claude`** — headless `claude -p` on the **subscription** (no API billing). This is the path
-  on the Mac and the Pi. It streams `stream-json`, so tool calls surface live on the activity bar.
-- **`ApiRunner`** — the direct `anthropic` Messages API, used on Fly, which has no subscription
-  login. Warm MCP stdio sessions started once, tool schemas inlined with the prompt, full agentic
-  loop, no built-in Claude Code tools. The stable prefix (schemas + system, ~8k tokens) is
-  **prompt-cached for 1 hour** (`cache_control ttl:1h` + the `extended-cache-ttl` beta), which is
-  what makes always-on affordable.
+Which runner a turn uses is **not** a per-machine choice. Both are used on the Mac and the Pi, one
+per stage of the same turn:
+
+- **`ApiRunner`** — the direct `anthropic` Messages API. Warm MCP stdio sessions started once, tool
+  schemas inlined with the prompt, full agentic loop, no built-in Claude Code tools. The stable prefix
+  (schemas + system, ~8k tokens) is **prompt-cached for 1 hour** (`cache_control ttl:1h` + the
+  `extended-cache-ttl` beta). This runs the **fast path** everywhere, because `claude -p` spawns the
+  CLI and four stdio MCP servers per command — 3.6s on the Pi, ~42% of a simple turn, before the model
+  sees a token. It is **billed** (~1c/turn), which is why the cheap model runs here.
+- **`run_claude`** — headless `claude -p` on the **subscription** (no API billing). It streams
+  `stream-json`, so tool calls surface live on the activity bar. This runs the **escalation**: Opus is
+  the expensive model to meter, escalated turns are rare and already slow enough that the CLI cold
+  start is noise, and the subscription costs nothing per token. Also photo turns, which need the CLI's
+  `Read` for vision.
+
+So the money and the latency point in opposite directions, and the design follows the money: the
+common case is metered and gets the cheap model plus the warm runner; the rare case is free and gets
+the capable model plus a cold start. Fly is the exception — no subscription login at all, so it runs
+Opus on the API and refuses photo turns rather than running them blind.
 
 Photo turns are subscription-only: the CLI's `Read` tool is how a model views an image file, so a
 photo request that reaches Fly is refused rather than run blind.
