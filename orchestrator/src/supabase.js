@@ -194,3 +194,15 @@ export async function pruneAdoptedSessions(beforeIso) {
     { method: 'DELETE', headers: headers({ Prefer: 'return=minimal' }) });
   if (!res.ok) throw new Error(`pruneAdoptedSessions ${res.status}: ${await res.text()}`);
 }
+
+/** Enqueue a command for the other machine — how a transfer asks the destination to resume. */
+export async function insertCommand(kind, payload) {
+  const id = crypto.randomUUID();
+  const res = await fetch(`${base()}/desk_commands`, {
+    method: 'POST',
+    headers: headers({ Prefer: 'return=minimal' }),
+    body: JSON.stringify({ id, kind, payload }),
+  });
+  if (!res.ok) throw new Error(`insertCommand ${res.status}: ${await res.text()}`);
+  return id;
+}

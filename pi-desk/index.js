@@ -34,6 +34,9 @@ import { randomUUID } from 'node:crypto';
 // platform-specific in it, and two copies of "which keys make a project entry complete" would drift.
 import { ensureTrusted } from '../orchestrator/src/trust.js';
 import { findTranscript, readTail, liveSessions, evict, pickEviction } from './sessions.js';
+// Shared with the Mac rather than reimplemented: both halves of a transfer must agree byte for
+// byte on what a mirrored transcript is.
+import { mirrorUp, mirrorDown } from '../orchestrator/src/mirror.js';
 // The same self-healing subscription the Mac's orchestrator uses. Shared rather than reimplemented:
 // its header documents a hard-won lesson — supabase-js does not reliably recover a dead channel, and
 // callers that fall back to a tight poll burn ~20k reads a day without noticing.
@@ -160,6 +163,13 @@ async function reconcileSessions() {
       if (found) { tpath = found.path; cid = found.id; claimed.add(found.id); console.log(`[pi-desk] adopted transcript ${found.id} for ${name}`); }
     }
     const tail = tpath ? readTail(tpath) : { working: false, lastReply: null, bytes: 0, lastActivity: 0 };
+    // Mirror at the end of a turn — the only moment the transcript is a complete thought — so this
+    // session can be picked up on the Mac later, including while this machine is unreachable.
+    let mirrored = null;
+    if (!tail.working && cid && tpath && tail.bytes > (row?.mirror_offset || 0)) {
+      try { mirrored = await mirrorUp(cid, tpath, row?.mirror_offset || 0); }
+      catch (e) { console.error('[pi-desk] mirror:', e.message); }
+    }
     // lastActivity is what eviction sorts on. A session with no transcript reports 0 and therefore
     // sorts first — correct, since a session nothing can be read from is the least costly to lose.
     residents.push({ name, working: tail.working, bytes: tail.bytes, lastActivity: tail.lastActivity, row });
@@ -182,6 +192,8 @@ async function reconcileSessions() {
           // still being written. Without it a reader cannot tell an answer from a stale one.
           working: tail.working,
           reply_at: tail.replyAt || row?.reply_at || null,
+          mirror_offset: mirrored ?? (row?.mirror_offset || 0),
+          ...(mirrored ? { mirror_at: new Date().toISOString() } : {}),
           last_seen: new Date().toISOString(),
         }]),
       });
@@ -406,7 +418,8 @@ const finish = (id, status, detail) =>
  * for (it is generated inside the process), so it is recovered by finding the transcript Claude Code
  * writes at startup — the filename IS the id.
  */
-async function startSession({ name, prompt, resumeId = null, commandId = null, report = false, label = null }) {
+async function startSession({ name, prompt, resumeId = null, commandId = null, report = false, label = null,
+                              knownClaudeId = null, transcriptPath = null, mirrorOffset = null, origin = null }) {
   const { dir, warning } = await ensureRepo(name);
   // Without this the session opens onto "Do you trust the files in this folder?" and waits for a
   // click nobody is there to make. Matters most on a fresh clone, which by definition is unseen.
@@ -426,8 +439,18 @@ async function startSession({ name, prompt, resumeId = null, commandId = null, r
     // only durable handle the caller had at the time, since the session did not exist yet.
     body: JSON.stringify([{ id: session, worker: WORKER, repo: name, status: 'resident', command_id: commandId,
                             label: label || null,
+                            ...(origin ? { origin } : {}),
+                            ...(knownClaudeId ? { claude_session_id: knownClaudeId, transcript_path: transcriptPath,
+                                                  mirror_offset: mirrorOffset ?? 0 } : {}),
                             prompt: String(prompt || '').trim().slice(0, 500) || null }]),
   }).catch((e) => console.error('[pi-desk] publish:', e.message));
+
+  // A handed-over session already knows its id — it is the transcript that came across — so there is
+  // nothing to search for, and searching would be wrong: the file was written a moment ago by the
+  // mirror, not by Claude starting up.
+  if (knownClaudeId) {
+    return `tmux ${session} in ${dir} (resumed from the Mac)${warning ? ' (stale checkout)' : ''} (trust: ${trust})`;
+  }
 
   // Backfilled once Claude has written its transcript. Async on purpose — the caller should not wait
   // on filesystem polling to learn that the launch happened.
@@ -494,6 +517,56 @@ async function run(cmd) {
     }
     if (!row.claude_session_id) throw new Error(`${id} has no recorded claude session id — cannot resume`);
     return startSession({ name: row.repo, prompt: (cmd.payload || {}).prompt || '', resumeId: row.claude_session_id, commandId: cmd.id, report: (cmd.payload || {}).report === true });
+  }
+
+  // SOURCE half of a handover: this machine owns the session and is giving it up.
+  //
+  // Order matters and is the whole point. Close first, because resuming a transcript that is still
+  // live elsewhere does not reattach — it starts a second process replaying the same file, and the
+  // two diverge with one id between them. Then flush the mirror, which is only complete once the
+  // session has stopped writing. Only then is the destination asked to pick it up.
+  if (cmd.kind === 'transfer_session') {
+    const id = String((cmd.payload || {}).session || '').trim();
+    const to = (cmd.payload || {}).to === 'mac' ? 'mac' : 'pi';
+    if (!/^hub-[A-Za-z0-9._-]+$/.test(id)) throw new Error(`unusable session name: ${id}`);
+    const rows = await sb(`desk_sessions?id=eq.${encodeURIComponent(id)}&select=*`);
+    const row = rows?.[0];
+    if (!row) throw new Error(`no such session: ${id}`);
+    if (!row.claude_session_id) throw new Error(`${id} has no transcript recorded — nothing to hand over`);
+    await evict(id);
+    const at = await mirrorUp(row.claude_session_id, row.transcript_path, row.mirror_offset || 0);
+    const now = new Date().toISOString();
+    await sb(`desk_sessions?id=eq.${encodeURIComponent(id)}`, {
+      method: 'PATCH', headers: { Prefer: 'return=minimal' },
+      body: JSON.stringify({ status: 'transferred', ended: now, working: false,
+                             ...(at != null ? { mirror_offset: at, mirror_at: now } : {}) }),
+    });
+    await sb('desk_commands', {
+      method: 'POST', headers: { Prefer: 'return=minimal' },
+      body: JSON.stringify({ id: randomUUID(), kind: 'resume_mirrored',
+                             payload: { target: to, claude_session_id: row.claude_session_id, repo: row.repo,
+                                        label: row.label, origin: row.origin || 'dispatched', from: 'pi' } }),
+    });
+    return `handed ${id} to the ${to === 'mac' ? 'Mac' : 'Pi'}`;
+  }
+
+  // DESTINATION half: assemble the mirrored transcript here and resume it.
+  if (cmd.kind === 'resume_mirrored') {
+    const claudeId = String((cmd.payload || {}).claude_session_id || '').trim();
+    const name = safeName((cmd.payload || {}).repo);
+    if (!claudeId) throw new Error('no session id to resume');
+    if (!name) throw new Error(`unusable project name: ${JSON.stringify((cmd.payload || {}).repo)}`);
+    const { dir } = await ensureRepo(name);
+    const file = await mirrorDown(claudeId, dir);
+    // Nothing mirrored means the session never sat idle long enough to be uploaded. Resuming would
+    // open an empty conversation wearing its id, which is worse than not resuming at all.
+    if (!file) throw new Error(`nothing has been mirrored for ${claudeId}`);
+    return startSession({ name, resumeId: claudeId, commandId: cmd.id,
+                          label: (cmd.payload || {}).label || null,
+                          origin: (cmd.payload || {}).origin || 'dispatched',
+                          knownClaudeId: claudeId, transcriptPath: file,
+                          // Everything already uploaded stays uploaded: this machine appends from here.
+                          mirrorOffset: fs.statSync(file).size });
   }
 
   if (cmd.kind !== 'open_session') throw new Error(`unknown kind ${cmd.kind}`);

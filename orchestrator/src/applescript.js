@@ -262,7 +262,7 @@ export async function reopenDeskTab(cwd, id) {
 // session never starting. Measured exactly: a 2500-character prompt reached the terminal as 1024
 // characters. The command line now stays short whatever the prompt is, and the shell reads the text
 // itself, where no such limit applies. (This is the same reason pi-desk hands tmux a file path.)
-export async function openFreshTab(cwd, name, prompt, sessionId = null) {
+export async function openFreshTab(cwd, name, prompt, sessionId = null, resumeId = null) {
   // The Remote Control name is an IDENTITY in the Claude app, so it has to be unique per SESSION,
   // not per repo. Named after the repo alone, two sessions on status-hub both register as
   // "status-hub" and the app lists two entries claiming to be the same session. Bare
@@ -274,7 +274,10 @@ export async function openFreshTab(cwd, name, prompt, sessionId = null) {
   // The session's own id, exported for the command so the data MCP — a child of claude, which
   // inherits this environment — can attribute a published report to the session that wrote it.
   const env = sessionId ? `HUB_SESSION_ID=${shQuote(sessionId)} ` : '';
-  return runInNewTerminal(`cd ${shQuote(cwd)}; ${env}${shQuote(config.CLAUDE_BIN)}${rc}${first}`);
+  // Resuming a transcript that was mirrored from the other machine: same flags as a fresh session,
+  // so a handed-over session is reachable and identifiable exactly like any other.
+  const resume = resumeId ? ` --resume ${shQuote(resumeId)}` : '';
+  return runInNewTerminal(`cd ${shQuote(cwd)}; ${env}${shQuote(config.CLAUDE_BIN)}${resume}${rc}${first}`);
 }
 
 /**

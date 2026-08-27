@@ -20,6 +20,7 @@ import { config } from './config.js';
 import { deskSessionsFor, patchDeskSession, upsertDeskSession, pruneAdoptedSessions } from './supabase.js';
 import { sweepStashedPrompts } from './applescript.js';
 import { discoverSessions } from './discover.js';
+import { mirrorUp } from './mirror.js';
 import { readTail } from './transcripts.js';
 
 const exec = promisify(execFile);
@@ -111,6 +112,16 @@ async function tick() {
       // empty (mid-write, or a rotated file) must not erase what the session already said.
       if (tail.lastReply) { patch.last_reply = tail.lastReply.slice(0, 4000); patch.reply_at = tail.replyAt || row.reply_at || null; }
       patch.working = alive && tail.working;
+    }
+    // Mirror at the end of a turn, which is the only moment the transcript is a complete thought.
+    // Idle-only on purpose: uploading mid-turn would ship half an answer, and the tail is re-read on
+    // the next tick anyway. This is what makes a session pickable up on the other machine later —
+    // including when this one is asleep, which is exactly when it matters.
+    if (tail && !tail.working && row.claude_session_id && tail.bytes > (row.mirror_offset || 0)) {
+      try {
+        const at = await mirrorUp(row.claude_session_id, row.transcript_path, row.mirror_offset || 0);
+        if (at != null) { patch.mirror_offset = at; patch.mirror_at = new Date().toISOString(); }
+      } catch (e) { console.error('[desk-sessions] mirror:', e.message); }
     }
     if (!alive && ageS > LAUNCH_GRACE_S) {
       // ENDED, not evicted. 'evicted' means parked-and-resumable, which is a Pi concept: a closed

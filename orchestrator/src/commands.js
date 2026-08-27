@@ -14,18 +14,21 @@
 // Launching also pre-accepts the workspace-trust prompt for the target (see trust.js), since a
 // session stuck on that modal is indistinguishable from one that never started.
 import os from 'node:os';
+import path from 'node:path';
+import fs from 'node:fs';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { config } from './config.js';
 
 const exec = promisify(execFile);
 import { pendingCommands, claimCommand, finishCommand, upsertDeskSession, deskSession,
-         patchDeskSession, deadLetterCommand, abandonedClaims } from './supabase.js';
+         patchDeskSession, deadLetterCommand, abandonedClaims, insertCommand } from './supabase.js';
 import { findTranscript } from './transcripts.js';
 import { watchTable } from './realtime.js';
 import { isKnownRepo } from './repos.js';
 import { ensureTrusted } from './trust.js';
-import { openFreshTab, sendToTty } from './applescript.js';
+import { openFreshTab, sendToTty, closeTabForTty } from './applescript.js';
+import { mirrorUp, mirrorDown } from './mirror.js';
 
 // Appended only when a dispatch ASKED for a write-up (`report` on the command payload, set by the
 // voice tool when Jared says so). Reports are opt-in because most dispatched work just needs
@@ -42,6 +45,32 @@ const REPORT_DIRECTIVE =
 let timer = null;
 let draining = false;
 
+/**
+ * Bring a checkout up to date before a session opens in it.
+ *
+ * Non-fatal by design: a checkout that cannot fast-forward still opens, and the warning rides along
+ * in the prompt so the session knows rather than silently building on a stale base.
+ */
+async function pull(dir) {
+  try {
+    await exec('git', ['-C', dir, 'fetch', '--all', '--prune'], { timeout: 120000 });
+    await exec('git', ['-C', dir, 'pull', '--ff-only'], { timeout: 120000 });
+    return null;
+  } catch (e) {
+    const msg = String(e.stderr || e.message || '').split('\n')[0].slice(0, 200);
+    console.warn(`[commands] pull failed in ${dir}: ${msg}`);
+    return `NOTE: this checkout could not be fast-forwarded (${msg}). Check git status and reconcile with origin before making changes.`;
+  }
+}
+
+/** Where a repo lives on this machine. Never taken from a payload — only ever built and checked. */
+function repoDir(name) {
+  if (!name || name === 'root') return os.homedir();
+  const dir = path.join(os.homedir(), 'repos', name);
+  if (!isKnownRepo(dir)) throw new Error(`not a known project: ${name}`);
+  return dir;
+}
+
 async function run(cmd) {
   // Type a follow-up into a session this machine already has open, addressed by its tab's tty.
   if (cmd.kind === 'follow_up') {
@@ -56,6 +85,57 @@ async function run(cmd) {
     if (row.status !== 'resident') throw new Error(`${session} has ended`);
     const how = await sendToTty(tty, prompt);
     return `sent ${prompt.length} chars to ${tty} (${how})`;
+  }
+
+  // SOURCE half of a handover: this machine owns the session and is giving it up.
+  //
+  // Order matters and is the whole point. Close first, because resuming a transcript that is still
+  // live elsewhere does not reattach — it starts a second process replaying the same file, and the
+  // two diverge with one id between them. Then flush the mirror, which is only complete once the
+  // session has stopped writing. Only then is the destination asked to pick it up.
+  if (cmd.kind === 'transfer_session') {
+    const id = String((cmd.payload || {}).session || '').trim();
+    const to = (cmd.payload || {}).to === 'pi' ? 'pi' : 'mac';
+    const row = await deskSession(id);
+    if (!row) throw new Error(`no such session: ${id}`);
+    if (!row.claude_session_id) throw new Error(`${id} has no transcript recorded — nothing to hand over`);
+    if (row.tty) await closeTabForTty(row.tty);
+    await new Promise((r) => setTimeout(r, 2000));   // let claude exit and flush its last records
+    const at = await mirrorUp(row.claude_session_id, row.transcript_path, row.mirror_offset || 0);
+    const now = new Date().toISOString();
+    await patchDeskSession(id, { status: 'transferred', ended: now, working: false,
+                                 ...(at != null ? { mirror_offset: at, mirror_at: now } : {}) });
+    await insertCommand('resume_mirrored', {
+      target: to, claude_session_id: row.claude_session_id, repo: row.repo,
+      label: row.label, origin: row.origin || 'dispatched', from: 'mac',
+    });
+    return `handed ${id} to the ${to === 'pi' ? 'Pi' : 'Mac'}`;
+  }
+
+  // DESTINATION half: assemble the mirrored transcript here and resume it.
+  if (cmd.kind === 'resume_mirrored') {
+    const claudeId = String((cmd.payload || {}).claude_session_id || '').trim();
+    const repo = String((cmd.payload || {}).repo || 'root').trim();
+    if (!claudeId) throw new Error('no session id to resume');
+    const dir = repoDir(repo);
+    const file = await mirrorDown(claudeId, dir);
+    // Nothing mirrored means the session never sat idle long enough to be uploaded. Resuming would
+    // open an empty conversation wearing its id, which is worse than not resuming at all.
+    if (!file) throw new Error(`nothing has been mirrored for ${claudeId}`);
+    ensureTrusted(dir);
+    if (repo !== 'root') await pull(dir);
+    const sessionId = `mac-${cmd.id.slice(0, 8)}`;
+    const raw = await openFreshTab(dir, repo, null, sessionId, claudeId);
+    const [how, tty] = String(raw).split('\t');
+    await upsertDeskSession({
+      id: sessionId, worker: 'desk', repo, status: 'resident',
+      origin: (cmd.payload || {}).origin || 'dispatched', command_id: cmd.id, tty: tty || null,
+      label: (cmd.payload || {}).label || null,
+      claude_session_id: claudeId, transcript_path: file,
+      // Everything already uploaded stays uploaded: this machine carries on appending from here.
+      mirror_offset: fs.statSync(file).size,
+    });
+    return `resumed ${claudeId.slice(0, 8)} here (${how})`;
   }
 
   if (cmd.kind !== 'open_session') throw new Error(`unknown kind ${cmd.kind}`);
@@ -81,17 +161,7 @@ async function run(cmd) {
   // checkout was last touched, and a session that starts on a stale tree writes against the wrong
   // base. Non-fatal: a checkout that cannot fast-forward (local changes, diverged) still opens, and
   // the warning rides along in the prompt so the session knows rather than silently building on it.
-  let staleWarning = null;
-  if (!isRoot) {
-    try {
-      await exec('git', ['-C', target, 'fetch', '--all', '--prune'], { timeout: 120000 });
-      await exec('git', ['-C', target, 'pull', '--ff-only'], { timeout: 120000 });
-    } catch (e) {
-      const msg = String(e.stderr || e.message || '').split('\n')[0].slice(0, 200);
-      console.warn(`[commands] pull failed in ${target}: ${msg}`);
-      staleWarning = `NOTE: this checkout could not be fast-forwarded (${msg}). Check git status and reconcile with origin before making changes.`;
-    }
-  }
+  const staleWarning = isRoot ? null : await pull(target);
   const spoken = String((cmd.payload || {}).prompt || '').trim();
   const wantsReport = (cmd.payload || {}).report === true;
   const prompt = [staleWarning, spoken, (wantsReport && spoken) ? REPORT_DIRECTIVE : null].filter(Boolean).join('\n\n') || null;
