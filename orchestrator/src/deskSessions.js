@@ -19,7 +19,7 @@ import { promisify } from 'node:util';
 import { config } from './config.js';
 import { deskSessionsFor, patchDeskSession, upsertDeskSession, pruneAdoptedSessions } from './supabase.js';
 import { sweepStashedPrompts } from './applescript.js';
-import { discoverSessions } from './discover.js';
+import { discoverSessions, fresherTranscript } from './discover.js';
 import { mirrorUp } from './mirror.js';
 import { readTail } from './transcripts.js';
 
@@ -101,17 +101,44 @@ async function tick() {
   try { rows = await deskSessionsFor('desk', 'resident'); }
   catch (e) { return console.error('[desk-sessions] list:', e.message); }
 
+  // Transcripts already spoken for, so a rebind cannot take the conversation of a session that is
+  // still using it — two sessions in one repo is the normal case, not the exception.
+  const bound = new Set((rows || []).map((r) => r.claude_session_id).filter(Boolean));
+
   for (const row of rows || []) {
     const alive = await claudeOnTty(row.tty);
     const ageS = (Date.now() - new Date(row.started).getTime()) / 1000;
-    const tail = row.transcript_path ? readTail(row.transcript_path) : null;
-
     const patch = { last_seen: new Date().toISOString() };
+
+    // Follow a `/clear`: same process, new transcript. Without this the row keeps reporting the
+    // conversation the session USED to be having, which reads as a stale, wrong session in the pane.
+    if (alive && row.transcript_path) {
+      const mine = new Set(bound); mine.delete(row.claude_session_id);
+      const fresher = fresherTranscript(row.transcript_path, new Date(row.started).getTime(), mine);
+      if (fresher && fresher.id !== row.claude_session_id) {
+        patch.transcript_path = fresher.path;
+        patch.claude_session_id = fresher.id;
+        // The mirror is keyed by session id, so a new id is a new upload from zero.
+        patch.mirror_offset = 0;
+        bound.add(fresher.id);
+        row.transcript_path = fresher.path;
+        row.claude_session_id = fresher.id;
+        row.mirror_offset = 0;
+        console.log(`[desk-sessions] ${row.id} started a new transcript (${fresher.id.slice(0, 8)}) — rebound`);
+      }
+    }
+    const tail = row.transcript_path ? readTail(row.transcript_path) : null;
     if (tail) {
       // Carry the old reply forward rather than blanking it: a transcript that momentarily reads as
       // empty (mid-write, or a rotated file) must not erase what the session already said.
       if (tail.lastReply) { patch.last_reply = tail.lastReply.slice(0, 4000); patch.reply_at = tail.replyAt || row.reply_at || null; }
       patch.working = alive && tail.working;
+      // An adopted session's name is Claude Code's own title, and it CHANGES as the conversation
+      // moves on — so it is refreshed here rather than stamped once when the session was found. A
+      // dispatched session keeps the label the router wrote, which describes the job asked for.
+      if (row.origin === 'adopted' && tail.title && tail.title.slice(0, 60) !== row.label) {
+        patch.label = tail.title.slice(0, 60);
+      }
     }
     // Mirror at the end of a turn, which is the only moment the transcript is a complete thought.
     // Idle-only on purpose: uploading mid-turn would ship half an answer, and the tail is re-read on

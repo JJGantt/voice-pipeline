@@ -96,3 +96,32 @@ export async function discoverSessions({ knownTtys = new Set(), takenIds = new S
   }
   return found;
 }
+
+/**
+ * A newer transcript for a session that is still running.
+ *
+ * `/clear` (and a compaction) starts a FRESH transcript file while the process keeps going, so the
+ * file a session was bound to at launch or adoption stops being the conversation it is having. The
+ * row then reports a title and a last reply from before the clear — which is how a tab titled "Voice
+ * command timeout tuning" appeared in the pane as "Crimson Desert village search prompt", quoting a
+ * reply from the previous day.
+ *
+ * Bounded the same way adoption is: born after the process started, never a file another live session
+ * is already bound to, and only accepted when it is genuinely fresher than the current one.
+ */
+export function fresherTranscript(currentPath, startedAtMs, excludeIds = new Set()) {
+  let dir, currentMtime = 0;
+  try {
+    dir = path.dirname(currentPath);
+    currentMtime = fs.statSync(currentPath).mtimeMs;
+  } catch { return null; }
+  let names;
+  try { names = fs.readdirSync(dir); } catch { return null; }
+  const best = names.filter((f) => f.endsWith('.jsonl'))
+    .map((f) => ({ id: f.slice(0, -6), p: path.join(dir, f) }))
+    .filter((x) => !excludeIds.has(x.id))
+    .map((x) => { try { const st = fs.statSync(x.p); return { ...x, birth: st.birthtimeMs, m: st.mtimeMs }; } catch { return null; } })
+    .filter((x) => x && x.birth >= startedAtMs - MATCH_SLACK_MS && x.m > currentMtime)
+    .sort((a, b) => b.m - a.m)[0];
+  return best ? { id: best.id, path: best.p } : null;
+}

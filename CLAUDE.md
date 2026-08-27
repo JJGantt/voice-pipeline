@@ -114,7 +114,16 @@ No confident match means no row — a session reported with someone else's conve
 one not reported at all.
 
 A process whose transcript already belongs to a row revives that row rather than making a new one,
-which is what a manual `claude --resume` looks like from outside. Adopted rows are pruned a week
+which is what a manual `claude --resume` looks like from outside.
+
+**A session outlives its transcript.** `/clear` starts a fresh file while the process keeps running,
+so a row bound at adoption drifts onto a conversation that has ended — one tab reported yesterday's
+subject and yesterday's last reply for hours after it had moved on. Each tick therefore looks for a
+fresher transcript in the same directory (born after the process started, not bound to another live
+session) and rebinds, resetting `mirror_offset` because the mirror is keyed by session id. An adopted
+session's label is Claude Code's own title and is refreshed the same way; a dispatched one keeps the
+label the router wrote, which names the job rather than the conversation. **pi-desk does not do this
+yet** — a `/clear` on a Pi session still leaves its row on the old transcript. Adopted rows are pruned a week
 after they end; dispatched ones are a record of what was asked for and stay.
 
 ## Moving a session between machines
