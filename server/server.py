@@ -121,10 +121,12 @@ LONG_UTTERANCE_WARN_S = 300.0  # warn if a single capture runs this long
 # you've been absent (no confirmed-Jared window) for the hangover. Tune from the logged vad/endpoint lines.
 VAD_WINDOW_S = 2.0           # trailing audio fed to ECAPA per check
 VAD_CHECK_EVERY_S = 0.7      # re-score cadence while capturing
-VAD_ABSENT_MISSES = 1       # EXPERIMENT 2026-08-25: was 2. Mirrors the Mac (voice-id/wakefree.py) —
-                            # the two mics must endpoint identically or the same sentence gets cut
-                            # differently depending on which one heard it. Revert both together.
-                            # timer that races the cadence and clips you between words)
+VAD_ABSENT_MISSES_MIN = 1   # consecutive non-confirms that close a SHORT capture (event-based, not a
+                            # timer that races the cadence and clips you between words). The requirement
+                            # scales up with how long you have been talking — see _absent_misses below.
+VAD_ABSENT_MISSES_MAX = 5   # ceiling — past this only MAX_UTTERANCE_S stops a runaway capture
+VAD_ABSENT_RAMP_S = 8.0     # +1 tolerated miss per this much speech (~2.0s of pause at the floor,
+                            # ~4.8s at the ceiling — a 50s dictated command survives a 4s thinking-pause)
 VAD_FIRST_CHECK_S = 1.8      # wait for this much audio before the first check
 VAD_NO_JARED_ABORT_S = 3.5  # never confirmed you within this much audio → it's noise/TV, drop cheap
 VAD_KEEPALIVE_MIN = 0.14     # once confirmed, KEEP the capture alive until the match falls to clearly-not-you
@@ -144,6 +146,16 @@ log = logging.getLogger("voice")
 
 groq = Groq(api_key=os.environ["GROQ_API_KEY"])
 oww = Model(wakeword_models=[WAKE_MODEL, WAKE_MODEL_POWER], inference_framework="onnx")
+
+
+def _absent_misses(audio_s: float) -> int:
+    """Consecutive non-confirms needed to close a capture that has run this long. A short command is one
+    breath, so the first non-confirm ends it the moment he stops rather than recording the room after.
+    A long multi-part command has real thinking-pauses in it, and cutting one in half loses the whole
+    command — worth far more than a second of trailing silence. MUST match the Mac's copy in
+    voice-id/wakefree.py: the two mics have to endpoint identically, or the same sentence is cut
+    differently depending on which one heard it and the pair stops collapsing into one command."""
+    return min(VAD_ABSENT_MISSES_MAX, VAD_ABSENT_MISSES_MIN + int(audio_s // VAD_ABSENT_RAMP_S))
 
 
 def pcm_to_wav(pcm: bytes) -> bytes:
@@ -532,10 +544,11 @@ async def connection(ws):
                             last_confirm = datetime.now(timezone.utc)
                         elif jared_seen:
                             miss += 1
-                            log.info("wake-free: vad sim=%.2f<thr=%.2f miss=%d", sim, thr, miss)
+                            log.info("wake-free: vad sim=%.2f<thr=%.2f miss=%d/%d audio_s=%.1f",
+                                     sim, thr, miss, _absent_misses(audio_s), audio_s)
                     if elapsed >= MAX_UTTERANCE_S:
                         close, reason = True, "max"
-                    elif jared_seen and miss >= VAD_ABSENT_MISSES:   # consecutive non-confirms → you've stopped
+                    elif jared_seen and miss >= _absent_misses(audio_s):  # consecutive non-confirms → you've stopped
                         close, reason = True, "absent"
                     elif not jared_seen and audio_s >= VAD_NO_JARED_ABORT_S:  # never you → it's noise
                         close, reason, is_noise = True, "noise-abort", True

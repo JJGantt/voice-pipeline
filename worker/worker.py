@@ -1508,22 +1508,32 @@ def claim_one(db: Supabase) -> dict | None:
     return claimed[0]
 
 
+# Results that mean the request executed NOTHING. A row like this must never be the surviving half of a
+# two-mic pair: if one mic endpoints early it enqueues a mid-sentence fragment, the fragment is discarded
+# as a false positive, and the OTHER mic's complete capture then arrives overlapping it — dedupe on
+# arrival order alone drops the real command and the whole utterance disappears with nothing run.
+# Skipping these is safe precisely because they did no work, so there is nothing to run twice.
+NO_WORK_RESULTS = ("(duplicate — dropped)", "(ignored: wake-word false positive)")
+
+
 def _duplicate_of_recent(db: Supabase, req: dict) -> bool:
-    """True if an earlier already-claimed/done request covers the SAME RECORDING WINDOW as this one — i.e.
-    a second always-on mic (ESP + Mac) heard the same utterance. Compares the actual [capture_start,
-    capture_end] spans (overlap, each padded by DEDUP_TOL_S for clock skew + ESP stream latency), NOT
-    enqueue time — so the pair always collapses regardless of transcription speed, while two genuinely
-    distinct (sequential, non-overlapping) commands BOTH run even a second apart. Falls back to created_at
-    proximity only for a pair where either side predates capture-window stamping."""
+    """True if an earlier already-claimed/done request that ACTUALLY RAN covers the SAME RECORDING WINDOW
+    as this one — i.e. a second always-on mic (ESP + Mac) heard the same utterance. Compares the actual
+    [capture_start, capture_end] spans (overlap, each padded by DEDUP_TOL_S for clock skew + ESP stream
+    latency), NOT enqueue time — so the pair always collapses regardless of transcription speed, while two
+    genuinely distinct (sequential, non-overlapping) commands BOTH run even a second apart. Falls back to
+    created_at proximity only for a pair where either side predates capture-window stamping."""
     rid = req.get("id")
     s, e = _parse_ts(req.get("capture_start") or ""), _parse_ts(req.get("capture_end") or "")
     ts = _parse_ts(req.get("created_at") or "")
     rows = db.get("voice_requests",
-                  "select=id,created_at,status,capture_start,capture_end&order=created_at.desc&limit=12")
+                  "select=id,created_at,status,result,capture_start,capture_end&order=created_at.desc&limit=12")
     tol = timedelta(seconds=DEDUP_TOL_S)
     for r in rows:
         if r.get("id") == rid or r.get("status") not in ("claimed", "done"):
             continue
+        if (r.get("result") or "").strip() in NO_WORK_RESULTS:
+            continue        # it ran nothing — it cannot stand in for this capture
         os_, oe = _parse_ts(r.get("capture_start") or ""), _parse_ts(r.get("capture_end") or "")
         if s and e and os_ and oe:
             if s <= oe + tol and os_ <= e + tol:   # padded window overlap → same utterance

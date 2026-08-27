@@ -55,7 +55,6 @@ FRAME_S = 0.1          # 100ms capture frames — responsive endpointing
 ENERGY_GATE = 0.006    # below this RMS = silence (calibrated under Jared's speech ~0.008+)
 THRESHOLD = float(os.environ.get("VOICEID_THRESHOLD", "0.30"))   # cosine ≥ this = Jared (overridden by hub setting)
 TOPK = 3
-PAUSE_S = float(os.environ.get("WAKEFREE_PAUSE_S", "2.0"))       # how long with no confirmed-Jared window ends it
 MAX_UTTER_S = 600.0   # runaway backstop ONLY (matches the ESP server) — the speaker gate ends a command
                       # when you actually stop; this never touches real speech. Was a stale 30s default.
 MIN_UTTER_S = 0.5
@@ -66,13 +65,25 @@ VAD_CHECK_EVERY_S = 0.7      # re-score cadence while capturing
 VAD_FIRST_CHECK_S = 1.4      # min audio before the first check (the close Mac mic confirms fast)
 VAD_NO_JARED_ABORT_S = 3.5  # never confirmed within this much audio → not Jared, drop
 KEEPALIVE_MARGIN = 0.16      # hysteresis: once confirmed, stay locked unless match falls to ~not-you/silence
-ABSENT_MISSES = 1            # EXPERIMENT 2026-08-25: was 2. Closing on the FIRST non-confirm ends a
-                             # capture as soon as you stop, instead of holding it open through the
-                             # pause and recording whatever follows. Measured over 2140 captures:
-                             # saves a mean 2.3s overall (p90 7.4s) but only ~1.1s on command-shaped
-                             # ones, against ~6% of typical commands being truncated mid-sentence.
-                             # Revert to 2 if real commands start getting cut.
-                             # timer that can race the check cadence and cut you off between words
+# How many CONSECUTIVE non-confirming checks close a capture — event-based, NOT a timer that can race
+# the check cadence and cut you off between words. The number SCALES with how long you have been
+# talking, because the two cases pull opposite ways. A short command is one breath: closing on the
+# first non-confirm ends it the moment you stop, instead of holding the mic open over whatever is said
+# next. A long, multi-part command has real thinking-pauses in it, and cutting one in half loses the
+# whole command — which costs far more than a second of trailing silence. Each extra miss buys roughly
+# another VAD_CHECK_EVERY_S of pause.
+ABSENT_MISSES_MIN = 1        # short command: close on the first non-confirm (~2s of silence)
+ABSENT_MISSES_MAX = 5        # ceiling — past this only MAX_UTTER_S is left to stop a runaway capture
+ABSENT_RAMP_S = 8.0          # +1 tolerated miss per this much speech (~2.0s of pause at the floor,
+                             # ~4.8s at the ceiling — a 50s dictated command survives a 4s thinking-pause)
+
+
+def absent_misses(audio_s: float) -> int:
+    """Consecutive non-confirms needed to close a capture that has run this long. MUST match the ESP
+    server (server/server.py): the two mics have to endpoint identically, or the same sentence is cut
+    differently depending on which one heard it and the pair stops collapsing into one command."""
+    return min(ABSENT_MISSES_MAX, ABSENT_MISSES_MIN + int(audio_s // ABSENT_RAMP_S))
+
 
 # Push-to-talk coordination: Hammerspoon sends SIGUSR1 (pause) / SIGUSR2 (resume) while you dictate to
 # Claude, so wake-free never fights the mic or executes your dictation. set = capturing; cleared = muted.
@@ -475,13 +486,12 @@ def main() -> int:
         print("FATAL: no voiceprint (app_settings.voiceprint empty and no exemplars.npy) — enroll first.",
               file=sys.stderr); return 2
 
-    global THRESHOLD, PAUSE_S      # hub UI controls these via app_settings (fall back to the defaults above)
+    global THRESHOLD               # hub UI controls this via app_settings (falls back to the default above)
     THRESHOLD = get_setting("voiceid_threshold", THRESHOLD)
-    PAUSE_S = get_setting("wakefree_pause_s", PAUSE_S)
 
     log("loading ECAPA…")
     enc = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb", savedir=str(HERE / ".model"))
-    log(f"wake-free listening — Jared's voice only (thresh={THRESHOLD}, pause={PAUSE_S}s, stt=groq:{GROQ_MODEL})")
+    log(f"wake-free listening — Jared's voice only (thresh={THRESHOLD}, stt=groq:{GROQ_MODEL})")
 
     def score(seg_f32: np.ndarray) -> float:
         # Peak-normalize before encoding (same as the server + enrollment) so the embedding doesn't
@@ -575,11 +585,11 @@ def main() -> int:
                             last_confirm = datetime.now(timezone.utc)
                         elif jared_seen:
                             miss += 1
-                            log(f"vad sim={sim:.2f}<thr={thr:.2f} miss={miss}")
+                            log(f"vad sim={sim:.2f}<thr={thr:.2f} miss={miss}/{absent_misses(audio_s)} audio={audio_s:.1f}s")
                     close, reason = False, ""
                     if now - t0 >= MAX_UTTER_S:
                         close, reason = True, "max"
-                    elif jared_seen and miss >= ABSENT_MISSES:    # consecutive non-confirms → you've stopped
+                    elif jared_seen and miss >= absent_misses(audio_s):   # consecutive non-confirms → you've stopped
                         close, reason = True, "absent"
                     elif not jared_seen and audio_s >= VAD_NO_JARED_ABORT_S:
                         close, reason = True, "noise"

@@ -140,10 +140,16 @@ word, every source (Mac *and* ESP) gates on Jared's voice; OFF → the wake word
   (default 0.30) = Jared. Enroll from **separate command-shaped phrases** (short ones + far-away
   `--append` passes) — like-against-like coverage is what makes short/distant commands verify, not
   slices of one monologue.
-- **Capture — same logic on both ends.** Segment on speech energy → end on a ~2s pause
-  (`wakefree_pause_s`) → trim silence → verify the speaker on the whole utterance → only then transcribe
-  (Groq) + enqueue a `voice_requests` row. The TV / other people are filtered for free (never
-  transcribed); the worker's `__IGNORE__` directive drops any of *your* speech that isn't a command.
+- **Capture — same logic on both ends.** Segment on speech energy → hold the capture open on Jared's
+  *verified presence* (re-score the trailing 2s with ECAPA every 0.7s) → close after N consecutive
+  non-confirming checks → trim silence → transcribe (Groq) + enqueue a `voice_requests` row. The TV /
+  other people are filtered for free (never transcribed); the worker's `__IGNORE__` directive drops any
+  of *your* speech that isn't a command.
+  - **N rises with how long he has been talking** (`absent_misses()` in `wakefree.py`,
+    `_absent_misses()` in `server.py`): 1 miss (~2s of pause tolerated) for a short command, up to 5
+    (~4.8s) past ~32s of speech. A one-breath command should end the instant he stops rather than
+    record the room afterwards; a long dictated one is full of thinking-pauses, and cutting one in half
+    loses the entire command — which costs far more than a few seconds of trailing silence.
   - **Mac:** `voice-id/wakefree.py` (ECAPA local, on-demand).
   - **ESP:** the `jared-voice` Fly server runs the same ECAPA + the shared voiceprint (lazy-loaded on
     turn-on; the box is **2 GB** for it) and captures on energy instead of openWakeWord while on.
@@ -190,6 +196,6 @@ bridges to the ESP over HTTP).
 | `agent_mode` / `agent_cwd` | `0` | worker — full-agent (coding) mode and its working directory |
 | `synth_on_mac` | `0` | worker — synthesize the reply on the Mac and ship PCM to the Pi to play |
 | `voiceid_threshold` | `0.30` | wakefree + ESP server — "it's Jared" cosine threshold |
-| `wakefree_pause_s` | `2.0` | wakefree + ESP server — trailing-silence that ends an utterance |
+| `wakefree_pause_s` | `2.0` | ESP server only — the energy endpoint it falls back to while wake-free is on but ECAPA/the voiceprint has not loaded (and during enrollment). The speaker-gated path ignores it |
 | `voiceprint` | — | wakefree (local) + ESP server — base64 ECAPA exemplar bank (uploaded by `enroll.py`) |
 | `weight_reminder_*`, `surplus_cal` | — | hub server (reminders / nutrition) |

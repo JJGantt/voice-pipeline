@@ -37,6 +37,19 @@ and `worker/`. Editing a copy is lost work. Deploy with:
 No `fly.toml`, no `Dockerfile`, nothing deploys it. The real Fly worker is `server/worker.py`,
 assembled from `worker/worker.py`. Do not read it for current behaviour and do not edit it.
 
+## Both mics must endpoint identically
+
+The ESP and the Mac hear the same sentence, and the worker collapses the pair by *recording-window
+overlap* (`_duplicate_of_recent`), keeping whichever arrived first. That only holds while the two agree
+on where the sentence ended, so the endpointing constants in `voice-id/wakefree.py` and
+`server/server.py` are one setting written twice — change both together.
+
+When they disagree the failure is silent and total. The mic that closes early enqueues a mid-sentence
+fragment; the fragment is discarded as a false positive; the other mic's *complete* capture then
+overlaps it and is dropped as the duplicate. Nothing runs, and nothing anywhere reports an error.
+Dedupe therefore skips rows whose `result` is in `NO_WORK_RESULTS` — a request that executed nothing
+can never stand in for one that would have.
+
 ## Never commit a voiceprint
 
 `voice-id/exemplars.npy` and `reference.npy` are biometric data and are gitignored. The live copy
