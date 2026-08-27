@@ -148,12 +148,15 @@ async function tick() {
       } catch (e) { console.error('[desk-sessions] mirror:', e.message); }
     }
     if (!alive && ageS > LAUNCH_GRACE_S) {
-      // ENDED, not evicted. 'evicted' means parked-and-resumable, which is a Pi concept: a closed
-      // Terminal tab cannot be brought back, and offering to resume it would be a lie.
-      patch.status = 'ended';
+      // The two closed states say whether anything can be done about it, and nothing else:
+      //   evicted — the transcript is known, so `claude --resume` brings the whole conversation back
+      //             in a new tab. Exactly what the Pi means by it; a closed tab is not special.
+      //   ended   — no transcript was ever bound (it never wrote one, or adoption never matched it),
+      //             so there is nothing to resume and offering it would be a lie.
+      patch.status = row.claude_session_id ? 'evicted' : 'ended';
       patch.ended = new Date().toISOString();
       patch.working = false;
-      console.log(`[desk-sessions] ${row.id} ended (no claude on ${row.tty || 'no tty'})`);
+      console.log(`[desk-sessions] ${row.id} ${patch.status} (no claude on ${row.tty || 'no tty'})`);
     }
     try { await patchDeskSession(row.id, patch); }
     catch (e) { console.error('[desk-sessions] patch:', e.message); }

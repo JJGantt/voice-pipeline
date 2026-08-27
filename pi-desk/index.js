@@ -650,6 +650,10 @@ async function drain() {
 const KEEP_CLOSED_DAYS = Number(process.env.KEEP_CLOSED_DAYS || 7);    // ended / transferred: not resumable anyway
 const KEEP_PARKED_DAYS = Number(process.env.KEEP_PARKED_DAYS || 14);   // evicted: resumable, and worth keeping a while
 const KEEP_COMMAND_DAYS = Number(process.env.KEEP_COMMAND_DAYS || 30); // the queue log
+// Raw captures. Thousands of rows of transcribed speech, and the only time one is read is shortly
+// after it goes wrong. Deleting a request does NOT delete the conversation: voice_messages rows have
+// no cascade from here (verified), so the readable thread survives and only the capture row goes.
+const KEEP_REQUEST_DAYS = Number(process.env.KEEP_REQUEST_DAYS || 7);
 const ago = (days) => new Date(Date.now() - days * 86400000).toISOString();
 
 async function forget(rows, why) {
@@ -672,6 +676,7 @@ async function sweepRetention() {
     // The command log. Dead letters are NOT swept: an unretried one holds words Jared may still want,
     // and a retried or dismissed one is a decision he made, which is small and worth keeping.
     await sb(`desk_commands?created=lt.${ago(KEEP_COMMAND_DAYS)}`, { method: 'DELETE', headers: { Prefer: 'return=minimal' } });
+    await sb(`voice_requests?created_at=lt.${ago(KEEP_REQUEST_DAYS)}`, { method: 'DELETE', headers: { Prefer: 'return=minimal' } });
   } catch (e) { console.error('[pi-desk] retention:', e.message); }
 }
 

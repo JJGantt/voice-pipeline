@@ -87,16 +87,42 @@ async function run(cmd) {
     return `sent ${prompt.length} chars to ${tty} (${how})`;
   }
 
-  // Close a session here. The Pi parks its own (evicted, resumable with full context); a Terminal tab
-  // cannot be brought back once closed, so this is `ended` — the same state the reconciler records
-  // when it finds the tab gone.
+  // Close a session here — parked, not destroyed, whenever there is a transcript to come back to.
+  // Same meaning as the Pi's eviction: the tab goes, the conversation does not.
   if (cmd.kind === 'end_session') {
     const id = String((cmd.payload || {}).session || '').trim();
     const row = await deskSession(id);
     if (!row) throw new Error(`no such session: ${id}`);
     if (row.tty) await closeTabForTty(row.tty);
-    await patchDeskSession(id, { status: 'ended', ended: new Date().toISOString(), working: false });
-    return `closed ${id}`;
+    const status = row.claude_session_id ? 'evicted' : 'ended';
+    await patchDeskSession(id, { status, ended: new Date().toISOString(), working: false });
+    return `${status === 'evicted' ? 'parked' : 'closed'} ${id}`;
+  }
+
+  // Bring a parked session back, in a new tab, with its whole conversation. `claude --resume` replays
+  // the transcript, which is why the id is recorded the moment a session is launched or adopted.
+  if (cmd.kind === 'resume_session') {
+    const id = String((cmd.payload || {}).session || '').trim();
+    const row = await deskSession(id);
+    if (!row) throw new Error(`no such session: ${id}`);
+    if (row.status === 'resident') throw new Error(`${id} is still running`);
+    if (!row.claude_session_id) throw new Error(`${id} has no transcript recorded — cannot resume`);
+    const dir = repoDir(row.repo);
+    ensureTrusted(dir);
+    if (row.repo !== 'root') await pull(dir);
+    const sessionId = `mac-${cmd.id.slice(0, 8)}`;
+    const prompt = String((cmd.payload || {}).prompt || '').trim() || null;
+    const raw = await openFreshTab(dir, row.repo, prompt, sessionId, row.claude_session_id);
+    const [how, tty] = String(raw).split('\t');
+    // A NEW row for the new tab, exactly as the Pi makes a new tmux session on resume. The old row
+    // stays parked until retention drops it; it is where that stretch of the conversation happened.
+    await upsertDeskSession({
+      id: sessionId, worker: 'desk', repo: row.repo, status: 'resident',
+      origin: row.origin || 'dispatched', command_id: cmd.id, tty: tty || null,
+      label: row.label || null, claude_session_id: row.claude_session_id,
+      transcript_path: row.transcript_path, mirror_offset: row.mirror_offset || 0,
+    });
+    return `resumed ${id} here (${how})`;
   }
 
   // SOURCE half of a handover: this machine owns the session and is giving it up.

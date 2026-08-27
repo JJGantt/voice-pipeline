@@ -130,7 +130,11 @@ after they end; dispatched ones are a record of what was asked for and stay.
 
 `sweepRetention` in `pi-desk` is the ONE retention rule, on the always-on machine: closed sessions
 (`ended`/`transferred`) go after 7 days, parked ones (`evicted`) after 14, the `desk_commands` log
-after 30. All tunable by env.
+after 30, and `voice_requests` — the raw captures — after 7. All tunable by env.
+
+Deleting a voice request does **not** delete the conversation: `voice_messages` has no cascade from
+it (verified by deleting one and counting), so the readable thread survives and only the capture row
+goes.
 
 Deleting a row does not destroy a conversation — the transcript stays on disk on the machine that ran
 it, and `claude --resume` still works. What goes is the row that OFFERS it in the pane, plus the
@@ -195,8 +199,13 @@ a turn, identified by the transcript record whose `stop_reason` is `end_turn` �
 assistant text", which mid-turn is a half-written thought. `working` is what separates them: a reply
 is final only when `working` is false.
 
-The Mac's `deskSessions.js` tick is deliberately much smaller than the Pi's: no residency cap, no
-eviction, no resume. Those exist because a headless 4GB machine must decide what to close; on the Mac
+A closed session means the same thing on both machines: **`evicted` is parked and resumable**, and
+`ended` means no transcript was ever bound, so there is nothing to bring back. The Mac used to mark
+every closed tab `ended` because it recorded no transcript id at all — that stopped being true the
+moment it started finding them, and the status was left saying otherwise for a while.
+
+The Mac's `deskSessions.js` tick is still much smaller than the Pi's: no residency cap and no
+eviction of its own. Those exist because a headless 4GB machine must decide what to close; on the Mac
 Jared can see the tabs. It answers only "is it still up" (a `claude` process on the tab's tty — the
 tab outlives the process, so the tab is the wrong question) and "what did it last say".
 
