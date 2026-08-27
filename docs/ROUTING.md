@@ -37,13 +37,14 @@ Converting this list to a deny list disables escalation silently — every gated
 ## What is gated
 
 Data **writes** needing domain knowledge — nutrition values, muscle maps, maintenance math:
-`log_nutrition`, `stage_meal`, `commit_staged`, `subtract_leftovers`, `log_weight`, `set_height`,
+`log_nutrition`, `stage_meal`, `commit_staged`, `subtract_leftovers`, `set_height`,
 `log_set`, `update_set`, `remove_set`, `upsert_catalog_exercise`, the rep-watcher pair, and the
 nutrition edit/delete siblings.
 
 Everything else is on the fast path: reads, actuators (lights, feeder, TV, voice settings), the
-low-stakes writes needing no domain knowledge (lists, notes, dated items), and dispatching work to a
-machine — `start_session` starts a session, it does not itself change data.
+low-stakes writes needing no domain knowledge (lists, notes, dated items), `log_weight` (the tool
+takes only a number the user spoke — estimating one is forbidden, so there is nothing to know), and
+dispatching work to a machine — `start_session` starts a session, it does not itself change data.
 
 ## Keeping the list honest
 

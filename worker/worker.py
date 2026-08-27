@@ -255,7 +255,7 @@ POWER_DIRECTIVE = (
 )
 
 # ---- Dynamic route. Sonnet is the fast first responder, given ONLY the SAFE tools below in its
-# --allowedTools; the gated tools (data WRITES that need real knowledge — nutrition, weight, workouts/sets,
+# --allowedTools; the gated tools (data WRITES that need real knowledge — nutrition, workouts/sets,
 # the exercise catalog, nutrition targets, body measurements) are absent, so in `-p` mode Sonnet is DENIED
 # them and physically cannot corrupt that data. It still SEES them in the schema and, per the escalate
 # directive, hands the whole turn to a fresh Opus rather than claiming it can't. Reads, actuators, and the
@@ -284,6 +284,9 @@ SAFE_TOOLS = [
     "mcp__data__get_due", "mcp__data__set_due", "mcp__data__set_list_emoji",
     "mcp__data__get_lists", "mcp__data__add_to_list", "mcp__data__remove_from_list", "mcp__data__delete_list",
     "mcp__data__get_notes", "mcp__data__create_note", "mcp__data__delete_note",
+    # A weigh-in is a number the user spoke out loud — the tool refuses to accept anything else.
+    # Nothing to estimate, so nothing the capable model would do better.
+    "mcp__data__log_weight",
     # Dispatching work to a machine: starts a SESSION, changes no data itself.
     "mcp__data__list_repos", "mcp__data__start_session", "mcp__data__get_sessions",
     "mcp__data__resume_session", "mcp__data__end_session",
@@ -325,10 +328,11 @@ def validate_safe_tools(mcp_js: str) -> None:
 ESCALATE_SENTINEL = "__ESCALATE__"
 ESCALATE_DIRECTIVE = (
     "\n\n[You are the fast first responder. You can see the full toolset, but the data-WRITE tools — "
-    "logging or editing nutrition, weight, workouts/sets, the exercise catalog, nutrition targets, or "
+    "logging or editing nutrition, workouts/sets, the exercise catalog, nutrition targets, or "
     "body measurements — are handled by a more capable model, not you, because they need careful "
     "knowledge (nutrition values, muscle maps, maintenance math). You CAN read anything (get_*/list_*), "
-    "manage reminders, lists, and notes, and drive the lights, feeder, TV, and voice settings yourself, "
+    "manage reminders, lists, and notes, log a weight the user stated as a number, and drive the "
+    "lights, feeder, TV, and voice settings yourself, "
     "and you should. If fulfilling the "
     "request needs any of those gated WRITE tools, do NOT attempt it and do NOT say you can't — reply "
     f"with EXACTLY '{ESCALATE_SENTINEL}' and nothing else, and it is handed to the capable model. "
