@@ -12,96 +12,12 @@
 // last resort, taken only when a new session needs a slot.
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 
 const exec = promisify(execFile);
-const CLAUDE_PROJECTS = path.join(os.homedir(), '.claude', 'projects');
 
-/** Claude Code's directory name for a working directory: the path with / and . turned into dashes. */
-function projectDir(cwd) {
-  return path.join(CLAUDE_PROJECTS, cwd.replace(/[/.]/g, '-'));
-}
-
-/**
- * The transcript Claude Code just started for a session in `cwd`.
- *
- * Matched by BIRTH TIME rather than by asking Claude, because there is no way to ask: the id is
- * generated inside the process.
- *
- * It used to match on mtime, and that produced two sessions sharing one transcript. mtime bounds
- * nothing while a session is alive: an older session that is still being written keeps a fresh mtime
- * forever, so a second session launched in the same directory adopted the first one's file and both
- * rows recorded the same claude id. Two slots, one conversation. Birth time cannot do that — a
- * transcript created before this launch is not this launch's, however recently it was touched.
- *
- * `taken` excludes ids already claimed by a live session, which closes the same hole from the other
- * side if two launches ever land inside one filesystem timestamp.
- *
- * The window is generous (90s) because Claude Code takes a while to come up on a Pi and writes its
- * transcript only once it does. A 10s window silently produced sessions with no recorded id — which
- * looks like nothing at all going wrong until you try to resume one and find you cannot.
- */
-export function findTranscript(cwd, since, { attempts = 90, delayMs = 1000, taken = new Set() } = {}) {
-  const dir = projectDir(cwd);
-  return new Promise((resolve) => {
-    let n = 0;
-    const tick = () => {
-      try {
-        const hit = fs.readdirSync(dir)
-          .filter((f) => f.endsWith('.jsonl'))
-          .filter((f) => !taken.has(f.replace(/\.jsonl$/, '')))
-          .map((f) => ({ f, p: path.join(dir, f), m: fs.statSync(path.join(dir, f)).birthtimeMs }))
-          .filter((x) => x.m >= since)
-          .sort((a, b) => b.m - a.m)[0];
-        if (hit) return resolve({ id: hit.f.replace(/\.jsonl$/, ''), path: hit.p });
-      } catch { /* the directory does not exist until the first session in that repo */ }
-      if (++n >= attempts) return resolve(null);
-      setTimeout(tick, delayMs);
-    };
-    tick();
-  });
-}
-
-/**
- * Read a transcript's tail: whether the session is mid-turn, and its last assistant reply.
- *
- * THIS IS THE IDLE SIGNAL, and it has to come from here rather than from CPU. A session waiting on the
- * API and a session that finished an hour ago are both at 0% CPU and indistinguishable from the
- * outside; evicting on CPU would kill work mid-thought. The transcript knows: a user turn with no
- * assistant reply after it means a turn is in flight.
- */
-export function readTail(transcriptPath) {
-  let lines;
-  try { lines = fs.readFileSync(transcriptPath, 'utf8').split('\n'); }
-  catch { return { working: false, lastReply: null, turns: 0, bytes: 0, lastActivity: 0 }; }
-
-  let lastRole = null, lastReply = null, turns = 0;
-  for (const line of lines) {
-    if (!line.trim()) continue;
-    let d;
-    try { d = JSON.parse(line); } catch { continue; }
-    const t = d.type;
-    if (t !== 'user' && t !== 'assistant') continue;
-    turns++;
-    lastRole = t;
-    if (t === 'assistant') {
-      const blocks = d.message?.content;
-      if (Array.isArray(blocks)) {
-        const txt = blocks.filter((b) => b?.type === 'text').map((b) => b.text).join('').trim();
-        if (txt) lastReply = txt;
-      }
-    }
-  }
-  // mtime is the last time anything was written to this conversation — the recency signal eviction
-  // sorts on. Read from the file rather than from the parsed turns because a transcript's timestamps
-  // are not guaranteed to be present on every record type.
-  let bytes = 0, lastActivity = 0;
-  try { const st = fs.statSync(transcriptPath); bytes = st.size; lastActivity = st.mtimeMs; } catch {}
-  // A trailing user turn means Claude has been asked something and has not answered yet.
-  return { working: lastRole === 'user', lastReply, turns, bytes, lastActivity };
-}
+// Reading transcripts is not Pi-specific — the Mac's consumer needs the same idle signal and the
+// same final reply — so it lives in one place and is re-exported here for this module's callers.
+export { findTranscript, readTail } from '../orchestrator/src/transcripts.js';
 
 /** tmux sessions this daemon owns, and whether a claude process is actually inside each. */
 export async function liveSessions() {

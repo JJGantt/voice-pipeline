@@ -8,7 +8,8 @@
 //   GET  /health   ok
 //
 // Background loops: focus watcher (voice_focus id=1) + session registry + desk control
-// (publish ~/repos to Supabase, drain the hub's launch queue).
+// (publish ~/repos to Supabase, drain the hub's launch queue) + desk session reconcile (is each
+// dispatched session still up, and what did it last say).
 import http from 'node:http';
 import { WebSocketServer } from 'ws';
 import { config } from './config.js';
@@ -17,6 +18,7 @@ import { startFocusWatcher } from './focus.js';
 import { startRegistry } from './registry.js';
 import { startRepos } from './repos.js';
 import { startCommands } from './commands.js';
+import { startDeskSessions } from './deskSessions.js';
 
 // ---- auth -----------------------------------------------------------------
 
@@ -129,6 +131,7 @@ server.listen(config.PORT, '0.0.0.0', () => {
   startRegistry();
   startRepos();
   startCommands();
+  startDeskSessions();
 });
 
 // Graceful-ish shutdown for launchd.

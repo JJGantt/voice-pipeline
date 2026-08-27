@@ -19,7 +19,9 @@ import { promisify } from 'node:util';
 import { config } from './config.js';
 
 const exec = promisify(execFile);
-import { pendingCommands, claimCommand, finishCommand, upsertDeskSession, deskSession } from './supabase.js';
+import { pendingCommands, claimCommand, finishCommand, upsertDeskSession, deskSession,
+         patchDeskSession, deadLetterCommand, abandonedClaims } from './supabase.js';
+import { findTranscript } from './transcripts.js';
 import { watchTable } from './realtime.js';
 import { isKnownRepo } from './repos.js';
 import { ensureTrusted } from './trust.js';
@@ -47,8 +49,11 @@ async function run(cmd) {
     const prompt = String((cmd.payload || {}).prompt || '').trim();
     if (!prompt) throw new Error('no prompt to send');
     const row = await deskSession(session);
-    const tty = row && row.transcript_path;
+    const tty = row && row.tty;
     if (!tty) throw new Error(`no terminal recorded for ${session}`);
+    // A session the reconciler has already found dead has no tab to type into. Fail here rather than
+    // letting AppleScript hunt for a tty that a later tab may have been given.
+    if (row.status !== 'resident') throw new Error(`${session} has ended`);
     await sendToTty(tty, prompt);
     return `sent ${prompt.length} chars to ${tty}`;
   }
@@ -90,6 +95,7 @@ async function run(cmd) {
   const spoken = String((cmd.payload || {}).prompt || '').trim();
   const wantsReport = (cmd.payload || {}).report === true;
   const prompt = [staleWarning, spoken, (wantsReport && spoken) ? REPORT_DIRECTIVE : null].filter(Boolean).join('\n\n') || null;
+  const startedAt = Date.now() - 1000;   // slack: the transcript may be stamped just before
   const raw = await openFreshTab(target, name, prompt, `mac-${cmd.id.slice(0, 8)}`);
   // openFreshTab reports "<how>\t<tty>"; the tty is the handle a later follow-up addresses.
   const [how, tty] = String(raw).split('\t');
@@ -98,14 +104,25 @@ async function run(cmd) {
 
   // Publish it. Until now the Mac published nothing, so a Mac session was invisible to the sessions
   // panel and unreachable by follow_up — which resolves a dispatch through desk_sessions.command_id.
+  const sessionId = `mac-${cmd.id.slice(0, 8)}`;
   try {
     await upsertDeskSession({
-      id: `mac-${cmd.id.slice(0, 8)}`, worker: 'desk', repo: name || 'root',
-      status: 'resident', command_id: cmd.id, transcript_path: tty || null,
+      id: sessionId, worker: 'desk', repo: name || 'root',
+      status: 'resident', command_id: cmd.id, tty: tty || null,
       label: (cmd.payload || {}).label || null,
       prompt: prompt ? prompt.slice(0, 500) : null,
     });
   } catch (e) { console.error('[commands] publish:', e.message); }
+
+  // Find the transcript this session just started, the same way the Pi does — the filename is the
+  // Claude session id, and it is the only way to read what the session says. Async on purpose: the
+  // launch has already happened and nothing should wait on filesystem polling to hear about it.
+  findTranscript(target, startedAt).then((t) => {
+    if (!t) return console.error(`[commands] no transcript for ${sessionId} — its replies will not be readable`);
+    console.log(`[commands] ${sessionId} -> claude session ${t.id}`);
+    return patchDeskSession(sessionId, { claude_session_id: t.id, transcript_path: t.path });
+  }).catch((e) => console.error('[commands] transcript:', e.message));
+
   return how;
 }
 
@@ -118,6 +135,11 @@ async function drain() {
       if (ageS > config.COMMAND_TTL_S) {
         if (await claimCommand(cmd.id)) {
           await finishCommand(cmd.id, 'expired', `queued ${Math.round(ageS)}s ago`);
+          // Expiring is right — a laptop that was asleep must not wake up and open every terminal
+          // queued in the meantime — but the words are not disposable. They are kept for a manual
+          // retry rather than dropped along with the command.
+          await deadLetterCommand(cmd, `expired unrun — queued ${Math.round(ageS)}s before this machine saw it`)
+            .catch((e) => console.error('[commands] dead letter:', e.message));
           console.log(`[commands] expired ${cmd.kind} (${Math.round(ageS)}s old)`);
         }
         continue;
@@ -134,6 +156,7 @@ async function drain() {
       } catch (e) {
         console.error('[commands] failed:', e.message);
         await finishCommand(cmd.id, 'error', e.message);
+        await deadLetterCommand(cmd, e.message).catch((err) => console.error('[commands] dead letter:', err.message));
       }
     }
   } catch (e) {
@@ -143,8 +166,30 @@ async function drain() {
   }
 }
 
+/**
+ * Commands this machine claimed and never finished.
+ *
+ * A crash, a restart, or a sleep between claim and finish leaves a row 'running' for ever: no
+ * consumer will look at it again, and nothing anywhere says it did not happen. Only the claimer can
+ * judge this — hence claimed_by — and only well after the longest legitimate launch could still be
+ * in flight.
+ */
+const CLAIM_STALE_S = parseInt(process.env.CLAIM_STALE_S || '900', 10);
+async function sweepAbandonedClaims() {
+  try {
+    const cutoff = new Date(Date.now() - CLAIM_STALE_S * 1000).toISOString();
+    for (const cmd of await abandonedClaims('desk', cutoff)) {
+      await finishCommand(cmd.id, 'error', 'abandoned — claimed by desk and never finished');
+      await deadLetterCommand(cmd, 'the Mac stopped before it finished this');
+      console.log(`[commands] swept abandoned claim ${cmd.id}`);
+    }
+  } catch (e) { console.error('[commands] sweep claims:', e.message); }
+}
+
 export function startCommands() {
   drain();
+  sweepAbandonedClaims();
+  const sweeper = setInterval(sweepAbandonedClaims, 300000);
   const rt = watchTable({
     channel: 'orch-commands', table: 'desk_commands', event: 'INSERT', onChange: drain, tag: 'commands',
   });
@@ -158,6 +203,7 @@ export function startCommands() {
   timer = setTimeout(loop, config.COMMAND_POLL_MS);
   return () => {
     if (timer) clearTimeout(timer);
+    clearInterval(sweeper);
     rt.stop();
   };
 }

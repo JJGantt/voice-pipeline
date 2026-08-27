@@ -93,7 +93,9 @@ export async function claimCommand(id) {
   const res = await fetch(`${base()}/desk_commands?id=eq.${encodeURIComponent(id)}&status=eq.pending`, {
     method: 'PATCH',
     headers: headers({ Prefer: 'return=representation' }),
-    body: JSON.stringify({ status: 'running', updated: new Date().toISOString() }),
+    // claimed_by is what makes an abandoned claim recoverable: a command left 'running' by a machine
+    // that died can only be swept by the machine that took it, and this is how it knows which.
+    body: JSON.stringify({ status: 'running', claimed_by: 'desk', updated: new Date().toISOString() }),
   });
   if (!res.ok) throw new Error(`claimCommand ${res.status}: ${await res.text()}`);
   const rows = await res.json();
@@ -122,9 +124,9 @@ export async function heartbeatDesk(worker, info) {
 
 // ---- desk sessions -------------------------------------------------------
 // The Mac publishes what it has open for the same two reasons the Pi does: the sessions panel needs
-// to show it, and a follow-up resolves its target through command_id. `transcript_path` carries the
-// tab's tty here rather than a file — it is the same idea, the handle needed to reach the session
-// again, and the column already existed.
+// to show it, and a follow-up resolves its target through command_id. Two handles, two columns: the
+// tab's `tty` is how a follow-up reaches the session, `transcript_path` is how anything reads what
+// it said. They were the same column once, which is why a Mac session's replies were unreadable.
 export async function upsertDeskSession(row) {
   const res = await fetch(`${base()}/desk_sessions?on_conflict=id`, {
     method: 'POST',
@@ -139,4 +141,48 @@ export async function deskSession(id) {
   if (!res.ok) return null;
   const rows = await res.json();
   return rows[0] || null;
+}
+
+export async function patchDeskSession(id, patch) {
+  const res = await fetch(`${base()}/desk_sessions?id=eq.${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    headers: headers({ Prefer: 'return=minimal' }),
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) throw new Error(`patchDeskSession ${res.status}: ${await res.text()}`);
+}
+
+/** Sessions this machine has published, optionally filtered by status. */
+export async function deskSessionsFor(worker, status) {
+  const q = `worker=eq.${encodeURIComponent(worker)}${status ? `&status=eq.${status}` : ''}`;
+  const res = await fetch(`${base()}/desk_sessions?${q}&select=*`, { headers: headers() });
+  if (!res.ok) throw new Error(`deskSessionsFor ${res.status}: ${await res.text()}`);
+  return res.json();
+}
+
+/**
+ * Keep a command that could not run.
+ *
+ * The prompt inside is usually minutes of dictated speech that cannot be repeated, so it is never
+ * simply logged and lost. Not a retry queue — the command is finished, and Jared decides later
+ * whether he still wants it.
+ */
+export async function deadLetterCommand(cmd, reason, source = 'desk', machine = 'mac') {
+  const res = await fetch(`${base()}/desk_dead_letters`, {
+    method: 'POST',
+    headers: headers({ Prefer: 'return=minimal' }),
+    body: JSON.stringify([{ id: crypto.randomUUID(), command_id: cmd.id, kind: cmd.kind,
+                            payload: cmd.payload || {}, machine,
+                            reason: String(reason || '').slice(0, 500), source }]),
+  });
+  if (!res.ok) throw new Error(`deadLetterCommand ${res.status}: ${await res.text()}`);
+}
+
+/** Commands this machine claimed and never finished — see the sweep in commands.js. */
+export async function abandonedClaims(worker, olderThanIso) {
+  const res = await fetch(
+    `${base()}/desk_commands?status=eq.running&claimed_by=eq.${encodeURIComponent(worker)}&updated=lt.${olderThanIso}&select=*`,
+    { headers: headers() });
+  if (!res.ok) throw new Error(`abandonedClaims ${res.status}: ${await res.text()}`);
+  return res.json();
 }

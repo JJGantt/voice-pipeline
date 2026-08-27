@@ -177,7 +177,11 @@ async function reconcileSessions() {
           // Carried through explicitly: this is a merge-duplicates upsert, so any column it sends
           // overwrites. Omitting the label would blank it on the very next reconcile tick.
           label: row?.label || null,
-          last_reply: tail.lastReply ? tail.lastReply.slice(0, 2000) : row?.last_reply || null,
+          last_reply: tail.lastReply ? tail.lastReply.slice(0, 4000) : row?.last_reply || null,
+          // last_reply is the FINAL message of a turn; `working` is what says whether a newer one is
+          // still being written. Without it a reader cannot tell an answer from a stale one.
+          working: tail.working,
+          reply_at: tail.replyAt || row?.reply_at || null,
           last_seen: new Date().toISOString(),
         }]),
       });
@@ -363,9 +367,29 @@ async function claim(id) {
   const rows = await sb(`desk_commands?id=eq.${encodeURIComponent(id)}&status=eq.pending`, {
     method: 'PATCH',
     headers: { Prefer: 'return=representation' },
-    body: JSON.stringify({ status: 'running', updated: new Date().toISOString() }),
+    // claimed_by is what makes an abandoned claim recoverable: a command left 'running' by a machine
+    // that died can only be swept by the machine that took it, and this is how it knows which.
+    body: JSON.stringify({ status: 'running', claimed_by: WORKER, updated: new Date().toISOString() }),
   });
   return Array.isArray(rows) && rows.length > 0;
+}
+
+/**
+ * Keep a command that could not run.
+ *
+ * The prompt inside is usually minutes of dictated speech that cannot be repeated, so it is never
+ * simply logged and lost. Not a retry queue — the command is finished, and Jared decides later
+ * whether he still wants it.
+ */
+async function deadLetter(cmd, reason) {
+  try {
+    await sb('desk_dead_letters', {
+      method: 'POST', headers: { Prefer: 'return=minimal' },
+      body: JSON.stringify([{ id: randomUUID(), command_id: cmd.id, kind: cmd.kind,
+                              payload: cmd.payload || {}, machine: 'pi',
+                              reason: String(reason || '').slice(0, 500), source: WORKER }]),
+    });
+  } catch (e) { console.error('[pi-desk] dead letter:', e.message); }
 }
 
 const finish = (id, status, detail) =>
@@ -515,6 +539,7 @@ async function drain() {
       if (ageS > COMMAND_TTL_S) {
         if (await claim(cmd.id)) {
           await finish(cmd.id, 'expired', `queued ${Math.round(ageS)}s ago`);
+          await deadLetter(cmd, `expired unrun — queued ${Math.round(ageS)}s before this machine saw it`);
           console.log(`[pi-desk] expired ${cmd.id} (${Math.round(ageS)}s old)`);
         }
         continue;
@@ -528,6 +553,7 @@ async function drain() {
       } catch (e) {
         console.error('[pi-desk] failed:', e.message);
         await finish(cmd.id, 'error', e.message);
+        await deadLetter(cmd, e.message);
       }
     }
   } catch (e) {
@@ -535,6 +561,27 @@ async function drain() {
   } finally {
     draining = false;
   }
+}
+
+/**
+ * Commands this machine claimed and never finished.
+ *
+ * A crash or a restart between claim and finish leaves a row 'running' for ever: no consumer will
+ * look at it again, and nothing anywhere says it did not happen. Only the claimer can judge this —
+ * hence claimed_by — and only well after the longest legitimate launch (a cold clone) could still
+ * be in flight.
+ */
+const CLAIM_STALE_S = Number(process.env.CLAIM_STALE_S || 900);
+async function sweepAbandonedClaims() {
+  try {
+    const cutoff = new Date(Date.now() - CLAIM_STALE_S * 1000).toISOString();
+    const rows = await sb(`desk_commands?status=eq.running&claimed_by=eq.${WORKER}&updated=lt.${cutoff}&select=*`);
+    for (const cmd of rows || []) {
+      await finish(cmd.id, 'error', `abandoned — claimed by ${WORKER} and never finished`);
+      await deadLetter(cmd, 'the machine stopped before it finished this');
+      console.log(`[pi-desk] swept abandoned claim ${cmd.id}`);
+    }
+  } catch (e) { console.error('[pi-desk] sweep claims:', e.message); }
 }
 
 console.log(`[pi-desk] watching desk_commands (repos in ${REPO_ROOT}, owner ${GITHUB_OWNER})`);
@@ -557,3 +604,5 @@ pollTimer = setTimeout(pollLoop, POLL_DEGRADED_MS);
 
 reconcileSessions();
 setInterval(reconcileSessions, PRESENCE_MS);
+sweepAbandonedClaims();
+setInterval(sweepAbandonedClaims, 300000);

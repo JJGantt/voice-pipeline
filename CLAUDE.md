@@ -61,6 +61,38 @@ no credential helper the pull prompts for a username, fails instantly in a daemo
 after the first runs against a stale tree. The pull failure is non-fatal by design, so it shows up as
 wrong results rather than an error.
 
+## A command that cannot run is kept, never dropped
+
+Both desk consumers write `desk_dead_letters` when a command expires unrun, errors, or was claimed by
+a machine that then died — the whole payload, prompt included. A dispatched prompt is usually minutes
+of dictated speech nobody can repeat, so losing one costs far more than the launch it was meant to
+start.
+
+It is **not** a retry queue, and adding automatic retry would be the wrong fix: work that could not
+run when it was asked for has usually stopped being wanted by the time the machine comes back, and a
+prompt that fires hours late is worse than one that never fired. Retry is a decision made afterwards,
+from the saved list.
+
+The other half is upstream: `data-layer`'s dispatch path checks the target machine is beating before
+it writes a command at all, because the queue itself has no way to fail — an unclaimed command simply
+expires while the caller has already been told a session started.
+
+## Reading a session: two handles, two columns
+
+`desk_sessions.tty` reaches a Mac session (its Terminal tab); `transcript_path` reads what any session
+said. They were one column once, and a Mac row's "transcript path" was really a tty — which is why
+nothing could read a Mac session's replies.
+
+`orchestrator/src/transcripts.js` is shared by both machines. `readTail` reports the FINAL message of
+a turn, identified by the transcript record whose `stop_reason` is `end_turn` — not "the last
+assistant text", which mid-turn is a half-written thought. `working` is what separates them: a reply
+is final only when `working` is false.
+
+The Mac's `deskSessions.js` tick is deliberately much smaller than the Pi's: no residency cap, no
+eviction, no resume. Those exist because a headless 4GB machine must decide what to close; on the Mac
+Jared can see the tabs. It answers only "is it still up" (a `claude` process on the tab's tty — the
+tab outlives the process, so the tab is the wrong question) and "what did it last say".
+
 ## Docs
 
 `docs/ROUTING.md` is the routing contract. `ARCHITECTURE.md` covers the always-on machinery —
