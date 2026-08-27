@@ -480,6 +480,17 @@ async function run(cmd) {
     return typeInto(target, prompt);
   }
 
+  // Name the session itself, with the command Jared would type. Claude Code writes the `custom-title`
+  // record, so the name comes back through the transcript rather than living only in our row.
+  if (cmd.kind === 'rename_session') {
+    const target = String((cmd.payload || {}).session || '').trim();
+    const name = String((cmd.payload || {}).name || '').replace(/[\r\n]+/g, ' ').trim().slice(0, 60);
+    if (!/^hub-[A-Za-z0-9._-]+$/.test(target)) throw new Error(`unusable session name: ${target}`);
+    if (!name) throw new Error('no name to set');
+    await typeInto(target, `/rename ${name}`);
+    return `renamed ${target} to ${name}`;
+  }
+
   if (cmd.kind === 'end_session') {
     const target = String((cmd.payload || {}).session || '').trim();
     if (!/^hub-[A-Za-z0-9._-]+$/.test(target)) throw new Error(`unusable session name: ${target}`);

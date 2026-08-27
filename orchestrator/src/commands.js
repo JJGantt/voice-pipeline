@@ -87,6 +87,21 @@ async function run(cmd) {
     return `sent ${prompt.length} chars to ${tty} (${how})`;
   }
 
+  // Name the session itself. `/rename` is the command Jared types, so this is the same act rather than
+  // a parallel label: Claude Code renames itself, the tab title changes, and it writes the
+  // `custom-title` record the reconcile tick reads straight back into the row.
+  if (cmd.kind === 'rename_session') {
+    const id = String((cmd.payload || {}).session || '').trim();
+    const name = String((cmd.payload || {}).name || '').replace(/[\r\n]+/g, ' ').trim().slice(0, 60);
+    if (!name) throw new Error('no name to set');
+    const row = await deskSession(id);
+    if (!row) throw new Error(`no such session: ${id}`);
+    if (!row.tty) throw new Error(`no terminal recorded for ${id}`);
+    if (row.status !== 'resident') throw new Error(`${id} is not running`);
+    await sendToTty(row.tty, `/rename ${name}`);
+    return `renamed ${id} to ${name}`;
+  }
+
   // Close a session here — parked, not destroyed, whenever there is a transcript to come back to.
   // Same meaning as the Pi's eviction: the tab goes, the conversation does not.
   if (cmd.kind === 'end_session') {
