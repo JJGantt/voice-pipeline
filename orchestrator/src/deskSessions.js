@@ -130,12 +130,14 @@ async function tick() {
       // empty (mid-write, or a rotated file) must not erase what the session already said.
       if (tail.lastReply) { patch.last_reply = tail.lastReply.slice(0, 4000); patch.reply_at = tail.replyAt || row.reply_at || null; }
       patch.working = alive && tail.working;
-      // An adopted session's name is Claude Code's own title, and it CHANGES as the conversation
-      // moves on — so it is refreshed here rather than stamped once when the session was found. A
-      // dispatched session keeps the label the router wrote, which describes the job asked for.
-      if (row.origin === 'adopted' && tail.title && tail.title.slice(0, 60) !== row.label) {
-        patch.label = tail.title.slice(0, 60);
-      }
+      // What a session is CALLED, in order of authority:
+      //   1. a name Jared typed himself (ctrl-R in the session picker, written to the transcript as a
+      //      `custom-title` record) — an explicit act, so it outranks everything, dispatched or not;
+      //   2. the label the router wrote at dispatch, which names the job that was asked for;
+      //   3. Claude Code's own generated title, for a session nobody dispatched and nobody named.
+      // Refreshed every tick rather than stamped once, because 1 and 3 both change as work goes on.
+      const named = tail.customTitle || (row.origin === 'adopted' ? tail.title : null);
+      if (named && named.slice(0, 60) !== row.label) patch.label = named.slice(0, 60);
     }
     // Mirror at the end of a turn, which is the only moment the transcript is a complete thought.
     // Idle-only on purpose: uploading mid-turn would ship half an answer, and the tail is re-read on

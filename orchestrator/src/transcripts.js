@@ -72,7 +72,7 @@ export function findTranscript(cwd, since, { attempts = 90, delayMs = 1000, take
  * or written by an older version. Reporting the last thing said beats reporting nothing.
  */
 export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
-  const empty = { working: false, lastReply: null, replyAt: null, title: null, bytes: 0, lastActivity: 0 };
+  const empty = { working: false, lastReply: null, replyAt: null, title: null, customTitle: null, bytes: 0, lastActivity: 0 };
   // Only ever a regular file. A path that is anything else must not be read: `desk_sessions` rows
   // written before the tty got its own column carry a device path here, and readFileSync on
   // /dev/ttys007 BLOCKS THE PROCESS FOR EVER waiting for terminal input — the daemon stops beating,
@@ -135,6 +135,10 @@ export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
   // mtime is the last time anything was written to this conversation — the recency signal eviction
   // sorts on. Taken from the file rather than from the parsed turns because a transcript's
   // timestamps are not guaranteed to be present on every record type.
-  return { working, lastReply: finalReply ?? anyAssistantText, replyAt, title: customTitle || aiTitle,
+  // Two names, kept apart on purpose: `customTitle` is Jared renaming the session by hand, `aiTitle`
+  // is Claude Code's guess from the content. A hand-written name outranks anything derived — see the
+  // label rule in deskSessions.js.
+  return { working, lastReply: finalReply ?? anyAssistantText, replyAt,
+           title: customTitle || aiTitle, customTitle,
            bytes: st.size, lastActivity: st.mtimeMs };
 }

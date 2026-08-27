@@ -121,8 +121,13 @@ so a row bound at adoption drifts onto a conversation that has ended — one tab
 subject and yesterday's last reply for hours after it had moved on. Each tick therefore looks for a
 fresher transcript in the same directory (born after the process started, not bound to another live
 session) and rebinds, resetting `mirror_offset` because the mirror is keyed by session id. An adopted
-session's label is Claude Code's own title and is refreshed the same way; a dispatched one keeps the
-label the router wrote, which names the job rather than the conversation.
+a session's NAME is refreshed the same way, in order of authority: a name Jared typed himself
+(ctrl-R in the session picker, which writes a `custom-title` record into the transcript) beats the
+label the router wrote at dispatch, which beats Claude Code's own generated title.
+
+That order is the point. A generated title describes the content, so **two different sessions about
+the same subject get the same name** — 'Pull day workout log' is the title of nineteen transcripts
+here. The only reliable way to tell two apart is to name one.
 
 **This is Mac-only on purpose.** A transcript only rolls when someone types `/clear`; COMPACTION does
 not roll it — it writes `compactMetadata` and `isCompactSummary` records into the same file (verified
