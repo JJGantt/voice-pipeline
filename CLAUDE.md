@@ -83,6 +83,27 @@ expires while the caller has already been told a session started.
 said. They were one column once, and a Mac row's "transcript path" was really a tty — which is why
 nothing could read a Mac session's replies.
 
+## Sessions nobody dispatched are adopted, but never take the follow-up pointer
+
+The Mac recognises `claude` processes it did not start — a terminal Jared opened himself — and
+publishes them into `desk_sessions` with `origin='adopted'`, so liveness and the last reply work the
+same for everything running. `discover.js` does the finding; adoption writes only `desk_sessions` and
+**never `desk_focus`**. A dictated follow-up is aimed at work handed over, and the session he is
+typing in is precisely what it must never land in.
+
+Matching a process to its transcript is the hard part: there is no session id in the environment, and
+Claude Code appends-and-closes the file so it is not held open either. Birth order is what works —
+processes oldest-first, each taking the EARLIEST unclaimed transcript in its project directory born
+within three minutes of its start. "Newest transcript since this process started" (which the LAUNCH
+path can safely use, because it looks the instant it launches) is wrong here: measured on two live
+sessions in one directory, both claimed the same file and each was reported saying the other's words.
+No confident match means no row — a session reported with someone else's conversation is worse than
+one not reported at all.
+
+A process whose transcript already belongs to a row revives that row rather than making a new one,
+which is what a manual `claude --resume` looks like from outside. Adopted rows are pruned a week
+after they end; dispatched ones are a record of what was asked for and stay.
+
 ## A tty takes 1024 bytes, so nothing long is ever typed at the Mac
 
 `do script` writes into a Terminal tab's tty, and a tty accepts 1024 bytes of input and silently

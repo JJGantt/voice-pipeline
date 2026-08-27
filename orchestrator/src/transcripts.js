@@ -71,8 +71,8 @@ export function findTranscript(cwd, since, { attempts = 90, delayMs = 1000, take
  * The last-assistant-text fallback is for transcripts with no end_turn record at all: one compacted,
  * or written by an older version. Reporting the last thing said beats reporting nothing.
  */
-export function readTail(transcriptPath) {
-  const empty = { working: false, lastReply: null, replyAt: null, turns: 0, bytes: 0, lastActivity: 0 };
+export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
+  const empty = { working: false, lastReply: null, replyAt: null, title: null, bytes: 0, lastActivity: 0 };
   // Only ever a regular file. A path that is anything else must not be read: `desk_sessions` rows
   // written before the tty got its own column carry a device path here, and readFileSync on
   // /dev/ttys007 BLOCKS THE PROCESS FOR EVER waiting for terminal input — the daemon stops beating,
@@ -80,11 +80,22 @@ export function readTail(transcriptPath) {
   let st;
   try { st = fs.statSync(transcriptPath); } catch { return empty; }
   if (!st.isFile()) return empty;
+  // Only the tail is read. These files reach tens of megabytes — one project directory here holds
+  // 31MB — and every tick would otherwise read all of it to learn the last few lines. The window is
+  // far larger than a turn, and the leading fragment is dropped because the read starts mid-line.
   let lines;
-  try { lines = fs.readFileSync(transcriptPath, 'utf8').split('\n'); }
-  catch { return empty; }
+  const from = Math.max(0, st.size - maxBytes);
+  try {
+    const fd = fs.openSync(transcriptPath, 'r');
+    try {
+      const buf = Buffer.allocUnsafe(st.size - from);
+      fs.readSync(fd, buf, 0, buf.length, from);
+      lines = buf.toString('utf8').split('\n');
+    } finally { fs.closeSync(fd); }
+  } catch { return empty; }
+  if (from > 0) lines.shift();
 
-  let working = false, turns = 0;
+  let working = false, aiTitle = null, customTitle = null;
   let turnText = [];            // text blocks seen since the current turn began
   let finalReply = null, replyAt = null;
   let anyAssistantText = null;  // fallback when no turn ever completed
@@ -93,9 +104,12 @@ export function readTail(transcriptPath) {
     if (!line.trim()) continue;
     let d;
     try { d = JSON.parse(line); } catch { continue; }
+    // Claude Code's own name for the conversation — a `/rename` beats the generated one. Free to
+    // pick up here, and it is the only description a session nobody dispatched ever has.
+    if (d.type === 'custom-title' && typeof d.customTitle === 'string') customTitle = d.customTitle;
+    else if (typeof d.aiTitle === 'string') aiTitle = d.aiTitle;
     const t = d.type;
     if (t !== 'user' && t !== 'assistant') continue;
-    turns++;
     if (t === 'user') {
       // Tool results are recorded as user records too. They are the model's own work coming back,
       // not Jared saying something, so they must not look like the start of a new turn.
@@ -121,6 +135,6 @@ export function readTail(transcriptPath) {
   // mtime is the last time anything was written to this conversation — the recency signal eviction
   // sorts on. Taken from the file rather than from the parsed turns because a transcript's
   // timestamps are not guaranteed to be present on every record type.
-  return { working, lastReply: finalReply ?? anyAssistantText, replyAt,
-           turns, bytes: st.size, lastActivity: st.mtimeMs };
+  return { working, lastReply: finalReply ?? anyAssistantText, replyAt, title: customTitle || aiTitle,
+           bytes: st.size, lastActivity: st.mtimeMs };
 }

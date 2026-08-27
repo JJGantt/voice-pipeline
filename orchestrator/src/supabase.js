@@ -186,3 +186,11 @@ export async function abandonedClaims(worker, olderThanIso) {
   if (!res.ok) throw new Error(`abandonedClaims ${res.status}: ${await res.text()}`);
   return res.json();
 }
+
+/** Drop adopted sessions that ended long ago — see the prune in deskSessions.js. */
+export async function pruneAdoptedSessions(beforeIso) {
+  const res = await fetch(
+    `${base()}/desk_sessions?worker=eq.desk&origin=eq.adopted&status=eq.ended&ended=lt.${beforeIso}`,
+    { method: 'DELETE', headers: headers({ Prefer: 'return=minimal' }) });
+  if (!res.ok) throw new Error(`pruneAdoptedSessions ${res.status}: ${await res.text()}`);
+}

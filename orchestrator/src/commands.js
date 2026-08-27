@@ -108,7 +108,7 @@ async function run(cmd) {
   try {
     await upsertDeskSession({
       id: sessionId, worker: 'desk', repo: name || 'root',
-      status: 'resident', command_id: cmd.id, tty: tty || null,
+      status: 'resident', origin: 'dispatched', command_id: cmd.id, tty: tty || null,
       label: (cmd.payload || {}).label || null,
       prompt: prompt ? prompt.slice(0, 500) : null,
     });
