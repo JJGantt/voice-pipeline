@@ -255,11 +255,15 @@ POWER_DIRECTIVE = (
 )
 
 # ---- Dynamic route. Sonnet is the fast first responder, given ONLY the SAFE tools below in its
-# --allowedTools; the gated tools (data WRITES that need real knowledge — nutrition, workouts/sets,
-# the exercise catalog, nutrition targets, body measurements) are absent, so in `-p` mode Sonnet is DENIED
-# them and physically cannot corrupt that data. It still SEES them in the schema and, per the escalate
-# directive, hands the whole turn to a fresh Opus rather than claiming it can't. Reads, actuators, and the
-# low-stakes writes that need no domain knowledge (reminders, lists, notes) it handles itself.
+# --allowedTools; the gated tools are absent, so in `-p` mode Sonnet is DENIED them and physically cannot
+# corrupt that data. It still SEES them in the schema and, per the escalate directive, hands the whole
+# turn to a fresh Opus rather than claiming it can't.
+#
+# What decides the split is NOT read vs write. It is whether the model has to supply a value out of its
+# OWN knowledge: a food's macros, or the muscle map for a movement the catalog has never seen. Those are
+# gated. A tool whose every argument is already in front of the model — a number the user spoke, an id
+# from a read it just did — is on the fast path however destructive it is, because there is nothing there
+# for a bigger model to know better.
 ALL_TOOLS = ["mcp__data", "mcp__voice", "mcp__govee-lights", "mcp__petlibro-feeder"]  # full toolset (Opus)
 
 # Sonnet's allow list.  ⚠️  See docs/ROUTING.md before changing this.
@@ -284,9 +288,21 @@ SAFE_TOOLS = [
     "mcp__data__get_due", "mcp__data__set_due", "mcp__data__set_list_emoji",
     "mcp__data__get_lists", "mcp__data__add_to_list", "mcp__data__remove_from_list", "mcp__data__delete_list",
     "mcp__data__get_notes", "mcp__data__create_note", "mcp__data__delete_note",
-    # A weigh-in is a number the user spoke out loud — the tool refuses to accept anything else.
-    # Nothing to estimate, so nothing the capable model would do better.
-    "mcp__data__log_weight",
+    # Body figures the user says out loud. log_weight refuses anything it was not explicitly given;
+    # set_height is inches. Nothing to estimate, so nothing the capable model would do better.
+    "mcp__data__log_weight", "mcp__data__set_height",
+    # Sets. logSets() canonicalises against the catalog and THROWS on a movement it does not know
+    # unless a muscle map comes with it, so the one case that needs real knowledge cannot be reached
+    # from here by accident — the directive turns that into an escalation before it becomes an error.
+    # update_set/remove_set take a set id and the reps the user stated; neither can touch an exercise.
+    "mcp__data__log_set", "mcp__data__update_set", "mcp__data__remove_set",
+    # Rep watcher: an exercise the catalog already has, plus a weight. setWatcher() cannot create a
+    # catalog entry — it errors on an unknown name — and clear takes no arguments at all.
+    "mcp__data__set_rep_watcher", "mcp__data__clear_rep_watcher",
+    # Moving or deleting an entry by ITS ID. The macros were estimated when it was staged; committing
+    # it changes no number, and a delete invents nothing. Destructive, but destructiveness is not a
+    # question a bigger model answers better.
+    "mcp__data__commit_staged", "mcp__data__remove_staged", "mcp__data__delete_nutrition_entry",
     # Dispatching work to a machine: starts a SESSION, changes no data itself.
     "mcp__data__list_repos", "mcp__data__start_session", "mcp__data__get_sessions",
     "mcp__data__resume_session", "mcp__data__end_session",
@@ -327,16 +343,22 @@ def validate_safe_tools(mcp_js: str) -> None:
 # dispatch then re-runs the whole turn on Opus + max thinking. Appended to every standard-route turn.
 ESCALATE_SENTINEL = "__ESCALATE__"
 ESCALATE_DIRECTIVE = (
-    "\n\n[You are the fast first responder. You can see the full toolset, but the data-WRITE tools — "
-    "logging or editing nutrition, workouts/sets, the exercise catalog, nutrition targets, or "
-    "body measurements — are handled by a more capable model, not you, because they need careful "
-    "knowledge (nutrition values, muscle maps, maintenance math). You CAN read anything (get_*/list_*), "
-    "manage reminders, lists, and notes, log a weight the user stated as a number, and drive the "
-    "lights, feeder, TV, and voice settings yourself, "
-    "and you should. If fulfilling the "
-    "request needs any of those gated WRITE tools, do NOT attempt it and do NOT say you can't — reply "
-    f"with EXACTLY '{ESCALATE_SENTINEL}' and nothing else, and it is handed to the capable model. "
-    "Handle everything else yourself.]"
+    "\n\n[You are the fast first responder. You can see the full toolset, but the tools that need a "
+    "value supplied out of the model's OWN knowledge are handled by a more capable model, not you: "
+    "estimating a food's macros (logging, staging or editing nutrition, or subtracting leftovers), "
+    "setting nutrition targets, and giving categories/muscles to an exercise the catalog does not have "
+    "yet. Everything whose arguments are already in front of you is YOURS, and you should just do it: "
+    "read anything (get_*/list_*); manage lists, notes and dated items; log a weight or height he "
+    "stated as a number; commit, remove or delete an entry by its id; log, edit or remove a SET; set or "
+    "clear the rep watcher; and drive the lights, feeder, TV and voice settings. "
+    "For sets, call get_workout_catalog first and reuse the exact name. If the movement is NOT already "
+    "in the catalog it needs a muscle map you would have to invent — escalate instead. "
+    "Decide this from the CURRENT instruction ALONE. The recent conversation above is background: that "
+    "it was about food, weight or workouts does not make THIS turn one, and a request to add something "
+    "to a list is a list request no matter what was being discussed a minute ago. "
+    "If the current instruction genuinely needs a gated tool, do NOT attempt it and do NOT say you "
+    f"can't — reply with EXACTLY '{ESCALATE_SENTINEL}' and nothing else, and it is handed to the "
+    "capable model. Handle everything else yourself.]"
 )
 
 # Photo turns (attachments on the request): the photos are downloaded locally, their paths ride the

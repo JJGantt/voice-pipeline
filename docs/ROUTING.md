@@ -36,15 +36,41 @@ Converting this list to a deny list disables escalation silently — every gated
 
 ## What is gated
 
-Data **writes** needing domain knowledge — nutrition values, muscle maps, maintenance math:
-`log_nutrition`, `stage_meal`, `commit_staged`, `subtract_leftovers`, `set_height`,
-`log_set`, `update_set`, `remove_set`, `upsert_catalog_exercise`, the rep-watcher pair, and the
-nutrition edit/delete siblings.
+Not reads vs writes — **whether the model has to supply a value out of its own knowledge.**
 
-Everything else is on the fast path: reads, actuators (lights, feeder, TV, voice settings), the
-low-stakes writes needing no domain knowledge (lists, notes, dated items), `log_weight` (the tool
-takes only a number the user spoke — estimating one is forbidden, so there is nothing to know), and
-dispatching work to a machine — `start_session` starts a session, it does not itself change data.
+| gated | what it would have to invent |
+|---|---|
+| `log_nutrition` `stage_meal` `edit_staged` `subtract_leftovers` | a food's macros, and the cooked weight of a dish |
+| `set_nutrition_targets` | maintenance math, when the ask is "targets for a cut" rather than a stated number |
+| `upsert_catalog_exercise` | a movement's categories and fractional muscle map |
+| `follow_up` `publish_report` | — (gated by convention; neither runs on a voice turn often enough to matter) |
+
+Everything else is on the fast path, including writes that are destructive: reads, actuators, lists,
+notes, dated items, sessions, `log_weight`/`set_height`, `log_set`/`update_set`/`remove_set`, the rep
+watcher, and `commit_staged`/`remove_staged`/`delete_nutrition_entry`. Every argument those take is
+either a number the user spoke or an id from a read — there is nothing in them a bigger model knows
+better. **Destructiveness is not what the gate is for**; a wrong delete is a tool-description problem,
+and Sonnet already deletes notes and whole lists.
+
+### Sets are gated per CALL, not per tool
+
+`log_set` is on the fast path because nearly every set is a movement the catalog already has, where the
+call is pass-through. Only a genuinely new movement needs a muscle map. The escalate directive tells
+Sonnet to read the catalog first and escalate if the name is not in it.
+
+`logSets()` backs that up: it throws on an unknown exercise unless a `muscles` map comes with the call,
+so a Sonnet that skips the catalog read gets an error, not a corrupt row. What the server does NOT
+enforce is "don't invent a map" — that guardrail is prompt-level, and it is the one thing here that is
+weaker than a mechanical gate. `setWatcher()` is stricter still: it cannot create a catalog entry at
+all, only error.
+
+### Judge the instruction, not the conversation
+
+`recent_context()` prepends the recent hub conversation to the prompt, so the escalation decision is
+made over a blob that often contains the last few nutrition turns. Sonnet used to read that and
+escalate a to-do add because the previous minute had been about food. The directive now says to decide
+from the current instruction alone; if escalations for lights and list adds reappear, that clause is
+what regressed.
 
 ## Keeping the list honest
 
