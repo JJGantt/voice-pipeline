@@ -122,8 +122,13 @@ subject and yesterday's last reply for hours after it had moved on. Each tick th
 fresher transcript in the same directory (born after the process started, not bound to another live
 session) and rebinds, resetting `mirror_offset` because the mirror is keyed by session id. An adopted
 session's label is Claude Code's own title and is refreshed the same way; a dispatched one keeps the
-label the router wrote, which names the job rather than the conversation. **pi-desk does not do this
-yet** — a `/clear` on a Pi session still leaves its row on the old transcript.
+label the router wrote, which names the job rather than the conversation.
+
+**This is Mac-only on purpose.** A transcript only rolls when someone types `/clear`; COMPACTION does
+not roll it — it writes `compactMetadata` and `isCompactSummary` records into the same file (verified
+across the transcripts on disk). Pi sessions are headless in tmux with nobody typing in them, so
+there is nothing there to follow. Adding the same rebinding to `pi-desk` would be code for a case
+that cannot happen unless Jared attaches to the tmux session himself and clears it.
 
 ## Nothing in here is kept for ever
 
