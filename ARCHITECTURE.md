@@ -92,6 +92,10 @@ commands, and the ESP's complete 888-character capture — the actual instructio
 session to be started — was discarded as a duplicate of them. Earliest-wins is the wrong rule
 whenever one mic endpoints early, which is most of the time on dictation.
 
+Captures are kept for **7 days** (`sweepRetention`, pi-desk): the only time a raw request is read is
+shortly after something went wrong with it. The conversation is not affected — `voice_messages` has
+no cascade from `voice_requests`, so the readable thread outlives the capture row.
+
 **The interesting version is not built.** If the Mac hears the first half and the ESP the second — you
 walk between rooms mid-sentence — longest-wins keeps one half and loses the other. Stitching the
 halves together by their recording windows would make mic handoff work, and would be a genuinely nice

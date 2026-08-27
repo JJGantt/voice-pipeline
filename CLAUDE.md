@@ -123,8 +123,7 @@ fresher transcript in the same directory (born after the process started, not bo
 session) and rebinds, resetting `mirror_offset` because the mirror is keyed by session id. An adopted
 session's label is Claude Code's own title and is refreshed the same way; a dispatched one keeps the
 label the router wrote, which names the job rather than the conversation. **pi-desk does not do this
-yet** — a `/clear` on a Pi session still leaves its row on the old transcript. Adopted rows are pruned a week
-after they end; dispatched ones are a record of what was asked for and stay.
+yet** — a `/clear` on a Pi session still leaves its row on the old transcript.
 
 ## Nothing in here is kept for ever
 
@@ -199,15 +198,18 @@ a turn, identified by the transcript record whose `stop_reason` is `end_turn` �
 assistant text", which mid-turn is a half-written thought. `working` is what separates them: a reply
 is final only when `working` is false.
 
-A closed session means the same thing on both machines: **`evicted` is parked and resumable**, and
-`ended` means no transcript was ever bound, so there is nothing to bring back. The Mac used to mark
-every closed tab `ended` because it recorded no transcript id at all — that stopped being true the
-moment it started finding them, and the status was left saying otherwise for a while.
+It reads only the last 512KB. These files reach tens of megabytes — one project directory here holds
+31MB — and every tick would otherwise read all of it to learn the last few lines.
 
-The Mac's `deskSessions.js` tick is still much smaller than the Pi's: no residency cap and no
-eviction of its own. Those exist because a headless 4GB machine must decide what to close; on the Mac
-Jared can see the tabs. It answers only "is it still up" (a `claude` process on the tab's tty — the
-tab outlives the process, so the tab is the wrong question) and "what did it last say".
+A closed session means the same thing on both machines: **`evicted` is parked and resumable** (a new
+tab on the Mac, a new tmux session on the Pi), and `ended` means no transcript was ever bound, so
+there is nothing to bring back.
+
+The Mac's `deskSessions.js` tick is still smaller than the Pi's: no residency cap and no eviction of
+its own. Those exist because a headless 4GB machine must decide what to close; on the Mac Jared can
+see the tabs. What it does do each tick: adopt what it finds running, answer "is it still up" (a
+`claude` process on the tab's tty — the tab outlives the process, so the tab is the wrong question),
+publish the last completed turn, follow a `/clear` to the new transcript, and mirror the tail.
 
 ## Docs
 
