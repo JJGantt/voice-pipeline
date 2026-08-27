@@ -187,14 +187,6 @@ export async function abandonedClaims(worker, olderThanIso) {
   return res.json();
 }
 
-/** Drop adopted sessions that ended long ago — see the prune in deskSessions.js. */
-export async function pruneAdoptedSessions(beforeIso) {
-  const res = await fetch(
-    `${base()}/desk_sessions?worker=eq.desk&origin=eq.adopted&status=eq.ended&ended=lt.${beforeIso}`,
-    { method: 'DELETE', headers: headers({ Prefer: 'return=minimal' }) });
-  if (!res.ok) throw new Error(`pruneAdoptedSessions ${res.status}: ${await res.text()}`);
-}
-
 /** Enqueue a command for the other machine — how a transfer asks the destination to resume. */
 export async function insertCommand(kind, payload) {
   const id = crypto.randomUUID();

@@ -636,6 +636,45 @@ async function drain() {
   }
 }
 
+// ---- retention -------------------------------------------------------------
+// Sessions and commands accumulate for ever otherwise. Two days in, 16 session rows and 57 commands;
+// the parked list is what shows in the pane, and it only ever grows.
+//
+// This runs HERE, on the always-on machine, and nowhere else — one retention rule in one file. The
+// Mac sleeps, so a sweep there would be arbitrary.
+//
+// Deleting a row does NOT destroy a conversation: the transcript stays on disk on whichever machine
+// ran it, and Claude Code can still resume it by id. What is dropped is the row that OFFERS it, and
+// the mirrored copy in storage — which is why the mirror is cleared in the same step rather than
+// left orphaned under a session id nothing can name any more.
+const KEEP_CLOSED_DAYS = Number(process.env.KEEP_CLOSED_DAYS || 7);    // ended / transferred: not resumable anyway
+const KEEP_PARKED_DAYS = Number(process.env.KEEP_PARKED_DAYS || 14);   // evicted: resumable, and worth keeping a while
+const KEEP_COMMAND_DAYS = Number(process.env.KEEP_COMMAND_DAYS || 30); // the queue log
+const ago = (days) => new Date(Date.now() - days * 86400000).toISOString();
+
+async function forget(rows, why) {
+  for (const r of rows || []) {
+    if (r.claude_session_id) {
+      try { await mirrorReset(r.claude_session_id); } catch (e) { console.error('[pi-desk] mirror reset:', e.message); }
+    }
+    await sb(`desk_sessions?id=eq.${encodeURIComponent(r.id)}`, { method: 'DELETE', headers: { Prefer: 'return=minimal' } })
+      .catch((e) => console.error('[pi-desk] forget:', e.message));
+    console.log(`[pi-desk] forgot ${r.id} (${why})`);
+  }
+}
+
+async function sweepRetention() {
+  try {
+    await forget(await sb(`desk_sessions?status=in.(ended,transferred)&ended=lt.${ago(KEEP_CLOSED_DAYS)}&select=id,claude_session_id`),
+                 `closed over ${KEEP_CLOSED_DAYS} days ago`);
+    await forget(await sb(`desk_sessions?status=eq.evicted&last_seen=lt.${ago(KEEP_PARKED_DAYS)}&select=id,claude_session_id`),
+                 `parked over ${KEEP_PARKED_DAYS} days ago`);
+    // The command log. Dead letters are NOT swept: an unretried one holds words Jared may still want,
+    // and a retried or dismissed one is a decision he made, which is small and worth keeping.
+    await sb(`desk_commands?created=lt.${ago(KEEP_COMMAND_DAYS)}`, { method: 'DELETE', headers: { Prefer: 'return=minimal' } });
+  } catch (e) { console.error('[pi-desk] retention:', e.message); }
+}
+
 /**
  * Commands this machine claimed and never finished.
  *
@@ -679,3 +718,5 @@ reconcileSessions();
 setInterval(reconcileSessions, PRESENCE_MS);
 sweepAbandonedClaims();
 setInterval(sweepAbandonedClaims, 300000);
+sweepRetention();
+setInterval(sweepRetention, 3600000);   // hourly is far more often than a daily boundary needs

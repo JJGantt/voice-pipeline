@@ -126,6 +126,20 @@ label the router wrote, which names the job rather than the conversation. **pi-d
 yet** — a `/clear` on a Pi session still leaves its row on the old transcript. Adopted rows are pruned a week
 after they end; dispatched ones are a record of what was asked for and stay.
 
+## Nothing in here is kept for ever
+
+`sweepRetention` in `pi-desk` is the ONE retention rule, on the always-on machine: closed sessions
+(`ended`/`transferred`) go after 7 days, parked ones (`evicted`) after 14, the `desk_commands` log
+after 30. All tunable by env.
+
+Deleting a row does not destroy a conversation — the transcript stays on disk on the machine that ran
+it, and `claude --resume` still works. What goes is the row that OFFERS it in the pane, plus the
+mirrored copy in storage, cleared in the same step so the bucket cannot fill with transcripts of
+sessions nothing can name any more.
+
+Dead letters are deliberately exempt: an unretried one holds words Jared may still want, and a
+retried or dismissed one is a decision worth keeping.
+
 ## Moving a session between machines
 
 A session is an append-only transcript plus a working directory, so handing one over is copying the

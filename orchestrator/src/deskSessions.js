@@ -17,7 +17,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { config } from './config.js';
-import { deskSessionsFor, patchDeskSession, upsertDeskSession, pruneAdoptedSessions } from './supabase.js';
+import { deskSessionsFor, patchDeskSession, upsertDeskSession } from './supabase.js';
 import { sweepStashedPrompts } from './applescript.js';
 import { discoverSessions, fresherTranscript } from './discover.js';
 import { mirrorUp } from './mirror.js';
@@ -85,11 +85,8 @@ async function tick() {
   // and they are dictated speech — not something to leave lying in a home directory for ever.
   sweepStashedPrompts();
 
-  // Every terminal Jared opens becomes a row, so unlike dispatched work — which is a record of what
-  // was asked for and stays — adopted rows are pruned once they are long dead. A week keeps the
-  // recent past readable without the table growing for ever.
-  try { await pruneAdoptedSessions(new Date(Date.now() - 7 * 86400000).toISOString()); }
-  catch (e) { console.error('[desk-sessions] prune:', e.message); }
+  // Retention lives on the Pi (`sweepRetention` in pi-desk), which is always on — one rule in one
+  // file, covering every kind of row rather than only the adopted ones this machine happens to make.
 
   let all;
   try { all = await deskSessionsFor('desk'); }
