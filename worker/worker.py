@@ -305,7 +305,7 @@ SAFE_TOOLS = [
     "mcp__data__commit_staged", "mcp__data__remove_staged", "mcp__data__delete_nutrition_entry",
     # Dispatching work to a machine: starts a SESSION, changes no data itself.
     "mcp__data__list_repos", "mcp__data__start_session", "mcp__data__get_sessions",
-    "mcp__data__resume_session", "mcp__data__end_session",
+    "mcp__data__resume_session", "mcp__data__end_session", "mcp__data__transfer_session",
 ]
 
 def validate_safe_tools(mcp_js: str) -> None:
