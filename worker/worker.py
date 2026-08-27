@@ -217,6 +217,13 @@ STANDBY_POLL_S = 120.0       # deferring → idle-poll every 120s (realtime carr
 OWNER_GRACE_S = 150.0
 DEDUP_WINDOW_S = 10.0         # fallback only: 2 mics' enqueue times for rows that predate capture-window stamping
 DEDUP_TOL_S = 0.75            # pad each recording window by this (Fly↔Mac clock skew + ESP→Fly stream latency)
+# A mic still hearing Jared means the utterance is NOT FINISHED, whoever else has already enqueued a
+# row for it. Claiming during that window is how a mid-sentence fragment gets acted on while the mic
+# that has the whole thing is still recording.
+MIC_QUIET_S = float(os.environ.get("MIC_QUIET_S", "2.5"))
+# Never hold for ever. A mic wedged stamping, or a genuinely long pause, must not park a command.
+MAX_HOLD_S = float(os.environ.get("MAX_HOLD_S", "25"))
+HOLD_RETRY_S = 1.0            # how soon to look again while holding — not the idle backstop
 SESSION_IDLE_RESET_S = 5 * 60       # default reset budget (5min idle); hub setting session_reset_s overrides
 HTTP_TIMEOUT_S = 30.0
 CLAUDE_TIMEOUT_S = float(os.environ.get("CLAUDE_TIMEOUT_S", "300"))
@@ -648,6 +655,9 @@ PRESENCE_CACHE_S = 30.0
 # attempt in claim_one; read by the heartbeat thread and the main loop to pick the slow standby cadence.
 # A plain bool is safe here: one writer (the main loop), and the GIL makes the read/write atomic.
 _standby = False
+# Set while a claim is deliberately deferred because a mic is still hearing him. The main loop looks
+# again in a second rather than waiting out the idle backstop, so the hold costs ~1s, not ~15.
+_holding = False
 
 
 def presence_rows(db: Supabase) -> list:
@@ -1476,6 +1486,49 @@ def reclaim_stale(db: Supabase) -> dict | None:
     return None
 
 
+def _mics_hearing(db: Supabase):
+    """The most recent moment ANY mic reported hearing Jared, or None.
+
+    `voice_presence.heard_jared_at` is already written by every capture source on each confirmed check
+    — it drives the HUD and the ESP light. Nothing used it to decide WHEN TO ACT, which is what let a
+    fragment run while another mic was still recording the same sentence.
+    """
+    stamps = [_parse_ts(r.get("heard_jared_at") or "")
+              for r in db.get("voice_presence", "select=heard_jared_at")]
+    stamps = [t for t in stamps if t]
+    return max(stamps) if stamps else None
+
+
+def _same_utterance(rows: list, first: dict) -> list:
+    """The pending rows that are the SAME utterance as `first` — one spoken thing, several mics.
+
+    Grown transitively over the union of recording windows, because that is the shape the failure had:
+    the Mac cut one dictation into two fragments while the ESP held the whole 65 seconds, so the
+    fragments only meet each other THROUGH the long window that contains them both.
+
+    A row with no window (typed input) is nobody's duplicate and stands alone.
+    """
+    tol = timedelta(seconds=DEDUP_TOL_S)
+    win = (_parse_ts(first.get("capture_start") or ""), _parse_ts(first.get("capture_end") or ""))
+    if not (win[0] and win[1]):
+        return [first]
+    group, lo, hi = [first], win[0], win[1]
+    changed = True
+    while changed:
+        changed = False
+        for r in rows:
+            if r in group:
+                continue
+            s2, e2 = _parse_ts(r.get("capture_start") or ""), _parse_ts(r.get("capture_end") or "")
+            if not (s2 and e2):
+                continue
+            if s2 <= hi + tol and lo <= e2 + tol:
+                group.append(r)
+                lo, hi = min(lo, s2), max(hi, e2)
+                changed = True
+    return group
+
+
 def claim_one(db: Supabase) -> dict | None:
     """Find one pending request and atomically claim it. Returns the row or None."""
     global _standby
@@ -1485,13 +1538,47 @@ def claim_one(db: Supabase) -> dict | None:
         return None
     _standby = False      # I'm eligible to claim → run the active cadence
 
+    global _holding
     pending = db.get(
         "voice_requests",
-        "status=eq.pending&order=created_at.asc&limit=1&select=id,transcript,source",
+        "status=eq.pending&order=created_at.asc&limit=8"
+        "&select=id,transcript,source,created_at,capture_start,capture_end",
     )
     if not pending:
+        _holding = False
         return reclaim_stale(db)
-    req = pending[0]
+
+    # HOLD WHILE HE IS STILL TALKING. One utterance reaches the queue as several rows — mics endpoint
+    # at different pauses — and acting on the first one to arrive is how half a sentence becomes a
+    # command. Measured case: the Mac cut a 65-second dictation into two fragments and enqueued them
+    # while the ESP was still recording; the fragments ran, and the ESP's complete 888-character
+    # capture (the actual instruction) was then discarded as a duplicate of them.
+    #
+    # Waiting for every mic to go quiet costs nothing on a short command: by the time "turn the light
+    # blue" is enqueued, no mic has heard anything for seconds, so it claims immediately.
+    heard = _mics_hearing(db)
+    oldest_at = _parse_ts(pending[0].get("created_at") or "")
+    held_s = (datetime.now(timezone.utc) - oldest_at).total_seconds() if oldest_at else 0.0
+    if heard and (datetime.now(timezone.utc) - heard).total_seconds() < MIC_QUIET_S and held_s < MAX_HOLD_S:
+        if not _holding:
+            log(f"holding {len(pending)} pending request(s) — a mic is still hearing him")
+        _holding = True
+        return None
+    _holding = False
+
+    # THE FULLEST CAPTURE WINS, not the first to arrive. Two mics produce two accounts of one
+    # utterance; the longer one heard more of it. Deliberately never a merge of both: stitching two
+    # transcripts risks saying a sentence twice inside a command, which is worse than losing a clause.
+    #
+    # (A real merge is the interesting version — the Mac hears the first half, the ESP the second, and
+    # walking between rooms mid-sentence still yields one command. That needs the halves aligned by
+    # their recording windows rather than concatenated, and is deliberately not attempted here.)
+    group = _same_utterance(pending, pending[0])
+    req = max(group, key=lambda r: len(r.get("transcript") or ""))
+    if len(group) > 1:
+        log(f"one utterance, {len(group)} captures — taking {req.get('source')}'s "
+            f"({len(req.get('transcript') or '')} chars) over "
+            f"{[(r.get('source'), len(r.get('transcript') or '')) for r in group if r is not req]}")
     rid = req["id"]
 
     claimed = db.patch(
@@ -1509,6 +1596,14 @@ def claim_one(db: Supabase) -> dict | None:
     # Empty representation array => someone else won the race.
     if not claimed:
         return None
+    # The other captures of the same utterance are retired HERE, before this one runs — not left
+    # pending for the next iteration to pick up as a fresh command. Marked, never deleted: a bad
+    # grouping should be visible in the queue rather than a command that silently vanished.
+    for other in group:
+        if other is req:
+            continue
+        db.patch("voice_requests", f"id=eq.{other['id']}&status=eq.pending",
+                 {"status": "done", "result": SUPERSEDED_RESULT, "updated_at": now_iso()})
     return claimed[0]
 
 
@@ -1517,7 +1612,8 @@ def claim_one(db: Supabase) -> dict | None:
 # as a false positive, and the OTHER mic's complete capture then arrives overlapping it — dedupe on
 # arrival order alone drops the real command and the whole utterance disappears with nothing run.
 # Skipping these is safe precisely because they did no work, so there is nothing to run twice.
-NO_WORK_RESULTS = ("(duplicate — dropped)", "(ignored: wake-word false positive)")
+SUPERSEDED_RESULT = "(superseded — a fuller capture of the same words ran)"
+NO_WORK_RESULTS = ("(duplicate — dropped)", "(ignored: wake-word false positive)", SUPERSEDED_RESULT)
 
 
 def _duplicate_of_recent(db: Supabase, req: dict) -> bool:
@@ -2094,7 +2190,9 @@ def main() -> int:
                     # health — it isn't the one claiming, realtime wakes it on real commands, and it ramps
                     # back the instant the primary goes silent (should_defer flips false). Only the ACTIVE
                     # worker tightens to the degraded 2s poll when realtime drops; otherwise healthy backstop.
-                    if _standby:
+                    if _holding:
+                        wait_s = HOLD_RETRY_S   # he is still talking; look again shortly
+                    elif _standby:
                         wait_s = STANDBY_POLL_S
                     elif not waker.healthy:
                         wait_s = IDLE_POLL_DEGRADED_S

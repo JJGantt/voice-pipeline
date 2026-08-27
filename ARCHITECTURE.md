@@ -69,6 +69,35 @@ photo request that reaches Fly is refused rather than run blind.
 - A deferring worker drops to a **slower heartbeat and poll** (still inside `HEARTBEAT_FRESH_S`, so it
   never looks dead to the workers below it) and ramps back up when the primary goes quiet.
 
+## One utterance can be several rows, and only the fullest one runs
+
+Two always-on mics hear the same speech and endpoint at different pauses, so a single spoken thing
+reaches `voice_requests` as two, three, sometimes four rows. Two rules keep that from becoming two,
+three or four commands:
+
+**Nothing is claimed while a mic is still hearing him.** Every capture source already stamps
+`voice_presence.heard_jared_at` on each confirmed check; the worker now waits until every mic has been
+quiet for `MIC_QUIET_S` (2.5s) before claiming anything, with `MAX_HOLD_S` as the backstop against a
+wedged mic parking a command for ever. Short commands never notice — by the time "turn the light blue"
+is enqueued, nothing has heard anything for seconds.
+
+**Among the captures of one utterance, the longest transcript wins**, not the first to arrive. Rows
+are grouped transitively by overlapping recording windows (`capture_start`/`capture_end`, padded for
+clock skew), the fullest is claimed, and the rest are marked `(superseded …)` before it runs — marked,
+never deleted, so a bad grouping is visible instead of a command that vanished.
+
+This is not a refinement. Without it, on 2026-08-27, the Mac cut a 65-second dictation into two
+mid-sentence fragments and enqueued them while the ESP was still recording; the fragments ran as
+commands, and the ESP's complete 888-character capture — the actual instruction, which asked for a
+session to be started — was discarded as a duplicate of them. Earliest-wins is the wrong rule
+whenever one mic endpoints early, which is most of the time on dictation.
+
+**The interesting version is not built.** If the Mac hears the first half and the ESP the second — you
+walk between rooms mid-sentence — longest-wins keeps one half and loses the other. Stitching the
+halves together by their recording windows would make mic handoff work, and would be a genuinely nice
+property. It is deliberately not attempted yet: a naive concatenation would say a clause twice inside
+a command, which is worse than dropping one.
+
 ## Feedback is universal — never scoped to which input captured the command
 
 Capture is arbitrary. Which device hears a wake word first (Mac mic vs ESP mic) is **not
