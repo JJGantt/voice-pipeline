@@ -303,9 +303,13 @@ SAFE_TOOLS = [
     # it changes no number, and a delete invents nothing. Destructive, but destructiveness is not a
     # question a bigger model answers better.
     "mcp__data__commit_staged", "mcp__data__remove_staged", "mcp__data__delete_nutrition_entry",
-    # Dispatching work to a machine: starts a SESSION, changes no data itself.
+    # Dispatching work to a machine and managing what is running there. None of it changes data, and
+    # none of it needs domain knowledge — routing a prompt to a session, closing one, moving one. The
+    # whole group belongs on the fast path or none of it does, and follow_up sat outside it only by
+    # oversight, which cost every dictated follow-up a full Opus re-run before it could be typed.
     "mcp__data__list_repos", "mcp__data__start_session", "mcp__data__get_sessions",
     "mcp__data__resume_session", "mcp__data__end_session", "mcp__data__transfer_session",
+    "mcp__data__follow_up",
 ]
 
 def validate_safe_tools(mcp_js: str) -> None:
