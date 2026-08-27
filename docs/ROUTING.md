@@ -43,11 +43,13 @@ Not reads vs writes — **whether the model has to supply a value out of its own
 | `log_nutrition` `stage_meal` `edit_staged` `subtract_leftovers` | a food's macros, and the cooked weight of a dish |
 | `set_nutrition_targets` | maintenance math, when the ask is "targets for a cut" rather than a stated number |
 | `upsert_catalog_exercise` | a movement's categories and fractional muscle map |
-| `follow_up` `publish_report` | — (gated by convention; neither runs on a voice turn often enough to matter) |
+| `publish_report` | — (gated by convention; it does not run on a voice turn often enough to matter) |
 
 Everything else is on the fast path, including writes that are destructive: reads, actuators, lists,
-notes, dated items, sessions, `log_weight`/`set_height`, `log_set`/`update_set`/`remove_set`, the rep
-watcher, and `commit_staged`/`remove_staged`/`delete_nutrition_entry`. Every argument those take is
+notes, dated items, the whole session group (`start_session`, `follow_up`, `get_sessions`,
+`resume_session`, `end_session`, `transfer_session`), `log_weight`/`set_height`,
+`log_set`/`update_set`/`remove_set`, the rep watcher, and
+`commit_staged`/`remove_staged`/`delete_nutrition_entry`. Every argument those take is
 either a number the user spoke or an id from a read — there is nothing in them a bigger model knows
 better. **Destructiveness is not what the gate is for**; a wrong delete is a tool-description problem,
 and Sonnet already deletes notes and whole lists.
@@ -71,6 +73,35 @@ made over a blob that often contains the last few nutrition turns. Sonnet used t
 escalate a to-do add because the previous minute had been about food. The directive now says to decide
 from the current instruction alone; if escalations for lights and list adds reappear, that clause is
 what regressed.
+
+## What the split is for — measured, because the obvious answer is wrong
+
+It is **not that Sonnet is meaningfully faster**. Measured on the Mac, subscription path, `claude -p
+--output-format json`, three runs each, API time only (CLI startup excluded):
+
+| | short voice reply | ~490-token answer |
+|---|---|---|
+| Sonnet | 6.7 / 7.9 / 10.4s | 7.5s |
+| Opus | 6.4 / 8.0 / 8.6s | 10.5s |
+
+On a short reply — which is every voice turn — the two are indistinguishable: the run-to-run spread is
+wider than the gap, and Opus won one of the three. Sonnet only pulls ahead once an answer is long
+(~63 tok/s vs ~47), and voice answers never are.
+
+So the justifications, in the order they actually hold:
+
+1. **What the fast path can REACH.** The allow list is a correctness gate — a tool that would have to
+   invent a number is simply not in the schema Sonnet is handed, so it cannot quietly write one. This
+   is the real reason, and it is about tools, not models.
+2. **Cost on Fly.** `ApiRunner` bills per token. The Mac and Pi run on the subscription and pay
+   nothing marginal, so this saves money on exactly one of the three workers.
+3. **Speed.** Barely, and only on long answers.
+
+The corollary matters more than the ranking: an escalated turn **re-runs the whole thing on Opus**, so
+a gated command pays a full Sonnet turn *and* a full Opus turn. That doubling dwarfs any per-token
+difference between the models — which is why anything that does not need the gate belongs on the fast
+path, and why the fix for speed, if one is ever wanted, is to continue an escalated turn rather than
+restart it.
 
 ## Keeping the list honest
 
