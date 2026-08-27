@@ -73,6 +73,13 @@ export function findTranscript(cwd, since, { attempts = 90, delayMs = 1000, take
  */
 export function readTail(transcriptPath) {
   const empty = { working: false, lastReply: null, replyAt: null, turns: 0, bytes: 0, lastActivity: 0 };
+  // Only ever a regular file. A path that is anything else must not be read: `desk_sessions` rows
+  // written before the tty got its own column carry a device path here, and readFileSync on
+  // /dev/ttys007 BLOCKS THE PROCESS FOR EVER waiting for terminal input — the daemon stops beating,
+  // stops draining commands, and steals the keystrokes of whoever is typing in that tab.
+  let st;
+  try { st = fs.statSync(transcriptPath); } catch { return empty; }
+  if (!st.isFile()) return empty;
   let lines;
   try { lines = fs.readFileSync(transcriptPath, 'utf8').split('\n'); }
   catch { return empty; }
@@ -112,9 +119,8 @@ export function readTail(transcriptPath) {
   }
 
   // mtime is the last time anything was written to this conversation — the recency signal eviction
-  // sorts on. Read from the file rather than from the parsed turns because a transcript's timestamps
-  // are not guaranteed to be present on every record type.
-  let bytes = 0, lastActivity = 0;
-  try { const st = fs.statSync(transcriptPath); bytes = st.size; lastActivity = st.mtimeMs; } catch {}
-  return { working, lastReply: finalReply ?? anyAssistantText, replyAt, turns, bytes, lastActivity };
+  // sorts on. Taken from the file rather than from the parsed turns because a transcript's
+  // timestamps are not guaranteed to be present on every record type.
+  return { working, lastReply: finalReply ?? anyAssistantText, replyAt,
+           turns, bytes: st.size, lastActivity: st.mtimeMs };
 }
