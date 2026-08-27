@@ -121,9 +121,17 @@ so a row bound at adoption drifts onto a conversation that has ended — one tab
 subject and yesterday's last reply for hours after it had moved on. Each tick therefore looks for a
 fresher transcript in the same directory (born after the process started, not bound to another live
 session) and rebinds, resetting `mirror_offset` because the mirror is keyed by session id. An adopted
-a session's NAME is refreshed the same way, in order of authority: a name Jared typed himself
-(ctrl-R in the session picker, which writes a `custom-title` record into the transcript) beats the
-label the router wrote at dispatch, which beats Claude Code's own generated title.
+a session's NAME is refreshed the same way, in order of authority: a name Jared chose himself beats
+the label the router wrote at dispatch, which beats Claude Code's own generated title.
+
+He can choose it two ways, and they are the same act: `/rename <name>` typed into the session, or
+ctrl-R in the session picker. Both make Claude Code write a `custom-title` record into the transcript,
+which is what gets read back here.
+
+**Renaming from the hub or by voice sends `/rename` into the live session** rather than writing that
+record ourselves. Tested both: appending the record directly works for everything that READS the
+transcript, but the running session never re-reads its own file, so its terminal tab keeps the old
+title. `/rename` renames the session itself — tab included — and it writes the record for us.
 
 That order is the point. A generated title describes the content, so **two different sessions about
 the same subject get the same name** — 'Pull day workout log' is the title of nineteen transcripts
