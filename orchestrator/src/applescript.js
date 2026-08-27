@@ -11,6 +11,9 @@
 // Read-only helpers (enumerateTtys, ttyForSession) are SAFE to call anytime.
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { config } from './config.js';
 import { findSessionFile } from './sessions.js';
 
@@ -144,7 +147,17 @@ export async function closeTabForTty(tty) {
  * "front window" is whatever Jared last clicked — which is exactly the mistake to avoid, since a
  * dictated follow-up landing in the wrong terminal is worse than one that fails.
  */
+// The same 1024-byte tty ceiling applies here, and this end has no file trick available: the text is
+// going into Claude Code's composer, not a shell, so there is nothing on the other side to read a
+// path. Splitting is not an option either — `do script` always appends a return, so every chunk would
+// submit as its own message. So a follow-up too long to deliver whole is refused, which puts it in
+// the dead-letter list intact rather than typing half of it into a live session.
+const TTY_INPUT_MAX = 900;   // 1024 with room for the escaping the AppleScript adds
+
 export async function sendToTty(tty, text) {
+  if (String(text).length > TTY_INPUT_MAX) {
+    throw new Error(`follow-up is ${String(text).length} chars — a Terminal tab accepts about ${TTY_INPUT_MAX} at once`);
+  }
   const escaped = String(text).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
   return osascript(`tell application "Terminal"
       set found to false
@@ -202,9 +215,13 @@ export async function reopenDeskTab(cwd, id) {
 // Start a FRESH session in `cwd` with Remote Control on, named after the repo (plus a unique
 // suffix) so it's identifiable in the Claude app's session list. This is what the hub's repo picker fires: the Mac opens a
 // terminal, the session registers itself for remote control, and the phone picks it up from there.
-// `prompt` (optional) becomes the session's FIRST message: `claude` takes a positional prompt, so the
-// dictated text is handed over at launch rather than typed in afterwards. shQuote is what makes that
-// safe — the prompt is arbitrary dictated speech and never gets to be shell syntax.
+//
+// THE PROMPT GOES THROUGH A FILE, NOT THE TYPED LINE. `do script` writes the command into the tab's
+// tty, and a tty accepts 1024 bytes of input and silently discards the rest — so a dictated prompt
+// longer than that was cut off mid-word, leaving the shell holding an unterminated quote and the
+// session never starting. Measured exactly: a 2500-character prompt reached the terminal as 1024
+// characters. The command line now stays short whatever the prompt is, and the shell reads the text
+// itself, where no such limit applies. (This is the same reason pi-desk hands tmux a file path.)
 export async function openFreshTab(cwd, name, prompt, sessionId = null) {
   // The Remote Control name is an IDENTITY in the Claude app, so it has to be unique per SESSION,
   // not per repo. Named after the repo alone, two sessions on status-hub both register as
@@ -212,11 +229,25 @@ export async function openFreshTab(cwd, name, prompt, sessionId = null) {
   // `--remote-control` already auto-generates a unique name, so only the named path needs a suffix.
   const rcName = name ? `${name}-${Date.now().toString(36)}` : '';
   const rc = rcName ? ` --remote-control ${shQuote(rcName)}` : ' --remote-control';
-  const first = prompt ? ` ${shQuote(prompt)}` : '';
+  const pf = prompt ? promptFile(prompt) : null;
+  const first = pf ? ` "$(cat ${shQuote(pf)}; rm -f ${shQuote(pf)})"` : '';
   // The session's own id, exported for the command so the data MCP — a child of claude, which
   // inherits this environment — can attribute a published report to the session that wrote it.
   const env = sessionId ? `HUB_SESSION_ID=${shQuote(sessionId)} ` : '';
   return runInNewTerminal(`cd ${shQuote(cwd)}; ${env}${shQuote(config.CLAUDE_BIN)}${rc}${first}`);
+}
+
+/**
+ * Park a prompt on disk for the launch command to read.
+ *
+ * Deleted by the launcher itself the moment it has been read (`rm` runs inside the same command
+ * substitution as the `cat`), so dictated speech does not sit in /tmp for the life of the session.
+ * 0600 for the same reason.
+ */
+function promptFile(text) {
+  const f = path.join(os.tmpdir(), `desk-prompt-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6)}.txt`);
+  fs.writeFileSync(f, String(text), { mode: 0o600 });
+  return f;
 }
 
 // ---- util -----------------------------------------------------------------
