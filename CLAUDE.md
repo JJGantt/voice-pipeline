@@ -83,6 +83,29 @@ expires while the caller has already been told a session started.
 said. They were one column once, and a Mac row's "transcript path" was really a tty — which is why
 nothing could read a Mac session's replies.
 
+## A tty takes 1024 bytes, so nothing long is ever typed at the Mac
+
+`do script` writes into a Terminal tab's tty, and a tty accepts 1024 bytes of input and silently
+discards the rest — a 2500-character dispatch arrived as exactly 1024 characters, mid-word, leaving
+the shell on an unterminated quote and no session at all. Both directions now go by reference:
+
+- **Launching** puts the prompt in a file and lets the SHELL read it (`"$(cat …)"`), so the typed
+  line is ~214 characters whatever was said. Same idea as the file `pi-desk` hands tmux.
+- **A follow-up** cannot do that — it goes to Claude Code's composer, not a shell — so over ~900
+  characters (or with any newline, which an AppleScript string literal cannot hold) the text is
+  stashed in `~/.claude-desk-prompts/` and the session is told to read it, **echo it back verbatim
+  first**, then act. The echo is what keeps the words visible in the session; without it the terminal
+  shows a stub and the request lives only in a file.
+
+Three approaches that look right and are not: chunking (`do script` appends a return, so every chunk
+submits as its own message), System Events `keystroke` (types without a return, but needs
+Accessibility permission a launchd daemon does not have), and `claude --resume <id> "$(cat …)"` in a
+fresh tab (resume on a LIVE session starts a second process replaying the same transcript, so the
+conversation forks into two copies with one id).
+
+The Pi needs none of this: tmux writes into the pane with its own flow control — measured, 3000
+characters in, 3000 out.
+
 `orchestrator/src/transcripts.js` is shared by both machines. `readTail` reports the FINAL message of
 a turn, identified by the transcript record whose `stop_reason` is `end_turn` — not "the last
 assistant text", which mid-turn is a half-written thought. `working` is what separates them: a reply

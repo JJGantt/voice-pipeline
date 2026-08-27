@@ -17,6 +17,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { config } from './config.js';
 import { deskSessionsFor, patchDeskSession } from './supabase.js';
+import { sweepStashedPrompts } from './applescript.js';
 import { readTail } from './transcripts.js';
 
 const exec = promisify(execFile);
@@ -35,6 +36,10 @@ async function claudeOnTty(tty) {
 }
 
 async function tick() {
+  // Messages handed to a session by file. A day is far longer than any session takes to read one,
+  // and they are dictated speech — not something to leave lying in a home directory for ever.
+  sweepStashedPrompts();
+
   let rows;
   try { rows = await deskSessionsFor('desk', 'resident'); }
   catch (e) { return console.error('[desk-sessions] list:', e.message); }

@@ -147,19 +147,58 @@ export async function closeTabForTty(tty) {
  * "front window" is whatever Jared last clicked — which is exactly the mistake to avoid, since a
  * dictated follow-up landing in the wrong terminal is worse than one that fails.
  */
-// The same 1024-byte tty ceiling applies here, and this end has no file trick available: the text is
-// going into Claude Code's composer, not a shell, so there is nothing on the other side to read a
-// path. Splitting is not an option either — `do script` always appends a return, so every chunk would
-// submit as its own message. So a follow-up too long to deliver whole is refused, which puts it in
-// the dead-letter list intact rather than typing half of it into a live session.
+// A tty accepts 1024 bytes of input at once and discards the rest, so what gets TYPED here has to
+// stay short whatever Jared said. Long messages are handed over by reference instead: the text goes
+// to a file and the session is told to read it, echo it back verbatim, then act on it.
+//
+// The echo is the point. Without it the words exist only in a file nobody looks at, and the terminal
+// shows an instruction rather than the request — so anyone reading the session sees a stub. With it,
+// the full message appears in the session's own output within a second or two and the file stops
+// mattering, which is why the file is disposable.
+//
+// The alternatives all fail on this end. `do script` always appends a return, so chunking submits
+// each piece as a separate message. System Events can type without one, but needs Accessibility
+// permission a launchd daemon does not have. And `claude --resume <id> "$(cat file)"` in a fresh tab
+// — the trick the LAUNCH path uses, since that goes through a shell — forks a live session: resume
+// starts a second process replaying the same transcript, so the conversation becomes two copies with
+// one id and a message typed into one is invisible in the other.
 const TTY_INPUT_MAX = 900;   // 1024 with room for the escaping the AppleScript adds
+// Not /tmp: a busy session may not get to the message for a long time, and periodic cleaning there
+// would take the words with it. (They are never ONLY here — the payload is in desk_commands.)
+const PROMPT_DIR = path.join(os.homedir(), '.claude-desk-prompts');
+
+/** Park a message on disk for a session to read, and return its path. */
+function stashPrompt(text, tag) {
+  fs.mkdirSync(PROMPT_DIR, { recursive: true, mode: 0o700 });
+  const f = path.join(PROMPT_DIR, `${String(tag || 'msg').replace(/[^A-Za-z0-9._-]/g, '')}-${Date.now().toString(36)}.txt`);
+  fs.writeFileSync(f, String(text), { mode: 0o600 });
+  return f;
+}
+
+/** Drop stashed messages older than a day. Nothing reads them after that, and they are dictated speech. */
+export function sweepStashedPrompts(maxAgeMs = 86400000) {
+  let names;
+  try { names = fs.readdirSync(PROMPT_DIR); } catch { return; }
+  for (const n of names) {
+    const f = path.join(PROMPT_DIR, n);
+    try { if (Date.now() - fs.statSync(f).mtimeMs > maxAgeMs) fs.unlinkSync(f); } catch { /* gone already */ }
+  }
+}
+
+const handoff = (file) =>
+  `[A message from Jared, too long to type into this terminal. It is in ${file} — read that file now, `
+  + 'reply with its full text verbatim first so it is visible here, then do what it asks. '
+  + 'Leave the file alone afterwards; it is cleaned up on its own.]';
 
 export async function sendToTty(tty, text) {
-  if (String(text).length > TTY_INPUT_MAX) {
-    throw new Error(`follow-up is ${String(text).length} chars — a Terminal tab accepts about ${TTY_INPUT_MAX} at once`);
-  }
-  const escaped = String(text).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-  return osascript(`tell application "Terminal"
+  const body = String(text);
+  // Newlines go by file too, whatever the length: an AppleScript string literal cannot contain a raw
+  // one, so a multi-line message typed directly is a syntax error rather than a delivery.
+  const line = (body.length > TTY_INPUT_MAX || /[\r\n]/.test(body))
+    ? handoff(stashPrompt(body, tty.replace('/dev/', '')))
+    : body;
+  const escaped = line.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  await osascript(`tell application "Terminal"
       set found to false
       repeat with w in windows
         repeat with t in tabs of w
@@ -172,6 +211,7 @@ export async function sendToTty(tty, text) {
       if not found then error "no tab with tty ${tty}"
     end tell
     return "sent"`);
+  return line === body ? 'typed' : 'handed over by file';
 }
 
 async function runInNewTerminal(shellCmd) {

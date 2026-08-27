@@ -54,8 +54,8 @@ async function run(cmd) {
     // A session the reconciler has already found dead has no tab to type into. Fail here rather than
     // letting AppleScript hunt for a tty that a later tab may have been given.
     if (row.status !== 'resident') throw new Error(`${session} has ended`);
-    await sendToTty(tty, prompt);
-    return `sent ${prompt.length} chars to ${tty}`;
+    const how = await sendToTty(tty, prompt);
+    return `sent ${prompt.length} chars to ${tty} (${how})`;
   }
 
   if (cmd.kind !== 'open_session') throw new Error(`unknown kind ${cmd.kind}`);
