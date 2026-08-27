@@ -117,6 +117,33 @@ A process whose transcript already belongs to a row revives that row rather than
 which is what a manual `claude --resume` looks like from outside. Adopted rows are pruned a week
 after they end; dispatched ones are a record of what was asked for and stay.
 
+## Moving a session between machines
+
+A session is an append-only transcript plus a working directory, so handing one over is copying the
+file and resuming it. Both consumers mirror the tail of every transcript to the `transcripts` storage
+bucket at the END OF A TURN (`mirror.js`), which is the only moment it is a complete thought. Only
+the delta goes up — one transcript here is 16MB and a turn adds tens of KB — as
+`<claude_session_id>/<offset>.part`, and `desk_sessions.mirror_offset` is how much is already there.
+
+The one rewrite that makes a transcript portable is the home directory: `/Users/jaredgantt` on the
+Mac, `/home/jaredgantt` on the Pi. `localize()` does it on the way down. Without it the resumed
+session points at a directory that does not exist.
+
+**ONE WRITER, ALWAYS.** `claude --resume` on a transcript that is live elsewhere does not reattach —
+it starts a second process replaying the same file, and the two diverge with one id between them
+(measured: 11 records became 27 on the Pi while the Mac's copy stayed at 11). So a transfer is
+claimed by the machine GIVING THE SESSION UP: it closes the session, flushes the last of the mirror,
+and only then enqueues `resume_mirrored` for the destination.
+
+When the source machine is unreachable there is nothing to close and nothing left to flush, so the
+destination is asked directly and the old row is marked `transferred`. That is the case the whole
+mechanism exists for — the laptop is shut and the work should carry on — and it costs whatever the
+session said after its last completed turn, which is nothing, because that is when mirroring runs.
+
+Closing a session on the Mac is `/exit` typed into the tab, then SIGTERM if it is ignored. A Terminal
+TAB does not understand AppleScript's `close` (it answers -1708), which is why `closeTabForTty` used
+to report failure and close nothing; the window is closed only when that tab is the last one in it.
+
 ## A tty takes 1024 bytes, so nothing long is ever typed at the Mac
 
 `do script` writes into a Terminal tab's tty, and a tty accepts 1024 bytes of input and silently

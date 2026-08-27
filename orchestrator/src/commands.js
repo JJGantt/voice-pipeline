@@ -87,6 +87,18 @@ async function run(cmd) {
     return `sent ${prompt.length} chars to ${tty} (${how})`;
   }
 
+  // Close a session here. The Pi parks its own (evicted, resumable with full context); a Terminal tab
+  // cannot be brought back once closed, so this is `ended` — the same state the reconciler records
+  // when it finds the tab gone.
+  if (cmd.kind === 'end_session') {
+    const id = String((cmd.payload || {}).session || '').trim();
+    const row = await deskSession(id);
+    if (!row) throw new Error(`no such session: ${id}`);
+    if (row.tty) await closeTabForTty(row.tty);
+    await patchDeskSession(id, { status: 'ended', ended: new Date().toISOString(), working: false });
+    return `closed ${id}`;
+  }
+
   // SOURCE half of a handover: this machine owns the session and is giving it up.
   //
   // Order matters and is the whole point. Close first, because resuming a transcript that is still

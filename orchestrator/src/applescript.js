@@ -103,31 +103,60 @@ export async function enumerateTtys() {
 
 // ---- MUTATING (do NOT run against the dev session while testing) ----------
 
-// Close the single Terminal tab whose tty matches `tty`. No-op if not found.
-// Returns true if a tab was closed.
+// End the Claude session in the tab whose tty matches `tty`. No-op if not found.
+//
+// A Terminal TAB does not understand `close` — AppleScript answers -1708 — so the old version of
+// this never closed anything and reported failure into whatever asked. What works is the same
+// sequence the Pi uses on tmux: ask Claude Code to exit, then terminate the process if it ignores
+// that. The shell is left alive in its tab, exactly as tmux leaves a husk; ending the SESSION is
+// what matters, because a transcript being resumed elsewhere must have exactly one writer.
+//
+// The window is closed only when that tab is the last one in it: closing a window with other tabs
+// takes unrelated sessions down with it.
+async function claudePidOnTty(tty) {
+  try {
+    const { stdout } = await execFileP('ps', ['-t', tty.replace('/dev/', ''), '-o', 'pid=,comm='], { timeout: 10000 });
+    const hit = stdout.split('\n').map((l) => l.trim().split(/\s+/))
+      .find(([, comm]) => comm && comm.split('/').pop() === 'claude');
+    return hit ? Number(hit[0]) : null;
+  } catch { return null; }
+}
+
 export async function closeTabForTty(tty) {
   if (!tty) return false;
   const running = await osascript(
     'tell application "System Events" to (exists process "Terminal")'
   );
   if (running !== 'true') return false;
-  // We close the *tab* by closing it directly. `close t` closes that tab;
-  // if it's the last tab in a window the window closes too, which is fine.
-  const result = await osascript(
+  if (!(await claudePidOnTty(tty))) return false;   // nothing running there
+
+  // `/exit` is Claude Code's own way out: it flushes the transcript and leaves the repo alone. A
+  // signal would do neither, which is why it is only the fallback.
+  await osascript(
     `tell application "Terminal"
-       set target to "${tty}"
        repeat with w in windows
          repeat with t in tabs of w
-           if (tty of t) is target then
-             close t
-             return "closed"
-           end if
+           if (tty of t) is "${tty}" then do script "/exit" in t
          end repeat
        end repeat
-       return "notfound"
      end tell`
-  );
-  return result === 'closed';
+  ).catch(() => {});
+  await new Promise((r) => setTimeout(r, 3000));
+
+  const pid = await claudePidOnTty(tty);
+  if (pid) {
+    try { process.kill(pid, 'SIGTERM'); } catch { /* already gone */ }
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+  // Only when nothing else is in that window.
+  await osascript(
+    `tell application "Terminal"
+       repeat with w in windows
+         if (count of tabs of w) is 1 and (tty of item 1 of tabs of w) is "${tty}" then close w
+       end repeat
+     end tell`
+  ).catch(() => {});
+  return true;
 }
 
 // Run a shell command in a new Terminal tab, falling back to a new window.
