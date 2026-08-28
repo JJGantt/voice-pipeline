@@ -139,6 +139,12 @@ by subject matter. Listing example sentences that are "not for you" is the wrong
 and was removed: it teaches that certain CONTENT is never a dispatch, when the same words forwarded
 deliberately are exactly that.
 
+5. focusing a session NAMES the destination — everything after "focus the X session", in that same
+   turn, goes to that session as a follow-up, with no handoff phrase needed. Point 4 says the
+   opposite for talk that names no destination, and without this clause it wins: the model reads the
+   remainder as belonging to a session that already heard him, forwards nothing, and then reports
+   having sent a follow-up it never sent.
+
 **Keep it that short.** Anything that helps the model spot noise, or argues about what a mistake
 would cost, misfires on dictated development work — which rambles, names a machine, and is the most
 expensive thing to lose. State facts it cannot observe; leave it the judgements it can make itself.
