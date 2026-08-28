@@ -1758,6 +1758,12 @@ def process_request(db: Supabase, req: dict) -> None:
     source = (req.get("source") or "").strip()
     quick = source == "web-quick"
     audio = source in ("fly", "mac", "web-quick")   # transcribed (mishear-prone); typed text is excluded
+    # AMBIENT is a different property from transcribed, and conflating them silently ate real messages.
+    # The always-on mics hear the whole room, so most of what they send was not addressed to the
+    # assistant and a turn may legitimately be dropped as noise. The phone's quick button is
+    # PUSH-TO-TALK: he held it and spoke, so every utterance from it is meant, however conversational
+    # it sounds. Judging one of those "not for you" threw away "So I've never done better than 3 by 10."
+    ambient = source in ("fly", "mac")
     prompt = transcript
     # Give the model a clock so any relative date/time resolves correctly — without it the model defaults
     # to its training era (e.g. logging "yesterday" against 2024). Pure wall-clock, no timezone concept.
@@ -1796,7 +1802,7 @@ def process_request(db: Supabase, req: dict) -> None:
                "different time named), pass this exact moment as occurred_at (YYYY-MM-DDTHH:MM:SS) to the "
                "logging tool explicitly rather than omitting it — the tool's own clock may not be wherever "
                "this was actually said/typed.]")
-    if audio:
+    if ambient:
         prompt += ADDRESSING_DIRECTIVE
     if quick:
         prompt += QUICK_REPLY_DIRECTIVE
@@ -1913,7 +1919,7 @@ def process_request(db: Supabase, req: dict) -> None:
 
     # Wake-word false positive: the model flagged the transcript as noise/mishear → drop it silently.
     # No user OR assistant turn is written, so the conversation stays clean; just clear the activity bar.
-    if audio and ("__ignore__" in text.lower() or re.sub(r"[^a-z]", "", text.lower()) == "ignore"):
+    if ambient and ("__ignore__" in text.lower() or re.sub(r"[^a-z]", "", text.lower()) == "ignore"):
         push_activity("(ignored — likely noise)", "done")
         db.patch("voice_requests", f"id=eq.{rid}",
                  {"status": "done", "result": "(ignored: wake-word false positive)", "updated_at": now_iso()})
