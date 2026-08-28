@@ -923,7 +923,7 @@ def recent_context(db: Supabase) -> str:
     try:
         rows = db.get("voice_messages",
                       "focus=eq.hub&mode=eq.hub&role=in.(user,assistant)&done=eq.true"
-                      "&order=created_at.desc&limit=40&select=role,text,created_at")
+                      "&order=created_at.desc&limit=40&select=role,text,created_at,ignored")
     except Exception:  # noqa: BLE001
         return ""
     if not rows:
@@ -937,8 +937,14 @@ def recent_context(db: Supabase) -> str:
                 or ts.astimezone().date() != now.astimezone().date()):
             break
         kept.append(r); prev = ts
-    lines = [f"{'You' if r.get('role') == 'user' else 'Raspy'}: {(r.get('text') or '').strip()}"
-             for r in reversed(kept) if (r.get('text') or '').strip()]
+    # An ignored turn is marked rather than hidden. Unmarked, room chatter would replay as things Jared
+    # said TO the assistant; marked, he can point at one — "do the one you ignored" — and the model can
+    # see both what was said and that nothing was done about it.
+    def _line(r):
+        who = 'You' if r.get('role') == 'user' else 'Raspy'
+        txt = (r.get('text') or '').strip()
+        return f"You (ignored as room noise, not acted on): {txt}" if r.get('ignored') else f"{who}: {txt}"
+    lines = [_line(r) for r in reversed(kept) if (r.get('text') or '').strip()]
     if not lines:
         return ""
     return ("[Recent conversation so far — context only; tool RESULTS are not included, so call a tool "
@@ -1917,13 +1923,20 @@ def process_request(db: Supabase, req: dict) -> None:
                             model="opus", allow_read=bool(att_paths))
         text = (result.get("text") or "").strip()
 
-    # Wake-word false positive: the model flagged the transcript as noise/mishear → drop it silently.
-    # No user OR assistant turn is written, so the conversation stays clean; just clear the activity bar.
+    # Wake-word false positive: the model judged the transcript noise or a mishear. No ASSISTANT turn is
+    # written — nothing was done and nothing is spoken — but the words are KEPT, flagged `ignored`.
+    #
+    # They used to be erased entirely, and that made a wrong judgement unrecoverable: Jared could not
+    # say "do the one you ignored", and a following "answer my question" pointed at something that, as
+    # far as the model could see, had never been said. Which is precisely what happened on 2026-08-28.
     if ambient and ("__ignore__" in text.lower() or re.sub(r"[^a-z]", "", text.lower()) == "ignore"):
         push_activity("(ignored — likely noise)", "done")
+        db.post("voice_messages",
+                {"request_id": rid, "focus": "hub", "mode": msg_mode, "role": "user",
+                 "text": transcript, "done": True, "ignored": True, "worker": WORKER_ID})
         db.patch("voice_requests", f"id=eq.{rid}",
                  {"status": "done", "result": "(ignored: wake-word false positive)", "updated_at": now_iso()})
-        log(f"ignored likely false-positive: {transcript[:60]!r}")
+        log(f"ignored likely false-positive (kept in thread): {transcript[:60]!r}")
         return
 
     # Real turn → now write the user bubble (deferred past the noise check), then close the activity bar.
