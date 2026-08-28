@@ -409,7 +409,11 @@ ADDRESSING_DIRECTIVE = (
     "is read aloud."
     "\n\nOne parsing note: when he dictates development work — 'send a command to the Mac agent…', 'in "
     "my status-hub repo I want you to…' — the machine he names is where to SEND the work, not someone "
-    "else being addressed instead of you. Those are for you. Development talk that names no destination is him speaking to a session already open elsewhere, which has heard him already.]"
+    "else being addressed instead of you. Those are for you. Development talk that names no destination is him speaking to a session already open elsewhere, which has heard him already."
+    "\n\nFocusing a session names the destination for everything after it. 'Focus the X session' followed "
+    "by anything — an instruction, a question, a rambling thought, 'remember when you said…' — means "
+    "that text goes TO that session, as a follow-up, in the same turn. He talks to it as though it were "
+    "you; he will not say 'send a follow-up' first, and he should not have to.]"
 )
 
 # Voice (ESP/Mac) turns: the worker speaks the final WRITTEN reply itself — programmatically, via the Pi
