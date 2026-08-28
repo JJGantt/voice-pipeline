@@ -18,7 +18,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { config } from './config.js';
 import { deskSessionsFor, patchDeskSession, upsertDeskSession } from './supabase.js';
-import { sweepStashedPrompts } from './applescript.js';
+import { sweepStashedPrompts, sendToTty } from './applescript.js';
 import { discoverSessions, fresherTranscript } from './discover.js';
 import { mirrorUp } from './mirror.js';
 import { readTail } from './transcripts.js';
@@ -69,6 +69,9 @@ async function adopt(rows) {
     await upsertDeskSession({
       id: `mac-${s.claudeId.slice(0, 8)}`, worker: 'desk', repo: s.repo, status: 'resident',
       origin: 'adopted', tty: s.tty, transcript_path: s.transcriptPath, claude_session_id: s.claudeId,
+      // Left null deliberately: an adopted session has NOT got Remote Control yet, and the tick above
+      // turns it on at the first safe moment.
+      rc_sent: null,
       // Claude Code's own name for the conversation. A dispatched session gets a label written by
       // the router; this is the only description one nobody dispatched ever has.
       label: tail.title ? tail.title.slice(0, 60) : null,
@@ -148,6 +151,17 @@ async function tick() {
         const at = await mirrorUp(row.claude_session_id, row.transcript_path, row.mirror_offset || 0);
         if (at != null) { patch.mirror_offset = at; patch.mirror_at = new Date().toISOString(); }
       } catch (e) { console.error('[desk-sessions] mirror:', e.message); }
+    }
+    // EVERY session should be reachable in the Claude app, including the ones Jared opened himself.
+    // Those start without Remote Control, and `/remote-control` is an in-session toggle — so this
+    // types into his session, and waits for a moment when that is safe: idle, and with a completed
+    // turn behind it, so there is no half-written message in the composer to submit by accident.
+    if (alive && row.origin === 'adopted' && !row.rc_sent && row.tty && tail && !tail.working && tail.lastReply) {
+      try {
+        await sendToTty(row.tty, '/remote-control');
+        patch.rc_sent = new Date().toISOString();
+        console.log(`[desk-sessions] ${row.id} put under Remote Control`);
+      } catch (e) { console.error('[desk-sessions] remote control:', e.message); }
     }
     if (!alive && ageS > LAUNCH_GRACE_S) {
       // The two closed states say whether anything can be done about it, and nothing else:

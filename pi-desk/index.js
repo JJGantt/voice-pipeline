@@ -186,7 +186,11 @@ async function reconcileSessions() {
           transcript_path: tpath,
           // Carried through explicitly: this is a merge-duplicates upsert, so any column it sends
           // overwrites. Omitting the label would blank it on the very next reconcile tick.
-          label: row?.label || null,
+          //
+          // A name Jared typed himself (`/rename`, which writes a `custom-title` record) outranks the
+          // label the router wrote — the same rule the Mac applies. Without this the rename reached
+          // the session and nothing ever read it back, so the pane kept showing the old label.
+          label: tail.customTitle ? tail.customTitle.slice(0, 60) : (row?.label || null),
           last_reply: tail.lastReply ? tail.lastReply.slice(0, 4000) : row?.last_reply || null,
           // last_reply is the FINAL message of a turn; `working` is what says whether a newer one is
           // still being written. Without it a reader cannot tell an answer from a stale one.
