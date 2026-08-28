@@ -191,6 +191,8 @@ async function reconcileSessions() {
           // label the router wrote — the same rule the Mac applies. Without this the rename reached
           // the session and nothing ever read it back, so the pane kept showing the old label.
           label: tail.customTitle ? tail.customTitle.slice(0, 60) : (row?.label || null),
+          // Separately, so a tab can show the repo unless Jared named the session himself.
+          custom_title: tail.customTitle ? tail.customTitle.slice(0, 60) : (row?.custom_title || null),
           last_reply: tail.lastReply ? tail.lastReply.slice(0, 4000) : row?.last_reply || null,
           // last_reply is the FINAL message of a turn; `working` is what says whether a newer one is
           // still being written. Without it a reader cannot tell an answer from a stale one.

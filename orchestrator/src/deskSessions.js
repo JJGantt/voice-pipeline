@@ -138,6 +138,10 @@ async function tick() {
       // Refreshed every tick rather than stamped once, because 1 and 3 both change as work goes on.
       const named = tail.customTitle || (row.origin === 'adopted' ? tail.title : null);
       if (named && named.slice(0, 60) !== row.label) patch.label = named.slice(0, 60);
+      // Kept separately from `label` as well: a glanceable surface shows the repo unless he named
+      // the session himself, and `label` cannot answer which of the three sources it came from.
+      const chosen = tail.customTitle ? tail.customTitle.slice(0, 60) : null;
+      if (chosen !== (row.custom_title ?? null)) patch.custom_title = chosen;
     }
     // Mirror at the end of a turn, which is the only moment the transcript is a complete thought.
     // Idle-only on purpose: uploading mid-turn would ship half an answer, and the tail is re-read on

@@ -317,6 +317,7 @@ SAFE_TOOLS = [
     "mcp__data__list_repos", "mcp__data__start_session", "mcp__data__get_sessions",
     "mcp__data__resume_session", "mcp__data__end_session", "mcp__data__transfer_session",
     "mcp__data__follow_up", "mcp__data__rename_session", "mcp__data__focus_session",
+    "mcp__data__set_wall",
 ]
 
 def validate_safe_tools(mcp_js: str) -> None:
