@@ -1214,6 +1214,10 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
 # with a user-facing text reply. MCP servers are started ONCE (warm stdio sessions) and their schemas
 # are inlined with the prompt, so a turn is one round-trip (+ tool round-trips), no spin-up per request.
 API_MODEL_IDS = {"haiku": "claude-haiku-4-5", "sonnet": "claude-sonnet-5", "opus": "claude-opus-5"}
+# The API requires a max_tokens, so it is each model's own ceiling — never a shorter number picked
+# here. It exists to bound a runaway, and a reply ends when the model is done, not when a budget
+# runs out. Values this large need the streaming call below or the request outlives its HTTP timeout.
+API_MAX_TOKENS = {"claude-opus-5": 128000, "claude-sonnet-5": 128000, "claude-haiku-4-5": 64000}
 
 
 def _api_allowed_names(allowed):
@@ -1332,12 +1336,10 @@ class ApiRunner:
             _srv, _exact = _api_allowed_names(allowed)
             tools = [t for t in self._tools
                      if t["name"].split("__", 1)[0] in _srv or t["name"] in _exact]
-        # max_tokens is a runaway guard, never a length lever: it is the same on both paths so a fast-path
-        # reply is never cut off mid-answer. Reply length is the model's call — a simple question gets a
-        # short answer, a hard one gets as long an answer as it needs.
-        kwargs = dict(model=API_MODEL_IDS.get(model, model), system=sys_param,
+        model_id = API_MODEL_IDS.get(model, model)
+        kwargs = dict(model=model_id, system=sys_param,
                       tools=tools, messages=self._messages,
-                      max_tokens=8000,
+                      max_tokens=API_MAX_TOKENS.get(model_id, 64000),
                       extra_headers={"anthropic-beta": "extended-cache-ttl-2025-04-11"})
         if think:  # adaptive thinking (budget_tokens is rejected on 4.8); effort sets the depth
             kwargs["thinking"] = {"type": "adaptive"}
@@ -1345,7 +1347,11 @@ class ApiRunner:
         final_text = ""
         logged_cache = False
         for _ in range(8):  # agentic loop: chain tool calls until a final text reply
-            resp = await self._client.messages.create(**kwargs)
+            # Streamed, not `create`: max_tokens is the model's full ceiling, and the SDK rejects a
+            # non-streaming request that large because it can outrun the HTTP timeout. The stream is
+            # collected into the same final Message the rest of this loop reads.
+            async with self._client.messages.stream(**kwargs) as _s:
+                resp = await _s.get_final_message()
             if not logged_cache:  # verify caching engages: creation on cold, read on warm
                 u = getattr(resp, "usage", None)
                 if u is not None:
