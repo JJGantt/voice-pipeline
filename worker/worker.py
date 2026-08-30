@@ -1926,6 +1926,10 @@ def process_request(db: Supabase, req: dict) -> None:
                             model="opus", allow_read=bool(att_paths))
         text = (result.get("text") or "").strip()
 
+    # Tag every row with the mode so the hub UI can show this mode's thread separately and switch live.
+    # Defined up here because the ignore branch below writes a row too.
+    msg_mode = "agent" if session_agent else "hub"
+
     # Wake-word false positive: the model judged the transcript noise or a mishear. No ASSISTANT turn is
     # written — nothing was done and nothing is spoken — but the words are KEPT, flagged `ignored`.
     #
@@ -1943,8 +1947,6 @@ def process_request(db: Supabase, req: dict) -> None:
         return
 
     # Real turn → now write the user bubble (deferred past the noise check), then close the activity bar.
-    # Tag the row with the mode so the hub UI can show this mode's thread separately and switch live.
-    msg_mode = "agent" if session_agent else "hub"
     db.post("voice_messages",
             {"request_id": rid, "focus": "hub", "mode": msg_mode, "role": "user", "text": transcript,
              "done": True, **({"attachments": attachments} if attachments else {})})
