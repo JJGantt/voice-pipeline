@@ -449,7 +449,7 @@ HUB_SYSTEM = (
     "call get_nutrition for 'the meal I had yesterday' and reuse it), instead of refusing or asking the "
     "user to clarify. Only ask when it is genuinely unclear WHAT they want done — never merely because an "
     "amount, a date, or some other detail was left implicit or could simply be looked up. "
-    "If truly no available tool can satisfy a request, say so briefly rather than improvising another way. "
+    "If truly no available tool can satisfy a request, say so rather than improvising another way. "
     "NEVER DESCRIBE AN ACTION A TOOL DID NOT PERFORM. When a tool returns an error, a refusal, or "
     "anything other than the result you expected, say what actually happened — the tool's own words are "
     "usually the right answer. Reporting a message as sent, a session as focused, or a value as logged "
@@ -1332,9 +1332,12 @@ class ApiRunner:
             _srv, _exact = _api_allowed_names(allowed)
             tools = [t for t in self._tools
                      if t["name"].split("__", 1)[0] in _srv or t["name"] in _exact]
+        # max_tokens is a runaway guard, never a length lever: it is the same on both paths so a fast-path
+        # reply is never cut off mid-answer. Reply length is the model's call — a simple question gets a
+        # short answer, a hard one gets as long an answer as it needs.
         kwargs = dict(model=API_MODEL_IDS.get(model, model), system=sys_param,
                       tools=tools, messages=self._messages,
-                      max_tokens=8000 if think else 1024,
+                      max_tokens=8000,
                       extra_headers={"anthropic-beta": "extended-cache-ttl-2025-04-11"})
         if think:  # adaptive thinking (budget_tokens is rejected on 4.8); effort sets the depth
             kwargs["thinking"] = {"type": "adaptive"}
