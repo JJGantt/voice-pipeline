@@ -16,11 +16,15 @@ two things that break silently:
 `voice_requests.tier` is still written by every capture path and read by nothing — the wake word that
 sets it (`hey_jarvis` vs `hey_rhasspy`) no longer changes how a turn runs.
 
-## `claude -p` must not see `ANTHROPIC_API_KEY`
+## `ANTHROPIC_API_KEY` is the fallback billing path — only `ApiRunner` may touch it
 
-The CLI silently prefers it over the subscription login and bills the API. `run_claude()` and
-`pi-desk/launch.sh` each strip it from the subprocess environment; the service env keeps it because
-`ApiRunner` (the Fly path) needs it. Anywhere new that spawns Claude has to strip it too.
+The CLI and the Agent SDK silently prefer the key over the subscription login and bill the API.
+`worker.py` pops it from the environment at import (into `_API_KEY`, read only by `ApiRunner`), so
+nothing it spawns — the warm SDK client, `claude -p`, the MCP servers — can inherit it.
+`pi-desk/launch.sh` strips it separately (it sources the worker's `.env` itself). The subscription is
+the primary path on every machine; the Console key exists to be a funded fallback at the SAME model
+tier when a subscription path errors (and Fly's last resort), never a silent upgrade — the dispatch
+comment in `worker.py` has the 2026-08-30 incident that fixed this shape.
 
 ## `server/` is a build context, not source
 

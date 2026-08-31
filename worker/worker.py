@@ -38,6 +38,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from datetime import datetime, timezone, date, timedelta
 from pathlib import Path
 
@@ -65,6 +66,11 @@ WORKER_PRIORITY = [
 
 STATE_DIR = Path(os.path.expanduser(os.environ.get("STATE_DIR", "~/.voice-worker")))
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
+
+# The Console API key is the FALLBACK billing path, not the default. Pop it out of the environment at
+# import so no subprocess — the SDK/CLI runners, the MCP servers — can inherit it and silently bill the
+# API; the ApiRunner (the one legitimate consumer) reads it from this variable instead.
+_API_KEY = os.environ.pop("ANTHROPIC_API_KEY", "")
 # synth-on-Mac (hub setting `synth_on_mac`, default OFF): the Mac's PyTorch Kokoro synthesizes ~4x faster
 # than the Pi's CPU ONNX, so when on, the Mac worker turns the reply to PCM here and ships it to the Pi to
 # play — instead of writing voice_speech for the Pi to synthesize (slow). Falls back to voice_speech on
@@ -850,6 +856,38 @@ def synth_on_mac() -> bool:
     return _synth_mac_cache["v"]
 
 
+AO_IGNORE_STREAK_OFF = 5   # consecutive ignored turns that switch always-on OFF (provisional — Jared to set)
+
+
+def maybe_auto_disable_wakefree() -> None:
+    """A run of nothing-but-noise means nobody is talking TO the assistant: switch always-on off and let
+    the wake words take over (they stay live when wake-free is off, so voice never goes dark). The streak
+    is DERIVED from the last hub rows rather than counted in memory, so it reads the same whichever
+    worker judged each turn; any acted-on command breaks it."""
+    try:
+        r = httpx.get(f"{SUPABASE_URL}/rest/v1/voice_messages",
+                      params={"select": "ignored", "focus": "eq.hub", "role": "eq.user",
+                              # id is a UUID — ordering by it is lexical, not recency. created_at only.
+                              "order": "created_at.desc", "limit": str(AO_IGNORE_STREAK_OFF)},
+                      headers=headers(), timeout=5)
+        rows = r.json()
+        if len(rows) < AO_IGNORE_STREAK_OFF or not all(row.get("ignored") for row in rows):
+            return
+        g = httpx.get(f"{SUPABASE_URL}/rest/v1/app_settings",
+                      params={"key": "eq.wakefree_enabled", "select": "value"},
+                      headers=headers(), timeout=5)
+        grows = g.json()
+        if not (grows and str(grows[0].get("value")).strip().lower() in ("1", "true", "on", "yes")):
+            return   # already off — nothing to flip
+        httpx.post(f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
+                   headers={**headers(), "Prefer": "resolution=merge-duplicates"},
+                   json={"key": "wakefree_enabled", "value": "0", "updated_at": now_iso()},
+                   timeout=10)
+        log(f"always-on auto-disabled: last {AO_IGNORE_STREAK_OFF} turns were all noise")
+    except Exception as e:  # noqa: BLE001 — the governor must never take a turn down
+        log(f"wakefree auto-off check failed: {e}")
+
+
 def speak_via_mac(text: str) -> bool:
     """Synthesize `text` on the Mac synth server and POST the PCM to the Pi to play. Returns True on success;
     on ANY failure returns False so the caller falls back to the Pi-synth voice_speech path."""
@@ -1058,11 +1096,10 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
     t_spawn = t_init = t_first = None   # timing seams: spawn → MCP-ready (system init) → first model token
     n_tools = 0
 
-    # Subscription path: `claude -p` must use the logged-in Claude subscription, not an API key. If
-    # ANTHROPIC_API_KEY is in the env (it is, so the SDK path can use it), the CLI silently bills the
-    # Anthropic API instead — so strip it for this subprocess only. The SDK runner still sees it.
+    # Subscription path: `claude -p` uses the logged-in Claude subscription. ANTHROPIC_API_KEY is popped
+    # from the environment at import (it is the fallback billing path, held in _API_KEY for the
+    # ApiRunner only), so no subprocess can inherit it and silently bill the API.
     sub_env = os.environ.copy()
-    sub_env.pop("ANTHROPIC_API_KEY", None)
     # Load ALL MCP tool schemas inline every turn — no lazy tool-search/discovery round-trip. This is a
     # tool-centric agent (its whole job is calling these tools), and the trimmed toolset is well under the
     # context budget, so we want every tool callable directly. (Default 'auto' defers above 10% of context.)
@@ -1259,7 +1296,7 @@ class ApiRunner:
     async def _ensure(self):
         if self._client is None:
             from anthropic import AsyncAnthropic
-            self._client = AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+            self._client = AsyncAnthropic(api_key=_API_KEY)
         if self._sessions:
             return
         from contextlib import AsyncExitStack
@@ -1406,7 +1443,107 @@ class ApiRunner:
             return {"session_id": None, "text": "", "result": "", "ok": False, "raw_error": f"api run failed: {e}"}
 
 
+class SdkRunner:
+    """Warm Claude Agent SDK client — the PRIMARY fast path, billed to the subscription.
+
+    One long-lived headless Claude Code process holds the four MCP servers, so the per-command spawn
+    cost the ApiRunner was built to avoid is paid once, not per turn. Each hub turn runs in a FRESH
+    session (a new session_id on the same warm process): the caller replays the hub conversation into
+    the prompt — the same contract as the ApiRunner's `fresh` runs. Pinned to Sonnet + SAFE_TOOLS at
+    connect; escalation and full-agent turns keep their own `claude -p` spawns (full toolset).
+
+    The ApiRunner is the FALLBACK: same model tier, Console-billed, used only when this path errors
+    (rate-limited subscription, expired login, wedged process). Errors never upgrade the model.
+    """
+
+    def __init__(self):
+        self._loop = None
+        self._client = None
+
+    def _start_loop(self):
+        if self._loop is None:
+            self._loop = asyncio.new_event_loop()
+            threading.Thread(target=self._loop.run_forever, name="sdk-loop", daemon=True).start()
+
+    async def _ensure(self):
+        if self._client is not None:
+            return
+        from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, PermissionResultDeny
+
+        async def _deny(tool_name, tool_input, context):  # noqa: ARG001
+            # SAFE_TOOLS are pre-approved via allowed_tools and never reach this callback; anything
+            # that does is gated — deny it and point the model at the escalation contract. (Without a
+            # callback the SDK raises on a permission request, failing the whole turn.)
+            return PermissionResultDeny(message="This tool is gated on the fast path. If the request "
+                                                "needs it, reply __ESCALATE__ (alone).")
+
+        opts = ClaudeAgentOptions(
+            model="sonnet",
+            mcp_servers=write_mcp_config(),
+            allowed_tools=list(SAFE_TOOLS),
+            # The stable hub framing lives here so the prefix caches across turns; per-turn context
+            # (the govee device list, the replayed conversation) rides on the prompt instead.
+            system_prompt={"type": "preset", "preset": "claude_code",
+                           "append": HUB_SYSTEM + "\n\n" + SHARED_STATE_NOTE,
+                           "exclude_dynamic_sections": True},
+            env={"ENABLE_TOOL_SEARCH": "false"},   # all schemas inline, same as the -p path
+            can_use_tool=_deny,
+            cwd=os.path.expanduser("~"),
+        )
+        client = ClaudeSDKClient(options=opts)
+        await client.connect()
+        self._client = client
+        log("sdk runner: warm client up (sonnet, safe toolset)")
+
+    async def _teardown(self):
+        if self._client is not None:
+            try:
+                await self._client.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            self._client = None
+
+    async def _turn(self, prompt, on_event):
+        await self._ensure()
+        from claude_agent_sdk import AssistantMessage, TextBlock, ToolUseBlock, ResultMessage
+        await self._client.query(prompt, session_id=uuid.uuid4().hex)
+        chunks, result_text, ok, raw_error = [], "", True, None
+        async for msg in self._client.receive_response():
+            if isinstance(msg, AssistantMessage):
+                for b in msg.content:
+                    if isinstance(b, TextBlock):
+                        chunks.append(b.text)
+                    elif isinstance(b, ToolUseBlock) and on_event:
+                        try:
+                            on_event("tool", {"name": b.name, "input": b.input})
+                        except Exception:  # noqa: BLE001
+                            pass
+            elif isinstance(msg, ResultMessage):
+                ok = not msg.is_error
+                result_text = msg.result or ""
+                if msg.is_error:
+                    raw_error = result_text or msg.subtype
+        return {"session_id": None, "text": "\n".join(chunks).strip(),
+                "result": result_text, "ok": ok, "raw_error": raw_error}
+
+    def run(self, transcript, on_event=None) -> dict:
+        self._start_loop()
+        try:
+            fut = asyncio.run_coroutine_threadsafe(self._turn(transcript, on_event), self._loop)
+            return fut.result(timeout=CLAUDE_TIMEOUT_S + 30)
+        except Exception as e:  # noqa: BLE001 — never wedge the worker
+            # After a timeout or transport error the warm process's state is unknown: kill it so the
+            # next turn reconnects cold instead of inheriting a wedged client.
+            try:
+                asyncio.run_coroutine_threadsafe(self._teardown(), self._loop).result(timeout=15)
+            except Exception:  # noqa: BLE001
+                pass
+            return {"session_id": None, "text": "", "result": "", "ok": False,
+                    "raw_error": f"sdk run failed: {e}"}
+
+
 API = ApiRunner()
+SDK = SdkRunner()
 
 
 def get_focus(db: Supabase) -> str:
@@ -1861,7 +1998,8 @@ def process_request(db: Supabase, req: dict) -> None:
     # Dispatch — one dynamic route. `ctx` (the replayed hub conversation) rides on the FRESH run; there is no
     # --resume for hub turns, so the two models never share a session. agent → the unrestricted coding agent
     # (its own --resume session). Fly (Mac+Pi down) → Opus on the API. Photos → Opus (vision via Read).
-    # Otherwise: Sonnet with the safe toolset; a gated need (or a Sonnet error) → re-run on a FRESH Opus.
+    # Otherwise: Sonnet (warm SDK client, subscription) with the safe toolset; a gated need → a FRESH
+    # Opus on the subscription; a fast-path ERROR falls sideways to API Sonnet — never up to Opus.
     hub_prompt = ctx + prompt   # ctx is "" in agent mode (uses --resume) or when there's no live conversation
     if use_agent:
         result = run_claude(prompt, resume_id, on_event=_emit, system_append=sys_ctx, model="opus",
@@ -1883,29 +2021,32 @@ def process_request(db: Supabase, req: dict) -> None:
         result = run_claude(hub_prompt + POWER_DIRECTIVE, None, on_event=_emit, system_append=sys_ctx,
                             model="opus", allow_read=bool(att_paths))
     else:
-        # FAST PATH — Sonnet on the WARM api runner, safe toolset only. Not `claude -p`: that spawns the
-        # CLI and four stdio MCP servers per command, which measured 3.6s on the Pi (~42% of a simple
-        # turn) before the model saw a single token. The api runner holds those MCP sessions open and
-        # prompt-caches the schema prefix for an hour, so the spawn cost disappears. Billed to the API
-        # (~1c/turn); the escalation below stays on the subscription, where the money actually is.
-        result = API.run(hub_prompt + ESCALATE_DIRECTIVE, system_append=sys_ctx, on_event=_emit,
-                         model="sonnet", allowed=SAFE_TOOLS, fresh=True)
+        # FAST PATH — Sonnet on the WARM SDK client, safe toolset only, billed to the SUBSCRIPTION.
+        # Not a per-command `claude -p`: that spawn (CLI + four stdio MCP servers) measured 3.6s on the
+        # Pi (~42% of a simple turn) before the model saw a token; the warm client pays it once. The
+        # ApiRunner (Console-billed) is the FALLBACK, at the SAME tier, only when this path errors.
+        # Why this way round: on 2026-08-30 the inverse arrangement (API-billed fast path) drained the
+        # Console balance, and the then error-escalation turned every noise judgment into a fresh
+        # subscription Opus spawn — 291 in one evening. Errors must never upgrade the model.
+        fast_prompt = ((govee + "\n\n") if govee else "") + hub_prompt + ESCALATE_DIRECTIVE
+        result = SDK.run(fast_prompt, on_event=_emit)
+        if not result.get("ok"):
+            log(f"subscription fast path failed ({result.get('raw_error')}) — API Sonnet fallback")
+            result = API.run(hub_prompt + ESCALATE_DIRECTIVE, system_append=sys_ctx, on_event=_emit,
+                             model="sonnet", allowed=SAFE_TOOLS, fresh=True)
         st = (result.get("text") or "").strip().lower()
         escalate = ("__escalate__" in st) or (re.sub(r"[^a-z]", "", st) == "escalate")
-        # Escalate on a gated need (the sentinel) or an error — a fast-path failure still has to complete
-        # the command on Opus rather than drop it. (There is no denied-tool signal to check any more: the
-        # gated tools are absent from `tools=`, so they can't be attempted at all.)
-        if escalate or not result.get("ok"):
-            reason = "__ESCALATE__" if escalate else f"api sonnet error ({result.get('raw_error')})"
-            log(f"dynamic → Opus (full toolset): {reason}")
+        # Escalate ONLY on the sentinel — a gated need. A turn that failed on both Sonnet paths
+        # surfaces as an error below; it does not buy an Opus run.
+        if escalate:
+            log("dynamic → Opus (full toolset): __ESCALATE__")
             # Surface the hop itself: the bottom activity bar shows "escalated to Opus" and keeps an OPUS
             # chip up for the rest of the run, so a turn that quietly changed models is visible on the wall
             # instead of looking like an unexplained pause between the prompt and the first Opus tool call.
-            push_activity("Escalated to Opus — " + ("needs a full-access tool" if escalate
-                                                    else "fast path failed"), "escalate")
+            push_activity("Escalated to Opus — needs a full-access tool", "escalate")
             # Escalation runs on the SUBSCRIPTION: these turns are rare and already slow, so the CLI cold
-            # start is noise here, and Opus is the expensive one to bill. Mac and Pi both have it; Fly is
-            # intercepted earlier. If the subscription run fails anyway, finish on the API rather than drop.
+            # start is noise here. Mac and Pi both have it; Fly is intercepted earlier. If the
+            # subscription run fails anyway, finish on the API (the fallback) rather than drop.
             result = run_claude(hub_prompt + POWER_DIRECTIVE, None, on_event=_emit, system_append=sys_ctx,
                                 model="opus", allow_read=bool(att_paths))
             if not result.get("ok"):
@@ -1950,6 +2091,7 @@ def process_request(db: Supabase, req: dict) -> None:
         db.patch("voice_requests", f"id=eq.{rid}",
                  {"status": "done", "result": "(ignored: wake-word false positive)", "updated_at": now_iso()})
         log(f"ignored likely false-positive (kept in thread): {transcript[:60]!r}")
+        maybe_auto_disable_wakefree()
         return
 
     # Real turn → now write the user bubble (deferred past the noise check), then close the activity bar.

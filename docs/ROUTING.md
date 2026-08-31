@@ -3,10 +3,10 @@
 ```
 mic → transcript → voice_requests (Supabase)
                         ↓
-              worker claims it (Mac primary, Pi fallback, Fly last)
+              worker claims it (Pi primary, Mac fallback, Fly last)
                         ↓
           ┌─────────────┴──────────────┐
-          │  Sonnet, the fast responder │   ← SAFE_TOOLS in --allowedTools
+          │  Sonnet, the fast responder │   ← SAFE_TOOLS (allowed_tools on the warm SDK client)
           └─────────────┬──────────────┘
                         │
         ┌───────────────┼────────────────┐
@@ -74,21 +74,24 @@ escalate a to-do add because the previous minute had been about food. The direct
 from the current instruction alone; if escalations for lights and list adds reappear, that clause is
 what regressed.
 
-## What the split is for — and which half costs money
+## What the split is for — and how it bills
 
-**The fast path is the METERED one.** Sonnet runs on the warm `ApiRunner` (~1c/turn) on every machine;
-the escalation runs Opus through `claude -p` on the **subscription**, where tokens are free. That is
-the opposite way round from the intuition that escalating to the bigger model costs more — escalation
-moves a turn OFF the meter.
+**Everything runs on the subscription; the API key is the funded FALLBACK.** Sonnet runs on the warm
+`SdkRunner` (a long-lived headless Claude Code process holding the MCP servers); escalation runs Opus
+through `claude -p`. Both bill the subscription. The Console-billed `ApiRunner` still exists but runs
+only when a subscription path errors — at the SAME model tier, never as an upgrade. (It used to be the
+other way round: an API-billed fast path drained the Console balance on 2026-08-30, and the
+error-escalation of that era turned every noise judgment into a subscription Opus spawn — 291 in one
+evening. Errors falling sideways instead of upward is what prevents a recurrence.)
 
 So the reasons the split exists, in the order they hold:
 
 1. **What the fast path can REACH.** The allow list is a correctness gate — a tool that would have to
    invent a number is simply not in the schema Sonnet is handed, so it cannot quietly write one.
    Nothing to do with models or money.
-2. **Money, on the common case.** Every ordinary turn is billed, so the cheap model runs it. The
-   expensive model only ever runs where tokens are free.
-3. **Speed — from the RUNNER, not the model.** The warm runner is what avoids `claude -p` spawning
+2. **Capacity, on the common case.** Every ordinary turn draws from the shared subscription window,
+   so the cheap fast model runs it and Opus only runs the rare gated turn.
+3. **Speed — from the RUNNER, not the model.** The warm client is what avoids `claude -p` spawning
    the CLI and four stdio MCP servers per command: 3.6s on the Pi, ~42% of a simple turn, before the
    model sees a token.
 
@@ -105,10 +108,10 @@ On a short reply — which is every voice turn — they are indistinguishable: t
 wider than the gap, and Opus won one of the three runs. Sonnet only pulls ahead once an answer is long
 (~63 tok/s vs ~47), and voice answers never are.
 
-What escalation does cost is **time**: the whole turn is re-run, so a gated command pays a full API
-Sonnet turn, then a CLI cold start, then a full Opus turn. It does not cost double money — the second
-half is the free half. That is why anything not needing the gate belongs on the fast path, and why the
-fix for latency, if one is ever wanted, is to continue an escalated turn rather than restart it.
+What escalation does cost is **time**: the whole turn is re-run, so a gated command pays a full
+Sonnet turn, then a CLI cold start, then a full Opus turn. That is why anything not needing the gate
+belongs on the fast path, and why the fix for latency, if one is ever wanted, is to continue an
+escalated turn rather than restart it.
 
 ## Keeping the list honest
 

@@ -1,9 +1,11 @@
 # Voice-command worker daemon
 
 Claims voice commands from the Supabase `voice_requests` queue and runs each one
-through a headless `claude -p` session on the **Claude subscription** (no API
-key), with the `data` MCP attached, then writes the conversation back to Supabase
-(`voice_messages`) for a live display.
+on the **Claude subscription** — ordinary turns on a warm Agent SDK client
+(Sonnet, safe toolset), escalations and full-agent turns through headless
+`claude -p` (Opus) — with the `data` MCP attached, then writes the conversation
+back to Supabase (`voice_messages`) for a live display. The Console API key is
+only a fallback (see `../docs/ROUTING.md`).
 
 The same `worker.py` runs on the **Pi** (`WORKER_ID=pi`), the **Mac** (`WORKER_ID=mac`) and inside
 the `jared-voice` Fly image (`WORKER_ID=fly`); only `WORKER_ID` differs. How a claimed turn is
@@ -78,9 +80,11 @@ SUPABASE_KEY=<service-role-key> ./run.sh --once
 (`server/.venv`), then Homebrew `python3.11`, then plain `python3`. The system
 `python3` does **not** have `httpx` installed.
 
-`run.sh` loads a gitignored `.env` beside it, and `run_claude()` strips
-`ANTHROPIC_API_KEY` from the subprocess it spawns — the CLI prefers that key over
-the subscription login and would silently bill the API.
+`run.sh` loads a gitignored `.env` beside it. `worker.py` pops `ANTHROPIC_API_KEY`
+out of the environment at import: the Console key is the FALLBACK billing path
+(read only by the `ApiRunner`), and popping it means no spawned subprocess — the
+warm SDK client, `claude -p`, the MCP servers — can inherit it and silently bill
+the API instead of the subscription.
 
 ### Pi → Mac priority
 
