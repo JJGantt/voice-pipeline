@@ -856,22 +856,27 @@ def synth_on_mac() -> bool:
     return _synth_mac_cache["v"]
 
 
-AO_IGNORE_STREAK_OFF = 3   # consecutive ignored turns that switch always-on OFF (Jared's number)
+AO_IGNORE_STREAK_OFF = 5    # consecutive ignored turns that switch always-on OFF… (Jared's numbers)
+AO_IGNORE_WINDOW_S = 3600   # …but only when ALL of them landed within this window — a rate, not a lifetime count
 
 
 def maybe_auto_disable_wakefree() -> None:
     """A run of nothing-but-noise means nobody is talking TO the assistant: switch always-on off and let
     the wake words take over (they stay live when wake-free is off, so voice never goes dark). The streak
     is DERIVED from the last hub rows rather than counted in memory, so it reads the same whichever
-    worker judged each turn; any acted-on command breaks it."""
+    worker judged each turn; any acted-on command breaks it, and a streak that straddles a quiet gap
+    (older than the window) doesn't count — only a currently-noisy room flips the mode."""
     try:
         r = httpx.get(f"{SUPABASE_URL}/rest/v1/voice_messages",
-                      params={"select": "ignored", "focus": "eq.hub", "role": "eq.user",
+                      params={"select": "ignored,created_at", "focus": "eq.hub", "role": "eq.user",
                               # id is a UUID — ordering by it is lexical, not recency. created_at only.
                               "order": "created_at.desc", "limit": str(AO_IGNORE_STREAK_OFF)},
                       headers=headers(), timeout=5)
         rows = r.json()
         if len(rows) < AO_IGNORE_STREAK_OFF or not all(row.get("ignored") for row in rows):
+            return
+        oldest = datetime.fromisoformat(str(rows[-1]["created_at"]).replace("Z", "+00:00"))
+        if (datetime.now(timezone.utc) - oldest).total_seconds() > AO_IGNORE_WINDOW_S:
             return
         g = httpx.get(f"{SUPABASE_URL}/rest/v1/app_settings",
                       params={"key": "eq.wakefree_enabled", "select": "value"},
@@ -883,7 +888,7 @@ def maybe_auto_disable_wakefree() -> None:
                    headers={**headers(), "Prefer": "resolution=merge-duplicates"},
                    json={"key": "wakefree_enabled", "value": "0", "updated_at": now_iso()},
                    timeout=10)
-        log(f"always-on auto-disabled: last {AO_IGNORE_STREAK_OFF} turns were all noise")
+        log(f"always-on auto-disabled: last {AO_IGNORE_STREAK_OFF} turns all noise within the hour")
     except Exception as e:  # noqa: BLE001 — the governor must never take a turn down
         log(f"wakefree auto-off check failed: {e}")
 
