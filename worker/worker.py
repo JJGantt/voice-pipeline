@@ -856,8 +856,8 @@ def synth_on_mac() -> bool:
     return _synth_mac_cache["v"]
 
 
-AO_IGNORE_STREAK_OFF = 5    # consecutive ignored turns that switch always-on OFF… (Jared's numbers)
-AO_IGNORE_WINDOW_S = 3600   # …but only when ALL of them landed within this window — a rate, not a lifetime count
+AO_IGNORE_STREAK_OFF = 3    # consecutive ignored turns that put the brakes on… (Jared's numbers)
+AO_IGNORE_WINDOW_S = 300    # …when they all land within this window — a rate, not a lifetime count
 
 
 def maybe_auto_disable_wakefree() -> None:
@@ -899,15 +899,19 @@ def maybe_auto_disable_wakefree() -> None:
         log(f"wakefree auto-off check failed: {e}")
 
 
-AO_AUTOOFF_COOLDOWN_S = 3600    # auto-off self-heals after this (provisional — Jared to set)
+AO_AUTOOFF_COOLDOWN_S = 300     # one brake hold; a still-noisy room re-trips on re-arm (see docstring)
 _ao_reenable_check = {"t": 0.0}
 
 
 def maybe_auto_reenable_wakefree() -> None:
-    """The governor's auto-off is temporary: once the cooldown passes, always-on turns itself back on.
-    A MANUAL off (spoken command → set_always_on) writes no marker and never self-heals — only the
-    governor's marked flips do. Runs from the heartbeat thread on every worker, throttled to one
-    check per ~5 min (a slow timer needs no realtime; idempotent, so concurrent workers are fine)."""
+    """The governor's auto-off is one BRAKE HOLD, not a fixed cooldown: after AO_AUTOOFF_COOLDOWN_S it
+    re-arms always-on, and a room that is still noisy re-trips the brake within the next
+    AO_IGNORE_STREAK_OFF ignored turns — so sustained chatter keeps it red in successive holds and a
+    died-out conversation lets the re-arm stick. (The probe costs a few cheap fast-path judgments per
+    cycle; the no-cost version — ECAPA as a passive activity sensor during red — needs capture-layer
+    work and is not built.) A MANUAL off (spoken command → set_always_on) writes no marker and never
+    self-heals — only the governor's marked flips do. Runs from the heartbeat thread on every worker,
+    throttled to one check per ~5 min (a slow timer needs no realtime; idempotent across workers)."""
     now = time.monotonic()
     if now - _ao_reenable_check["t"] < 300:
         return
