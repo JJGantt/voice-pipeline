@@ -79,10 +79,10 @@ what regressed.
 **Everything runs on the subscription; the API key is the funded FALLBACK.** Sonnet runs on the warm
 `SdkRunner` (a long-lived headless Claude Code process holding the MCP servers); escalation runs Opus
 through `claude -p`. Both bill the subscription. The Console-billed `ApiRunner` still exists but runs
-only when a subscription path errors — at the SAME model tier, never as an upgrade. (It used to be the
-other way round: an API-billed fast path drained the Console balance on 2026-08-30, and the
-error-escalation of that era turned every noise judgment into a subscription Opus spawn — 291 in one
-evening. Errors falling sideways instead of upward is what prevents a recurrence.)
+only when a subscription path errors — at the SAME model tier, never as an upgrade. (The inverse — an
+API-billed fast path — is attractive because it spares the subscription window, and it fails: the
+Console balance drains at conversation volume, and any error path that upgrades the model turns every
+noise judgment into an Opus run. The dispatch comment in `worker.py` records the 2026-08-30 incident.)
 
 So the reasons the split exists, in the order they hold:
 
