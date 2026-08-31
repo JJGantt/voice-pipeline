@@ -2101,7 +2101,7 @@ def process_request(db: Supabase, req: dict) -> None:
             # Surface the hop itself: the bottom activity bar shows "escalated to Opus" and keeps an OPUS
             # chip up for the rest of the run, so a turn that quietly changed models is visible on the wall
             # instead of looking like an unexplained pause between the prompt and the first Opus tool call.
-            push_activity("Escalated to Opus — needs a full-access tool", "escalate")
+            push_activity("Escalated to Opus", "escalate")
             # Escalation runs on the SUBSCRIPTION: these turns are rare and already slow, so the CLI cold
             # start is noise here. Mac and Pi both have it; Fly is intercepted earlier. If the
             # subscription run fails anyway, finish on the API (the fallback) rather than drop.
@@ -2126,7 +2126,7 @@ def process_request(db: Supabase, req: dict) -> None:
     # backstop, re-run on a fresh Opus with NO context at all — nothing to mimic.
     if ("__escalate__" in text.lower()) or (re.sub(r"[^a-z]", "", text.lower()) == "escalate"):
         log("result leaked __ESCALATE__ → clean Opus re-run (no context)")
-        push_activity("Escalated to Opus — retry without context", "escalate")
+        push_activity("Escalated to Opus", "escalate")
         result = run_claude(prompt, None, on_event=_emit, system_append=sys_ctx,
                             model="opus", allow_read=bool(att_paths))
         text = (result.get("text") or "").strip()
