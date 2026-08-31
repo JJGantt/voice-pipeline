@@ -35,8 +35,9 @@ from openwakeword.model import Model
 
 # ---- config (env) ----------------------------------------------------------
 PORT = int(os.environ.get("PORT", "8080"))
-WAKE_MODEL = os.environ.get("WAKE_MODEL", "hey_rhasspy")            # "Hey Rhasspy" → fast tier (Haiku)
-WAKE_MODEL_POWER = os.environ.get("WAKE_MODEL_POWER", "hey_jarvis") # "Hey Jarvis"  → power tier (Opus + ultrathink)
+WAKE_MODEL = os.environ.get("WAKE_MODEL", "hey_rhasspy")            # "Hey Rhasspy" — equivalent wake words:
+WAKE_MODEL_POWER = os.environ.get("WAKE_MODEL_POWER", "hey_jarvis") # "Hey Jarvis" — either one wakes capture;
+                                                                    # routing is the worker's dynamic dispatch
 WAKE_THRESHOLD = float(os.environ.get("WAKE_THRESHOLD", "0.5"))
 GAIN = float(os.environ.get("GAIN", "15"))   # software boost for the quiet 16-bit mic
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "whisper-large-v3-turbo")
@@ -64,10 +65,6 @@ _inject = False
 # enqueueing. When OFF, wake words. The model + voiceprint load lazily on turn-on (hence the 2 GB box).
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 _wakefree = False
-# Wake-free has no wake word to pick the route per-utterance (unlike 'Hey Rhasspy'=fast / 'Hey Jarvis'=
-# power), so it runs on ONE configurable route: app_settings.wakefree_route ('fast'=Haiku / 'power'=Opus).
-# Loaded with the voiceprint on turn-on and updated live by the Mac listener via /wakefree-route.
-_wake_route = "fast"
 _enc = None          # ECAPA model (lazy)
 _bank = None         # voiceprint: (N, 192) exemplar embeddings from app_settings.voiceprint
 _vthresh = 0.30
@@ -245,7 +242,7 @@ async def _notify_transcribe_failure() -> None:
         pass
 
 
-async def _open_request(tier: str = "", cap_start: str | None = None, cap_end: str | None = None) -> str | None:
+async def _open_request(cap_start: str | None = None, cap_end: str | None = None) -> str | None:
     """Open the command's lifecycle row at CAPTURE-ACCEPT — status 'transcribing', no transcript yet.
     This is the moment the working indicators turn on (ESP blink here, floor lamp via pi-audio's
     realtime sub on this insert): the earliest instant the system has committed to processing the
@@ -261,7 +258,6 @@ async def _open_request(tier: str = "", cap_start: str | None = None, cap_end: s
                          "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
                          "Content-Type": "application/json", "Prefer": "return=representation"},
                 json={"status": "transcribing", "source": "fly", "focus": "hub",
-                      **({"tier": tier} if tier else {}),
                       **({"capture_start": cap_start} if cap_start else {}),
                       **({"capture_end": cap_end} if cap_end else {})},
             )
@@ -291,18 +287,17 @@ async def _close_request_error(rid: str, err: str) -> None:
         log.warning("close-request failed: %s", e)
 
 
-async def handle_transcript(text: str, duration_s: float, truncated: bool, tier: str = "",
+async def handle_transcript(text: str, duration_s: float, truncated: bool,
                             cap_start: str | None = None, cap_end: str | None = None,
                             rid: str | None = None) -> bool:
     """HANDOFF SEAM — the rest of the system hooks in here.
 
     `duration_s` is the captured length; `truncated` is True if the capture ended
     by hitting MAX_UTTERANCE_S while speech was still active (the hub surfaces this).
-    `tier` ('fast'|'power'|'') comes from which wake word fired; it rides the queue row.
     With `rid` (the lifecycle row opened at capture-accept) the transcript PATCHes that row to
     'pending'; without one it falls back to inserting the row here.
     """
-    log.info("TRANSCRIPT (%.0fs%s, tier=%s): %r", duration_s, ", TRUNCATED" if truncated else "", tier or "-", text)
+    log.info("TRANSCRIPT (%.0fs%s): %r", duration_s, ", TRUNCATED" if truncated else "", text)
     # Strip a leading wake phrase the STT often captures ("Hey Rhasspy, …" / "Hey Jarvis, …") — it's the
     # trigger word, not part of the command. Tolerant of Whisper mishears (raspy/rhaspy/raspberry, jarvis/jarvas; "very").
     text = re.sub(r"^\W*(hey|hi|ok|okay|very)?\W*(rhasspy|rhaspy|raspy|rasbee|rasby|raspberry|rasp|aspie|aspy|asbie|aspen|jarvis|jarvas|jervis)\b[\s,.!:;-]*",
@@ -333,7 +328,7 @@ async def handle_transcript(text: str, duration_s: float, truncated: bool, tier:
                         "Content-Type": "application/json",
                         "Prefer": "return=minimal",
                     },
-                    json={"transcript": text, "source": "fly", **({"tier": tier} if tier else {}),
+                    json={"transcript": text, "source": "fly",
                           **({"capture_start": cap_start} if cap_start else {}),
                           **({"capture_end": cap_end} if cap_end else {})},
                 )
@@ -393,7 +388,7 @@ async def connection(ws):
     ambient = deque(maxlen=max(1, int(AMBIENT_WINDOW_S * SAMPLE_RATE / FRAME_SAMPLES)))
     capturing = False
     utterance = bytearray()
-    wake_tier = None                # which wake word fired this utterance ('fast' | 'power')
+    woke = False                    # capture trigger fired (either wake word, or speech energy in wake-free)
     threshold = 0.0                 # adaptive speech/silence level, set at wake
     capture_floor = 0.0             # noise floor measured at capture start (for endpoint diagnostics)
     last_voice = 0.0
@@ -470,17 +465,15 @@ async def connection(ws):
                 speech_level = max(floor * FLOOR_MULT, floor + FLOOR_MIN_MARGIN)
 
                 if _wakefree:
-                    # No wake word — start on speech energy; the speaker is verified at close. The route
-                    # (Haiku/Opus) is the configured wake-free mode, not per-utterance.
-                    wake_tier = _wake_route if rms(frame) > speech_level else None
+                    # No wake word — start on speech energy; the speaker is verified at close.
+                    woke = rms(frame) > speech_level
                     fast_score = power_score = 0.0
                 else:
                     scores = oww.predict(frame)
                     power_score = scores.get(WAKE_MODEL_POWER, 0.0)
                     fast_score = scores.get(WAKE_MODEL, 0.0)
-                    # "Hey Jarvis" (power) checked first so it wins ties; "Hey Rhasspy" (fast) otherwise.
-                    wake_tier = "power" if power_score >= WAKE_THRESHOLD else ("fast" if fast_score >= WAKE_THRESHOLD else None)
-                if wake_tier:
+                    woke = max(power_score, fast_score) >= WAKE_THRESHOLD   # either wake word — same route
+                if woke:
                     threshold = speech_level
                     capture_floor = floor     # remember the room floor that set this threshold (diagnostics)
                     capturing = True          # LED stays as-is until we CONFIRM it's Jared (not raw energy)
@@ -496,7 +489,7 @@ async def connection(ws):
                     if _wakefree:
                         log.info("wake-free: speech — capturing…")
                     else:
-                        log.info("wake! tier=%s (fast=%.2f power=%.2f)", wake_tier, fast_score, power_score)
+                        log.info("wake! (fast=%.2f power=%.2f)", fast_score, power_score)
             else:
                 if not mute_flush:
                     utterance.extend(raw)   # post-mute audio is the dictation — never append it
@@ -638,7 +631,7 @@ async def connection(ws):
                 # flip the LED from solid (hearing you) to blink (working on it) NOW, before STT. The
                 # indicators answer "did my command go through?", so they start the moment we KNOW
                 # we're going to work, not when the worker eventually claims it.
-                rid = await _open_request(wake_tier or "", started_wall.isoformat(), end_wall.isoformat())
+                rid = await _open_request(started_wall.isoformat(), end_wall.isoformat())
                 _led_capturing = False
                 _led_working = True
                 await _render_led(ws)
@@ -646,7 +639,7 @@ async def connection(ws):
                 enqueued = False
                 try:
                     text = await transcribe(bytes(utterance))
-                    enqueued = await handle_transcript(text, dur, truncated, wake_tier or "",
+                    enqueued = await handle_transcript(text, dur, truncated,
                                                        started_wall.isoformat(), end_wall.isoformat(), rid=rid)
                 except Exception as e:
                     log.exception("transcription failed: %s", e)
@@ -755,7 +748,7 @@ def _get_settings(keys):
 
 def _load_voiceid():
     """Lazy-load ECAPA + the shared voiceprint + thresholds when wake-free turns on."""
-    global _enc, _bank, _vthresh, _vpause, _wake_route
+    global _enc, _bank, _vthresh, _vpause
     import base64
     import torch
     # On this shared 1-vCPU machine, torch's default thread pool oversubscribes the single core it
@@ -771,13 +764,12 @@ def _load_voiceid():
     from speechbrain.inference.speaker import EncoderClassifier
     if _enc is None:
         _enc = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb", savedir="/app/.ecapa")
-    s = _get_settings(["voiceprint", "voiceid_threshold", "wakefree_pause_s", "wakefree_route"])
+    s = _get_settings(["voiceprint", "voiceid_threshold", "wakefree_pause_s"])
     _bank = np.load(io.BytesIO(base64.b64decode(s["voiceprint"]))) if s.get("voiceprint") else None
     _vthresh = float(s.get("voiceid_threshold") or 0.30)
     _vpause = float(s.get("wakefree_pause_s") or 2.0)
-    _wake_route = s.get("wakefree_route") if s.get("wakefree_route") in ("power", "custom") else "fast"
-    log.info("wake-free loaded: voiceprint=%s thresh=%.2f pause=%.1fs route=%s",
-             None if _bank is None else _bank.shape, _vthresh, _vpause, _wake_route)
+    log.info("wake-free loaded: voiceprint=%s thresh=%.2f pause=%.1fs",
+             None if _bank is None else _bank.shape, _vthresh, _vpause)
 
 
 def _trim_voiced(wav, gate=0.006, margin_s=0.15):
@@ -1009,13 +1001,6 @@ async def process_request(connection, request):
             _wakefree = False
             log.info("wake-free OFF (wake-word capture)")
         return connection.respond(HTTPStatus.OK, "ok\n")
-    if path.startswith("/wakefree-route"):  # live route change, bridged by the Mac listener (?v=fast|power)
-        from urllib.parse import urlparse, parse_qs
-        global _wake_route
-        v = parse_qs(urlparse(path).query).get("v", [None])[0]
-        _wake_route = v if v in ("power", "custom") else "fast"
-        log.info("wake-free route → %s", _wake_route)
-        return connection.respond(HTTPStatus.OK, "ok\n")
     if path.startswith("/enroll-"):
         # Voiceprint enrollment from the ESP mic (token-gated like /led-*). /enroll-start?n=10 arms it:
         # the next n energy-endpointed utterances become exemplars in the shared bank. /enroll-stop
@@ -1068,7 +1053,7 @@ def _load_voiceid_bg() -> None:
 
 def _apply_setting(key, value) -> None:
     """Apply one app_settings change to the server's own state (no Mac bridge required)."""
-    global _wakefree, _suppressed, _wake_route, _inject
+    global _wakefree, _suppressed, _inject
     if key == "voice_inject_mode":
         _inject = _truthy(value)
         log.info("voice inject mode %s (from app_settings) — ESP %s", "ON" if _inject else "off",
@@ -1085,9 +1070,6 @@ def _apply_setting(key, value) -> None:
     elif key == "voice_muted":
         _suppressed = _truthy(value)
         log.info("global mute %s (from app_settings)", "ON" if _suppressed else "off")
-    elif key == "wakefree_route":
-        _wake_route = str(value) if str(value) in ("power", "custom") else "fast"
-        log.info("wake-free route → %s (from app_settings)", _wake_route)
     elif key in ("voiceid_threshold", "wakefree_pause_s", "voiceprint") and _wakefree:
         _load_voiceid_bg()   # refresh thresholds / voiceprint live
 
@@ -1108,11 +1090,11 @@ async def _settings_listener() -> None:
     if not (SUPABASE_URL and key):
         log.warning("settings listener: no supabase creds; ESP state will rely on the Mac bridge only")
         return
-    s = _get_settings(["wakefree_enabled", "voice_muted", "wakefree_route", "voice_inject_mode"])
-    for k in ("wakefree_route", "voice_muted", "wakefree_enabled", "voice_inject_mode"):
+    s = _get_settings(["wakefree_enabled", "voice_muted", "voice_inject_mode"])
+    for k in ("voice_muted", "wakefree_enabled", "voice_inject_mode"):
         if k in s:
             _apply_setting(k, s[k])
-    log.info("startup state from DB: wakefree=%s muted=%s route=%s inject=%s", _wakefree, _suppressed, _wake_route, _inject)
+    log.info("startup state from DB: wakefree=%s muted=%s inject=%s", _wakefree, _suppressed, _inject)
     from realtime import AsyncRealtimeClient
     while True:
         sock = None
@@ -1163,14 +1145,12 @@ async def _settings_listener() -> None:
                 # catches (and logs) a change realtime silently dropped, so a half-open socket can't leave
                 # the ESP mute / inject / wake-free stuck on a stale value.
                 try:
-                    s = _get_settings(["wakefree_enabled", "voice_muted", "wakefree_route", "voice_inject_mode"])
+                    s = _get_settings(["wakefree_enabled", "voice_muted", "voice_inject_mode"])
                     for k, cur in (("voice_muted", _suppressed), ("voice_inject_mode", _inject),
                                    ("wakefree_enabled", _wakefree)):
                         if k in s and _truthy(s[k]) != cur:
                             log.warning("settings backstop: realtime missed %s → applying from poll", k)
                             _apply_setting(k, s[k])
-                    if "wakefree_route" in s and str(s["wakefree_route"]) != _wake_route:
-                        _apply_setting("wakefree_route", s["wakefree_route"])
                 except Exception as e:  # noqa: BLE001
                     log.warning("settings backstop poll failed: %s", e)
             log.info("settings listener recycling realtime socket (connected=%s)", sock.is_connected)

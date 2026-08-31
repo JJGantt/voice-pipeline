@@ -4,9 +4,9 @@
 Continuously listens. Whenever speech energy is present it scores a rolling window against the
 enrolled voiceprint (ECAPA exemplar matching). While that's Jared, it accumulates the audio into an
 utterance; the utterance closes after ~2s with no Jared-voice (configurable). Each closed utterance is
-transcribed (Groq) and enqueued to voice_requests exactly like a wake-word command — source='mac',
-tier='fast' (Haiku + 1h prompt caching). The worker's __IGNORE__ directive drops anything that isn't a
-real command, so every chunk can be treated as one.
+transcribed (Groq) and enqueued to voice_requests exactly like a wake-word command (source='mac').
+The worker's __IGNORE__ directive drops anything that isn't a real command, so every chunk can be
+treated as one.
 
 The TV / other people never reach transcription — the speaker-ID gate filters them for free. Runs only
 while wake-free mode is toggled on (the listener releases the mic and keeps doing speech + HUD).
@@ -303,23 +303,6 @@ def transcribe(pcm_f32: np.ndarray) -> str:
             pass
 
 
-def route_tier() -> str:
-    """Wake-free has no wake word to pick the route per-utterance, so it runs on ONE configurable route:
-    app_settings.wakefree_route ('fast'=Haiku / 'power'=Opus). Read live per command (event-driven, one
-    GET when a real command fires — not a poll) so the hub toggle takes effect without a restart."""
-    try:
-        r = httpx.get(f"{SUPABASE_URL}/rest/v1/app_settings",
-                      params={"key": "eq.wakefree_route", "select": "value"},
-                      headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=8)
-        rows = r.json()
-        v = rows[0].get("value") if rows else None
-        if v in ("power", "custom"):
-            return v
-    except Exception:  # noqa: BLE001
-        pass
-    return "fast"
-
-
 LED_TOKEN = os.environ.get("LED_TOKEN", "")
 
 
@@ -334,7 +317,7 @@ def _esp_working() -> None:
         pass
 
 
-def open_request(tier: str, cap_start: str, cap_end: str) -> str | None:
+def open_request(cap_start: str, cap_end: str) -> str | None:
     """Open the command's lifecycle row at CAPTURE-ACCEPT (status 'transcribing', no transcript yet).
     This is what turns the working indicators on — the floor lamp goes amber on this insert and the
     ESP blink is pinged alongside it — at the earliest moment the system has committed to the command,
@@ -345,7 +328,7 @@ def open_request(tier: str, cap_start: str, cap_end: str) -> str | None:
         r = httpx.post(f"{SUPABASE_URL}/rest/v1/voice_requests",
                        headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
                                 "Content-Type": "application/json", "Prefer": "return=representation"},
-                       json={"status": "transcribing", "source": "mac", "focus": "hub", "tier": tier,
+                       json={"status": "transcribing", "source": "mac", "focus": "hub",
                              "capture_start": cap_start, "capture_end": cap_end}, timeout=6)
         rows = r.json()
         return rows[0]["id"] if isinstance(rows, list) and rows else None
@@ -383,7 +366,7 @@ def enqueue(text: str, cap_start: str | None = None, cap_end: str | None = None)
     if not (SUPABASE_KEY and text):
         return
     try:
-        payload = {"transcript": text, "source": "mac", "focus": "hub", "tier": route_tier()}
+        payload = {"transcript": text, "source": "mac", "focus": "hub"}
         if cap_start:
             payload["capture_start"] = cap_start
         if cap_end:
@@ -400,7 +383,7 @@ def enqueue(text: str, cap_start: str | None = None, cap_end: str | None = None)
 
 def inject_mode() -> bool:
     """True when the hub's voice_inject_mode is on — route confirmed commands to the focused Mac window
-    (paste + Enter) instead of the hub. Read live per command, like route_tier()."""
+    (paste + Enter) instead of the hub. Read live per command (one GET when a command fires)."""
     try:
         r = httpx.get(f"{SUPABASE_URL}/rest/v1/app_settings",
                       params={"key": "eq.voice_inject_mode", "select": "value"},
@@ -624,7 +607,7 @@ def main() -> int:
                                     inject = inject_mode()
                                     rid = None
                                     if not inject:
-                                        rid = open_request(route_tier(), t0_wall.isoformat(), cap_end_wall.isoformat())
+                                        rid = open_request(t0_wall.isoformat(), cap_end_wall.isoformat())
                                         threading.Thread(target=_esp_working, daemon=True).start()
                                     text = transcribe(pcm)
                                     if text:

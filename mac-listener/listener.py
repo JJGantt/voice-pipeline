@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Always-on Mac voice listener.
 
-openWakeWord runs continuously on the built-in mic with two wake words: "Hey Rhasspy" → fast tier
-(Haiku) and "Hey Jarvis" → power tier (Opus). On a wake hit it captures the following utterance
-(ending on a trailing silence), transcribes it with Groq whisper-large-v3-turbo when GROQ_API_KEY
-is set else local whisper.cpp, strips the wake phrase, and enqueues the transcript into Supabase
-`voice_requests` with source='mac' (carrying the tier) — the exact same queue the ESP/Fly path
+openWakeWord runs continuously on the built-in mic with two equivalent wake words ("Hey Rhasspy" /
+"Hey Jarvis" — either one wakes capture; routing is the worker's dynamic dispatch). On a wake hit it
+captures the following utterance (ending on a trailing silence), transcribes it with Groq
+whisper-large-v3-turbo when GROQ_API_KEY is set else local whisper.cpp, strips the wake phrase, and
+enqueues the transcript into Supabase `voice_requests` with source='mac' — the exact same queue the ESP/Fly path
 feeds. The Mac worker then drains it into the shared 'hub' conversation, identical to every other
 front-end. The Mac is just another set of ears. Live state (listening → working → done) is shown
 on screen via the Hammerspoon overlay HUD (see hud()).
@@ -32,8 +32,8 @@ from openwakeword.model import Model
 # ---- config (env, with sane defaults) -------------------------------------
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://felyggqjjhltwokdfhop.supabase.co").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")   # service_role or anon — only needs INSERT on voice_requests
-WAKE_MODEL = os.environ.get("WAKE_MODEL", "hey_rhasspy")          # fast tier → Haiku
-WAKE_MODEL_POWER = os.environ.get("WAKE_MODEL_POWER", "hey_jarvis") # power tier → Opus + ultrathink
+WAKE_MODEL = os.environ.get("WAKE_MODEL", "hey_rhasspy")            # "Hey Rhasspy" — equivalent wake words:
+WAKE_MODEL_POWER = os.environ.get("WAKE_MODEL_POWER", "hey_jarvis") # "Hey Jarvis" — either one wakes capture
 WAKE_THRESHOLD = float(os.environ.get("WAKE_THRESHOLD", "0.5"))
 WHISPER_BIN = os.path.expanduser(os.environ.get("WHISPER_BIN", "~/whisper.cpp/build/bin/whisper-cli"))
 WHISPER_MODEL = os.path.expanduser(os.environ.get("WHISPER_MODEL", "~/whisper.cpp/models/ggml-medium.en.bin"))
@@ -798,7 +798,7 @@ def _esp_blink() -> None:
         pass
 
 
-def open_request(tier: str, cap_start: str, cap_end: str) -> str | None:
+def open_request(cap_start: str, cap_end: str) -> str | None:
     """Open the command's lifecycle row at CAPTURE-ACCEPT (status 'transcribing', no transcript yet) —
     the moment the working indicators turn on (floor lamp amber via pi-audio's realtime sub on this
     insert; ESP blink pinged alongside). Returns the row id, or None (fall back to insert-at-enqueue)."""
@@ -809,7 +809,6 @@ def open_request(tier: str, cap_start: str, cap_end: str) -> str | None:
                        headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
                                 "Content-Type": "application/json", "Prefer": "return=representation"},
                        json={"status": "transcribing", "source": "mac", "focus": "hub",
-                             **({"tier": tier} if tier else {}),
                              "capture_start": cap_start, "capture_end": cap_end}, timeout=6)
         rows = r.json()
         return rows[0]["id"] if isinstance(rows, list) and rows else None
@@ -842,7 +841,7 @@ def close_request_error(rid: str, err: str) -> None:
         pass
 
 
-def enqueue(text: str, tier: str = "", cap_start: str | None = None, cap_end: str | None = None):
+def enqueue(text: str, cap_start: str | None = None, cap_end: str | None = None):
     """Fallback path (used when open_request failed at capture-accept): insert the finished transcript
     into voice_requests (source='mac', focus='hub'). Returns the new request_id or None. cap_start/
     cap_end stamp the recording's wall-clock window so the worker can dedup the ESP+Mac pair by span
@@ -851,8 +850,6 @@ def enqueue(text: str, tier: str = "", cap_start: str | None = None, cap_end: st
         return None
     try:
         payload: dict = {"transcript": text, "source": "mac", "focus": "hub"}
-        if tier:
-            payload["tier"] = tier
         if cap_start:
             payload["capture_start"] = cap_start
         if cap_end:
@@ -874,7 +871,7 @@ def enqueue(text: str, tier: str = "", cap_start: str | None = None, cap_end: st
             rid = rows[0]["id"] if isinstance(rows, list) and rows else None
         except Exception:  # noqa: BLE001
             pass
-        log(f"enqueued (tier={tier or 'default'}, id={rid}): {text[:80]!r}")
+        log(f"enqueued (id={rid}): {text[:80]!r}")
         return rid
     except Exception as e:  # noqa: BLE001
         log(f"enqueue failed: {e}")
@@ -989,13 +986,8 @@ def main() -> int:
                 scores = oww.predict(audio)
                 fast_score = scores.get(WAKE_MODEL, 0.0)
                 power_score = scores.get(WAKE_MODEL_POWER, 0.0)
-                fired_tier = None
-                if power_score >= WAKE_THRESHOLD:
-                    fired_tier = "power"   # power checked first — higher specificity wins ties
-                elif fast_score >= WAKE_THRESHOLD:
-                    fired_tier = "fast"
-                if fired_tier:
-                    log(f"wake! tier={fired_tier} (fast={fast_score:.2f} power={power_score:.2f}) — capturing…")
+                if max(fast_score, power_score) >= WAKE_THRESHOLD:   # either wake word — same route
+                    log(f"wake! (fast={fast_score:.2f} power={power_score:.2f}) — capturing…")
                     hud("listening")                    # LOCAL: only this Mac knows its own mic is open
                     warm_tts()                          # pre-warm TTS now — load overlaps capture + thinking
                     cap_start = datetime.now(timezone.utc)   # wall-clock start of the recording window
@@ -1004,20 +996,20 @@ def main() -> int:
                     hud("working")                      # capture done → transcribing / processing
                     # CAPTURE ACCEPTED — the command is committed from this instant: open the lifecycle
                     # row (lamp amber) + blink the ESP NOW, before STT runs.
-                    rid = open_request(fired_tier, cap_start.isoformat(), cap_end.isoformat())
+                    rid = open_request(cap_start.isoformat(), cap_end.isoformat())
                     threading.Thread(target=_esp_blink, daemon=True).start()
                     # Transcription blocks stream reads (Groq / whisper.cpp) — pause the watchdog's expectation.
                     _expect_frames.clear()
                     try:
                         text = strip_wake(transcribe(pcm))
                         if text:
-                            log(f"transcript (tier={fired_tier}): {text!r}")
+                            log(f"transcript: {text!r}")
                             # working/done HUD and the spoken reply are now driven UNIVERSALLY off
                             # voice_requests status + voice_speech (RealtimeFeedback) — for every source.
                             if rid:
                                 update_request_pending(rid, text)
                             else:
-                                enqueue(text, tier=fired_tier, cap_start=cap_start.isoformat(), cap_end=cap_end.isoformat())
+                                enqueue(text, cap_start=cap_start.isoformat(), cap_end=cap_end.isoformat())
                         else:
                             if rid:
                                 close_request_error(rid, "empty or failed transcription")

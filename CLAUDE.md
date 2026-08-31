@@ -13,8 +13,9 @@ two things that break silently:
 - **A new data-layer tool is invisible to voice until it is named there.** `validate_safe_tools()`
   logs the drift in both directions at startup; read that line after adding a tool.
 
-`voice_requests.tier` is still written by every capture path and read by nothing — the wake word that
-sets it (`hey_jarvis` vs `hey_rhasspy`) no longer changes how a turn runs.
+`voice_requests.tier` is a dead column: nothing writes or reads it (historical rows only). The two
+wake words ("Hey Rhasspy" / "Hey Jarvis") are equivalent triggers — routing is the worker's dynamic
+dispatch, and `app_settings.wakefree_route` is likewise an inert leftover row.
 
 ## `ANTHROPIC_API_KEY` is the fallback billing path — only `ApiRunner` may touch it
 
