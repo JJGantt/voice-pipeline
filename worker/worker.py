@@ -899,23 +899,26 @@ def maybe_auto_disable_wakefree() -> None:
         log(f"wakefree auto-off check failed: {e}")
 
 
-AO_AUTOOFF_COOLDOWN_S = 300     # one brake hold; a still-noisy room re-trips on re-arm (see docstring)
-_ao_reenable_check = {"t": 0.0}
+AO_AUTOOFF_COOLDOWN_S = 300     # minimum brake hold before a re-arm is even considered
+AO_REARM_QUIET_S = 180          # …and every mic's heard_jared_at must be at least this stale (room died down)
+_ao_reenable_check = {"t": 0.0, "interval": 300.0}
 
 
 def maybe_auto_reenable_wakefree() -> None:
-    """The governor's auto-off is one BRAKE HOLD, not a fixed cooldown: after AO_AUTOOFF_COOLDOWN_S it
-    re-arms always-on, and a room that is still noisy re-trips the brake within the next
-    AO_IGNORE_STREAK_OFF ignored turns — so sustained chatter keeps it red in successive holds and a
-    died-out conversation lets the re-arm stick. (The probe costs a few cheap fast-path judgments per
-    cycle; the no-cost version — ECAPA as a passive activity sensor during red — needs capture-layer
-    work and is not built.) A MANUAL off (spoken command → set_always_on) writes no marker and never
-    self-heals — only the governor's marked flips do. Runs from the heartbeat thread on every worker,
-    throttled to one check per ~5 min (a slow timer needs no realtime; idempotent across workers)."""
+    """The governor's auto-off holds until the ROOM GOES QUIET, then re-arms always-on. During red the
+    capture layer keeps ECAPA warm as a passive sensor and stamps voice_presence.heard_jared_at on
+    confirmed voice — no model judgments — so an ongoing conversation keeps the brake on and a
+    died-out one releases it: re-arm requires the minimum hold AND AO_REARM_QUIET_S of silence from
+    every mic. A stale/absent stamp reads as quiet, so a dead sensor can only re-arm EARLIER, never
+    wedge it red (and a still-noisy room then just re-trips on the next ignored streak). A MANUAL off
+    (spoken command → set_always_on) writes no marker and never self-heals — only the governor's
+    marked flips do. Runs from the heartbeat thread on every worker: one check per ~5 min normally,
+    tightened to ~60s while a brake is active (idempotent across workers)."""
     now = time.monotonic()
-    if now - _ao_reenable_check["t"] < 300:
+    if now - _ao_reenable_check["t"] < _ao_reenable_check["interval"]:
         return
     _ao_reenable_check["t"] = now
+    _ao_reenable_check["interval"] = 300.0
     try:
         r = httpx.get(f"{SUPABASE_URL}/rest/v1/app_settings",
                       params={"key": "in.(wakefree_enabled,wakefree_autooff_at)", "select": "key,value"},
@@ -935,13 +938,26 @@ def maybe_auto_reenable_wakefree() -> None:
             return
         if not marker:
             return   # manual off — stays off until Jared says otherwise
+        _ao_reenable_check["interval"] = 60.0   # brake active → watch for the release more closely
         age = (datetime.now(timezone.utc)
                - datetime.fromisoformat(marker.replace("Z", "+00:00"))).total_seconds()
         if age < AO_AUTOOFF_COOLDOWN_S:
             return
+        p = httpx.get(f"{SUPABASE_URL}/rest/v1/voice_presence",
+                      params={"select": "heard_jared_at"}, headers=headers(), timeout=5)
+        stamps = []
+        for row in p.json():
+            v = row.get("heard_jared_at")
+            if v:
+                try:
+                    stamps.append(datetime.fromisoformat(str(v).replace("Z", "+00:00")))
+                except ValueError:
+                    pass
+        if stamps and (datetime.now(timezone.utc) - max(stamps)).total_seconds() < AO_REARM_QUIET_S:
+            return   # the room is still talking — hold the brake
         _set("wakefree_enabled", "1")
         _set("wakefree_autooff_at", "")
-        log(f"always-on auto-re-enabled after {int(age)}s cooldown")
+        log(f"always-on auto-re-enabled: quiet after {int(age)}s braked")
     except Exception as e:  # noqa: BLE001 — never take the heartbeat down
         log(f"wakefree auto-reenable check failed: {e}")
 

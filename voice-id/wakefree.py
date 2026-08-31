@@ -189,18 +189,27 @@ def _alive_beacon() -> None:
         time.sleep(30)
 
 
+# Governor brake: run as a PASSIVE activity sensor — confirm Jared's voice and stamp the shared
+# heard_jared_at (so the worker can re-arm always-on when the room goes quiet), but never capture,
+# transcribe, enqueue, or touch the HUD/TTS. Spawned by the listener with this env while braked.
+SENSOR = os.environ.get("WAKEFREE_SENSOR") == "1"
+
+
 def log(msg: str) -> None:
-    print(f"{datetime.now(timezone.utc).isoformat()} [wakefree] {msg}", flush=True)
+    print(f"{datetime.now(timezone.utc).isoformat()} [{'wf-sensor' if SENSOR else 'wakefree'}] {msg}", flush=True)
 
 
 def hud(state: str) -> None:
     """Drive the Hammerspoon overlay pill. Redundant states are dropped rather than sent, against the
     SAME state file the listener writes — one pill, one state, whichever process last set it.
+    No-op in sensor mode: passive sensing must not paint 'listening'/'locked' over the wake-word pill.
 
     Hammerspoon's IPC port is not safe to flood: its error path logs back through the same port and
     re-enters the runloop, so queued requests recurse instead of unwinding (it crashed that way on
     2026-08-01). This process is respawned every ~15s while the audio stack is wedged, and each start
     re-asserted the pill; on disk, because a fresh process would otherwise remember nothing."""
+    if SENSOR:
+        return
     try:
         with _hud_send_lock:
             try:
@@ -265,7 +274,10 @@ def warm_tts() -> None:
     """Pre-warm the Kokoro TTS daemon the INSTANT speech capture starts — its ~7s cold load then overlaps
     capture + STT + the model's first turn, so the spoken `say` line plays immediately instead of waiting
     on a cold load (the wake-WORD path warms identically at wake detection; this brings parity). The
-    daemon self-exits after 30s idle, so it's only resident around active wake-free speech, never held."""
+    daemon self-exits after 30s idle, so it's only resident around active wake-free speech, never held.
+    No-op in sensor mode — nothing will be spoken."""
+    if SENSOR:
+        return
     try:
         subprocess.Popen([VOICE_DAEMON, "start"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:  # noqa: BLE001
@@ -588,6 +600,10 @@ def main() -> int:
                             if reason == "noise":
                                 log(f"never confirmed Jared ({audio_s:.1f}s) — skipped")
                             hud("off")
+                        elif SENSOR:
+                            # Sensor mode: the confirm loop above already stamped heard_jared_at — that IS
+                            # the output. No suppression check, no transcription, no enqueue.
+                            log(f"sensor: tracked your voice for {audio_s:.1f}s")
                         else:                          # tracked as Jared live → no end-of-utterance re-check
                             # Blocking network work (presence check + Groq + enqueue) pauses stream reads —
                             # tell the watchdog frames are legitimately not arriving until we're back.

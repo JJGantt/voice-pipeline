@@ -65,6 +65,7 @@ _inject = False
 # enqueueing. When OFF, wake words. The model + voiceprint load lazily on turn-on (hence the 2 GB box).
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 _wakefree = False
+_ao_braked = False   # governor brake marker (wakefree_autooff_at set) → run the passive voice sensor
 _enc = None          # ECAPA model (lazy)
 _bank = None         # voiceprint: (N, 192) exemplar embeddings from app_settings.voiceprint
 _vthresh = 0.30
@@ -118,6 +119,7 @@ LONG_UTTERANCE_WARN_S = 300.0  # warn if a single capture runs this long
 # you've been absent (no confirmed-Jared window) for the hangover. Tune from the logged vad/endpoint lines.
 VAD_WINDOW_S = 2.0           # trailing audio fed to ECAPA per check
 VAD_CHECK_EVERY_S = 0.7      # re-score cadence while capturing
+SENSE_EVERY_S = 5.0          # brake-sensor cadence: at most one ECAPA check per this much room speech
 VAD_ABSENT_MISSES_MIN = 1   # consecutive non-confirms that close a SHORT capture (event-based, not a
                             # timer that races the cadence and clips you between words). The requirement
                             # scales up with how long you have been talking — see _absent_misses below.
@@ -385,6 +387,10 @@ async def connection(ws):
     pending = bytearray()           # raw bytes not yet aligned to a frame
     preroll = bytearray()           # rolling pre-wake audio
     preroll_max = int(PREROLL_S * SAMPLE_RATE) * 2
+    sense_buf = bytearray()         # brake-sensor rolling window (red mode only; preroll is too short for ECAPA)
+    sense_max = int(VAD_WINDOW_S * SAMPLE_RATE) * 2
+    sense_task = None               # in-flight sensor ECAPA check
+    last_sense = 0.0                # throttle: last sensor check start (monotonic)
     ambient = deque(maxlen=max(1, int(AMBIENT_WINDOW_S * SAMPLE_RATE / FRAME_SAMPLES)))
     capturing = False
     utterance = bytearray()
@@ -473,6 +479,30 @@ async def connection(ws):
                     power_score = scores.get(WAKE_MODEL_POWER, 0.0)
                     fast_score = scores.get(WAKE_MODEL, 0.0)
                     woke = max(power_score, fast_score) >= WAKE_THRESHOLD   # either wake word — same route
+                    # Governor brake (red mode): PASSIVE voice sensor. ECAPA stays warm and stamps the
+                    # shared heard_jared_at on confirmed voice, so the worker holds the brake while the
+                    # conversation continues and re-arms once the room goes quiet. Nothing is captured,
+                    # transcribed, or judged here — and the wake words above keep working regardless.
+                    if _ao_braked and _enc is not None and _bank is not None:
+                        sense_buf.extend(raw)
+                        if len(sense_buf) > sense_max:
+                            del sense_buf[: len(sense_buf) - sense_max]
+                        _mono = time.monotonic()
+                        if (sense_task is None and _mono - last_sense >= SENSE_EVERY_S
+                                and len(sense_buf) >= sense_max and rms(frame) > speech_level):
+                            last_sense = _mono
+                            sense_task = asyncio.create_task(_check_speaker(
+                                np.frombuffer(bytes(sense_buf), dtype=np.int16), _mono))
+                        if sense_task is not None and sense_task.done():
+                            try:
+                                _sim, _ = sense_task.result()
+                            except Exception:  # noqa: BLE001
+                                _sim = 0.0
+                            sense_task = None
+                            if _sim >= _vthresh:
+                                asyncio.create_task(_publish_presence(True))
+                    elif sense_buf:
+                        sense_buf.clear()
                 if woke:
                     threshold = speech_level
                     capture_floor = floor     # remember the room floor that set this threshold (diagnostics)
@@ -1058,7 +1088,7 @@ def _load_voiceid_bg() -> None:
 
 def _apply_setting(key, value) -> None:
     """Apply one app_settings change to the server's own state (no Mac bridge required)."""
-    global _wakefree, _suppressed, _inject
+    global _wakefree, _suppressed, _inject, _ao_braked
     if key == "voice_inject_mode":
         _inject = _truthy(value)
         log.info("voice inject mode %s (from app_settings) — ESP %s", "ON" if _inject else "off",
@@ -1075,6 +1105,15 @@ def _apply_setting(key, value) -> None:
     elif key == "voice_muted":
         _suppressed = _truthy(value)
         log.info("global mute %s (from app_settings)", "ON" if _suppressed else "off")
+    elif key == "wakefree_autooff_at":
+        braked = bool(str(value or "").strip())
+        if braked and not _ao_braked:
+            log.info("governor brake ON — passive voice sensor armed")
+            if _enc is None or _bank is None:
+                _load_voiceid_bg()   # the sensor needs ECAPA even though wake-free itself is off
+        elif not braked and _ao_braked:
+            log.info("governor brake off — sensor idle")
+        _ao_braked = braked
     elif key in ("voiceid_threshold", "wakefree_pause_s", "voiceprint") and _wakefree:
         _load_voiceid_bg()   # refresh thresholds / voiceprint live
 
@@ -1095,8 +1134,8 @@ async def _settings_listener() -> None:
     if not (SUPABASE_URL and key):
         log.warning("settings listener: no supabase creds; ESP state will rely on the Mac bridge only")
         return
-    s = _get_settings(["wakefree_enabled", "voice_muted", "voice_inject_mode"])
-    for k in ("voice_muted", "wakefree_enabled", "voice_inject_mode"):
+    s = _get_settings(["wakefree_enabled", "voice_muted", "voice_inject_mode", "wakefree_autooff_at"])
+    for k in ("voice_muted", "wakefree_enabled", "voice_inject_mode", "wakefree_autooff_at"):
         if k in s:
             _apply_setting(k, s[k])
     log.info("startup state from DB: wakefree=%s muted=%s inject=%s", _wakefree, _suppressed, _inject)
@@ -1150,12 +1189,17 @@ async def _settings_listener() -> None:
                 # catches (and logs) a change realtime silently dropped, so a half-open socket can't leave
                 # the ESP mute / inject / wake-free stuck on a stale value.
                 try:
-                    s = _get_settings(["wakefree_enabled", "voice_muted", "voice_inject_mode"])
+                    s = _get_settings(["wakefree_enabled", "voice_muted", "voice_inject_mode",
+                                       "wakefree_autooff_at"])
                     for k, cur in (("voice_muted", _suppressed), ("voice_inject_mode", _inject),
                                    ("wakefree_enabled", _wakefree)):
                         if k in s and _truthy(s[k]) != cur:
                             log.warning("settings backstop: realtime missed %s → applying from poll", k)
                             _apply_setting(k, s[k])
+                    if ("wakefree_autooff_at" in s
+                            and bool(str(s["wakefree_autooff_at"] or "").strip()) != _ao_braked):
+                        log.warning("settings backstop: realtime missed wakefree_autooff_at → applying from poll")
+                        _apply_setting("wakefree_autooff_at", s["wakefree_autooff_at"])
                 except Exception as e:  # noqa: BLE001
                     log.warning("settings backstop poll failed: %s", e)
             log.info("settings listener recycling realtime socket (connected=%s)", sock.is_connected)

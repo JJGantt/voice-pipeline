@@ -58,6 +58,8 @@ _muted = threading.Event()      # set = global voice_muted (an explicit command 
 _mic_on = threading.Event()     # clear = THIS Mac's mic is off (app_settings.mac_mic_enabled); ESP unaffected
 _mic_on.set()                   # default ON — a missing/unreadable setting must never silently deafen the Mac
 _wakefree = threading.Event()   # set = wake-free mode on
+_sensor = threading.Event()     # set = governor brake → wakefree.py runs as a PASSIVE voice sensor
+_sensor_proc = None             # the sensor child (mic NOT yielded — wake words keep running here)
 _capture = threading.Event()    # set = the listener should own the mic (wake-word)
 _capture.set()
 
@@ -269,6 +271,10 @@ def set_mac_mic(on: bool) -> None:
             # is also what "mic off" should mean: the mic is fully released, not held muted.
             subprocess.Popen(["pkill", "-f", "wakefree.py"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if not on:
+        set_sensor(False)          # the passive sensor holds a mic stream too — mic off stops it
+    elif not _wakefree.is_set() and _read_setting("wakefree_autooff_at"):
+        set_sensor(True)           # mic back while still braked → resume sensing
     log(f"mac mic {'ON' if on else 'OFF'} (mac_mic_enabled) — ESP unaffected")
 
 
@@ -343,6 +349,7 @@ def set_wakefree(on: bool) -> None:
     """Toggle wake-free mode (driven by the hub setting). On → listener yields the mic and starts
     wakefree.py; Off → stop wakefree.py and reclaim the mic for wake-word capture."""
     if on and not _wakefree.is_set():
+        set_sensor(False)   # live wake-free stamps the same presence — the passive sensor is redundant
         _wakefree.set(); _recompute_capture()
         log("wake-free ON — yielding mic, starting wakefree.py (+ ESP)")
         if _mic_on.is_set():
@@ -359,6 +366,63 @@ def set_wakefree(on: bool) -> None:
         subprocess.Popen(["pkill", "-f", "wakefree.py"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         _pin_tts(False)   # session over → let the daemon idle-exit and give the ~1 GB back
         threading.Thread(target=_ping_esp_wakefree, args=(False,), daemon=True).start()
+        # The governor's off writes the brake marker BEFORE flipping the toggle, so by the time this
+        # event arrives the marker is already set and its own event found wake-free still on. Re-check
+        # here or the sensor never starts on an auto-off.
+        if _read_setting("wakefree_autooff_at"):
+            set_sensor(True)
+
+
+def set_sensor(on: bool) -> None:
+    """Governor brake (wakefree_autooff_at set) → run wakefree.py as a PASSIVE voice sensor: ECAPA
+    stays warm and stamps the shared heard_jared_at on confirmed voice, so the worker holds the brake
+    while the room conversation continues and re-arms always-on once it goes quiet. The listener KEEPS
+    the mic — wake words keep working (macOS lets both processes read the same input; wake-free mode
+    already runs both streams, just with the roles reversed). The sensor never captures, transcribes,
+    or enqueues. No-op while wake-free itself is on."""
+    global _sensor_proc
+    if on:
+        if _sensor.is_set() or _wakefree.is_set() or not _mic_on.is_set():
+            return
+        _sensor.set()
+        _spawn_sensor()
+        log("governor brake ON — voice sensor started (mic stays with wake words)")
+    else:
+        if not _sensor.is_set():
+            return
+        _sensor.clear()   # cleared FIRST so the supervisor won't respawn the kill
+        proc, _sensor_proc = _sensor_proc, None
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+        log("governor brake off — voice sensor stopped")
+
+
+def _spawn_sensor() -> None:
+    global _sensor_proc
+    started = time.monotonic()
+    slog = None
+    try:
+        slog = open(os.path.expanduser("~/repos/voice-pipeline/voice-id/wakefree.out.log"), "a")
+        _sensor_proc = subprocess.Popen([WAKEFREE_RUN], stdout=slog, stderr=slog,
+                                        env={**os.environ, "WAKEFREE_SENSOR": "1"})
+    except Exception as e:  # noqa: BLE001
+        log(f"failed to start voice sensor: {e}")
+        return
+    finally:
+        if slog is not None:
+            slog.close()   # same fd rule as _spawn_wakefree: the child holds its own dup
+
+    def _supervise(proc: subprocess.Popen) -> None:
+        rc = proc.wait()
+        if not (_sensor.is_set() and _mic_on.is_set() and proc is _sensor_proc) or rc == 2:
+            return   # deliberate stop, superseded, or fatal config
+        # Best-effort respawn with a flat backoff — no storm escalation like the real wakefree gets: a
+        # sensor that keeps dying only makes re-arm happen EARLIER (absence of stamps reads as quiet).
+        time.sleep(max(0.0, 10.0 - (time.monotonic() - started)))
+        if _sensor.is_set() and _mic_on.is_set() and proc is _sensor_proc:
+            _spawn_sensor()
+
+    threading.Thread(target=_supervise, args=(_sensor_proc,), daemon=True).start()
 
 
 # Flag the Claude Code hooks read: present → speak my replies (Kokoro) + write them spoken-word-friendly.
@@ -669,6 +733,8 @@ class RealtimeFeedback:
         truthy = str(rec.get("value")) not in ("0", "false", "off", "no", "", "None")
         if key == "wakefree_enabled":
             set_wakefree(truthy)
+        elif key == "wakefree_autooff_at":   # governor brake marker → passive voice sensor while red
+            set_sensor(truthy)
         elif key == "voice_muted":      # global mute set by any explicit input (PTT / FAB)
             _apply_mute(truthy)
         elif key == "mac_mic_enabled":     # per-device: silence THIS Mac's mic, ESP stays live
@@ -950,6 +1016,8 @@ def main() -> int:
     set_mac_mic(_read_setting("mac_mic_enabled", default=True))
     if _read_setting("wakefree_enabled"):  # apply persisted hub toggle at boot; live flips via RealtimeFeedback
         set_wakefree(True)
+    elif _read_setting("wakefree_autooff_at"):   # booted mid-brake → resume passive sensing
+        set_sensor(True)
     set_inject_mode(_read_setting("voice_inject_mode"))  # apply persisted inject toggle (forces wake-free on if set)
     set_speak_replies(_read_setting("voice_speak_replies"))  # apply persisted speech toggle (default off)
     # Clear any stale global mute on boot: push-to-talk mutes are Mac-local, so a fresh listener means
