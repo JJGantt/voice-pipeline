@@ -856,7 +856,7 @@ def synth_on_mac() -> bool:
     return _synth_mac_cache["v"]
 
 
-AO_IGNORE_STREAK_OFF = 5   # consecutive ignored turns that switch always-on OFF (provisional — Jared to set)
+AO_IGNORE_STREAK_OFF = 3   # consecutive ignored turns that switch always-on OFF (Jared's number)
 
 
 def maybe_auto_disable_wakefree() -> None:
