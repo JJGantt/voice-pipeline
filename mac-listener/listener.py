@@ -937,7 +937,7 @@ def main() -> int:
     _raise_fd_limit()   # headroom before we open models, sockets, and the wakefree supervisor
     log(f"loading wake models: fast={WAKE_MODEL!r} power={WAKE_MODEL_POWER!r} (threshold {WAKE_THRESHOLD})…")
     oww = Model(wakeword_models=[WAKE_MODEL, WAKE_MODEL_POWER], inference_framework="onnx")
-    log(f"listening — 'Hey Rhasspy' (fast/Haiku) or 'Hey Jarvis' (power/Opus)  (stt={stt}, hangover={HANGOVER_S}s)")
+    log(f"listening — 'Hey Rhasspy' or 'Hey Jarvis'  (stt={stt}, hangover={HANGOVER_S}s)")
 
     feedback = RealtimeFeedback()
     feedback.start()   # one persistent realtime sub → universal speech + HUD state (any source)
