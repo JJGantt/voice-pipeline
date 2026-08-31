@@ -476,7 +476,8 @@ async def connection(ws):
                 if woke:
                     threshold = speech_level
                     capture_floor = floor     # remember the room floor that set this threshold (diagnostics)
-                    capturing = True          # LED stays as-is until we CONFIRM it's Jared (not raw energy)
+                    capturing = True          # wake-free: LED stays as-is until ECAPA confirms it's Jared
+                                              # (raw energy is not confirmation); wake-word lights below
                     utterance = bytearray(preroll)
                     seed_len_s = len(utterance) / 2 / SAMPLE_RATE   # pre-roll length — excluded from VAD timing below
                     preroll.clear()
@@ -490,6 +491,10 @@ async def connection(ws):
                         log.info("wake-free: speech — capturing…")
                     else:
                         log.info("wake! (fast=%.2f power=%.2f)", fast_score, power_score)
+                        # Congruent with wake-free's confirmed state: the wake word IS the confirmation,
+                        # so the LED goes solid ("hearing you") the instant it fires — not at capture close.
+                        _led_capturing = True
+                        await _render_led(ws)
             else:
                 if not mute_flush:
                     utterance.extend(raw)   # post-mute audio is the dictation — never append it

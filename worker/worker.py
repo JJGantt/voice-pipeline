@@ -884,6 +884,12 @@ def maybe_auto_disable_wakefree() -> None:
         grows = g.json()
         if not (grows and str(grows[0].get("value")).strip().lower() in ("1", "true", "on", "yes")):
             return   # already off — nothing to flip
+        # Marker FIRST, then the flip: an auto-off must stay distinguishable from Jared turning
+        # always-on off by voice — only a MARKED off self-heals after the cooldown below.
+        httpx.post(f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
+                   headers={**headers(), "Prefer": "resolution=merge-duplicates"},
+                   json={"key": "wakefree_autooff_at", "value": now_iso(), "updated_at": now_iso()},
+                   timeout=10)
         httpx.post(f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
                    headers={**headers(), "Prefer": "resolution=merge-duplicates"},
                    json={"key": "wakefree_enabled", "value": "0", "updated_at": now_iso()},
@@ -891,6 +897,49 @@ def maybe_auto_disable_wakefree() -> None:
         log(f"always-on auto-disabled: last {AO_IGNORE_STREAK_OFF} turns all noise within the hour")
     except Exception as e:  # noqa: BLE001 — the governor must never take a turn down
         log(f"wakefree auto-off check failed: {e}")
+
+
+AO_AUTOOFF_COOLDOWN_S = 3600    # auto-off self-heals after this (provisional — Jared to set)
+_ao_reenable_check = {"t": 0.0}
+
+
+def maybe_auto_reenable_wakefree() -> None:
+    """The governor's auto-off is temporary: once the cooldown passes, always-on turns itself back on.
+    A MANUAL off (spoken command → set_always_on) writes no marker and never self-heals — only the
+    governor's marked flips do. Runs from the heartbeat thread on every worker, throttled to one
+    check per ~5 min (a slow timer needs no realtime; idempotent, so concurrent workers are fine)."""
+    now = time.monotonic()
+    if now - _ao_reenable_check["t"] < 300:
+        return
+    _ao_reenable_check["t"] = now
+    try:
+        r = httpx.get(f"{SUPABASE_URL}/rest/v1/app_settings",
+                      params={"key": "in.(wakefree_enabled,wakefree_autooff_at)", "select": "key,value"},
+                      headers=headers(), timeout=5)
+        s = {row["key"]: row["value"] for row in r.json()}
+        marker = (s.get("wakefree_autooff_at") or "").strip()
+        enabled = str(s.get("wakefree_enabled", "0")).strip().lower() in ("1", "true", "on", "yes")
+
+        def _set(k, v):
+            httpx.post(f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
+                       headers={**headers(), "Prefer": "resolution=merge-duplicates"},
+                       json={"key": k, "value": v, "updated_at": now_iso()}, timeout=10)
+
+        if enabled:
+            if marker:
+                _set("wakefree_autooff_at", "")   # re-enabled by hand before the cooldown — clear the stale marker
+            return
+        if not marker:
+            return   # manual off — stays off until Jared says otherwise
+        age = (datetime.now(timezone.utc)
+               - datetime.fromisoformat(marker.replace("Z", "+00:00"))).total_seconds()
+        if age < AO_AUTOOFF_COOLDOWN_S:
+            return
+        _set("wakefree_enabled", "1")
+        _set("wakefree_autooff_at", "")
+        log(f"always-on auto-re-enabled after {int(age)}s cooldown")
+    except Exception as e:  # noqa: BLE001 — never take the heartbeat down
+        log(f"wakefree auto-reenable check failed: {e}")
 
 
 def speak_via_mac(text: str) -> bool:
@@ -2301,6 +2350,7 @@ def _heartbeat_loop(stop_evt: threading.Event) -> None:
         while not stop_evt.is_set():
             try:
                 heartbeat(hb_db)
+                maybe_auto_reenable_wakefree()   # self-throttled to ~5 min; rides the beat, no extra timer
             except Exception as e:  # noqa: BLE001
                 log(f"heartbeat thread error: {e}")
             # Standing by → beat slowly (but still < HEARTBEAT_FRESH_S so we never look dead).
