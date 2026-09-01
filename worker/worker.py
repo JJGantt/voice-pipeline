@@ -1394,7 +1394,12 @@ class ApiRunner:
         from contextlib import AsyncExitStack
         from mcp import ClientSession, StdioServerParameters
         from mcp.client.stdio import stdio_client
-        env = {**os.environ, "SUPABASE_URL": SUPABASE_URL, "SUPABASE_KEY": SUPABASE_KEY}
+        # DATA_TS_FILE for the same reason the SDK path needs it, and these sessions are warm too
+        # (`if self._sessions: return` above) — but note this path never carried the override at all,
+        # so a set logged through the fallback landed at pipeline-end rather than at Jared's
+        # rest-clock moment. Same file, so both runners now agree.
+        env = {**os.environ, "SUPABASE_URL": SUPABASE_URL, "SUPABASE_KEY": SUPABASE_KEY,
+               "DATA_TS_FILE": str(CMD_TS_FILE)}
         specs = []
         if os.path.exists(DATA_MCP_JS):  specs.append(("data", "node", [DATA_MCP_JS]))
         if os.path.exists(VOICE_MCP_JS): specs.append(("voice", "node", [VOICE_MCP_JS]))
