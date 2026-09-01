@@ -43,16 +43,29 @@ Not reads vs writes — **whether the model has to supply a value out of its own
 | `log_nutrition` `stage_meal` `edit_staged` `subtract_leftovers` | a food's macros, and the cooked weight of a dish |
 | `set_nutrition_targets` | maintenance math, when the ask is "targets for a cut" rather than a stated number |
 | `upsert_catalog_exercise` | a movement's categories and fractional muscle map |
+| `save_recipe` | each ingredient's macros for the portion recorded — the same estimate as logging it |
 | `publish_report` | — (gated by convention; it does not run on a voice turn often enough to matter) |
 
 Everything else is on the fast path, including writes that are destructive: reads, actuators, lists,
 notes, dated items, the whole session group (`start_session`, `follow_up`, `get_sessions`,
 `resume_session`, `end_session`, `transfer_session`), `log_weight`/`set_height`,
 `log_set`/`update_set`/`remove_set`, the rep watcher, and
-`commit_staged`/`remove_staged`/`delete_nutrition_entry`. Every argument those take is
-either a number the user spoke or an id from a read — there is nothing in them a bigger model knows
-better. **Destructiveness is not what the gate is for**; a wrong delete is a tool-description problem,
+`commit_staged`/`remove_staged`/`delete_nutrition_entry`, and the recipe reads plus `log_recipe`.
+Every argument those take is either a number the user spoke or an id from a read — there is nothing in
+them a bigger model knows better. **Destructiveness is not what the gate is for**; a wrong delete is a tool-description problem,
 and Sonnet already deletes notes and whole lists.
+
+### A saved recipe is logged by a different tool so it can be ungated
+
+`log_recipe` exists because of this table. Logging a recipe supplies nothing out of the model's
+knowledge — a name the user said, a serving count the user said, and macros written down when the
+recipe was saved — so by the rule it belongs to Sonnet. But it used to be a variant of
+`log_nutrition`, and that tool is gated for good reason, so "log my overnight oats" bought a full
+Opus escalation to copy numbers that already existed.
+
+Splitting it made the gate mechanical rather than a matter of trust: `log_recipe` has no field on it
+through which a macro could be invented. `save_recipe` stays gated, because writing the recipe in the
+first place is exactly the estimating job `log_nutrition` does.
 
 ### Sets are gated per CALL, not per tool
 

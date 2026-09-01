@@ -301,6 +301,12 @@ SAFE_TOOLS = [
     "mcp__data__get_due", "mcp__data__set_due", "mcp__data__set_list_emoji",
     "mcp__data__get_lists", "mcp__data__add_to_list", "mcp__data__remove_from_list", "mcp__data__delete_list",
     "mcp__data__get_notes", "mcp__data__create_note", "mcp__data__delete_note",
+    # Recipes. Reading them invents nothing, and log_recipe cannot: it takes a saved recipe's NAME and
+    # a serving count, and every macro it writes was estimated once, when the recipe was saved. That is
+    # the whole reason it exists as a separate tool from log_nutrition — there is no field on it through
+    # which a macro could be guessed, so the fast path is safe by construction rather than by care.
+    # save_recipe IS gated: writing a recipe means estimating each ingredient's macros from its portion.
+    "mcp__data__list_recipes", "mcp__data__get_recipe", "mcp__data__log_recipe", "mcp__data__delete_recipe",
     # Body figures the user says out loud. log_weight refuses anything it was not explicitly given;
     # set_height is inches. Nothing to estimate, so nothing the capable model would do better.
     "mcp__data__log_weight", "mcp__data__set_height",
@@ -366,12 +372,15 @@ ESCALATE_SENTINEL = "__ESCALATE__"
 ESCALATE_DIRECTIVE = (
     "\n\n[You are the fast first responder. You can see the full toolset, but the tools that need a "
     "value supplied out of the model's OWN knowledge are handled by a more capable model, not you: "
-    "estimating a food's macros (logging, staging or editing nutrition, or subtracting leftovers), "
-    "setting nutrition targets, and giving categories/muscles to an exercise the catalog does not have "
-    "yet. Everything whose arguments are already in front of you is YOURS, and you should just do it: "
-    "read anything (get_*/list_*); manage lists, notes and dated items; log a weight or height he "
+    "estimating a food's macros (logging, staging or editing nutrition, subtracting leftovers, or SAVING "
+    "a recipe), setting nutrition targets, and giving categories/muscles to an exercise the catalog does "
+    "not have yet. Everything whose arguments are already in front of you is YOURS, and you should just "
+    "do it: read anything (get_*/list_*); manage lists, notes and dated items; log a weight or height he "
     "stated as a number; commit, remove or delete an entry by its id; log, edit or remove a SET; set or "
     "clear the rep watcher; and drive the lights, feeder, TV and voice settings. "
+    "When he calls a meal one of HIS — 'my oatmeal', 'my gochujang tofu' — check list_recipes: a SAVED "
+    "recipe is logged or staged with log_recipe, which is yours, because its macros were estimated once "
+    "when it was saved and you are only naming it. Only a meal that is NOT saved needs the capable model. "
     "For sets, call get_workout_catalog first and pass the matching exercise's ID — however he said it, "
     "plural or singular. If the movement is NOT in the catalog at all it needs a muscle map you would "
     "have to invent — escalate instead. "
