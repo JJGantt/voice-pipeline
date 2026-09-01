@@ -1100,15 +1100,30 @@ def fetch_attachments(paths: list) -> tuple[str | None, list[str]]:
     return tmpdir, local
 
 
-# The current command's audio-recording START time (voice_requests.capture_start), set by handle() per
-# command. The data MCP's now() uses it as the default timestamp so a voice-logged SET lands at when Jared
-# actually spoke — his rest-clock reference — not ~30s later when the command finishes the pipeline.
-_cmd_ts_override = None
+# The current command's audio-recording START time (voice_requests.capture_start), written here per
+# command. The data MCP's now() reads it so a voice-logged SET lands at when Jared actually spoke — his
+# rest-clock reference — not ~30s later when the command finishes the pipeline.
+#
+# It is a FILE and not an env value, and that distinction is the whole point. The fast path (ApiRunner)
+# starts its MCP servers ONCE per worker lifetime as warm stdio sessions, so anything placed in the
+# subprocess environment is fixed for as long as the worker runs: passing the timestamp that way froze
+# it at one moment and stamped 29 hours of writes with it (Aug 31, found 2026-09-01). The path is
+# constant — safe to bake into a warm session — while the contents change per command.
+CMD_TS_FILE = STATE_DIR / "cmd_ts"
+
+
+def set_cmd_ts(value: str | None) -> None:
+    """Publish (or clear) the in-flight command's capture_start for the data MCP."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        CMD_TS_FILE.write_text(value or "")
+    except Exception as e:  # noqa: BLE001
+        log(f"cmd_ts write failed: {e}")   # a stale stamp is worse than none, so this is never fatal
 
 
 def write_mcp_config() -> str:
     env = {"SUPABASE_URL": SUPABASE_URL, "SUPABASE_KEY": SUPABASE_KEY}
-    data_env = {**env, "DATA_TS_OVERRIDE": _cmd_ts_override} if _cmd_ts_override else env
+    data_env = {**env, "DATA_TS_FILE": str(CMD_TS_FILE)}
     cfg = {
         "mcpServers": {
             "data": {"command": "node", "args": [DATA_MCP_JS], "env": data_env},
@@ -1894,8 +1909,7 @@ def process_request(db: Supabase, req: dict) -> None:
     # Timestamp carry-through: the data MCP defaults every write's timestamp to when the audio recording
     # STARTED (not ~30s later at pipeline end), so a voice-logged set lands at Jared's rest-clock moment.
     # Only for audio captures (typed/web commands have no capture_start → real wall clock).
-    global _cmd_ts_override
-    _cmd_ts_override = (req.get("capture_start") or "").strip() or None
+    set_cmd_ts((req.get("capture_start") or "").strip() or None)
 
     # Manual context reset from the hub UI: drop the CURRENT mode's session so the next command starts
     # fresh — full-agent mode resets its own context, hub mode its own (whichever you're in). The status-hub
