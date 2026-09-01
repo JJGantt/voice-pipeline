@@ -307,7 +307,10 @@ SAFE_TOOLS = [
     # Sets. logSets() canonicalises against the catalog and THROWS on a movement it does not know
     # unless a muscle map comes with it, so the one case that needs real knowledge cannot be reached
     # from here by accident — the directive turns that into an escalation before it becomes an error.
-    # update_set/remove_set take a set id and the reps the user stated; neither can touch an exercise.
+    # update_set can now retitle a set, but only to a movement the catalog ALREADY holds — it throws on
+    # an unknown name rather than registering one — so the same escalation covers it. remove_set takes
+    # only an id. Both, and log_set, accept a stated occurred_at, which is a wall-clock string the user
+    # said out loud and needs no more knowledge than the reps do.
     "mcp__data__log_set", "mcp__data__update_set", "mcp__data__remove_set",
     # Rep watcher: an exercise the catalog already has, plus a weight. setWatcher() cannot create a
     # catalog entry — it errors on an unknown name — and clear takes no arguments at all.
