@@ -304,13 +304,13 @@ SAFE_TOOLS = [
     # Body figures the user says out loud. log_weight refuses anything it was not explicitly given;
     # set_height is inches. Nothing to estimate, so nothing the capable model would do better.
     "mcp__data__log_weight", "mcp__data__set_height",
-    # Sets. logSets() canonicalises against the catalog and THROWS on a movement it does not know
-    # unless a muscle map comes with it, so the one case that needs real knowledge cannot be reached
-    # from here by accident — the directive turns that into an escalation before it becomes an error.
-    # update_set can now retitle a set, but only to a movement the catalog ALREADY holds — it throws on
-    # an unknown name rather than registering one — so the same escalation covers it. remove_set takes
-    # only an id. Both, and log_set, accept a stated occurred_at, which is a wall-clock string the user
-    # said out loud and needs no more knowledge than the reps do.
+    # Sets. An exercise is named by its CATALOG ID (migration 00075), so none of these can invent a
+    # movement or land on the wrong one: an id from get_workout_catalog either exists or the call
+    # fails. Registering a genuinely new movement means inventing a muscle map, which is real
+    # knowledge — that is upsert_catalog_exercise, deliberately absent from this list, so the case
+    # escalates rather than being guessed at down here. remove_set takes a set id; all three accept a
+    # stated occurred_at, a wall-clock string he said out loud that needs no more knowledge than the
+    # reps do.
     "mcp__data__log_set", "mcp__data__update_set", "mcp__data__remove_set",
     # Rep watcher: an exercise the catalog already has, plus a weight. setWatcher() cannot create a
     # catalog entry — it errors on an unknown name — and clear takes no arguments at all.
@@ -372,8 +372,9 @@ ESCALATE_DIRECTIVE = (
     "read anything (get_*/list_*); manage lists, notes and dated items; log a weight or height he "
     "stated as a number; commit, remove or delete an entry by its id; log, edit or remove a SET; set or "
     "clear the rep watcher; and drive the lights, feeder, TV and voice settings. "
-    "For sets, call get_workout_catalog first and reuse the exact name. If the movement is NOT already "
-    "in the catalog it needs a muscle map you would have to invent — escalate instead. "
+    "For sets, call get_workout_catalog first and pass the matching exercise's ID — however he said it, "
+    "plural or singular. If the movement is NOT in the catalog at all it needs a muscle map you would "
+    "have to invent — escalate instead. "
     "Decide this from the CURRENT instruction ALONE. The recent conversation above is background: that "
     "it was about food, weight or workouts does not make THIS turn one, and a request to add something "
     "to a list is a list request no matter what was being discussed a minute ago. "
