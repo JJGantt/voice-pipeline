@@ -28,7 +28,9 @@ cd "$DIR" || exit 1
 #     take a while to find.
 #
 # Stripping both leaves the interactive login as the credential, which is the only one that supports
-# Remote Control. `claude /login` must therefore have been run on this host at least once.
+# Remote Control — and, for the same reason, Claude in Chrome. Neither can attach to a credential
+# with no claude.ai account behind it. `claude /login` must therefore have been run on this host at
+# least once.
 unset ANTHROPIC_API_KEY
 unset CLAUDE_CODE_OAUTH_TOKEN
 
@@ -42,9 +44,26 @@ MODEL="${PI_DESK_MODEL:-opus}"
 RESUME=()
 [ -n "$RESUME_ID" ] && RESUME=(--resume "$RESUME_ID")
 
+# The automation browser (repo: pi-browser) lives on display :99. Two things are needed and both are
+# easy to get wrong:
+#
+#   - DISPLAY=:99, or Chrome integration reports "Status: Disabled" however correct everything else
+#     is, and anything Claude Code opens — a permissions page, a login flow — appears on the wall TV
+#     on :0 instead, where nobody can click it.
+#   - --chrome on every session, not just ones that look browser-shaped. Nothing upstream classifies
+#     the request: the voice handler escalates it verbatim and this session decides what to do. Tools
+#     load at session start and cannot be acquired later, so a session that becomes a browser task on
+#     a remote-control follow-up would otherwise be stuck. Browser tools arrive deferred (names only,
+#     schemas fetched on use), so carrying them costs a couple of hundred tokens.
+#
+# ensure-ready is what actually makes the tools appear: the extension's service worker idles out, and
+# a session started while it is asleep gets no browser tools at all, silently.
+export DISPLAY="${PI_DESK_DISPLAY:-:99}"
+[ -x "$HOME/repos/pi-browser/bin/ensure-ready.sh" ] && "$HOME/repos/pi-browser/bin/ensure-ready.sh" || true
+
 if [ -n "$PROMPT_FILE" ] && [ -s "$PROMPT_FILE" ]; then
   PROMPT="$(cat "$PROMPT_FILE")"
   rm -f "$PROMPT_FILE"
-  exec claude --model "$MODEL" "${RESUME[@]}" --remote-control "$NAME" "$PROMPT"
+  exec claude --model "$MODEL" --chrome "${RESUME[@]}" --remote-control "$NAME" "$PROMPT"
 fi
-exec claude --model "$MODEL" "${RESUME[@]}" --remote-control "$NAME"
+exec claude --model "$MODEL" --chrome "${RESUME[@]}" --remote-control "$NAME"
