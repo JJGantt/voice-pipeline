@@ -127,3 +127,19 @@ must never become `--disallowedTools`, is `../docs/ROUTING.md`.
 Full-agent mode is the opposite shape: `--dangerously-skip-permissions` in
 `agent_cwd`, every native tool live. It exists for dictated coding work and is
 gated behind the `agent_mode` setting.
+
+## Failure alerts
+
+The worker pushes to Jared's phone (hub `/api/notify`, title `Voice worker`) when the subscription
+path fails — even if the API fallback then completes the request — and when a request fails on both
+paths. Body: `<host> · <stage> · <class> · <error>`, stage ∈ `subscription`/`request`, class ∈
+`auth`/`billing`/`rate-limit`/`error`. One push per host per (stage, class) per `ALERT_COOLDOWN_S`
+(default 3600). Not gated by the hub's push toggle; that toggle is for command results.
+
+What the classes mean on the phone:
+
+- `auth` — the setup token is revoked or expired. Re-mint: `claude setup-token` → this `.env` on
+  every host + `fly secrets set CLAUDE_CODE_OAUTH_TOKEN=… -a jared-voice` → restart. A Google
+  password change revokes it (the claude.ai account signs in with Google).
+- `billing` — the Console balance is empty; the API fallback cannot complete anything.
+- `rate-limit` — transient; nothing to do unless it persists.

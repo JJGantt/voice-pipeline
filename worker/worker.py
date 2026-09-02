@@ -168,6 +168,49 @@ def notify_phone(body: str, title: str = "Hub") -> None:
     threading.Thread(target=_send, daemon=True).start()
 
 
+# Failure alerts. A request is not allowed to fail silently: the subscription path failing is pushed
+# the moment it happens, even when the API fallback rescues the turn, because a revoked or expired
+# token is a standing condition that every later request pays for; a request that fails on both paths
+# is pushed with its error. One push per host per (stage, class) per ALERT_COOLDOWN_S, so a burst of
+# the same fault does not flood the phone. Deliberately bypasses push_enabled — that toggle is for
+# command results, not outages.
+ALERT_COOLDOWN_S = float(os.environ.get("ALERT_COOLDOWN_S", "3600"))
+_alert_last: dict = {}
+
+
+def classify_failure(err: str) -> str:
+    e = (err or "").lower()
+    if "401" in e or "authenticate" in e or "revoked" in e or "oauth" in e:
+        return "auth"
+    if "credit balance" in e or "billing" in e or "402" in e:
+        return "billing"
+    if "429" in e or "rate limit" in e or "overloaded" in e:
+        return "rate-limit"
+    return "error"
+
+
+def alert_failure(stage: str, err: str) -> None:
+    """Push a worker failure to Jared's phone: `<host> · <stage> · <class> · <error>`. Best-effort, threaded."""
+    kind = classify_failure(err)
+    key = f"{stage}:{kind}"
+    now = time.monotonic()
+    if now - _alert_last.get(key, -ALERT_COOLDOWN_S) < ALERT_COOLDOWN_S:
+        return
+    _alert_last[key] = now
+    body = f"{WORKER_ID} · {stage} · {kind} · {(err or '')[:180]}"
+    log(f"ALERT {body}")
+    if not HUB_NOTIFY_URL:
+        return
+
+    def _send():
+        try:
+            httpx.post(HUB_NOTIFY_URL, json={"title": "Voice worker", "body": body[:300], "kind": "voice"}, timeout=5.0)
+        except Exception:  # noqa: BLE001
+            pass
+
+    threading.Thread(target=_send, daemon=True).start()
+
+
 # Drive the ESP light to reflect EVERY command's lifecycle (universal indicator, not just ESP-sourced):
 # /led-blink while the worker is working, /led-off when done. The server holds the ESP socket; we hit its
 # HTTP routes. Fire-and-forget in a thread so it never adds latency to the command path.
@@ -2138,6 +2181,7 @@ def process_request(db: Supabase, req: dict) -> None:
         result = SDK.run(fast_prompt, on_event=_emit)
         if not result.get("ok"):
             log(f"subscription fast path failed ({result.get('raw_error')}) — API Sonnet fallback")
+            alert_failure("subscription", result.get("raw_error") or "")
             result = API.run(hub_prompt + ESCALATE_DIRECTIVE, system_append=sys_ctx, on_event=_emit,
                              model="sonnet", allowed=SAFE_TOOLS, fresh=True)
         st = (result.get("text") or "").strip().lower()
@@ -2157,6 +2201,7 @@ def process_request(db: Supabase, req: dict) -> None:
                                 model="opus", allow_read=bool(att_paths))
             if not result.get("ok"):
                 log(f"subscription Opus failed ({result.get('raw_error')}) — completing on the API")
+                alert_failure("subscription", result.get("raw_error") or "")
                 result = API.run(hub_prompt + POWER_DIRECTIVE, system_append=sys_ctx, on_event=_emit,
                                  model="opus", think=True, effort=effort, fresh=True)
 
@@ -2239,6 +2284,7 @@ def process_request(db: Supabase, req: dict) -> None:
             {"status": "error", "error": err, "updated_at": now_iso()},
         )
         log(f"ERROR request {rid}: {err}")
+        alert_failure("request", err)
 
 
 # --------------------------------------------------------------------------- #
