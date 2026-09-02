@@ -57,26 +57,9 @@ RESUME=()
 #     schemas fetched on use), so carrying them costs a couple of hundred tokens.
 export DISPLAY="${PI_DESK_DISPLAY:-:99}"
 
-# Browser preamble, prepended to the dispatched prompt. Two facts a session cannot work out for
-# itself and must not stop to ask about, because nobody is watching a dispatched session:
-#
-#   - WHICH browser. Two Chrome extensions are signed into the account (this Pi's and the Mac's), and
-#     a browser call refuses until one is chosen. There is no persistent default — `select_browser`
-#     and `/chrome → Select browser…` last only for the session — so the id is injected per launch.
-#     Read live from the pairing config rather than hardcoded: a re-pair changes it, and a stale id
-#     would send the session to the wrong machine's browser.
-#   - CLOSING tabs. Tabs are the session's to clean up; on a 4 GB box with no screen they otherwise
-#     accumulate. tidy-tabs.sh is only a cap, not the mechanism.
-DEVICE_ID="$(python3 -c 'import json,os,sys; print(json.load(open(os.path.expanduser("~/.claude.json"))).get("chromeExtension",{}).get("pairedDeviceId",""))' 2>/dev/null || true)"
-BROWSER_NOTE="[Browser: this machine has its own Chromium on display :99, already signed in to Jared's accounts."
-[ -n "$DEVICE_ID" ] && BROWSER_NOTE="$BROWSER_NOTE Two browsers are connected to the account; yours is deviceId $DEVICE_ID — call select_browser with it rather than asking which to use."
-BROWSER_NOTE="$BROWSER_NOTE Close every tab you open when you are done with it.]"
-
 if [ -n "$PROMPT_FILE" ] && [ -s "$PROMPT_FILE" ]; then
   PROMPT="$(cat "$PROMPT_FILE")"
   rm -f "$PROMPT_FILE"
-  exec claude --model "$MODEL" --chrome "${RESUME[@]}" --remote-control "$NAME" "$BROWSER_NOTE
-
-$PROMPT"
+  exec claude --model "$MODEL" --chrome "${RESUME[@]}" --remote-control "$NAME" "$PROMPT"
 fi
 exec claude --model "$MODEL" --chrome "${RESUME[@]}" --remote-control "$NAME"
