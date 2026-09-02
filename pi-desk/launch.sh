@@ -55,11 +55,7 @@ RESUME=()
 #     load at session start and cannot be acquired later, so a session that becomes a browser task on
 #     a remote-control follow-up would otherwise be stuck. Browser tools arrive deferred (names only,
 #     schemas fetched on use), so carrying them costs a couple of hundred tokens.
-#
-# ensure-ready is what actually makes the tools appear: the extension's service worker idles out, and
-# a session started while it is asleep gets no browser tools at all, silently.
 export DISPLAY="${PI_DESK_DISPLAY:-:99}"
-[ -x "$HOME/repos/pi-browser/bin/ensure-ready.sh" ] && "$HOME/repos/pi-browser/bin/ensure-ready.sh" || true
 
 if [ -n "$PROMPT_FILE" ] && [ -s "$PROMPT_FILE" ]; then
   PROMPT="$(cat "$PROMPT_FILE")"
