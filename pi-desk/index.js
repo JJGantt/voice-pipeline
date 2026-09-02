@@ -374,7 +374,15 @@ function launch(dir, name, prompt, resumeId = null) {
   }
 
   const args = ['new-session', '-d', '-s', session, '-c', dir, launcher, dir, rcName, promptFile, resumeId || '', session];
-  const child = spawn('tmux', args, { detached: true, stdio: 'ignore' });
+  // The first of these spawns creates the tmux SERVER, and the server keeps this environment for
+  // its whole life — every later session in it inherits the lot, including ones a person opens by
+  // hand. run.sh loaded worker/.env into this process, so without scrubbing here the server carries
+  // ANTHROPIC_API_KEY and CLAUDE_CODE_OAUTH_TOKEN, and any `claude` started under it that does not
+  // go through launch.sh silently bills the API or loses its account linkage. launch.sh strips them
+  // for its own sessions; this covers everything else.
+  const env = { ...process.env };
+  for (const k of ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_AUTH_TOKEN']) delete env[k];
+  const child = spawn('tmux', args, { detached: true, stdio: 'ignore', env });
   child.unref();
   return session;
 }
