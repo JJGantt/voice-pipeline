@@ -126,6 +126,26 @@ Sonnet turn, then a CLI cold start, then a full Opus turn. That is why anything 
 belongs on the fast path, and why the fix for latency, if one is ever wanted, is to continue an
 escalated turn rather than restart it.
 
+## A refused turn wedges the warm client
+
+The `SdkRunner` holds ONE long-lived headless Claude Code process. When the model refuses a turn, the
+CLI answers `API Error: Sonnet 5 can't help with this. Start a new session to continue.` and then
+returns that same error for **every later turn regardless of content**, until the process is
+reconnected. Passing a fresh `session_id` to `query()` does not clear it, even though each turn
+already does exactly that.
+
+The mic is always on, so the input that trips a refusal is usually room audio nobody addressed to the
+assistant — and the commands that die behind it are unrelated. On 2026-09-02 one false-triggered
+ambient capture wedged the client for 85 minutes; roughly fifteen commands failed, and the `ApiRunner`
+could not cover them because the Console balance was empty.
+
+So `SdkRunner.run()` recycles the client after **any** failed turn, not just a timeout or transport
+error — a refusal arrives through the ordinary `ResultMessage` path with `is_error` set, so an
+`except` block never sees it. It then re-runs the turn once on the cold client, but only when the
+failed attempt called no tool (`used_tools`): a refusal fails before any tool call, so that re-run has
+no side effects, while a turn that already acted is never replayed. A genuinely refusable turn just
+fails twice, quickly, and falls through to the fallback as before.
+
 ## Keeping the list honest
 
 An allow list of exact tool-name strings has no link to the tools that exist, so it drifts in both

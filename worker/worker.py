@@ -1663,38 +1663,65 @@ class SdkRunner:
         from claude_agent_sdk import AssistantMessage, TextBlock, ToolUseBlock, ResultMessage
         await self._client.query(prompt, session_id=uuid.uuid4().hex)
         chunks, result_text, ok, raw_error = [], "", True, None
+        used_tools = False
         async for msg in self._client.receive_response():
             if isinstance(msg, AssistantMessage):
                 for b in msg.content:
                     if isinstance(b, TextBlock):
                         chunks.append(b.text)
-                    elif isinstance(b, ToolUseBlock) and on_event:
-                        try:
-                            on_event("tool", {"name": b.name, "input": b.input})
-                        except Exception:  # noqa: BLE001
-                            pass
+                    elif isinstance(b, ToolUseBlock):
+                        used_tools = True   # gates the retry in run(); tracked even with no on_event
+                        if on_event:
+                            try:
+                                on_event("tool", {"name": b.name, "input": b.input})
+                            except Exception:  # noqa: BLE001
+                                pass
             elif isinstance(msg, ResultMessage):
                 ok = not msg.is_error
                 result_text = msg.result or ""
                 if msg.is_error:
                     raw_error = result_text or msg.subtype
-        return {"session_id": None, "text": "\n".join(chunks).strip(),
+        return {"session_id": None, "text": "\n".join(chunks).strip(), "used_tools": used_tools,
                 "result": result_text, "ok": ok, "raw_error": raw_error}
 
-    def run(self, transcript, on_event=None) -> dict:
-        self._start_loop()
+    def _recycle(self):
+        """Drop the warm client so the next turn reconnects cold."""
+        try:
+            asyncio.run_coroutine_threadsafe(self._teardown(), self._loop).result(timeout=15)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _attempt(self, transcript, on_event) -> dict:
+        """One turn on the warm client. `used_tools` reports whether it acted before failing; a crash
+        hides that, so it reports True — the conservative answer, since it only suppresses a retry."""
         try:
             fut = asyncio.run_coroutine_threadsafe(self._turn(transcript, on_event), self._loop)
             return fut.result(timeout=CLAUDE_TIMEOUT_S + 30)
         except Exception as e:  # noqa: BLE001 — never wedge the worker
-            # After a timeout or transport error the warm process's state is unknown: kill it so the
-            # next turn reconnects cold instead of inheriting a wedged client.
-            try:
-                asyncio.run_coroutine_threadsafe(self._teardown(), self._loop).result(timeout=15)
-            except Exception:  # noqa: BLE001
-                pass
-            return {"session_id": None, "text": "", "result": "", "ok": False,
+            return {"session_id": None, "text": "", "result": "", "ok": False, "used_tools": True,
                     "raw_error": f"sdk run failed: {e}"}
+
+    def run(self, transcript, on_event=None) -> dict:
+        self._start_loop()
+        result = self._attempt(transcript, on_event)
+        if result.get("ok"):
+            return result
+        # ANY failure leaves the warm process in an unknown state, so recycle it. Refusals are why the
+        # recycle cannot be limited to timeouts and transport errors: the CLI answers "Sonnet 5 can't
+        # help with this. Start a new session to continue." through the ORDINARY result path, and then
+        # returns that same error for every later turn regardless of content — passing a fresh
+        # session_id to an already-connected client does not clear it. On 2026-09-02 one false-triggered
+        # ambient capture wedged the client for 85 minutes; every command in that window died behind it.
+        self._recycle()
+        if result.get("used_tools"):
+            return result   # it acted, or may have: never replay side effects
+        # Nothing was called, so re-running is side-effect free and keeps the turn on the subscription
+        # instead of spending the caller's fallback. A genuinely refusable turn just fails twice, fast.
+        log(f"sdk turn failed ({result.get('raw_error')}) — recycled warm client, retrying once")
+        retry = self._attempt(transcript, on_event)
+        if not retry.get("ok"):
+            self._recycle()   # the cold client failed too; don't hand the next turn a used one
+        return retry
 
 
 API = ApiRunner()
