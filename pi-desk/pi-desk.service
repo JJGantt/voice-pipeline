@@ -15,6 +15,19 @@ RestartSec=5
 # being spawned detached. That meant restarting the daemon destroyed every session it was managing,
 # silently, on every deploy. Sessions must outlive their supervisor; that is the point of tmux.
 KillMode=process
+# A ceiling, so this unit cannot starve the wall display. The tmux server is inside this cgroup (see
+# KillMode above), so these bound the SESSIONS, not just the supervisor. pi-browser.service has
+# carried the same pair since it landed; pi-desk had MemoryMax=infinity, and on 2026-09-04 it grew to
+# 1.2GB and the kernel took the TV instead.
+#
+# Not a working limit — two sessions plus the supervisor run ~850MB, well under. It is the backstop
+# for when RESIDENT_MAX is somehow not enough. Combined with the oom_score_adj=800 that launch.sh
+# stamps on each session, a cgroup OOM here picks a session rather than the supervisor.
+MemoryHigh=1G
+MemoryMax=1300M
+# A session being OOM-killed must NOT take the unit down with it: the default (stop) would end the
+# supervisor and every other session over one casualty, turning a contained loss into a total one.
+OOMPolicy=continue
 Environment=HOME=/home/jaredgantt
 # tmux and gh live in /usr/bin; claude in /usr/local/bin.
 Environment=PATH=/usr/local/bin:/usr/bin:/bin

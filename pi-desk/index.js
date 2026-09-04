@@ -64,7 +64,26 @@ const COMMAND_TTL_S = Number(process.env.COMMAND_TTL_S || 120);
 // on purpose: this is real work, and cutting it short is the thing wrapping up exists to prevent.
 const WORKER = 'pi-desk';
 // A MEMORY bound: sessions cost ~334MB each whether or not they are doing anything.
-const RESIDENT_MAX = Number(process.env.RESIDENT_MAX || 3);
+//
+// Two, not three, since 2026-09-02: pi-browser.service became a permanent tenant of this Pi that
+// day (~450MB of Chromium on :99, capped at 1.3G). Three sessions plus the wall display plus the
+// automation browser does not fit in 4GB, and the way it does not fit is the kernel killing the
+// wall — see the OOM ordering note on IDLE_MAX_S below.
+const RESIDENT_MAX = Number(process.env.RESIDENT_MAX || 2);
+
+// A TIME bound, and the one the other limits do not provide.
+//
+// RESIDENT_MAX, WORKING_MAX, MIN_FREE_MB and pickEviction all run in ONE place: runQueue, when
+// something new wants a slot. Nothing queued means nothing re-examines what is already resident, so
+// a session that finished its work simply stays. On 2026-09-04 two Amazon-cart sessions from Sep 3
+// (one of which had already answered, one of which returned __ESCALATE__) sat idle for two days
+// holding ~516MB, and the kernel spent that afternoon killing the wall display's renderer instead —
+// 13 OOM kills in the final hour. Nothing was over any limit; there was no limit to be over.
+//
+// Eviction is not destructive: an evicted session keeps its transcript and `resume_session` brings
+// it back with full context, so the cost of reaping early is tokens on resume, not lost work. That
+// asymmetry is why this can be aggressive where pickEviction is a last resort.
+const IDLE_MAX_S = Number(process.env.PI_DESK_IDLE_MAX_S || 3600);
 // Capacity is not only a count. This Pi also drives the wall display, and Chromium is the process
 // that loses an out-of-memory fight — the kernel OOM-killed its renderer twice on 2026-08-26 while
 // sessions sat inside the residency cap, leaving the screen on 'Aw, Snap' with nothing technically
@@ -172,7 +191,9 @@ async function reconcileSessions() {
     }
     // lastActivity is what eviction sorts on. A session with no transcript reports 0 and therefore
     // sorts first — correct, since a session nothing can be read from is the least costly to lose.
-    residents.push({ name, working: tail.working, bytes: tail.bytes, lastActivity: tail.lastActivity, row });
+    // `created` is tmux's own start clock, carried so the idle reaper can tell a session that has
+    // gone quiet from one that has not written its first transcript line yet.
+    residents.push({ name, working: tail.working, bytes: tail.bytes, lastActivity: tail.lastActivity, created, row });
 
     try {
       await sb('desk_sessions?on_conflict=id', {
@@ -222,7 +243,39 @@ async function reconcileSessions() {
     }
   } catch (e) { console.error('[pi-desk] sweep:', e.message); }
 
-  await runQueue(residents);
+  await runQueue(await reapIdleSessions(residents));
+}
+
+/**
+ * Close resident sessions that have gone quiet, and return the ones that remain.
+ *
+ * Unlike pickEviction this is not about making room — it runs every tick whether or not anything is
+ * queued, which is precisely the case nothing else covered. It takes ALL sessions past the cutoff,
+ * not just the oldest, because the failure it exists to prevent is several of them accumulating.
+ *
+ * Two things are deliberately never reaped:
+ *   · a `working` session — a turn is in flight, and cutting it can leave a repo half-edited.
+ *   · a session younger than the cutoff by tmux's clock — `lastActivity` is 0 until the transcript's
+ *     first line lands, so a freshly launched session looks maximally idle and would be killed on
+ *     the tick after it started.
+ */
+async function reapIdleSessions(residents) {
+  if (!(IDLE_MAX_S > 0)) return residents;             // 0 or unset disables reaping entirely
+  const cutoff = Date.now() - IDLE_MAX_S * 1000;
+  const kept = [];
+  for (const r of residents) {
+    const quiet = (r.lastActivity || 0) < cutoff;
+    const old = (r.created || 0) < cutoff;             // never judge a session younger than the cutoff
+    if (r.working || !quiet || !old) { kept.push(r); continue; }
+    const idleMin = Math.round((Date.now() - (r.lastActivity || r.created || 0)) / 60000);
+    console.log(`[pi-desk] reaping ${r.name}: idle ${idleMin}m (limit ${Math.round(IDLE_MAX_S / 60)}m)`);
+    await evict(r.name);
+    await sb(`desk_sessions?id=eq.${encodeURIComponent(r.name)}`, {
+      method: 'PATCH', headers: { Prefer: 'return=minimal' },
+      body: JSON.stringify({ status: 'evicted', ended: new Date().toISOString() }),
+    }).catch(() => {});
+  }
+  return kept;
 }
 
 // ---- the queue ------------------------------------------------------------

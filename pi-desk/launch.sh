@@ -57,6 +57,19 @@ RESUME=()
 #     schemas fetched on use), so carrying them costs a couple of hundred tokens.
 export DISPLAY="${PI_DESK_DISPLAY:-:99}"
 
+# Make this session the kernel's preferred victim, ahead of the wall display.
+#
+# Chromium stamps its own renderers with oom_score_adj 200-300 — near the top of the kill list — while
+# a Claude session sits at the default 0. So under real pressure the kernel takes the TV wall and
+# leaves the idle session that caused the pressure, which is backwards and is exactly what happened
+# on 2026-09-04: 13 renderer kills in an hour while three sessions held 800MB between them.
+#
+# 800 outranks Chromium's 300, so a session goes first now. It is set on the shell and inherited
+# through `exec`, which matters: raising your OWN score needs no privilege, where lowering anything
+# (protecting the wall directly) needs CAP_SYS_RESOURCE. kiosk-health.py does that half with sudo;
+# this half has to work without it, because launch.sh must never need root.
+echo 800 > /proc/self/oom_score_adj 2>/dev/null || true
+
 if [ -n "$PROMPT_FILE" ] && [ -s "$PROMPT_FILE" ]; then
   PROMPT="$(cat "$PROMPT_FILE")"
   rm -f "$PROMPT_FILE"
