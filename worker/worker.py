@@ -342,7 +342,7 @@ SAFE_TOOLS = [
     # lists / notes / dated items: low-stakes writes needing no domain knowledge → fast path.
     # Reminders are not separate tools any more — a reminder is a list item with a due date (00056).
     "mcp__data__get_due", "mcp__data__set_due", "mcp__data__set_priority", "mcp__data__set_list_emoji",
-    "mcp__data__get_lists", "mcp__data__add_to_list", "mcp__data__remove_from_list", "mcp__data__delete_list",
+    "mcp__data__get_lists", "mcp__data__add_to_list", "mcp__data__complete_item", "mcp__data__remove_from_list", "mcp__data__delete_list",
     "mcp__data__get_notes", "mcp__data__create_note", "mcp__data__delete_note",
     # Recipes. Reading them invents nothing, and log_recipe cannot: it takes a saved recipe's NAME and
     # a serving count, and every macro it writes was estimated once, when the recipe was saved. That is
