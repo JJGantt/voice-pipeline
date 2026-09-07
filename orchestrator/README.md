@@ -47,6 +47,8 @@ launchctl load ~/Library/LaunchAgents/com.jaredgantt.voice-orchestrator.plist
 | `COMMAND_POLL_MS` | `30000` (realtime backstop)                        |
 | `COMMAND_TTL_S`   | `120`                                              |
 | `PRESENCE_MS`     | `30000`                                            |
+| `HUB_URL`         | `https://jared-status-hub.fly.dev`                 |
+| `HUB_TOKEN`       | the kiosk token (live session activity → the wall) |
 | `PTY_COLS`/`PTY_ROWS` | `200` / `50`                                   |
 | `REGISTRY_LIMIT`  | `5`                                                |
 
