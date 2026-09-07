@@ -164,12 +164,42 @@ async function sb(p, init) {
 // ---- presence -------------------------------------------------------------
 // Unconditional and separate from the queue, so the hub can tell the difference between "the Pi is
 // there and idle" and "nothing is listening at all".
+/**
+ * What this machine looks like right now, for the hub's status strip.
+ *
+ * It rides the heartbeat rather than getting a poller of its own: this already runs every 30s, the
+ * numbers come from files this process reads anyway for the admission gate, and a second timer
+ * hitting Supabase on a schedule is exactly the kind of thing that ran the egress bill up before.
+ *
+ * `sessions` is what the gate reasons about, so the strip shows the same count the gate does — the
+ * point of putting this on the wall is to see the machine the way the thing refusing work sees it.
+ */
+function hostStats(residentCount) {
+  const stats = { host: os.hostname() };
+  try {
+    const mi = fs.readFileSync('/proc/meminfo', 'utf8');
+    const kb = (k) => Number(mi.match(new RegExp('^' + k + ':\\s+(\\d+) kB', 'm'))?.[1] || 0);
+    const total = kb('MemTotal');
+    // MemAvailable, not MemFree: page cache is not "used" in any sense a person means by it, and
+    // `free` on this Pi reads ~85% used at rest purely because the kernel is caching.
+    if (total) stats.mem_pct = Math.round(((total - kb('MemAvailable')) / total) * 100);
+    const swapTotal = kb('SwapTotal');
+    if (swapTotal) stats.swap_pct = Math.round(((swapTotal - kb('SwapFree')) / swapTotal) * 100);
+  } catch { /* a machine that cannot read /proc simply reports no numbers */ }
+  if (Number.isFinite(residentCount)) stats.sessions = residentCount;
+  stats.session_max = RESIDENT_MAX;
+  return stats;
+}
+
+let lastResidentCount = null;   // set by reconcileSessions, read by the next heartbeat
+
 async function heartbeat() {
   try {
     await sb('worker_presence?on_conflict=worker', {
       method: 'POST',
       headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
-      body: JSON.stringify([{ worker: WORKER, last_seen: new Date().toISOString(), info: { host: os.hostname() } }]),
+      body: JSON.stringify([{ worker: WORKER, last_seen: new Date().toISOString(),
+                              info: hostStats(lastResidentCount) }]),
     });
   } catch (e) { console.error('[pi-desk] heartbeat:', e.message); }
 }
@@ -299,7 +329,9 @@ async function reconcileSessions() {
       }).catch((e) => console.error('[pi-desk] turn-end patch:', e.message));
     });
 
-  await runQueue(await reapIdleSessions(residents));
+  const kept = await reapIdleSessions(residents);
+  lastResidentCount = kept.length;   // what the next heartbeat publishes to the hub's status strip
+  await runQueue(kept);
 }
 
 /**
