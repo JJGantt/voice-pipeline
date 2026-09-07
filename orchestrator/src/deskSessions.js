@@ -22,6 +22,7 @@ import { sweepStashedPrompts } from './applescript.js';
 import { discoverSessions, fresherTranscript } from './discover.js';
 import { mirrorUp } from './mirror.js';
 import { readTail } from './transcripts.js';
+import { syncSessionWatch } from './sessionWatch.js';
 
 const exec = promisify(execFile);
 
@@ -167,6 +168,17 @@ async function tick() {
     try { await patchDeskSession(row.id, patch); }
     catch (e) { console.error('[desk-sessions] patch:', e.message); }
   }
+
+  // Watch what is running. The tick's job here is only to NOTICE a session — everything the session
+  // then does reaches the wall the instant it happens, without waiting for the next one.
+  syncSessionWatch(rows, (id, tail) => {
+    patchDeskSession(id, {
+      working: false,
+      last_reply: tail.lastReply ? tail.lastReply.slice(0, 4000) : null,
+      reply_at: tail.replyAt || null,
+      last_seen: new Date().toISOString(),
+    }).catch((e) => console.error('[desk-sessions] turn-end patch:', e.message));
+  });
 }
 
 export function startDeskSessions() {

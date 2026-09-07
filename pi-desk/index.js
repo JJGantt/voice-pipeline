@@ -34,6 +34,7 @@ import { randomUUID } from 'node:crypto';
 // platform-specific in it, and two copies of "which keys make a project entry complete" would drift.
 import { ensureTrusted } from '../orchestrator/src/trust.js';
 import { findTranscript, readTail, liveSessions, evict, pickEviction } from './sessions.js';
+import { syncSessionWatch } from '../orchestrator/src/sessionWatch.js';
 // Shared with the Mac rather than reimplemented: both halves of a transfer must agree byte for
 // byte on what a mirrored transcript is.
 import { mirrorUp, mirrorDown } from '../orchestrator/src/mirror.js';
@@ -193,7 +194,9 @@ async function reconcileSessions() {
     // sorts first — correct, since a session nothing can be read from is the least costly to lose.
     // `created` is tmux's own start clock, carried so the idle reaper can tell a session that has
     // gone quiet from one that has not written its first transcript line yet.
-    residents.push({ name, working: tail.working, bytes: tail.bytes, lastActivity: tail.lastActivity, created, row });
+    // `tpath` rather than row.transcript_path: a session that adopted its transcript on THIS pass has
+    // not been published yet, and the watcher would otherwise not start on it until the next tick.
+    residents.push({ name, working: tail.working, bytes: tail.bytes, lastActivity: tail.lastActivity, created, row, tpath });
 
     try {
       await sb('desk_sessions?on_conflict=id', {
@@ -242,6 +245,22 @@ async function reconcileSessions() {
       console.log(`[pi-desk] session left residency: ${r.id}`);
     }
   } catch (e) { console.error('[pi-desk] sweep:', e.message); }
+
+  // Watch what is running. The tick's job here is only to NOTICE a session — everything the session
+  // then does reaches the wall the instant it happens, without waiting for the next one.
+  syncSessionWatch(
+    residents.map((r) => ({ id: r.name, status: 'resident', transcript_path: r.tpath })),
+    (id, tail) => {
+      sb(`desk_sessions?id=eq.${encodeURIComponent(id)}`, {
+        method: 'PATCH', headers: { Prefer: 'return=minimal' },
+        body: JSON.stringify({
+          working: false,
+          last_reply: tail.lastReply ? tail.lastReply.slice(0, 4000) : null,
+          reply_at: tail.replyAt || null,
+          last_seen: new Date().toISOString(),
+        }),
+      }).catch((e) => console.error('[pi-desk] turn-end patch:', e.message));
+    });
 
   await runQueue(await reapIdleSessions(residents));
 }

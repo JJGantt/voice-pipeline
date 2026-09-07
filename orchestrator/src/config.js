@@ -18,6 +18,10 @@ export const config = {
   // orchestrator (127.0.0.1:PORT) with a valid TLS cert on the tailnet FQDN at :443.
   TERM_BASE: process.env.TERM_BASE || 'wss://<the Mac>.<tailnet>.ts.net',
   ORCH_TOKEN: process.env.ORCH_TOKEN || 'REDACTED',
+  // The status hub, for pushing live session activity (sessionWatch.js). Same base and same kiosk
+  // token the voice worker already posts its tool calls to; both go to the wall the same way.
+  HUB_URL: process.env.HUB_URL || 'https://jared-status-hub.fly.dev',
+  HUB_TOKEN: process.env.HUB_TOKEN || 'REDACTED',
   CLAUDE_BIN: process.env.CLAUDE_BIN || path.join(HOME, '.local/bin/claude'),
 
   // Where Claude Code stores per-session transcripts.
