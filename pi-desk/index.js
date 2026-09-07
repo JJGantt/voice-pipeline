@@ -99,6 +99,43 @@ function memAvailableMb() {
     return m ? Math.round(Number(m[1]) / 1024) : Infinity;   // unreadable → never block on it
   } catch { return Infinity; }
 }
+// The SECOND memory bound, and the one MIN_FREE_MB cannot express.
+//
+// MemAvailable is the kernel's estimate of what could be handed to a new process without swapping.
+// It says nothing about how much swap has ALREADY been spent, so a machine whose swap is completely
+// gone reports exactly the same headroom as one that has never touched it. On 2026-09-07 this Pi sat
+// at 75-100% swap for four days while MemAvailable stayed comfortably over the floor; the gate waved
+// a session through, and the machine went unresponsive hard enough to need the plug pulled.
+//
+// Swap here is zram, which is compressed RAM rather than disk, so a full swap is not slow-but-fine
+// the way a full disk swap is: it is RAM already spent, with nothing left to spill into. 70% leaves
+// real margin, since the two OOM kills that day both happened with swap sitting around 75%.
+const MAX_SWAP_PCT = Number(process.env.PI_DESK_MAX_SWAP_PCT || 70);
+
+/** Percent of swap in use, 0 when there is no swap or /proc is unreadable (never block on it). */
+function swapUsedPct() {
+  try {
+    const mi = fs.readFileSync('/proc/meminfo', 'utf8');
+    const total = Number(mi.match(/^SwapTotal:\s+(\d+) kB/m)?.[1] || 0);
+    const free  = Number(mi.match(/^SwapFree:\s+(\d+) kB/m)?.[1] || 0);
+    return total ? Math.round(((total - free) / total) * 100) : 0;
+  } catch { return 0; }
+}
+
+/**
+ * Why starting a session right now would be unsafe, or null if it is safe.
+ *
+ * Both callers go through this rather than testing the numbers themselves: they are the same
+ * question asked at two moments (a fresh dispatch, and the queue draining later), and when they were
+ * two separate expressions only one of them learned about swap.
+ */
+function memoryPressure() {
+  const freeMb = memAvailableMb();
+  if (freeMb < MIN_FREE_MB) return `only ${freeMb}MB free, need ${MIN_FREE_MB}MB`;
+  const swap = swapUsedPct();
+  if (swap > MAX_SWAP_PCT) return `swap ${swap}% used, ceiling is ${MAX_SWAP_PCT}%`;
+  return null;
+}
 // A CPU bound: four ARM cores, and two sessions both running a build contend badly.
 const WORKING_MAX = Number(process.env.WORKING_MAX || 2);
 
@@ -314,9 +351,9 @@ async function runQueue(residents) {
   // Under the memory floor with a free slot means the machine is short for some other reason — the
   // display, a build, anything. Evicting a session would not help (the slot is not what is missing)
   // and launching into it is how the wall display gets OOM-killed. Wait; the queue never expires.
-  const freeMb = memAvailableMb();
-  if (freeMb < MIN_FREE_MB && residents.length < RESIDENT_MAX) {
-    console.log(`[pi-desk] holding queue: ${freeMb}MB free, need ${MIN_FREE_MB}MB`);
+  const pressure = memoryPressure();
+  if (pressure && residents.length < RESIDENT_MAX) {
+    console.log(`[pi-desk] holding queue: ${pressure}`);
     return;
   }
 
@@ -675,8 +712,8 @@ async function run(cmd) {
   // a queued row rather than being dropped or forced onto a full machine. Resumes and the queue
   // runner call startSession directly and are deliberately not gated by this.
   const residents = (await liveSessions()).filter((l) => l.alive);
-  const freeMb = memAvailableMb();
-  if (residents.length >= RESIDENT_MAX || freeMb < MIN_FREE_MB) {
+  const pressure = memoryPressure();
+  if (residents.length >= RESIDENT_MAX || pressure) {
     await sb('desk_queue', {
       method: 'POST', headers: { Prefer: 'return=minimal' },
       body: JSON.stringify([{ id: randomUUID(), worker: WORKER, repo: name,
@@ -686,7 +723,7 @@ async function run(cmd) {
     });
     return residents.length >= RESIDENT_MAX
       ? `queued behind ${residents.length} resident session(s)`
-      : `queued — only ${freeMb}MB free, need ${MIN_FREE_MB}MB to start one safely`;
+      : `queued — ${pressure}`;
   }
   return startSession({ name, prompt: payload.prompt, commandId: cmd.id, report: payload.report === true, label: payload.label || null });
 }

@@ -96,6 +96,7 @@ export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
   if (from > 0) lines.shift();
 
   let working = false, aiTitle = null, customTitle = null;
+  let newestTs = 0;             // newest record timestamp — see the lastActivity note below
   let turnText = [];            // text blocks seen since the current turn began
   let finalReply = null, replyAt = null;
   let anyAssistantText = null;  // fallback when no turn ever completed
@@ -104,6 +105,12 @@ export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
     if (!line.trim()) continue;
     let d;
     try { d = JSON.parse(line); } catch { continue; }
+    // Every record type, not just the conversational ones: a turn ends with a `system`
+    // (turn_duration) record, and taking only user/assistant would report a turn as older than it is.
+    if (typeof d.timestamp === 'string') {
+      const ms = Date.parse(d.timestamp);
+      if (ms > newestTs) newestTs = ms;
+    }
     // Claude Code's own name for the conversation — a `/rename` beats the generated one. Free to
     // pick up here, and it is the only description a session nobody dispatched ever has.
     if (d.type === 'custom-title' && typeof d.customTitle === 'string') customTitle = d.customTitle;
@@ -132,13 +139,24 @@ export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
     }
   }
 
-  // mtime is the last time anything was written to this conversation — the recency signal eviction
-  // sorts on. Taken from the file rather than from the parsed turns because a transcript's
-  // timestamps are not guaranteed to be present on every record type.
+  // lastActivity is when this conversation last did something — the signal the idle reaper and
+  // pickEviction both run on. It is the newest record TIMESTAMP, and it must not be the file's mtime.
+  //
+  // mtime was the obvious choice and it silently disabled the reaper for as long as it was in place.
+  // Claude Code keeps appending untimestamped bookkeeping records to a transcript long after the
+  // conversation stops — `last-prompt`, `ai-title`, `mode`, `permission-mode`, `atis-latch`, and the
+  // `bridge-session` record that Remote Control rewrites. Each one moves mtime, so an idle session
+  // looks freshly active for ever. Measured on 2026-09-07: two Pi sessions idle for 8h and 11h were
+  // checked every 30s and judged active every time, until the kernel OOM-killed them instead. Across
+  // 203 transcripts on the Mac, 59 had mtimes 1h to 145h past their last real record.
+  //
+  // Falling back to mtime when nothing in the window carries a timestamp is deliberate: a compacted
+  // or very old transcript is then judged exactly as it was before, rather than reporting 0 and
+  // being treated as the least valuable session on the machine.
   // Two names, kept apart on purpose: `customTitle` is Jared renaming the session by hand, `aiTitle`
   // is Claude Code's guess from the content. A hand-written name outranks anything derived — see the
   // label rule in deskSessions.js.
   return { working, lastReply: finalReply ?? anyAssistantText, replyAt,
            title: customTitle || aiTitle, customTitle,
-           bytes: st.size, lastActivity: st.mtimeMs };
+           bytes: st.size, lastActivity: newestTs || st.mtimeMs };
 }
