@@ -343,8 +343,12 @@ SAFE_TOOLS = [
     # Neither reminders nor notes have tools of their own any more — a reminder is a list item with a
     # due date (00056), a note is an undated one whose body is its `text` (00092). Both are covered
     # by get_lists / add_to_list / remove_from_list.
+    # create_list IS on the fast path even though it makes something new: it invents nothing, taking
+    # only a name Jared said. It is separate from add_to_list precisely so that adding cannot create
+    # a list by accident (00094) — gating it here would just move that accident to a bigger model.
     "mcp__data__get_due", "mcp__data__set_due", "mcp__data__set_priority", "mcp__data__set_list_priority", "mcp__data__set_list_emoji",
     "mcp__data__get_lists", "mcp__data__add_to_list", "mcp__data__complete_item", "mcp__data__remove_from_list", "mcp__data__delete_list",
+    "mcp__data__create_list",
     # Recipes. Reading them invents nothing, and log_recipe cannot: it takes a saved recipe's NAME and
     # a serving count, and every macro it writes was estimated once, when the recipe was saved. That is
     # the whole reason it exists as a separate tool from log_nutrition — there is no field on it through
