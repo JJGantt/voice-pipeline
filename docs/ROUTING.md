@@ -46,14 +46,14 @@ Not reads vs writes — **whether the model has to supply a value out of its own
 | `save_recipe` | each ingredient's macros for the portion recorded — the same estimate as logging it |
 | `publish_report` | — (gated by convention; it does not run on a voice turn often enough to matter) |
 
-Everything else is on the fast path, including writes that are destructive: reads, actuators, lists,
-notes, dated items, the whole session group (`start_session`, `follow_up`, `get_sessions`,
+Everything else is on the fast path, including writes that are destructive: reads, actuators, lists
+and their dated and note items, the whole session group (`start_session`, `follow_up`, `get_sessions`,
 `resume_session`, `end_session`, `transfer_session`), `log_weight`/`set_height`,
 `log_set`/`update_set`/`remove_set`, the rep watcher, and
 `commit_staged`/`remove_staged`/`delete_nutrition_entry`, and the recipe reads plus `log_recipe`.
 Every argument those take is either a number the user spoke or an id from a read — there is nothing in
 them a bigger model knows better. **Destructiveness is not what the gate is for**; a wrong delete is a tool-description problem,
-and Sonnet already deletes notes and whole lists.
+and Sonnet already deletes list items and whole lists.
 
 ### A saved recipe is logged by a different tool so it can be ungated
 
