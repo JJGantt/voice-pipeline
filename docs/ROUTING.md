@@ -47,13 +47,17 @@ Not reads vs writes — **whether the model has to supply a value out of its own
 | `publish_report` | — (gated by convention; it does not run on a voice turn often enough to matter) |
 
 Everything else is on the fast path, including writes that are destructive: reads, actuators, lists
-and their dated and note items, the whole session group (`start_session`, `follow_up`, `get_sessions`,
+and their dated and note items, `create_list`, the whole session group (`start_session`, `follow_up`, `get_sessions`,
 `resume_session`, `end_session`, `transfer_session`), `log_weight`/`set_height`,
 `log_set`/`update_set`/`remove_set`, the rep watcher, and
 `commit_staged`/`remove_staged`/`delete_nutrition_entry`, and the recipe reads plus `log_recipe`.
 Every argument those take is either a number the user spoke or an id from a read — there is nothing in
 them a bigger model knows better. **Destructiveness is not what the gate is for**; a wrong delete is a tool-description problem,
 and Sonnet already deletes list items and whole lists.
+
+`create_list` is on the fast path for the same reason, despite making something new: it takes a name
+Jared said and invents nothing. It is a separate tool from `add_to_list` so that ADDING cannot create
+a list by accident (data-layer `00094`); gating it would only move that accident to a bigger model.
 
 ### A saved recipe is logged by a different tool so it can be ungated
 
