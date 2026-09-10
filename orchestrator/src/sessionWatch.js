@@ -149,7 +149,11 @@ export function syncSessionWatch(rows, onTurnEnd, onActivity = () => {}) {
   for (const r of rows || []) {
     if (r.status !== 'resident' || !r.transcript_path) continue;
     live.add(r.id);
-    if (watched.has(r.id)) continue;
+    const cur = watched.get(r.id);
+    if (cur && cur.path === r.transcript_path) continue;
+    // A session that has moved to a new conversation (`/clear`) is watched in its new transcript;
+    // staying on the old file would miss everything it does from here on.
+    if (cur) detach(r.id);
     // Start at the CURRENT end of the file. Reading from zero would replay a whole conversation's
     // tool calls onto the wall as though they were happening now.
     let offset = 0;

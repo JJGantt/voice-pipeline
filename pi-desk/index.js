@@ -235,17 +235,22 @@ async function reconcileSessions() {
     let tpath = row?.transcript_path || null;
     let cid = row?.claude_session_id || null;
     let mirrorFrom = row?.mirror_offset || 0;
+    let rebound = false;   // what the old conversation last said is not what this one said
     const s = pid ? sessionOf(pid) : null;
     if (s && s.claudeId !== cid) {
-      tpath = s.transcriptPath; cid = s.claudeId;
+      tpath = s.transcriptPath; cid = s.claudeId; rebound = true;
       mirrorFrom = 0;   // the mirror is keyed by conversation id, so a new one uploads from zero
       console.log(`[pi-desk] ${name} is in conversation ${cid.slice(0, 8)} now`);
     }
     const tail = tpath ? readTail(tpath) : { working: false, lastReply: null, turnAt: null, bytes: 0, lastActivity: 0 };
+    // Whether a turn is in flight: the process's own record first. The transcript is only the fallback,
+    // and on a long turn whose prompt has scrolled out of readTail's window it reads as idle — which
+    // the reaper and pickEviction would take as leave to close the session mid-thought.
+    const busy = s && s.busy != null ? s.busy : tail.working;
     // Mirror at the end of a turn — the only moment the transcript is a complete thought — so this
     // session can be picked up on the Mac later, including while this machine is unreachable.
     let mirrored = null;
-    if (!tail.working && cid && tpath && tail.bytes > mirrorFrom) {
+    if (!busy && cid && tpath && tail.bytes > mirrorFrom) {
       try { mirrored = await mirrorUp(cid, tpath, mirrorFrom); }
       catch (e) { console.error('[pi-desk] mirror:', e.message); }
     }
@@ -255,7 +260,7 @@ async function reconcileSessions() {
     // gone quiet from one that has not written its first transcript line yet.
     // `tpath` rather than row.transcript_path: a session that adopted its transcript on THIS pass has
     // not been published yet, and the watcher would otherwise not start on it until the next tick.
-    residents.push({ name, working: tail.working, bytes: tail.bytes, lastActivity: tail.lastActivity, created, row, tpath });
+    residents.push({ name, working: busy, bytes: tail.bytes, lastActivity: tail.lastActivity, created, row, tpath });
 
     try {
       await sb('desk_sessions?on_conflict=id', {
@@ -276,16 +281,17 @@ async function reconcileSessions() {
           label: tail.customTitle ? tail.customTitle.slice(0, 60) : (row?.label || null),
           // Separately, so a tab can show the repo unless Jared named the session himself.
           custom_title: tail.customTitle ? tail.customTitle.slice(0, 60) : (row?.custom_title || null),
-          last_reply: tail.lastReply ? tail.lastReply.slice(0, 4000) : row?.last_reply || null,
+          last_reply: tail.lastReply ? tail.lastReply.slice(0, 4000) : (rebound ? null : row?.last_reply || null),
           // last_reply is the FINAL message of a turn; `working` is what says whether a newer one is
           // still being written. Without it a reader cannot tell an answer from a stale one.
-          working: tail.working,
-          reply_at: tail.replyAt || row?.reply_at || null,
+          working: busy,
+          reply_at: tail.replyAt || (rebound ? null : row?.reply_at) || null,
           // Both carried through for the same merge-duplicates reason as the label. `active_at` is the
-          // last turn boundary, which orders and focuses sessions everywhere; the tick only ever moves
-          // it forward, catching a boundary the watcher missed.
+          // last turn boundary, which orders and focuses sessions everywhere: the process's record when
+          // there is one, written as-is so a wrong value cannot stick; otherwise the transcript's
+          // reconstruction, which may only move it forward.
           pid: pid || row?.pid || null,
-          active_at: laterOf(row?.active_at, tail.turnAt) || row?.started || new Date().toISOString(),
+          active_at: s?.statusAt || laterOf(row?.active_at, tail.turnAt) || row?.started || new Date().toISOString(),
           mirror_offset: mirrored ?? mirrorFrom,
           ...(mirrored ? { mirror_at: new Date().toISOString() } : {}),
           last_seen: new Date().toISOString(),

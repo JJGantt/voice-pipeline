@@ -41,8 +41,10 @@ export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
   try { st = fs.statSync(transcriptPath); } catch { return empty; }
   if (!st.isFile()) return empty;
   // Only the tail is read. These files reach tens of megabytes — one project directory here holds
-  // 31MB — and every tick would otherwise read all of it to learn the last few lines. The window is
-  // far larger than a turn, and the leading fragment is dropped because the read starts mid-line.
+  // 31MB — and every tick would otherwise read all of it to learn the last few lines. The leading
+  // fragment is dropped because the read starts mid-line. A window with no completed turn in it is
+  // widened (below): one long turn of tool calls fills 512KB on its own — measured, 137 records and no
+  // text — and the reply reported is the last COMPLETED turn's, which is then further back.
   let lines;
   const from = Math.max(0, st.size - maxBytes);
   try {
@@ -99,6 +101,8 @@ export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
       if (joined) { finalReply = joined; replyAt = d.timestamp || null; }
     }
   }
+
+  if (finalReply === null && from > 0) return readTail(transcriptPath, { maxBytes: maxBytes * 4 });
 
   // lastActivity is when this conversation last did something — the signal the idle reaper and
   // pickEviction both run on. It is the newest record TIMESTAMP, and it must not be the file's mtime.

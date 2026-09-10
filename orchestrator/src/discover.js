@@ -37,6 +37,11 @@ export function sessionOf(pid) {
     claudeId: d.sessionId, cwd: d.cwd,
     transcriptPath: path.join(projectDir(d.cwd), `${d.sessionId}.jsonl`),
     repo: d.cwd === os.homedir() ? 'root' : path.basename(d.cwd),
+    // Whether a turn is in flight, and when that last changed — which is the last turn boundary. From
+    // the process itself, so a turn long enough to push its own prompt out of the window readTail
+    // reads is still reported as working, and as active from when it began. Null when not recorded.
+    busy: d.status === 'busy' ? true : d.status === 'idle' ? false : null,
+    statusAt: Number.isFinite(d.statusUpdatedAt) ? new Date(d.statusUpdatedAt).toISOString() : null,
   };
 }
 

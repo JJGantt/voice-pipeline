@@ -37,6 +37,7 @@ export function beginLaunch() { launching++; }
 export function endLaunch() { launching = Math.max(0, launching - 1); }
 
 const ms = (t) => (t ? new Date(t).getTime() : 0);
+const later = (a, b) => (!a ? b || null : !b ? a : ms(a) >= ms(b) ? a : b);
 
 /**
  * Is `p` the process this row was started for? Its start has to fall where the row's does, which is
@@ -87,9 +88,9 @@ async function adopt(s, rows) {
     // the router; this is the only description one nobody dispatched ever has.
     label: tail.title ? tail.title.slice(0, 60) : null,
     started: startedIso,
-    working: tail.working, last_reply: tail.lastReply ? tail.lastReply.slice(0, 4000) : null,
+    working: s.busy ?? tail.working, last_reply: tail.lastReply ? tail.lastReply.slice(0, 4000) : null,
     reply_at: tail.replyAt || null,
-    active_at: tail.turnAt || startedIso,
+    active_at: s.statusAt || tail.turnAt || startedIso,
   });
   console.log(`[desk-sessions] adopted ${s.repo} in ${s.tty} (${tail.title || 'untitled'})`);
 }
@@ -107,7 +108,11 @@ async function reconcile(row, proc) {
       patch.transcript_path = proc.transcriptPath;
       // The mirror is keyed by conversation id, so a new one is a new upload from zero.
       patch.mirror_offset = 0;
-      Object.assign(row, { claude_session_id: proc.claudeId, transcript_path: proc.transcriptPath, mirror_offset: 0 });
+      // What the old conversation last said is not what this one said: read afresh below, or blank.
+      patch.last_reply = null;
+      patch.reply_at = null;
+      Object.assign(row, { claude_session_id: proc.claudeId, transcript_path: proc.transcriptPath, mirror_offset: 0,
+                           last_reply: null, reply_at: null });
       console.log(`[desk-sessions] ${row.id} is in conversation ${proc.claudeId.slice(0, 8)} now`);
     }
   }
@@ -117,7 +122,6 @@ async function reconcile(row, proc) {
     // Carry the old reply forward rather than blanking it: a transcript that momentarily reads as
     // empty (mid-write, or a rotated file) must not erase what the session already said.
     if (tail.lastReply) { patch.last_reply = tail.lastReply.slice(0, 4000); patch.reply_at = tail.replyAt || row.reply_at || null; }
-    patch.working = alive && tail.working;
     // What a session is CALLED, in order of authority:
     //   1. a name Jared typed himself (ctrl-R in the session picker, written to the transcript as a
     //      `custom-title` record) — an explicit act, so it outranks everything, dispatched or not;
@@ -130,16 +134,24 @@ async function reconcile(row, proc) {
     // the session himself, and `label` cannot answer which of the three sources it came from.
     const chosen = tail.customTitle ? tail.customTitle.slice(0, 60) : null;
     if (chosen !== (row.custom_title ?? null)) patch.custom_title = chosen;
-    // The last turn boundary. sessionWatch writes it the moment one happens; this only catches one it
-    // missed, since fs.watch drops events.
-    if (tail.turnAt && ms(tail.turnAt) > ms(row.active_at)) patch.active_at = tail.turnAt;
   }
+
+  // Whether a turn is in flight, and the last turn boundary. The process's own record says both
+  // directly; the transcript is only the fallback, and it can be wrong on a long turn whose prompt has
+  // scrolled out of the window readTail reads. sessionWatch writes the boundary the moment one happens;
+  // this catches one it missed, since fs.watch drops events.
+  const busy = proc && proc.busy != null ? proc.busy : !!(tail && tail.working);
+  patch.working = alive && busy;
+  // The record's time is the truth and is written as-is, so a wrong value cannot stick. The
+  // transcript's is a reconstruction and may only move the row forward.
+  const turnAt = proc && proc.statusAt ? proc.statusAt : later(tail && tail.turnAt, row.active_at);
+  if (turnAt && ms(turnAt) !== ms(row.active_at)) patch.active_at = turnAt;
 
   // Mirror at the end of a turn, which is the only moment the transcript is a complete thought.
   // Idle-only on purpose: uploading mid-turn would ship half an answer, and the tail is re-read on
   // the next tick anyway. This is what makes a session pickable up on the other machine later —
   // including when this one is asleep, which is exactly when it matters.
-  if (tail && !tail.working && row.claude_session_id && tail.bytes > (row.mirror_offset || 0)) {
+  if (tail && !busy && row.claude_session_id && tail.bytes > (row.mirror_offset || 0)) {
     try {
       const at = await mirrorUp(row.claude_session_id, row.transcript_path, row.mirror_offset || 0);
       if (at != null) { patch.mirror_offset = at; patch.mirror_at = new Date().toISOString(); }
