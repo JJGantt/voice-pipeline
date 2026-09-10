@@ -242,7 +242,7 @@ async function reconcileSessions() {
       mirrorFrom = 0;   // the mirror is keyed by conversation id, so a new one uploads from zero
       console.log(`[pi-desk] ${name} is in conversation ${cid.slice(0, 8)} now`);
     }
-    const tail = tpath ? readTail(tpath) : { working: false, lastReply: null, turnAt: null, bytes: 0, lastActivity: 0 };
+    const tail = tpath ? readTail(tpath) : { working: false, lastReply: null, replyAt: null, bytes: 0, lastActivity: 0 };
     // Whether a turn is in flight: the process's own record first. The transcript is only the fallback,
     // and on a long turn whose prompt has scrolled out of readTail's window it reads as idle — which
     // the reaper and pickEviction would take as leave to close the session mid-thought.
@@ -286,12 +286,12 @@ async function reconcileSessions() {
           // still being written. Without it a reader cannot tell an answer from a stale one.
           working: busy,
           reply_at: tail.replyAt || (rebound ? null : row?.reply_at) || null,
-          // Both carried through for the same merge-duplicates reason as the label. `active_at` is the
-          // last turn boundary, which orders and focuses sessions everywhere: the process's record when
-          // there is one, written as-is so a wrong value cannot stick; otherwise the transcript's
-          // reconstruction, which may only move it forward.
+          // Both carried through for the same merge-duplicates reason as the label. `active_at` is when
+          // the last turn FINISHED — the only thing that earns recency, which orders and focuses sessions
+          // everywhere: the process's record while it is idle, written as-is so a wrong value cannot
+          // stick; otherwise the transcript's reconstruction, which may only move it forward.
           pid: pid || row?.pid || null,
-          active_at: s?.statusAt || laterOf(row?.active_at, tail.turnAt) || row?.started || new Date().toISOString(),
+          active_at: s?.finishedAt || laterOf(row?.active_at, tail.replyAt) || row?.started || new Date().toISOString(),
           mirror_offset: mirrored ?? mirrorFrom,
           ...(mirrored ? { mirror_at: new Date().toISOString() } : {}),
           last_seen: new Date().toISOString(),
@@ -327,15 +327,16 @@ async function reconcileSessions() {
           working: false,
           last_reply: tail.lastReply ? tail.lastReply.slice(0, 4000) : null,
           reply_at: tail.replyAt || null,
-          active_at: tail.turnAt || new Date().toISOString(),
+          active_at: tail.replyAt || new Date().toISOString(),
           last_seen: new Date().toISOString(),
         }),
       }).catch((e) => console.error('[pi-desk] turn-end patch:', e.message));
     },
-    (id, at) => {
+    (id) => {
+      // A turn has started. It earns no recency — only finishing does — but the wall shows it working.
       sb(`desk_sessions?id=eq.${encodeURIComponent(id)}`, {
         method: 'PATCH', headers: { Prefer: 'return=minimal' },
-        body: JSON.stringify({ working: true, active_at: at }),
+        body: JSON.stringify({ working: true }),
       }).catch((e) => console.error('[pi-desk] turn-start patch:', e.message));
     });
 

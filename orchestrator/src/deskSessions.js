@@ -9,8 +9,8 @@
 //      in the numbering, looking exactly like a live one.
 //   2. WHICH CONVERSATION IT IS. Read from the process's own record (discover.js), so a row follows a
 //      `/clear` exactly and can never report another session's words.
-//   3. WHAT IT LAST SAID, AND WHEN IT LAST DID ANYTHING. The final message of a turn, and the turn
-//      boundary (`active_at`) every surface orders and focuses by.
+//   3. WHAT IT LAST SAID, AND WHEN IT FINISHED SAYING IT. The final message of a turn, and the moment
+//      that turn finished (`active_at`) — the only thing every surface orders and focuses by.
 //
 // A row belongs to a PROCESS (`pid`), not to a Terminal tab. A tab outlives the process inside it, and
 // a later `claude` typed into the same tab is a different session. Keyed by tab, a row closed the day
@@ -90,7 +90,7 @@ async function adopt(s, rows) {
     started: startedIso,
     working: s.busy ?? tail.working, last_reply: tail.lastReply ? tail.lastReply.slice(0, 4000) : null,
     reply_at: tail.replyAt || null,
-    active_at: s.statusAt || tail.turnAt || startedIso,
+    active_at: s.finishedAt || tail.replyAt || startedIso,
   });
   console.log(`[desk-sessions] adopted ${s.repo} in ${s.tty} (${tail.title || 'untitled'})`);
 }
@@ -136,16 +136,16 @@ async function reconcile(row, proc) {
     if (chosen !== (row.custom_title ?? null)) patch.custom_title = chosen;
   }
 
-  // Whether a turn is in flight, and the last turn boundary. The process's own record says both
-  // directly; the transcript is only the fallback, and it can be wrong on a long turn whose prompt has
-  // scrolled out of the window readTail reads. sessionWatch writes the boundary the moment one happens;
-  // this catches one it missed, since fs.watch drops events.
+  // Whether a turn is in flight, and when the last one FINISHED — the only thing that earns recency.
+  // The process's own record says both directly; the transcript is only the fallback, and it can be
+  // wrong on a long turn whose prompt has scrolled out of the window readTail reads. sessionWatch writes
+  // a finish the moment it happens; this catches one it missed, since fs.watch drops events.
   const busy = proc && proc.busy != null ? proc.busy : !!(tail && tail.working);
   patch.working = alive && busy;
   // The record's time is the truth and is written as-is, so a wrong value cannot stick. The
   // transcript's is a reconstruction and may only move the row forward.
-  const turnAt = proc && proc.statusAt ? proc.statusAt : later(tail && tail.turnAt, row.active_at);
-  if (turnAt && ms(turnAt) !== ms(row.active_at)) patch.active_at = turnAt;
+  const finishedAt = proc && proc.finishedAt ? proc.finishedAt : later(tail && tail.replyAt, row.active_at);
+  if (finishedAt && ms(finishedAt) !== ms(row.active_at)) patch.active_at = finishedAt;
 
   // Mirror at the end of a turn, which is the only moment the transcript is a complete thought.
   // Idle-only on purpose: uploading mid-turn would ship half an answer, and the tail is re-read on
@@ -212,12 +212,13 @@ async function tick() {
         working: false,
         last_reply: tail.lastReply ? tail.lastReply.slice(0, 4000) : null,
         reply_at: tail.replyAt || null,
-        active_at: tail.turnAt || new Date().toISOString(),
+        active_at: tail.replyAt || new Date().toISOString(),
         last_seen: new Date().toISOString(),
       }).catch((e) => console.error('[desk-sessions] turn-end patch:', e.message));
     },
-    (id, at) => {
-      patchDeskSession(id, { working: true, active_at: at })
+    (id) => {
+      // A turn has started. It earns no recency — only finishing does — but the wall shows it working.
+      patchDeskSession(id, { working: true })
         .catch((e) => console.error('[desk-sessions] turn-start patch:', e.message));
     });
 }
