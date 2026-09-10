@@ -26,14 +26,23 @@ import path from 'node:path';
 const STARTING_S = 90;
 
 const here = path.dirname(new URL(import.meta.url).pathname);
+// The service key: from the environment, else the files the services themselves load it from — the
+// voice worker's .env (the Pi's pi-desk borrows it from there), then data-layer's, which is where it
+// lives on the Mac (the orchestrator gets its own copy from its launchd plist).
 function key() {
   if (process.env.SUPABASE_KEY) return process.env.SUPABASE_KEY;
-  // The same file pi-desk's run.sh borrows the key from, present on both machines.
-  try {
-    const line = fs.readFileSync(path.join(here, '..', 'worker', '.env'), 'utf8')
-      .split('\n').find((l) => l.startsWith('SUPABASE_KEY='));
-    return line ? line.slice('SUPABASE_KEY='.length).trim().replace(/^['"]|['"]$/g, '') : '';
-  } catch { return ''; }
+  const candidates = [
+    path.join(here, '..', 'worker', '.env'),
+    path.join(os.homedir(), 'repos', 'data-layer', '.env'),
+    path.join(os.homedir(), 'data-layer', '.env'),
+  ];
+  for (const f of candidates) {
+    try {
+      const line = fs.readFileSync(f, 'utf8').split('\n').find((l) => l.startsWith('SUPABASE_KEY='));
+      if (line) return line.slice('SUPABASE_KEY='.length).trim().replace(/^['"]|['"]$/g, '');
+    } catch { /* not on this machine */ }
+  }
+  return '';
 }
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://felyggqjjhltwokdfhop.supabase.co';
 const KEY = key();
@@ -41,7 +50,11 @@ const MAC = process.platform === 'darwin';
 const WORKER = MAC ? 'desk' : 'pi-desk';
 const SESSIONS_DIR = path.join(os.homedir(), '.claude', 'sessions');
 
-const sh = (cmd, args) => { try { return execFileSync(cmd, args, { encoding: 'utf8', timeout: 10000 }); } catch { return ''; } };
+// stderr discarded: no tmux server at all is a normal state on the Pi, and tmux says so there.
+const sh = (cmd, args) => {
+  try { return execFileSync(cmd, args, { encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'ignore'] }); }
+  catch { return ''; }
+};
 
 /** [{ pid, where, startedAt }] for every claude that is somebody's session here. */
 function processes() {
