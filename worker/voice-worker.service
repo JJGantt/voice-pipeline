@@ -1,0 +1,25 @@
+[Unit]
+Description=Voice command worker (Pi — always-on accuracy fallback, defers to Mac)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jaredgantt
+WorkingDirectory=/home/jaredgantt/voice-pipeline/worker
+ExecStart=/home/jaredgantt/voice-pipeline/worker/run.sh
+Restart=always
+RestartSec=5
+# Signal only the worker on stop, then kill whatever is left once it has exited. The default,
+# control-group, sends SIGTERM to every process in the cgroup at once, including the Claude CLI
+# under the warm SDK client, so the worker's "finish the current request, then exit" handler never
+# got to run: a restart mid-request killed the run, and the worker reported that as a subscription
+# failure and pushed an error alert to the phone. pull-repos restarts this unit on every
+# voice-pipeline push, so that alert fired on deploys, not faults. run.sh execs python, so the main
+# process is the worker itself. A turn still running at TimeoutStopSec (default 90s) is SIGKILLed.
+KillMode=mixed
+Environment=HOME=/home/jaredgantt
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target

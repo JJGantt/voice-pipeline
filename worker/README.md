@@ -86,6 +86,20 @@ out of the environment at import: the Console key is the FALLBACK billing path
 warm SDK client, `claude -p`, the MCP servers — can inherit it and silently bill
 the API instead of the subscription.
 
+### On the Pi: systemd
+
+The Pi runs this as `voice-worker.service`. The unit is versioned here and installed by copying:
+
+    sudo install -m 644 ~/voice-pipeline/worker/voice-worker.service /etc/systemd/system/
+    sudo systemctl daemon-reload && sudo systemctl restart voice-worker
+
+A root-only drop-in, `/etc/systemd/system/voice-worker.service.d/oauth.conf`, adds an
+`EnvironmentFile` and is machine-local: it is not in git, and the copy above leaves it alone.
+
+`KillMode=mixed` is load-bearing (the unit's comment has the detail). Under the default, a restart
+kills the Claude CLI mid-request and the worker pushes a false failure alert to the phone, and
+`pull-repos` restarts this unit on every voice-pipeline push.
+
 ### Pi → Mac priority
 
 `run.sh` sets `WORKER_PRIORITY=pi,mac,fly`, so the **Pi claims whenever it is up**
