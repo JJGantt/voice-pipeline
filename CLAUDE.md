@@ -110,7 +110,8 @@ is computed from activity (`active_at`), not stored.
 
 Which conversation a process is in comes from `~/.claude/sessions/<pid>.json`, which Claude Code keeps
 for every live process: the conversation id (the transcript's filename) and the working directory. It
-rewrites the id on `/clear` and deletes the file when the process exits. `orchestrator/src/discover.js`
+rewrites the id on `/clear`, deletes the file when the process exits, and says whether a turn is in flight
+and since when — the source of `working` and `active_at`. `orchestrator/src/discover.js`
 reads it on both machines; on the Pi the tmux pane's pid is claude's because `launch.sh` `exec`s it.
 Do not go back to matching transcripts by birth time or recency: every session in the home directory
 shares one project directory, so each new session there looked like a `/clear` of every older one —
