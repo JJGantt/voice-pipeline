@@ -32,7 +32,7 @@ export function projectDir(cwd) {
  * or written by an older version. Reporting the last thing said beats reporting nothing.
  */
 export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
-  const empty = { working: false, lastReply: null, replyAt: null, title: null, customTitle: null, bytes: 0, lastActivity: 0 };
+  const empty = { working: false, lastReply: null, replyAt: null, turnAt: null, title: null, customTitle: null, bytes: 0, lastActivity: 0 };
   // Only ever a regular file. A path that is anything else must not be read: `desk_sessions` rows
   // written before the tty got its own column carry a device path here, and readFileSync on
   // /dev/ttys007 BLOCKS THE PROCESS FOR EVER waiting for terminal input — the daemon stops beating,
@@ -62,6 +62,7 @@ export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
   let turnText = [];            // text blocks seen since the current turn began
   let finalReply = null, replyAt = null;
   let anyAssistantText = null;  // fallback when no turn ever completed
+  let promptAt = null;          // when a turn was last started — see turnAt below
 
   for (const line of lines) {
     if (!line.trim()) continue;
@@ -85,7 +86,7 @@ export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
       const blocks = d.message?.content;
       const isToolResult = Array.isArray(blocks) && blocks.length > 0
         && blocks.every((b) => b?.type === 'tool_result');
-      if (!isToolResult) { working = true; turnText = []; }
+      if (!isToolResult) { working = true; turnText = []; promptAt = d.timestamp || promptAt; }
       continue;
     }
     const msg = d.message || {};
@@ -121,11 +122,12 @@ export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
   // is Claude Code's guess from the content. A hand-written name outranks anything derived — see the
   // label rule in deskSessions.js.
   //
-  // replyAt — when the last turn FINISHED — is also what every surface orders, numbers and focuses
-  // sessions by (`active_at`). Only finishing earns recency: not the prompt, and not the work between.
-  // Not lastActivity either, which moves with every tool call, so two working sessions would trade
-  // places mid-turn and "session two" would name a different session by the time it was resolved.
-  return { working, lastReply: finalReply ?? anyAssistantText, replyAt,
+  // turnAt is the last TURN BOUNDARY — a prompt sent or a turn finished — and it is what every surface
+  // orders, numbers and focuses sessions by. Deliberately not lastActivity: that moves with every tool
+  // call, so two working sessions would trade places mid-turn and "session two" would name a different
+  // session by the time the sentence saying it was resolved.
+  const turnAt = [promptAt, replyAt].filter(Boolean).sort().pop() || null;
+  return { working, lastReply: finalReply ?? anyAssistantText, replyAt, turnAt,
            title: customTitle || aiTitle, customTitle,
            bytes: st.size, lastActivity: newestTs || st.mtimeMs };
 }

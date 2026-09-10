@@ -233,7 +233,7 @@ The Mac's `deskSessions.js` tick is still smaller than the Pi's: no residency ca
 its own. Those exist because a headless 4GB machine must decide what to close; on the Mac Jared can
 see the tabs. What it does do each tick: bind each running row to its process (`pid`) and that
 process's current conversation, close a row whose process has exited, adopt any process no row owns,
-publish the last completed turn and when it finished (`active_at`), and mirror the tail.
+publish the last completed turn and the last turn boundary (`active_at`), and mirror the tail.
 
 ## Docs
 

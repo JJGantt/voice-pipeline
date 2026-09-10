@@ -7,7 +7,7 @@
 //
 // So this watches each live session's transcript and pushes what it sees:
 //
-//   a prompt    → the host marks the row `working`: a turn has started (it earns no recency)
+//   a prompt    → the host writes `active_at` (and `working`) to the row: a turn has started
 //   tool_use    → the hub's /api/session-activity, transient, straight out to the wall over SSE
 //   end_turn    → the same, carrying the reply, AND the host writes `last_reply` to the row
 //
@@ -88,8 +88,8 @@ function drain(st) {
       // own work coming back — the same distinction readTail draws.
       const blocks = d.message?.content;
       const toolResult = Array.isArray(blocks) && blocks.length > 0 && blocks.every((b) => b?.type === 'tool_result');
-      if (!toolResult) {
-        try { st.onTurnStart(st.id); } catch { /* the tick writes it regardless */ }
+      if (!toolResult && typeof d.timestamp === 'string') {
+        try { st.onActivity(st.id, d.timestamp); } catch { /* the tick writes it regardless */ }
       }
       continue;
     }
@@ -141,10 +141,10 @@ function detach(id) {
  * Called from each host's reconcile tick, so a session opened between ticks starts being watched
  * within one tick — the delay is in NOTICING a session, never in what it then does.
  *
- * `onTurnEnd(id, tail)` and `onTurnStart(id)` are the host writing its own row: the Mac
+ * `onTurnEnd(id, tail)` and `onActivity(id, isoTimestamp)` are the host writing its own row: the Mac
  * and the Pi patch `desk_sessions` through different clients, and this module should not know which.
  */
-export function syncSessionWatch(rows, onTurnEnd, onTurnStart = () => {}) {
+export function syncSessionWatch(rows, onTurnEnd, onActivity = () => {}) {
   const live = new Set();
   for (const r of rows || []) {
     if (r.status !== 'resident' || !r.transcript_path) continue;
@@ -158,7 +158,7 @@ export function syncSessionWatch(rows, onTurnEnd, onTurnStart = () => {}) {
     // tool calls onto the wall as though they were happening now.
     let offset = 0;
     try { offset = fs.statSync(r.transcript_path).size; } catch { continue; }
-    const st = { id: r.id, path: r.transcript_path, offset, rest: '', watcher: null, timer: null, onTurnEnd, onTurnStart };
+    const st = { id: r.id, path: r.transcript_path, offset, rest: '', watcher: null, timer: null, onTurnEnd, onActivity };
     watched.set(r.id, st);
     attach(st);
   }
