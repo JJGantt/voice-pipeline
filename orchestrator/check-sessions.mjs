@@ -89,7 +89,7 @@ function recordProblems(r) {
 
 const readRecord = (pid) => { try { return JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, `${pid}.json`), 'utf8')); } catch { return null; } };
 
-if (!KEY) { console.log('FAIL no SUPABASE_KEY (env, or ../worker/.env)'); process.exit(1); }
+if (!KEY) { console.log('FAIL no SUPABASE_KEY (env, worker/.env or data-layer/.env)'); process.exit(1); }
 const res = await fetch(`${SUPABASE_URL}/rest/v1/desk_sessions?worker=eq.${WORKER}&status=eq.resident&select=id,pid,claude_session_id,started`,
   { headers: { apikey: KEY, Authorization: `Bearer ${KEY}` } });
 if (!res.ok) { console.log(`FAIL desk_sessions ${res.status}: ${await res.text()}`); process.exit(1); }
