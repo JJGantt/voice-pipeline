@@ -23,7 +23,8 @@ import { config } from './config.js';
 const exec = promisify(execFile);
 import { pendingCommands, claimCommand, finishCommand, upsertDeskSession, deskSession,
          patchDeskSession, deadLetterCommand, abandonedClaims, insertCommand } from './supabase.js';
-import { findTranscript } from './transcripts.js';
+import { awaitSessionOn } from './discover.js';
+import { beginLaunch, endLaunch } from './deskSessions.js';
 import { watchTable } from './realtime.js';
 import { isKnownRepo } from './repos.js';
 import { ensureTrusted } from './trust.js';
@@ -127,17 +128,21 @@ async function run(cmd) {
     if (row.repo !== 'root') await pull(dir);
     const sessionId = `mac-${cmd.id.slice(0, 8)}`;
     const prompt = String((cmd.payload || {}).prompt || '').trim() || null;
-    const raw = await openFreshTab(dir, row.repo, prompt, sessionId, row.claude_session_id);
-    const [how, tty] = String(raw).split('\t');
-    // A NEW row for the new tab, exactly as the Pi makes a new tmux session on resume. The old row
-    // stays parked until retention drops it; it is where that stretch of the conversation happened.
-    await upsertDeskSession({
-      id: sessionId, worker: 'desk', repo: row.repo, status: 'resident',
-      origin: row.origin || 'dispatched', command_id: cmd.id, tty: tty || null,
-      label: row.label || null, claude_session_id: row.claude_session_id,
-      transcript_path: row.transcript_path, mirror_offset: row.mirror_offset || 0,
-    });
-    return `resumed ${id} here (${how})`;
+    beginLaunch();   // until the row exists — see open_session below
+    try {
+      const raw = await openFreshTab(dir, row.repo, prompt, sessionId, row.claude_session_id);
+      const [how, tty] = String(raw).split('\t');
+      // A NEW row for the new tab, exactly as the Pi makes a new tmux session on resume. The old row
+      // stays parked until retention drops it; it is where that stretch of the conversation happened.
+      await upsertDeskSession({
+        id: sessionId, worker: 'desk', repo: row.repo, status: 'resident',
+        origin: row.origin || 'dispatched', command_id: cmd.id, tty: tty || null,
+        label: row.label || null, claude_session_id: row.claude_session_id,
+        transcript_path: row.transcript_path, mirror_offset: row.mirror_offset || 0,
+        active_at: new Date().toISOString(),
+      });
+      return `resumed ${id} here (${how})`;
+    } finally { endLaunch(); }
   }
 
   // SOURCE half of a handover: this machine owns the session and is giving it up.
@@ -178,17 +183,21 @@ async function run(cmd) {
     ensureTrusted(dir);
     if (repo !== 'root') await pull(dir);
     const sessionId = `mac-${cmd.id.slice(0, 8)}`;
-    const raw = await openFreshTab(dir, repo, null, sessionId, claudeId);
-    const [how, tty] = String(raw).split('\t');
-    await upsertDeskSession({
-      id: sessionId, worker: 'desk', repo, status: 'resident',
-      origin: (cmd.payload || {}).origin || 'dispatched', command_id: cmd.id, tty: tty || null,
-      label: (cmd.payload || {}).label || null,
-      claude_session_id: claudeId, transcript_path: file,
-      // Everything already uploaded stays uploaded: this machine carries on appending from here.
-      mirror_offset: fs.statSync(file).size,
-    });
-    return `resumed ${claudeId.slice(0, 8)} here (${how})`;
+    beginLaunch();   // until the row exists — see open_session below
+    try {
+      const raw = await openFreshTab(dir, repo, null, sessionId, claudeId);
+      const [how, tty] = String(raw).split('\t');
+      await upsertDeskSession({
+        id: sessionId, worker: 'desk', repo, status: 'resident',
+        origin: (cmd.payload || {}).origin || 'dispatched', command_id: cmd.id, tty: tty || null,
+        label: (cmd.payload || {}).label || null,
+        claude_session_id: claudeId, transcript_path: file,
+        // Everything already uploaded stays uploaded: this machine carries on appending from here.
+        mirror_offset: fs.statSync(file).size,
+        active_at: new Date().toISOString(),
+      });
+      return `resumed ${claudeId.slice(0, 8)} here (${how})`;
+    } finally { endLaunch(); }
   }
 
   if (cmd.kind !== 'open_session') throw new Error(`unknown kind ${cmd.kind}`);
@@ -218,33 +227,41 @@ async function run(cmd) {
   const spoken = String((cmd.payload || {}).prompt || '').trim();
   const wantsReport = (cmd.payload || {}).report === true;
   const prompt = [staleWarning, spoken, (wantsReport && spoken) ? REPORT_DIRECTIVE : null].filter(Boolean).join('\n\n') || null;
-  const startedAt = Date.now() - 1000;   // slack: the transcript may be stamped just before
-  const raw = await openFreshTab(target, name, prompt, `mac-${cmd.id.slice(0, 8)}`);
-  // openFreshTab reports "<how>\t<tty>"; the tty is the handle a later follow-up addresses.
-  const [how, tty] = String(raw).split('\t');
-  console.log(`[commands] opened session in ${target} (${how}${tty ? `, tty ${tty}` : ''}, trust: ${trust}`
-    + `${prompt ? `, prompt: "${prompt.slice(0, 60)}"` : ''})`);
-
-  // Publish it. Until now the Mac published nothing, so a Mac session was invisible to the sessions
-  // panel and unreachable by follow_up — which resolves a dispatch through desk_sessions.command_id.
+  const startedAt = Date.now() - 1000;   // slack: ps reports a start time to the whole second
   const sessionId = `mac-${cmd.id.slice(0, 8)}`;
+  // Held from before the tab opens until its row exists. In between, the new claude looks exactly
+  // like a session nobody dispatched, and adopting it would give one session two rows.
+  beginLaunch();
+  let how, tty;
   try {
-    await upsertDeskSession({
-      id: sessionId, worker: 'desk', repo: name || 'root',
-      status: 'resident', origin: 'dispatched', command_id: cmd.id, tty: tty || null,
-      label: (cmd.payload || {}).label || null,
-      prompt: prompt ? prompt.slice(0, 500) : null,
-    });
-  } catch (e) { console.error('[commands] publish:', e.message); }
+    const raw = await openFreshTab(target, name, prompt, sessionId);
+    // openFreshTab reports "<how>\t<tty>"; the tty is the handle a later follow-up addresses.
+    [how, tty] = String(raw).split('\t');
+    console.log(`[commands] opened session in ${target} (${how}${tty ? `, tty ${tty}` : ''}, trust: ${trust}`
+      + `${prompt ? `, prompt: "${prompt.slice(0, 60)}"` : ''})`);
 
-  // Find the transcript this session just started, the same way the Pi does — the filename is the
-  // Claude session id, and it is the only way to read what the session says. Async on purpose: the
-  // launch has already happened and nothing should wait on filesystem polling to hear about it.
-  findTranscript(target, startedAt).then((t) => {
-    if (!t) return console.error(`[commands] no transcript for ${sessionId} — its replies will not be readable`);
-    console.log(`[commands] ${sessionId} -> claude session ${t.id}`);
-    return patchDeskSession(sessionId, { claude_session_id: t.id, transcript_path: t.path });
-  }).catch((e) => console.error('[commands] transcript:', e.message));
+    // Publish it, as the most recently active session: it is the work he just asked for.
+    try {
+      await upsertDeskSession({
+        id: sessionId, worker: 'desk', repo: name || 'root',
+        status: 'resident', origin: 'dispatched', command_id: cmd.id, tty: tty || null,
+        label: (cmd.payload || {}).label || null,
+        prompt: prompt ? prompt.slice(0, 500) : null,
+        active_at: new Date().toISOString(),
+      });
+    } catch (e) { console.error('[commands] publish:', e.message); }
+  } finally { endLaunch(); }
+
+  // Which conversation it is, read from the process's own record once claude is up (discover.js).
+  // Async on purpose: the launch has already happened and nothing should wait on it coming up. The
+  // reconcile tick binds the same way, so a miss here costs one tick, not the session.
+  if (tty) {
+    awaitSessionOn(tty, startedAt).then((s) => {
+      if (!s) return console.error(`[commands] no claude came up on ${tty} for ${sessionId}`);
+      console.log(`[commands] ${sessionId} -> claude session ${s.claudeId}`);
+      return patchDeskSession(sessionId, { pid: s.pid, claude_session_id: s.claudeId, transcript_path: s.transcriptPath });
+    }).catch((e) => console.error('[commands] session:', e.message));
+  }
 
   return how;
 }

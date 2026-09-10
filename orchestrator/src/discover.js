@@ -1,20 +1,20 @@
-// Claude sessions running on this Mac that nobody dispatched — the ones Jared opened himself.
+// Which conversation each Claude Code process on this machine is in — read from Claude Code's own
+// record, never inferred.
 //
-// A dispatched session records its own identity at launch. One started by typing `claude` in a tab
-// announces nothing, so it has to be recognised from outside: a `claude` process with a controlling
-// tty (which excludes the headless `claude -p` the worker runs, and the MCP children, neither of
-// which is a session anyone is sitting in), its working directory, and the transcript it created.
+// Every running Claude Code process writes ~/.claude/sessions/<pid>.json: the id of the conversation
+// it is having and its working directory. It rewrites the id when `/clear` starts a new conversation
+// (verified 2026-09-10: same pid, the id went c5b343ee → 67e5a855) and deletes the file when the
+// process exits. The conversation id IS the transcript's filename, so a process's transcript is a
+// lookup.
 //
-// MATCHING A PROCESS TO ITS TRANSCRIPT is the whole difficulty, because nothing links them: there is
-// no session id in the environment, and Claude Code appends-and-closes the file, so it is not held
-// open either. What is reliable is BIRTH ORDER — a session writes its transcript within seconds of
-// starting. So processes are paired oldest-first with the EARLIEST unclaimed transcript in their
-// project directory born inside a window around their start.
+// Inferring it from outside — transcript birth times, the newest transcript in a project directory —
+// is what this file used to do, and it cannot be made safe: every session opened in the home directory
+// shares one project directory, so a new session there looked exactly like a `/clear` in each older
+// one. The Mac logged 336 rebinds against 42 adoptions before that was found, and rows were reported
+// saying each other's words.
 //
-// "Newest transcript created since this process started" — the rule the launch path can safely use,
-// because it looks the instant it launches — is wrong here: an older session still running would
-// adopt a newer session's file. Measured on two live sessions in one directory, both claimed the
-// same transcript that way, and each was then reported as saying the other's words.
+// Shared by both machines. The Mac adopts every `claude` in a terminal; the Pi reads the record of
+// each process it launched in tmux.
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import fs from 'node:fs';
@@ -23,105 +23,63 @@ import path from 'node:path';
 import { projectDir } from './transcripts.js';
 
 const exec = promisify(execFile);
+const SESSIONS_DIR = process.env.CLAUDE_SESSIONS_DIR || path.join(os.homedir(), '.claude', 'sessions');
 
-// A transcript belongs to the process that started just before it. Generous, because a cold start on
-// a big repo takes a while; bounded, because a match outside it is a guess, and reporting no session
-// is better than reporting one with someone else's conversation in it.
-const MATCH_WINDOW_MS = 180000;
-const MATCH_SLACK_MS = 5000;   // the file can be stamped a moment before the process clock
+/** The conversation process `pid` is in, from Claude Code's own record; null when it has none. */
+export function sessionOf(pid) {
+  let d;
+  // No file: not a Claude Code process, or one that has not written its record yet (it does within
+  // a second of starting, so the next look finds it).
+  try { d = JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, `${pid}.json`), 'utf8')); }
+  catch { return null; }
+  if (!d || typeof d.sessionId !== 'string' || typeof d.cwd !== 'string') return null;
+  return {
+    claudeId: d.sessionId, cwd: d.cwd,
+    transcriptPath: path.join(projectDir(d.cwd), `${d.sessionId}.jsonl`),
+    repo: d.cwd === os.homedir() ? 'root' : path.basename(d.cwd),
+  };
+}
 
-/** Every `claude` sitting in a terminal, oldest first. */
-export async function liveClaudeProcesses() {
+/**
+ * Every `claude` sitting in a terminal on this machine, with the conversation it is in. Oldest first.
+ *
+ * A process with no controlling tty is nobody's session: the voice worker's SDK client writes the
+ * same record, and so would anything else headless, but nobody is sitting in it.
+ */
+export async function liveClaudeSessions() {
   let stdout;
-  try { ({ stdout } = await exec('ps', ['-Ao', 'pid=,tty=,comm=,lstart='], { timeout: 10000 })); }
+  // `comm` LAST: macOS truncates it to 16 characters when another column follows, which turned a
+  // `claude` launched by full path (/Users/jaredgantt/.local/bin/claude) into "/Users/jaredgant" and
+  // made that session invisible.
+  try { ({ stdout } = await exec('ps', ['-Ao', 'pid=,tty=,lstart=,comm='], { timeout: 10000 })); }
   catch { return []; }
   return stdout.split('\n').map((l) => l.trim()).filter(Boolean)
     .map((l) => {
-      const m = l.match(/^(\d+)\s+(\S+)\s+(\S+)\s+(.+)$/);
+      // lstart is five fields ("Wed Sep  9 16:02:54 2026"); comm is the rest of the line.
+      const m = l.match(/^(\d+)\s+(\S+)\s+(\w{3}\s+\w{3}\s+\d+\s+[\d:]+\s+\d{4})\s+(.+)$/);
       if (!m) return null;
-      const [, pid, tty, comm, lstart] = m;
-      // No controlling tty means nobody is sitting in it: the worker's `claude -p`, an MCP child,
-      // the orchestrator's own pty. Those are not sessions to manage.
+      const [, pid, tty, lstart, comm] = m;
       if (tty === '??' || tty === '?') return null;
       if (comm.split('/').pop() !== 'claude') return null;
       const startedAt = new Date(lstart).getTime();
-      return Number.isFinite(startedAt) ? { pid, tty: `/dev/${tty}`, startedAt } : null;
+      if (!Number.isFinite(startedAt)) return null;
+      const s = sessionOf(pid);
+      return s ? { pid: Number(pid), tty: `/dev/${tty}`, startedAt, ...s } : null;
     })
     .filter(Boolean)
     .sort((a, b) => a.startedAt - b.startedAt);
 }
 
-async function cwdOf(pid) {
-  try {
-    const { stdout } = await exec('lsof', ['-a', '-p', pid, '-d', 'cwd', '-Fn'], { timeout: 10000 });
-    const line = stdout.split('\n').find((l) => l.startsWith('n'));
-    return line ? line.slice(1) : null;
-  } catch { return null; }
-}
-
-/** The earliest transcript in `cwd`'s project directory born just after `startedAt`. */
-function transcriptFor(cwd, startedAt, taken) {
-  const dir = projectDir(cwd);
-  let names;
-  try { names = fs.readdirSync(dir); } catch { return null; }
-  return names.filter((f) => f.endsWith('.jsonl'))
-    .map((f) => ({ id: f.slice(0, -6), p: path.join(dir, f) }))
-    .filter((x) => !taken.has(x.id))
-    .map((x) => { try { return { ...x, birth: fs.statSync(x.p).birthtimeMs }; } catch { return null; } })
-    .filter((x) => x && x.birth >= startedAt - MATCH_SLACK_MS && x.birth <= startedAt + MATCH_WINDOW_MS)
-    .sort((a, b) => a.birth - b.birth)[0] || null;
-}
-
 /**
- * Sessions running here that are not already accounted for.
- *
- * `knownTtys` are tabs already tracked (a dispatched session is a live claude process too, and must
- * not be adopted a second time under another identity). `takenIds` are transcripts already spoken
- * for, so a tracked session's file cannot be handed to the process next to it.
+ * The session a launch just started on `tty`: the first `claude` there that began after `since`.
+ * Polled, because the tab opens before claude does. `ps` reports start times to the whole second, so
+ * `since` carries a second of slack from the caller.
  */
-export async function discoverSessions({ knownTtys = new Set(), takenIds = new Set() } = {}) {
-  const claimed = new Set(takenIds);
-  const found = [];
-  for (const p of await liveClaudeProcesses()) {
-    if (knownTtys.has(p.tty)) continue;
-    const cwd = await cwdOf(p.pid);
-    if (!cwd) continue;
-    const hit = transcriptFor(cwd, p.startedAt, claimed);
-    // No confident match: leave it alone. It will be picked up on a later tick if its transcript
-    // appears, and until then reporting nothing beats reporting the wrong conversation.
-    if (!hit) continue;
-    claimed.add(hit.id);
-    found.push({ ...p, cwd, repo: cwd === os.homedir() ? 'root' : path.basename(cwd),
-                 claudeId: hit.id, transcriptPath: hit.p });
+export async function awaitSessionOn(tty, since, { attempts = 90, delayMs = 1000 } = {}) {
+  for (let i = 0; i < attempts; i++) {
+    const hit = (await liveClaudeSessions()).find((s) => s.tty === tty && s.startedAt >= since);
+    if (hit) return hit;
+    await new Promise((r) => setTimeout(r, delayMs));
   }
-  return found;
-}
-
-/**
- * A newer transcript for a session that is still running.
- *
- * `/clear` (and a compaction) starts a FRESH transcript file while the process keeps going, so the
- * file a session was bound to at launch or adoption stops being the conversation it is having. The
- * row then reports a title and a last reply from before the clear — which is how a tab titled "Voice
- * command timeout tuning" appeared in the pane as "Crimson Desert village search prompt", quoting a
- * reply from the previous day.
- *
- * Bounded the same way adoption is: born after the process started, never a file another live session
- * is already bound to, and only accepted when it is genuinely fresher than the current one.
- */
-export function fresherTranscript(currentPath, startedAtMs, excludeIds = new Set()) {
-  let dir, currentMtime = 0;
-  try {
-    dir = path.dirname(currentPath);
-    currentMtime = fs.statSync(currentPath).mtimeMs;
-  } catch { return null; }
-  let names;
-  try { names = fs.readdirSync(dir); } catch { return null; }
-  const best = names.filter((f) => f.endsWith('.jsonl'))
-    .map((f) => ({ id: f.slice(0, -6), p: path.join(dir, f) }))
-    .filter((x) => !excludeIds.has(x.id))
-    .map((x) => { try { const st = fs.statSync(x.p); return { ...x, birth: st.birthtimeMs, m: st.mtimeMs }; } catch { return null; } })
-    .filter((x) => x && x.birth >= startedAtMs - MATCH_SLACK_MS && x.m > currentMtime)
-    .sort((a, b) => b.m - a.m)[0];
-  return best ? { id: best.id, path: best.p } : null;
+  return null;
 }

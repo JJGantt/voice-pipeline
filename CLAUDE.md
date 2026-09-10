@@ -101,33 +101,33 @@ expires while the caller has already been told a session started.
 said. They were one column once, and a Mac row's "transcript path" was really a tty — which is why
 nothing could read a Mac session's replies.
 
-## Sessions nobody dispatched are adopted, but never take the follow-up pointer
+## A process's conversation is read from Claude Code's own record — never matched or guessed
 
 The Mac recognises `claude` processes it did not start — a terminal Jared opened himself — and
 publishes them into `desk_sessions` with `origin='adopted'`, so liveness and the last reply work the
-same for everything running. `discover.js` does the finding; adoption writes only `desk_sessions` and
-**never `desk_focus`**. A dictated follow-up is aimed at work handed over, and the session he is
-typing in is precisely what it must never land in.
+same for everything running. Adoption writes only `desk_sessions`, never `desk_focus`: unpinned, focus
+is computed from activity (`active_at`), not stored.
 
-Matching a process to its transcript is the hard part: there is no session id in the environment, and
-Claude Code appends-and-closes the file so it is not held open either. Birth order is what works —
-processes oldest-first, each taking the EARLIEST unclaimed transcript in its project directory born
-within three minutes of its start. "Newest transcript since this process started" (which the LAUNCH
-path can safely use, because it looks the instant it launches) is wrong here: measured on two live
-sessions in one directory, both claimed the same file and each was reported saying the other's words.
-No confident match means no row — a session reported with someone else's conversation is worse than
-one not reported at all.
+Which conversation a process is in comes from `~/.claude/sessions/<pid>.json`, which Claude Code keeps
+for every live process: the conversation id (the transcript's filename) and the working directory. It
+rewrites the id on `/clear` and deletes the file when the process exits. `orchestrator/src/discover.js`
+reads it on both machines; on the Pi the tmux pane's pid is claude's because `launch.sh` `exec`s it.
+Do not go back to matching transcripts by birth time or recency: every session in the home directory
+shares one project directory, so each new session there looked like a `/clear` of every older one —
+336 rebinds against 42 adoptions, and rows reported saying each other's words.
 
-A process whose transcript already belongs to a row revives that row rather than making a new one,
-which is what a manual `claude --resume` looks like from outside.
+A row belongs to a PROCESS (`pid`), not a Terminal tab: a later `claude` in the same tab is a new row,
+and a row whose process has exited is closed. A process whose conversation already belongs to a row
+revives that row rather than making a new one, which is what a manual `claude --resume` looks like.
 
-**A session outlives its transcript.** `/clear` starts a fresh file while the process keeps running,
-so a row bound at adoption drifts onto a conversation that has ended — one tab reported yesterday's
-subject and yesterday's last reply for hours after it had moved on. Each tick therefore looks for a
-fresher transcript in the same directory (born after the process started, not bound to another live
-session) and rebinds, resetting `mirror_offset` because the mirror is keyed by session id. An adopted
-a session's NAME is refreshed the same way, in order of authority: a name Jared chose himself beats
-the label the router wrote at dispatch, which beats Claude Code's own generated title.
+`ps` must list `comm` LAST. macOS truncates it to 16 characters when another column follows, and a
+`claude` launched by full path then reads as `/Users/jaredgant` and is not seen at all.
+
+**A session outlives its transcript.** `/clear` starts a fresh file while the process keeps running.
+Each tick reads the process's record again and rebinds the row to whatever conversation it names,
+resetting `mirror_offset` because the mirror is keyed by session id. A session's NAME is refreshed
+every tick too, in order of authority: a name Jared chose himself beats the label the router wrote
+at dispatch, which beats Claude Code's own generated title.
 
 He can choose it two ways, and they are the same act: `/rename <name>` typed into the session, or
 ctrl-R in the session picker. Both make Claude Code write a `custom-title` record into the transcript,
@@ -230,9 +230,9 @@ there is nothing to bring back.
 
 The Mac's `deskSessions.js` tick is still smaller than the Pi's: no residency cap and no eviction of
 its own. Those exist because a headless 4GB machine must decide what to close; on the Mac Jared can
-see the tabs. What it does do each tick: adopt what it finds running, answer "is it still up" (a
-`claude` process on the tab's tty — the tab outlives the process, so the tab is the wrong question),
-publish the last completed turn, follow a `/clear` to the new transcript, and mirror the tail.
+see the tabs. What it does do each tick: bind each running row to its process (`pid`) and that
+process's current conversation, close a row whose process has exited, adopt any process no row owns,
+publish the last completed turn and the last turn boundary (`active_at`), and mirror the tail.
 
 ## Docs
 

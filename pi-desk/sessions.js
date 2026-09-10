@@ -17,7 +17,7 @@ const exec = promisify(execFile);
 
 // Reading transcripts is not Pi-specific — the Mac's consumer needs the same idle signal and the
 // same final reply — so it lives in one place and is re-exported here for this module's callers.
-export { findTranscript, readTail } from '../orchestrator/src/transcripts.js';
+export { readTail } from '../orchestrator/src/transcripts.js';
 
 /** tmux sessions this daemon owns, and whether a claude process is actually inside each. */
 export async function liveSessions() {
@@ -34,14 +34,16 @@ export async function liveSessions() {
 
   const out = [];
   for (const { n: name, created } of names) {
-    let alive = false;
+    let alive = false, pid = null;
     try {
-      const { stdout: panes } = await exec('tmux', ['list-panes', '-t', name, '-F', '#{pane_current_command}'], { timeout: 10000 });
+      const { stdout: panes } = await exec('tmux', ['list-panes', '-t', name, '-F', '#{pane_current_command}\t#{pane_pid}'], { timeout: 10000 });
       // tmux keeps the shell alive after claude exits, so "the session exists" is a different
-      // question from "claude is in it". Only the latter counts as live.
-      alive = panes.split('\n').some((c) => c.trim() === 'claude');
+      // question from "claude is in it". Only the latter counts as live. launch.sh `exec`s claude, so
+      // the pane's own process IS claude — the pid its session record is filed under.
+      const hit = panes.split('\n').map((l) => l.trim().split('\t')).find(([c]) => c === 'claude');
+      if (hit) { alive = true; pid = Number(hit[1]) || null; }
     } catch { alive = false; }
-    out.push({ name, alive, created });
+    out.push({ name, alive, created, pid });
   }
   return out;
 }

@@ -33,7 +33,10 @@ import { randomUUID } from 'node:crypto';
 // Shared with the Mac orchestrator rather than copied: it only writes ~/.claude.json and has nothing
 // platform-specific in it, and two copies of "which keys make a project entry complete" would drift.
 import { ensureTrusted } from '../orchestrator/src/trust.js';
-import { findTranscript, readTail, liveSessions, evict, pickEviction } from './sessions.js';
+import { readTail, liveSessions, evict, pickEviction } from './sessions.js';
+// Which conversation a process is in, from Claude Code's own record — shared with the Mac, which
+// reads the same files for the same reason.
+import { sessionOf } from '../orchestrator/src/discover.js';
 import { syncSessionWatch } from '../orchestrator/src/sessionWatch.js';
 // Shared with the Mac rather than reimplemented: both halves of a transfer must agree byte for
 // byte on what a mirrored transcript is.
@@ -205,23 +208,16 @@ async function heartbeat() {
 }
 
 // ---- live sessions --------------------------------------------------------
+// The later of two timestamps, either possibly missing.
+const laterOf = (a, b) => (!a ? b || null : !b ? a : (Date.parse(a) >= Date.parse(b) ? a : b));
+
 // Publish what is running and reap what is not, then run the queue. tmux is the source of truth
 // rather than a list this process keeps, because this process restarts and tmux does not.
 async function reconcileSessions() {
   const live = await liveSessions();
   const residents = [];
 
-  // Transcript ids already spoken for. Adoption picks the newest transcript created after a launch,
-  // and two launches close together in one directory could otherwise both land on the same file —
-  // which is exactly how two root sessions ended up recording one claude id and burning two slots on
-  // a single conversation.
-  const claimed = new Set();
-  try {
-    const rows = await sb('desk_sessions?claude_session_id=not.is.null&select=claude_session_id');
-    for (const r of rows || []) claimed.add(r.claude_session_id);
-  } catch {}
-
-  for (const { name, alive, created } of live) {
+  for (const { name, alive, created, pid } of live) {
     if (!alive) {
       // A husk: tmux session whose claude has exited. These are what accumulate, one per launch.
       try { await exec('tmux', ['kill-session', '-t', name], { timeout: 10000 }); } catch {}
@@ -233,28 +229,24 @@ async function reconcileSessions() {
       const rows = await sb(`desk_sessions?id=eq.${encodeURIComponent(name)}&select=*`);
       row = rows?.[0] || null;
     } catch {}
-    // Self-healing: a session with no recorded transcript — the initial lookup missed it, or the
-    // session predates this code — adopts one here rather than staying permanently unresumable.
+    // Which conversation the session is in, from its process's own record (orchestrator/src/
+    // discover.js) — including after a `/clear`, which starts a new one inside the same process. Until
+    // claude has written that record (its first second or so) the row keeps what it had.
     let tpath = row?.transcript_path || null;
     let cid = row?.claude_session_id || null;
-    if (!tpath) {
-      const repoName = row?.repo || name.replace(/^hub-/, '').replace(/-[^-]*$/, '');
-      // A root session lives in the home directory, not under REPO_ROOT — joining REPO_ROOT with
-      // 'root' pointed at a directory that does not exist, so root sessions never adopted anything.
-      const cwd = repoName === ROOT ? os.homedir() : path.join(REPO_ROOT, repoName);
-      // Bounded by when THIS session actually started (tmux's own clock, not the row's), never
-      // "newest in the directory". Unbounded, a session whose transcript had not appeared yet adopted
-      // its predecessor's — and resuming it would restore a different conversation entirely.
-      const since = created ? created - 5000 : null;
-      const found = since ? await findTranscript(cwd, since, { attempts: 1, delayMs: 0, taken: claimed }) : null;
-      if (found) { tpath = found.path; cid = found.id; claimed.add(found.id); console.log(`[pi-desk] adopted transcript ${found.id} for ${name}`); }
+    let mirrorFrom = row?.mirror_offset || 0;
+    const s = pid ? sessionOf(pid) : null;
+    if (s && s.claudeId !== cid) {
+      tpath = s.transcriptPath; cid = s.claudeId;
+      mirrorFrom = 0;   // the mirror is keyed by conversation id, so a new one uploads from zero
+      console.log(`[pi-desk] ${name} is in conversation ${cid.slice(0, 8)} now`);
     }
-    const tail = tpath ? readTail(tpath) : { working: false, lastReply: null, bytes: 0, lastActivity: 0 };
+    const tail = tpath ? readTail(tpath) : { working: false, lastReply: null, turnAt: null, bytes: 0, lastActivity: 0 };
     // Mirror at the end of a turn — the only moment the transcript is a complete thought — so this
     // session can be picked up on the Mac later, including while this machine is unreachable.
     let mirrored = null;
-    if (!tail.working && cid && tpath && tail.bytes > (row?.mirror_offset || 0)) {
-      try { mirrored = await mirrorUp(cid, tpath, row?.mirror_offset || 0); }
+    if (!tail.working && cid && tpath && tail.bytes > mirrorFrom) {
+      try { mirrored = await mirrorUp(cid, tpath, mirrorFrom); }
       catch (e) { console.error('[pi-desk] mirror:', e.message); }
     }
     // lastActivity is what eviction sorts on. A session with no transcript reports 0 and therefore
@@ -289,7 +281,12 @@ async function reconcileSessions() {
           // still being written. Without it a reader cannot tell an answer from a stale one.
           working: tail.working,
           reply_at: tail.replyAt || row?.reply_at || null,
-          mirror_offset: mirrored ?? (row?.mirror_offset || 0),
+          // Both carried through for the same merge-duplicates reason as the label. `active_at` is the
+          // last turn boundary, which orders and focuses sessions everywhere; the tick only ever moves
+          // it forward, catching a boundary the watcher missed.
+          pid: pid || row?.pid || null,
+          active_at: laterOf(row?.active_at, tail.turnAt) || row?.started || new Date().toISOString(),
+          mirror_offset: mirrored ?? mirrorFrom,
           ...(mirrored ? { mirror_at: new Date().toISOString() } : {}),
           last_seen: new Date().toISOString(),
         }]),
@@ -324,9 +321,16 @@ async function reconcileSessions() {
           working: false,
           last_reply: tail.lastReply ? tail.lastReply.slice(0, 4000) : null,
           reply_at: tail.replyAt || null,
+          active_at: tail.turnAt || new Date().toISOString(),
           last_seen: new Date().toISOString(),
         }),
       }).catch((e) => console.error('[pi-desk] turn-end patch:', e.message));
+    },
+    (id, at) => {
+      sb(`desk_sessions?id=eq.${encodeURIComponent(id)}`, {
+        method: 'PATCH', headers: { Prefer: 'return=minimal' },
+        body: JSON.stringify({ working: true, active_at: at }),
+      }).catch((e) => console.error('[pi-desk] turn-start patch:', e.message));
     });
 
   const kept = await reapIdleSessions(residents);
@@ -566,6 +570,23 @@ const finish = (id, status, detail) =>
     body: JSON.stringify({ status, detail: String(detail || '').slice(0, 500), updated: new Date().toISOString() }),
   }).catch((e) => console.error('[pi-desk] finish:', e.message));
 
+/** Record which conversation a just-launched session is in, as soon as its claude has written its record. */
+async function bindWhenUp(session, { attempts = 90, delayMs = 1000 } = {}) {
+  for (let i = 0; i < attempts; i++) {
+    const me = (await liveSessions()).find((x) => x.name === session);
+    const s = me?.pid ? sessionOf(me.pid) : null;
+    if (s) {
+      console.log(`[pi-desk] ${session} -> claude session ${s.claudeId}`);
+      return sb(`desk_sessions?id=eq.${encodeURIComponent(session)}`, {
+        method: 'PATCH', headers: { Prefer: 'return=minimal' },
+        body: JSON.stringify({ pid: me.pid, claude_session_id: s.claudeId, transcript_path: s.transcriptPath }),
+      });
+    }
+    await new Promise((r) => setTimeout(r, delayMs));
+  }
+  console.error(`[pi-desk] no claude came up in ${session} — it will not be resumable`);
+}
+
 /**
  * Launch a session and record everything needed to bring it back later.
  *
@@ -584,7 +605,6 @@ async function startSession({ name, prompt, resumeId = null, commandId = null, r
   // doing, and a report on a one-line change is noise — so it is opt-in, set by the voice tool
   // when Jared actually asks. A bare session with no prompt has nothing to report on either way.
   const full = [warning, spoken, (report && spoken) ? REPORT_DIRECTIVE : null].filter(Boolean).join('\n\n');
-  const startedAt = Date.now() - 1000;   // slack: the transcript may be stamped just before
   const session = launch(dir, name, full, resumeId);
 
   // Published immediately so the indicator lights up when work starts, not a poll later.
@@ -592,8 +612,9 @@ async function startSession({ name, prompt, resumeId = null, commandId = null, r
     method: 'POST', headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
     // command_id is what lets a follow-up find this session: the dispatch that created it is the
     // only durable handle the caller had at the time, since the session did not exist yet.
+    // The most recently active session from the moment it exists: it is the work he just asked for.
     body: JSON.stringify([{ id: session, worker: WORKER, repo: name, status: 'resident', command_id: commandId,
-                            label: label || null,
+                            label: label || null, active_at: new Date().toISOString(),
                             ...(origin ? { origin } : {}),
                             ...(knownClaudeId ? { claude_session_id: knownClaudeId, transcript_path: transcriptPath,
                                                   mirror_offset: mirrorOffset ?? 0 } : {}),
@@ -607,16 +628,10 @@ async function startSession({ name, prompt, resumeId = null, commandId = null, r
     return `tmux ${session} in ${dir} (resumed from the Mac)${warning ? ' (stale checkout)' : ''} (trust: ${trust})`;
   }
 
-  // Backfilled once Claude has written its transcript. Async on purpose — the caller should not wait
-  // on filesystem polling to learn that the launch happened.
-  findTranscript(dir, startedAt).then((t) => {
-    if (!t) return console.error(`[pi-desk] no transcript for ${session} — it will not be resumable`);
-    console.log(`[pi-desk] ${session} -> claude session ${t.id}`);
-    return sb(`desk_sessions?id=eq.${encodeURIComponent(session)}`, {
-      method: 'PATCH', headers: { Prefer: 'return=minimal' },
-      body: JSON.stringify({ claude_session_id: t.id, transcript_path: t.path }),
-    });
-  }).catch((e) => console.error('[pi-desk] transcript:', e.message));
+  // Which conversation it is, from the process's own record once claude is up. Async on purpose — the
+  // caller should not wait on the session coming up to learn that the launch happened. The reconcile
+  // tick reads the same record, so a miss here costs one tick, not the session.
+  bindWhenUp(session).catch((e) => console.error('[pi-desk] session:', e.message));
 
   return `tmux ${session} in ${dir}${full ? ' with a prompt' : ''}${resumeId ? ' (resumed)' : ''}`
     + `${warning ? ' (stale checkout)' : ''} (trust: ${trust})`;

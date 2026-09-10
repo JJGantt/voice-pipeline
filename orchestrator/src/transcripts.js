@@ -1,5 +1,5 @@
-// Reading a Claude Code transcript: which one belongs to a session we just launched, and what that
-// session has actually said.
+// Reading a Claude Code transcript: what a session has actually said, and when it last did anything.
+// Which transcript belongs to which process is not decided here — see discover.js.
 //
 // Shared by both desk consumers rather than copied. The Pi has always read transcripts (it is the
 // only way to tell an idle session from one mid-thought before evicting it); the Mac now needs the
@@ -14,46 +14,6 @@ const PROJECTS = process.env.CLAUDE_PROJECTS_DIR || path.join(os.homedir(), '.cl
 /** Claude Code's directory name for a working directory: the path with / and . turned into dashes. */
 export function projectDir(cwd) {
   return path.join(PROJECTS, cwd.replace(/[/.]/g, '-'));
-}
-
-/**
- * The transcript Claude Code just started for a session in `cwd`.
- *
- * Matched by BIRTH TIME rather than by asking Claude, because there is no way to ask: the id is
- * generated inside the process.
- *
- * It used to match on mtime, and that produced two sessions sharing one transcript. mtime bounds
- * nothing while a session is alive: an older session that is still being written keeps a fresh mtime
- * forever, so a second session launched in the same directory adopted the first one's file and both
- * rows recorded the same claude id. Two slots, one conversation. Birth time cannot do that — a
- * transcript created before this launch is not this launch's, however recently it was touched.
- *
- * `taken` excludes ids already claimed by a live session, which closes the same hole from the other
- * side if two launches ever land inside one filesystem timestamp.
- *
- * The window is generous (90s) because Claude Code takes a while to come up on a Pi and writes its
- * transcript only once it does. A 10s window silently produced sessions with no recorded id — which
- * looks like nothing at all going wrong until you try to resume one and find you cannot.
- */
-export function findTranscript(cwd, since, { attempts = 90, delayMs = 1000, taken = new Set() } = {}) {
-  const dir = projectDir(cwd);
-  return new Promise((resolve) => {
-    let n = 0;
-    const tick = () => {
-      try {
-        const hit = fs.readdirSync(dir)
-          .filter((f) => f.endsWith('.jsonl'))
-          .filter((f) => !taken.has(f.replace(/\.jsonl$/, '')))
-          .map((f) => ({ f, p: path.join(dir, f), m: fs.statSync(path.join(dir, f)).birthtimeMs }))
-          .filter((x) => x.m >= since)
-          .sort((a, b) => b.m - a.m)[0];
-        if (hit) return resolve({ id: hit.f.replace(/\.jsonl$/, ''), path: hit.p });
-      } catch { /* the directory does not exist until the first session in that repo */ }
-      if (++n >= attempts) return resolve(null);
-      setTimeout(tick, delayMs);
-    };
-    tick();
-  });
 }
 
 /**
@@ -72,7 +32,7 @@ export function findTranscript(cwd, since, { attempts = 90, delayMs = 1000, take
  * or written by an older version. Reporting the last thing said beats reporting nothing.
  */
 export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
-  const empty = { working: false, lastReply: null, replyAt: null, title: null, customTitle: null, bytes: 0, lastActivity: 0 };
+  const empty = { working: false, lastReply: null, replyAt: null, turnAt: null, title: null, customTitle: null, bytes: 0, lastActivity: 0 };
   // Only ever a regular file. A path that is anything else must not be read: `desk_sessions` rows
   // written before the tty got its own column carry a device path here, and readFileSync on
   // /dev/ttys007 BLOCKS THE PROCESS FOR EVER waiting for terminal input — the daemon stops beating,
@@ -100,6 +60,7 @@ export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
   let turnText = [];            // text blocks seen since the current turn began
   let finalReply = null, replyAt = null;
   let anyAssistantText = null;  // fallback when no turn ever completed
+  let promptAt = null;          // when a turn was last started — see turnAt below
 
   for (const line of lines) {
     if (!line.trim()) continue;
@@ -123,7 +84,7 @@ export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
       const blocks = d.message?.content;
       const isToolResult = Array.isArray(blocks) && blocks.length > 0
         && blocks.every((b) => b?.type === 'tool_result');
-      if (!isToolResult) { working = true; turnText = []; }
+      if (!isToolResult) { working = true; turnText = []; promptAt = d.timestamp || promptAt; }
       continue;
     }
     const msg = d.message || {};
@@ -156,7 +117,13 @@ export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
   // Two names, kept apart on purpose: `customTitle` is Jared renaming the session by hand, `aiTitle`
   // is Claude Code's guess from the content. A hand-written name outranks anything derived — see the
   // label rule in deskSessions.js.
-  return { working, lastReply: finalReply ?? anyAssistantText, replyAt,
+  //
+  // turnAt is the last TURN BOUNDARY — a prompt sent or a turn finished — and it is what every surface
+  // orders, numbers and focuses sessions by. Deliberately not lastActivity: that moves with every tool
+  // call, so two working sessions would trade places mid-turn and "session two" would name a different
+  // session by the time the sentence saying it was resolved.
+  const turnAt = [promptAt, replyAt].filter(Boolean).sort().pop() || null;
+  return { working, lastReply: finalReply ?? anyAssistantText, replyAt, turnAt,
            title: customTitle || aiTitle, customTitle,
            bytes: st.size, lastActivity: newestTs || st.mtimeMs };
 }
