@@ -212,15 +212,20 @@ word, every source (Mac *and* ESP) gates on Jared's voice; OFF → the wake word
     `capture_start` moves back with it, so the worker's grouping and the data MCP's "when did he say
     it" see the true start. `PREROLL_S`/`HISTORY_S`/`BACKFILL_*` are one setting written twice —
     `server.py` and `wakefree.py`.
-  - **The finished clip is verified once more as a whole before anything is transcribed.** The live
-    gate only ever scores 2s slices, and one slice over the confirm bar commits the capture — which is
-    how a TV voice fluking a single slice past 0.30 got transcribed and ran a model turn that answered
-    `__IGNORE__` (321 such turns in the week to 2026-09-10). A whole clip embeds far more steadily than
-    any slice: his own 4s clips never scored under 0.23, 10s clips never under 0.37, while other voices
-    (JFK, synthetic male voices) land at 0.00–0.16. So at accept, after the back-fill, the first 15s of
-    the trimmed clip is scored once and a clip under `voiceid_accept_threshold` (0.22) is dropped before
-    STT, logged as `whole clip sim=… — dropped` with every slice score it had. Accepted clips log their
-    whole-clip score too, so the bar is tuned from data, not guessed.
+  - **The confirmed span is verified once more before anything is transcribed.** The live gate only
+    ever scores 2s slices, and one slice over the confirm bar commits the capture — which is how a TV
+    voice fluking a single slice past 0.30 got transcribed and ran a model turn that answered
+    `__IGNORE__` (321 such turns in the week to 2026-09-10). A longer stretch embeds far more steadily
+    than any slice: his own 4s clips never scored under 0.23, 10s clips never under 0.37, while other
+    voices (JFK, synthetic male voices) land at 0.00–0.16. So at accept, after the back-fill, the
+    stretch from the first confirming window to the last (first 15s of it) is scored once, and a
+    capture under `voiceid_accept_threshold` is dropped before STT, logged as `confirmed span sim=… —
+    dropped` with every slice score it had. It is the SPAN, never the whole capture: the capture also
+    holds the pre-confirm lead-in and the trailing windows that closed it, and on the far mic those
+    are the TV — a real 14.9s ESP command whose confirmed windows scored 0.33/0.31/0.27 scored 0.20 as
+    a whole and was dropped on 2026-09-11. Accepted captures log their span score too. **The row is
+    0 (gate off) until those logs show what his far-field spans score on the ESP**; the close-mic
+    recordings that set 0.22 say nothing about that mic.
   - **Mac:** `voice-id/wakefree.py` (ECAPA local, on-demand).
   - **ESP:** the `jared-voice` Fly server runs the same ECAPA + the shared voiceprint (lazy-loaded on
     turn-on; the box is **2 GB** for it) and captures on energy instead of openWakeWord while on.
@@ -267,7 +272,7 @@ bridges to the ESP over HTTP).
 | `agent_mode` / `agent_cwd` | `0` | worker — full-agent (coding) mode and its working directory |
 | `synth_on_mac` | `0` | worker — synthesize the reply on the Mac and ship PCM to the Pi to play |
 | `voiceid_threshold` | `0.30` | wakefree + ESP server — "it's Jared" cosine threshold for the live 2s-slice gate |
-| `voiceid_accept_threshold` | `0.22` | wakefree + ESP server — the whole-clip bar at capture-accept; a finished clip under it is dropped before STT. No hub UI yet; set the row directly |
+| `voiceid_accept_threshold` | `0` | wakefree + ESP server — the confirmed-span bar at capture-accept; a capture under it is dropped before STT. `0` = off (measure only). No hub UI yet; set the row directly |
 | `wakefree_pause_s` | `2.0` | ESP server only — the energy endpoint it falls back to while wake-free is on but ECAPA/the voiceprint has not loaded (and during enrollment). The speaker-gated path ignores it |
 | `voiceprint` | — | wakefree (local) + ESP server — base64 ECAPA exemplar bank (uploaded by `enroll.py`) |
 | `weight_reminder_*`, `surplus_cal` | — | hub server (reminders / nutrition) |

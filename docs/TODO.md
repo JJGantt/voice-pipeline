@@ -43,14 +43,18 @@ releasing partway through the dictation.
 - Leaked dictations are recorded as ignored turns, and those count toward the 3-ignored brake, so
   one leak can help re-trip the brake (it did at 18:10:27).
 
-### Tune the whole-clip accept bar from the logs
+### Set the confirmed-span accept bar from ESP data — the gate is OFF (row = 0)
 
-The whole-clip re-verify at accept (ARCHITECTURE.md, wake-free capture) shipped 2026-09-10 with
-`voiceid_accept_threshold` = 0.22, chosen from his recordings and synthetic other voices — not from
-real TV captures, because no TV audio was on hand. Both mics now log `whole clip sim=…` on every
-accepted clip and on every drop. After a few days: the drops' scores show what TV actually scores
-whole-clip, and any accepted turn that still came back `__IGNORE__` shows what slipped through. Move
-the row (no deploy needed; both mics re-read it) and, if a real command ever logs a drop, lower it.
+The span re-verify at accept (ARCHITECTURE.md, wake-free capture) is deployed on both mics but
+`voiceid_accept_threshold` is 0, so it only measures. It went live at 0.22 on 2026-09-10, chosen from
+his close-mic recordings and synthetic other voices, and within half an hour dropped a real far-field
+ESP command (as a whole clip: 0.20; its confirmed windows: 0.33/0.31/0.27). The scoring was then
+changed to the confirmed span, but the bar still has no far-field evidence behind it.
+
+Both mics log `confirmed span sim=…` on every accept. After a few days of ESP-captured commands:
+the lowest span score of a REAL command is the floor; any accepted turn that came back `__IGNORE__`
+shows what a TV clip scores. Set the row between them (no deploy; the server re-reads it live, the
+Mac at its next respawn). If nothing separates them, the lever is enrollment, below.
 
 Second lever, unchanged: enroll far-field exemplars from the ESP itself (`/enroll-start`,
 ARCHITECTURE.md) so his voice on that mic scores higher than the TV does.

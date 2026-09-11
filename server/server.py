@@ -442,6 +442,9 @@ async def connection(ws):
     last_check = 0.0                # monotonic time the last check was launched
     miss = 0                        # consecutive non-confirming checks since the last confirm
     jared_seen = False              # have we confirmed Jared at all this capture?
+    pending_span = (0, 0)           # byte span of the window the in-flight check is scoring
+    conf_lo, conf_hi = 0, 0         # byte span from the first confirming window to the last — the part of
+                                    # the capture that is HIM, which is what the whole-clip check scores
     mute_flush = False              # mute landed mid-capture on audio worth keeping → close it, don't bin it
     last_confirm = None             # wall-clock of the last confirm (send-suppression vs the other mic)
 
@@ -557,6 +560,7 @@ async def connection(ws):
                     if check_task is not None:
                         check_task.cancel()
                     check_task, last_check, miss, jared_seen, last_confirm = None, 0.0, 0, False, None
+                    conf_lo = conf_hi = 0
                     if _wakefree:
                         log.info("wake-free: speech — capturing…")
                     else:
@@ -589,6 +593,7 @@ async def connection(ws):
                     # frame capture keeps flowing while it runs (~0.4s for a 2.5s window on this box).
                     if check_task is None and audio_s >= VAD_FIRST_CHECK_S and now - last_check >= VAD_CHECK_EVERY_S:
                         win = bytes(utterance[-int(VAD_WINDOW_S * SAMPLE_RATE) * 2:])
+                        pending_span = (len(utterance) - len(win), len(utterance))
                         last_check = now
                         check_task = asyncio.create_task(_check_speaker(np.frombuffer(win, dtype=np.int16), now))
                     if check_task is not None and check_task.done():
@@ -601,8 +606,10 @@ async def connection(ws):
                         sims_seen.append(sim)    # every score is reported once, on the capture's closing line
                         if sim >= thr:
                             miss = 0
+                            conf_hi = pending_span[1]
                             if not jared_seen:
                                 jared_seen = True
+                                conf_lo = pending_span[0]
                                 log.info("wake-free: Jared confirmed (sim=%.2f after %.1fs) — tracking", sim, audio_s)
                                 _led_capturing = True        # LED → solid: confirmed it's YOU
                                 await _render_led(ws, "confirmed Jared")
@@ -706,6 +713,7 @@ async def connection(ws):
                 # indicators answer "did my command go through?", so they start the moment we KNOW
                 # we're going to work, not when the worker eventually claims it.
                 # Reach back for the start of the sentence the trigger (or a noise-abort restart) missed.
+                back = 0
                 if speaker_gated and history_snap:
                     back = await asyncio.to_thread(_backfill, np.frombuffer(history_snap, dtype=np.int16))
                     if back:
@@ -715,21 +723,32 @@ async def connection(ws):
                         started_wall -= timedelta(seconds=back_s)
                         dur += back_s
                         log.info("wake-free: back-filled %.1fs of his voice from before the trigger", back_s)
-                # The whole clip, once, against the accept bar — see ACCEPT_THR_DEFAULT.
+                # The confirmed span, once, against the accept bar — see ACCEPT_THR_DEFAULT. Scored on the
+                # stretch from the first confirming window to the last (plus any back-fill, which proved
+                # itself window by window) — NOT the whole capture. The capture also holds the pre-confirm
+                # lead-in and the trailing windows that closed it, and on this far mic those are the TV: on
+                # 2026-09-11 a real 14.9s command whose confirmed windows scored 0.33/0.31/0.27 scored 0.20
+                # as a whole clip because ~5s of TV after he stopped were inside it, and was dropped.
                 if speaker_gated:
-                    whole = await asyncio.to_thread(
-                        _verify_jared, np.frombuffer(bytes(utterance), dtype=np.int16)[:int(ACCEPT_MAX_S * SAMPLE_RATE)])
+                    if back:
+                        span_lo, span_hi = 0, conf_hi + back * 2
+                    else:
+                        span_lo, span_hi = conf_lo, conf_hi
+                    span = np.frombuffer(bytes(utterance[span_lo:span_hi]), dtype=np.int16)[:int(ACCEPT_MAX_S * SAMPLE_RATE)]
+                    whole = await asyncio.to_thread(_verify_jared, span)
                     windows = "/".join(f"{x:.2f}" for x in sims_seen) or "none"
                     if whole < _vaccept:
-                        log.info("wake-free: whole clip sim=%.2f < %.2f — another voice slipped a 2s window past the "
-                                 "gate; dropped (%.1fs, windows %s)", whole, _vaccept, dur, windows)
+                        log.info("wake-free: confirmed span sim=%.2f < %.2f — another voice slipped a 2s window past "
+                                 "the gate; dropped (%.1fs, span %.1fs, windows %s)", whole, _vaccept, dur,
+                                 len(span) / SAMPLE_RATE, windows)
                         _led_capturing = False
                         await _render_led(ws, "whole clip not Jared")
                         capturing = False
                         utterance = bytearray()
                         oww.reset()
                         continue
-                    log.info("wake-free: whole clip sim=%.2f (windows %s)", whole, windows)
+                    log.info("wake-free: confirmed span sim=%.2f (span %.1fs of %.1fs, windows %s)",
+                             whole, len(span) / SAMPLE_RATE, dur, windows)
                 rid = await _open_request(started_wall.isoformat(), end_wall.isoformat())
                 _led_capturing = False
                 _led_working = True

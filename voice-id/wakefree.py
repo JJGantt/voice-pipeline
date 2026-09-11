@@ -559,6 +559,8 @@ def main() -> int:
     last_check = 0.0           # when the last check was launched
     miss = 0                   # consecutive non-confirming checks since the last confirm
     jared_seen = False         # confirmed Jared at all this utterance?
+    pending_span = (0, 0)      # sample span of the window the in-flight check is scoring
+    conf_lo = conf_hi = 0      # sample span from the first confirming window to the last — the part that is YOU
     last_confirm = None        # wall-clock of the last confirm (send-suppression vs the other mic)
     paused_logged = False
     with _open_input_stream(frame) as stream:
@@ -598,6 +600,7 @@ def main() -> int:
                     t0 = now
                     t0_wall = datetime.now(timezone.utc)   # wall-clock start of the recording window
                     vad_future, last_check, miss, jared_seen, last_confirm = None, 0.0, 0, False, None
+                    conf_lo = conf_hi = 0
                     hud("listening")
                     warm_tts()      # speech started → warm TTS now so the spoken reply isn't cold-delayed
                 elif capturing:
@@ -607,8 +610,10 @@ def main() -> int:
                     # never stalls. The Mac is fast (~0.1s/check), so this stays real-time as you talk.
                     if vad_future is None and audio_s >= VAD_FIRST_CHECK_S and now - last_check >= VAD_CHECK_EVERY_S:
                         last_check = now
+                        total = sum(len(s) for s in seg)
                         win = trim_voiced(np.concatenate(seg)[-int(VAD_WINDOW_S * SR):], ENERGY_GATE)
                         if win.size >= int(0.4 * SR):
+                            pending_span = (max(0, total - int(VAD_WINDOW_S * SR)), total)
                             vad_future = vad_pool.submit(score, win)   # enough voice to score
                         elif jared_seen:
                             miss += 1                                  # window went silent → you're not speaking
@@ -622,8 +627,10 @@ def main() -> int:
                         sims_seen.append(sim)
                         if sim >= thr:
                             miss = 0
+                            conf_hi = pending_span[1]
                             if not jared_seen:
                                 jared_seen = True
+                                conf_lo = pending_span[0]
                                 log(f"Jared confirmed (sim={sim:.2f} after {audio_s:.1f}s) — tracking")
                             hud("locked")          # live 'it's you' — you're being heard right now
                             publish_presence(True)  # shared 'Hearing Jared' truth
@@ -675,18 +682,22 @@ def main() -> int:
                                         pcm = trim_voiced(raw, ENERGY_GATE)
                                         t0_wall -= timedelta(seconds=back / SR)
                                         log(f"back-filled {back / SR:.1f}s of your voice from before the trigger")
-                                    # The whole clip, once, against the accept bar — see ACCEPT_THRESHOLD.
-                                    whole = score(pcm[:int(ACCEPT_MAX_S * SR)]) if pcm.size >= int(0.4 * SR) else 0.0
+                                    # The confirmed span, once, against the accept bar — see ACCEPT_THRESHOLD and
+                                    # the server's copy for why it is the span and not the whole capture.
+                                    span = trim_voiced(raw[(0 if back else conf_lo):conf_hi + back], ENERGY_GATE)
+                                    span = span[:int(ACCEPT_MAX_S * SR)]
+                                    whole = score(span) if span.size >= int(0.4 * SR) else 0.0
                                 windows = "/".join(f"{x:.2f}" for x in sims_seen) or "none"
                                 if suppressed:               # ESP clearly heard you later → this is the partial; drop it
                                     log("another mic still has you — suppressing this Mac partial")
                                     hud("off")
                                 elif whole < ACCEPT_THRESHOLD:
-                                    log(f"whole clip sim={whole:.2f} < {ACCEPT_THRESHOLD:.2f} — another voice slipped a "
-                                        f"2s window past the gate; dropped ({audio_s:.1f}s, windows {windows})")
+                                    log(f"confirmed span sim={whole:.2f} < {ACCEPT_THRESHOLD:.2f} — another voice slipped a "
+                                        f"2s window past the gate; dropped ({audio_s:.1f}s, span {span.size / SR:.1f}s, "
+                                        f"windows {windows})")
                                     hud("off")
                                 else:
-                                    log(f"whole clip sim={whole:.2f} (windows {windows})")
+                                    log(f"confirmed span sim={whole:.2f} (span {span.size / SR:.1f}s of {audio_s:.1f}s, windows {windows})")
                                     # CAPTURE ACCEPTED — the command is committed from this instant:
                                     # open the lifecycle row (lamp amber) + blink the ESP NOW, pre-STT.
                                     # Inject mode has no hub lifecycle (paste-to-window), so skip both.
