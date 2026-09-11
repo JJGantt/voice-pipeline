@@ -43,19 +43,17 @@ releasing partway through the dictation.
 - Leaked dictations are recorded as ignored turns, and those count toward the 3-ignored brake, so
   one leak can help re-trip the brake (it did at 18:10:27).
 
-### TV audio still reaches the model: 321 ignored turns in the week to 2026-09-10
+### Tune the whole-clip accept bar from the logs
 
-203 ESP + 118 Mac captures that week passed the speaker gate, were transcribed, ran a Sonnet turn
-(with ~8k chars of conversation injected), and came back `__IGNORE__` — nearly all TV ("teach ISIS what
-furries are", "San Francisco area code"). Each costs a Groq call and a model turn, and every three
-within an hour trip the always-on brake. A 2s window of a TV voice fluking over 0.30 is enough today,
-because the speaker-gated path never re-scores the whole utterance at accept.
+The whole-clip re-verify at accept (ARCHITECTURE.md, wake-free capture) shipped 2026-09-10 with
+`voiceid_accept_threshold` = 0.22, chosen from his recordings and synthetic other voices — not from
+real TV captures, because no TV audio was on hand. Both mics now log `whole clip sim=…` on every
+accepted clip and on every drop. After a few days: the drops' scores show what TV actually scores
+whole-clip, and any accepted turn that still came back `__IGNORE__` shows what slipped through. Move
+the row (no deploy needed; both mics re-read it) and, if a real command ever logs a drop, lower it.
 
-Proposal: re-verify the WHOLE trimmed utterance at capture-accept (one ECAPA encode; a longer clip gives
-a far steadier embedding than any 2s window) and drop it under a bar to be chosen from data — his own
-clean 2s windows measure p5 0.27 / median 0.39, so the whole-clip bar can sit near the confirm bar
-without costing real commands. Second lever: enroll far-field exemplars from the ESP itself
-(`/enroll-start`, ARCHITECTURE.md) so his voice on that mic scores higher than the TV does.
+Second lever, unchanged: enroll far-field exemplars from the ESP itself (`/enroll-start`,
+ARCHITECTURE.md) so his voice on that mic scores higher than the TV does.
 
 ### The always-on brake kills a confirmed capture mid-flight
 

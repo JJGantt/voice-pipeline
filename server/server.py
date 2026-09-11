@@ -69,6 +69,7 @@ _ao_braked = False   # governor brake marker (wakefree_autooff_at set) → run t
 _enc = None          # ECAPA model (lazy)
 _bank = None         # voiceprint: (N, 192) exemplar embeddings from app_settings.voiceprint
 _vthresh = 0.30
+_vaccept = 0.22      # whole-clip bar at capture-accept (app_settings.voiceid_accept_threshold) — see the accept path
 _vpause = 2.0
 # ---- Voiceprint enrollment from THIS mic (/enroll-start) -----------------------------------------
 # The original exemplars were recorded on the Mac mic; matching ESP far-field audio against them is a
@@ -156,6 +157,19 @@ HISTORY_S = 8.0              # raw audio retained from before the trigger (bound
 BACKFILL_MAX_S = 5.0         # never reach further back than this — covers a full 3.5s noise-abort plus the restart
 BACKFILL_STEP_S = 0.5
 BACKFILL_THR = 0.22
+# Whole-clip re-verify at accept. The live gate only ever scores 2s slices, and ONE slice at or over the
+# confirm bar commits the whole capture — so a TV voice that flukes a single slice past 0.30 got
+# transcribed and ran a model turn that answered __IGNORE__ (203 such turns from this mic in the week to
+# 2026-09-10). A longer clip gives a far steadier embedding than any slice: measured on his own recordings,
+# whole clips of 4s never scored under 0.23 (n=266), 6s never under 0.29, 10s never under 0.37, and only 2
+# of 427 clips as short as 2.5s fell under 0.22; JFK's speech scores 0.16 whole-clip and synthetic male
+# voices 0.06–0.20. So one more encode on the finished clip, and a clip under the bar is dropped before
+# STT. The bar is app_settings.voiceid_accept_threshold (default below), separate from the confirm bar so
+# either can move alone; every accepted clip logs its whole-clip score so the bar can be tuned from data.
+ACCEPT_THR_DEFAULT = 0.22
+ACCEPT_MAX_S = 15.0          # score at most this much of the clip: the encode is linear in length on this
+                             # shared vCPU (~0.1s per second of audio), and a 10s clip is already steadier
+                             # than the bar needs (his 10s clips never scored under 0.37)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("voice")
@@ -701,6 +715,21 @@ async def connection(ws):
                         started_wall -= timedelta(seconds=back_s)
                         dur += back_s
                         log.info("wake-free: back-filled %.1fs of his voice from before the trigger", back_s)
+                # The whole clip, once, against the accept bar — see ACCEPT_THR_DEFAULT.
+                if speaker_gated:
+                    whole = await asyncio.to_thread(
+                        _verify_jared, np.frombuffer(bytes(utterance), dtype=np.int16)[:int(ACCEPT_MAX_S * SAMPLE_RATE)])
+                    windows = "/".join(f"{x:.2f}" for x in sims_seen) or "none"
+                    if whole < _vaccept:
+                        log.info("wake-free: whole clip sim=%.2f < %.2f — another voice slipped a 2s window past the "
+                                 "gate; dropped (%.1fs, windows %s)", whole, _vaccept, dur, windows)
+                        _led_capturing = False
+                        await _render_led(ws, "whole clip not Jared")
+                        capturing = False
+                        utterance = bytearray()
+                        oww.reset()
+                        continue
+                    log.info("wake-free: whole clip sim=%.2f (windows %s)", whole, windows)
                 rid = await _open_request(started_wall.isoformat(), end_wall.isoformat())
                 _led_capturing = False
                 _led_working = True
@@ -847,7 +876,7 @@ def _get_settings(keys):
 
 def _load_voiceid():
     """Lazy-load ECAPA + the shared voiceprint + thresholds when wake-free turns on."""
-    global _enc, _bank, _vthresh, _vpause
+    global _enc, _bank, _vthresh, _vaccept, _vpause
     import base64
     import torch
     # On this shared 1-vCPU machine, torch's default thread pool oversubscribes the single core it
@@ -863,12 +892,13 @@ def _load_voiceid():
     from speechbrain.inference.speaker import EncoderClassifier
     if _enc is None:
         _enc = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb", savedir="/app/.ecapa")
-    s = _get_settings(["voiceprint", "voiceid_threshold", "wakefree_pause_s"])
+    s = _get_settings(["voiceprint", "voiceid_threshold", "voiceid_accept_threshold", "wakefree_pause_s"])
     _bank = np.load(io.BytesIO(base64.b64decode(s["voiceprint"]))) if s.get("voiceprint") else None
     _vthresh = float(s.get("voiceid_threshold") or 0.30)
+    _vaccept = float(s.get("voiceid_accept_threshold") or ACCEPT_THR_DEFAULT)
     _vpause = float(s.get("wakefree_pause_s") or 2.0)
-    log.info("wake-free loaded: voiceprint=%s thresh=%.2f pause=%.1fs",
-             None if _bank is None else _bank.shape, _vthresh, _vpause)
+    log.info("wake-free loaded: voiceprint=%s thresh=%.2f accept=%.2f pause=%.1fs",
+             None if _bank is None else _bank.shape, _vthresh, _vaccept, _vpause)
 
 
 def _trim_voiced(wav, gate=0.006, margin_s=0.15):
@@ -1199,7 +1229,7 @@ def _apply_setting(key, value) -> None:
         elif not braked and _ao_braked:
             log.info("governor brake off — sensor idle")
         _ao_braked = braked
-    elif key in ("voiceid_threshold", "wakefree_pause_s", "voiceprint") and _wakefree:
+    elif key in ("voiceid_threshold", "voiceid_accept_threshold", "wakefree_pause_s", "voiceprint") and _wakefree:
         _load_voiceid_bg()   # refresh thresholds / voiceprint live
 
 

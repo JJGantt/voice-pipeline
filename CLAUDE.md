@@ -49,7 +49,8 @@ overlap* (`_duplicate_of_recent`), keeping whichever arrived first. That only ho
 on where the sentence ended, so the endpointing constants in `voice-id/wakefree.py` and
 `server/server.py` are one setting written twice — change both together. The same goes for where a
 sentence STARTED: `PREROLL_S`, `HISTORY_S` and the `BACKFILL_*` constants (how far an accepted capture
-reaches back for the words spoken before its trigger) live in both files and must match.
+reaches back for the words spoken before its trigger) live in both files and must match, as do the
+whole-clip accept defaults (`ACCEPT_THR_DEFAULT` / `ACCEPT_THRESHOLD`, `ACCEPT_MAX_S`).
 
 When they disagree the failure is silent and total. The mic that closes early enqueues a mid-sentence
 fragment; the fragment is discarded as a false positive; the other mic's *complete* capture then

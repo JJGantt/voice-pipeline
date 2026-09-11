@@ -39,14 +39,17 @@ exemplars) and a permissive threshold (the TV tops out ~0.20, so 0.30 still clea
 `wakefree.py`: speech energy opens a capture (1.2s pre-roll) → ECAPA re-scores the trailing 2s every
 0.7s → confirmed = tracking, and the capture closes after consecutive non-confirms (more are tolerated
 the longer you have talked) → at accept it **back-fills** up to 5s of your voice from before the trigger
-(a noise-dropped capture that was really the start of your sentence) → Groq transcribe → enqueue
-`voice_requests {source: mac}`. Never confirmed within 3.5s = dropped as the TV, before transcription. Toggled by `app_settings.wakefree_enabled`; the Mac listener owns the mic handoff
+(a noise-dropped capture that was really the start of your sentence) → the **whole clip is scored once
+more** and dropped under `voiceid_accept_threshold` (a TV voice that fluked one 2s slice) → Groq
+transcribe → enqueue `voice_requests {source: mac}`. Never confirmed within 3.5s = dropped as the TV,
+before transcription. Toggled by `app_settings.wakefree_enabled`; the Mac listener owns the mic handoff
 (push-to-talk > wake-free > wake-word). See `../ARCHITECTURE.md` → "Wake-free mode".
 
 ## Settings (hub-controlled, `app_settings`)
 
 - `wakefree_enabled` — on/off (the listener reacts live via realtime).
-- `voiceid_threshold` — match threshold (lower = more permissive).
+- `voiceid_threshold` — the live 2s-slice match threshold (lower = more permissive).
+- `voiceid_accept_threshold` — the whole-clip bar at accept (default 0.22).
 - `wakefree_pause_s` — ESP server only (its energy fallback before the voiceprint loads); not read here.
 
-`wakefree.py` reads the threshold at startup (a toggle off→on re-reads it).
+`wakefree.py` reads both thresholds at startup (a toggle off→on re-reads them).

@@ -104,6 +104,12 @@ HISTORY_S = 8.0
 BACKFILL_MAX_S = 5.0
 BACKFILL_STEP_S = 0.5
 BACKFILL_THR = 0.22
+# Whole-clip re-verify at accept — see server/server.py for the reasoning and the measurements. One 2s slice
+# over the confirm bar commits a capture; the finished clip is scored once more as a whole, and a clip under
+# this bar is dropped before STT (118 TV turns from this mic in the week to 2026-09-10 got through). Overridden
+# by app_settings.voiceid_accept_threshold at boot, like THRESHOLD; every accepted clip logs its score.
+ACCEPT_THRESHOLD = 0.22
+ACCEPT_MAX_S = 15.0          # score at most this much of the clip (matches the server)
 
 
 def absent_misses(audio_s: float) -> int:
@@ -516,12 +522,13 @@ def main() -> int:
         print("FATAL: no voiceprint (app_settings.voiceprint empty and no exemplars.npy) — enroll first.",
               file=sys.stderr); return 2
 
-    global THRESHOLD               # hub UI controls this via app_settings (falls back to the default above)
+    global THRESHOLD, ACCEPT_THRESHOLD   # hub-controlled via app_settings (fall back to the defaults above)
     THRESHOLD = get_setting("voiceid_threshold", THRESHOLD)
+    ACCEPT_THRESHOLD = get_setting("voiceid_accept_threshold", ACCEPT_THRESHOLD)
 
     log("loading ECAPA…")
     enc = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb", savedir=str(HERE / ".model"))
-    log(f"wake-free listening — Jared's voice only (thresh={THRESHOLD}, stt=groq:{GROQ_MODEL})")
+    log(f"wake-free listening — Jared's voice only (thresh={THRESHOLD}, accept={ACCEPT_THRESHOLD}, stt=groq:{GROQ_MODEL})")
 
     def score(seg_f32: np.ndarray) -> float:
         # Peak-normalize before encoding (same as the server + enrollment) so the embedding doesn't
@@ -658,10 +665,8 @@ def main() -> int:
                                 suppressed = (other is not None and last_confirm is not None
                                               and (datetime.now(timezone.utc) - other).total_seconds() <= 1.5
                                               and other > last_confirm + timedelta(seconds=0.3))
-                                if suppressed:               # ESP clearly heard you later → this is the partial; drop it
-                                    log("another mic still has you — suppressing this Mac partial")
-                                    hud("off")
-                                else:
+                                whole = None
+                                if not suppressed:
                                     # Reach back for the start of the sentence the trigger (or a noise-abort
                                     # restart) missed — see backfill().
                                     back = backfill(history_snap, score) if history_snap.size else 0
@@ -670,6 +675,18 @@ def main() -> int:
                                         pcm = trim_voiced(raw, ENERGY_GATE)
                                         t0_wall -= timedelta(seconds=back / SR)
                                         log(f"back-filled {back / SR:.1f}s of your voice from before the trigger")
+                                    # The whole clip, once, against the accept bar — see ACCEPT_THRESHOLD.
+                                    whole = score(pcm[:int(ACCEPT_MAX_S * SR)]) if pcm.size >= int(0.4 * SR) else 0.0
+                                windows = "/".join(f"{x:.2f}" for x in sims_seen) or "none"
+                                if suppressed:               # ESP clearly heard you later → this is the partial; drop it
+                                    log("another mic still has you — suppressing this Mac partial")
+                                    hud("off")
+                                elif whole < ACCEPT_THRESHOLD:
+                                    log(f"whole clip sim={whole:.2f} < {ACCEPT_THRESHOLD:.2f} — another voice slipped a "
+                                        f"2s window past the gate; dropped ({audio_s:.1f}s, windows {windows})")
+                                    hud("off")
+                                else:
+                                    log(f"whole clip sim={whole:.2f} (windows {windows})")
                                     # CAPTURE ACCEPTED — the command is committed from this instant:
                                     # open the lifecycle row (lamp amber) + blink the ESP NOW, pre-STT.
                                     # Inject mode has no hub lifecycle (paste-to-window), so skip both.
