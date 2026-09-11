@@ -109,11 +109,15 @@ deterministic** — it comes down to who's closest/loudest in the moment — and
 Feedback must look identical and appear **everywhere** regardless of who happened to capture it. It's
 one system; the surfaces act together. Never scope feedback to the capturing device.
 
-Two kinds of feedback, two scopes:
+Three signals, and only the first is local:
 
-- **Capture indicator — LOCAL.** Only the device with the open mic can show "I'm listening": the Mac
-  HUD pill on the Mac mic, the ESP light on the ESP mic. This is the one inherently-local signal — a
-  device only knows about its own microphone.
+- **Sound at a mic — LOCAL, and barely shown.** Speech energy opening a capture means nothing yet (it is
+  the TV as often as not), so it shows only as the Mac HUD's faint "listening" for the Mac's own mic,
+  and as nothing at all on the ESP.
+- **Hearing Jared — UNIVERSAL.** The instant any mic's speaker check confirms him it stamps
+  `voice_presence.heard_jared_at`, and every surface renders that one row: the ESP light goes solid and
+  the Mac HUD locks whether the Mac, the ESP, or both are the ones hearing him. This is the signal that
+  answers "is anything listening to me", and it is deliberately not scoped to the capturing device.
 - **Processing + response — UNIVERSAL.** "working" (the brain is running), "done", and the spoken
   reply reflect **one shared command lifecycle** that every surface subscribes to and renders the
   same. An ESP-captured command still lights the Mac HUD and speaks on the Mac; a Mac-captured
@@ -126,8 +130,8 @@ These are **two independent channels** — visual state and a single spoken line
 (`voice_requests` status) — NOT by the model:
 
 ```
-listening → LOCAL     (only the capturing device's mic indicator)
-working   → UNIVERSAL (every screen / light, the instant the worker claims the turn)
+hearing   → UNIVERSAL (every light / HUD, on any mic's confirmed check — voice_presence.heard_jared_at)
+working   → UNIVERSAL (every screen / light, from capture-accept through the worker's turn — voice_requests)
 done      → UNIVERSAL (every screen / light clears when the turn ends)
 ```
 
@@ -143,21 +147,24 @@ activity/state = the visual lifecycle above (+ `push_activity` tool events on th
 audio = the one `voice_speech` line. Only the last is played aloud.
 
 **Implemented (live, not aspirational):**
-- **Mac listener** holds one persistent realtime subscription (`RealtimeFeedback`): plays every
-  `voice_speech` line aloud (Kokoro via an on-demand warm daemon — see below), drives its on-screen HUD
-  off `voice_requests` status (`claimed`→working / `done`→done), and shows `listening` locally for its
-  own mic.
+- **Mac listener** holds one persistent realtime subscription (`RealtimeFeedback`): drives its on-screen
+  HUD off `voice_requests` status (`claimed`→working / `done`→done) and off `voice_presence` ("Hearing
+  you", from ANY mic), and shows `listening` locally for its own mic. (`voice_speech` is played by the
+  Pi audio service, not here.)
 - **Worker** drives the ESP light for every command — `/led-blink` on working, `/led-off` on done
   (jared-voice server's generic `/led-<state>` HTTP route).
 - Nothing is `request_id`-gated: the Mac speaks and lights up for an ESP- or phone-captured command the
   same as for one it captured itself.
-- **The ESP light is a single-owner state machine** (server-side, `working > capturing > idle`). Every
-  change — the ESP's own capture, the worker's `/led-blink|off`, and the Mac's at-enqueue `/led-blink` —
-  feeds the SAME two flags and renders with precedence, so two paths can never fight the bulb. (The old
+- **The ESP light is a single-owner state machine** (server-side, `hearing > working > idle`). Every
+  input — the ESP's own confirmed capture, the Mac's `voice_presence` stamps over realtime, the
+  capturers' and worker's `/led-blink|off` pings, and the `voice_requests` lifecycle over realtime —
+  feeds the SAME flags and renders with precedence, so two paths can never fight the bulb. (The old
   code let the local capture machine and the worker's pings stomp each other last-writer-wins, which is
-  what produced the solid→off→blink flicker when both mics heard one command.) `/led-off` (done) is the
-  one reset that clears everything; an enqueued capture stays solid until the worker's blink takes over,
-  so the light never dips to off mid-command.
+  what produced the solid→off→blink flicker when both mics heard one command.) There is ONE working
+  backstop timer, re-armed on every working edge and cancelled on done; stacked per-ping timers used to
+  switch the light off under a later command. Every change of the bulb's state is logged in `fly logs`
+  as `LED <cmd> (<why>)`, and a failed send is logged rather than swallowed — when the light does
+  nothing, that log answers whether the server ever asked it to.
 
 ### TTS engine (Kokoro, on-demand)
 The spoken line plays through a local Kokoro daemon (`~/scripts/kokoro_daemon.py`). It is **not** kept
@@ -195,6 +202,16 @@ word, every source (Mac *and* ESP) gates on Jared's voice; OFF → the wake word
     (~4.8s) past ~32s of speech. A one-breath command should end the instant he stops rather than
     record the room afterwards; a long dictated one is full of thinking-pauses, and cutting one in half
     loses the entire command — which costs far more than a few seconds of trailing silence.
+  - **An accepted capture reaches BACK for the words before its trigger.** A capture that has not
+    confirmed him within 3.5s is dropped as the TV — and if he is mid-sentence, the next capture opens
+    on the next frame, so the first 3.5s of the command used to be gone (56 of 184 Mac commands in the
+    week to 2026-09-10 began within 1s of such a drop; "scoop of protein powder to the smoothie" was one).
+    Both mics now keep the last 8s of raw audio, and at capture-accept the speaker gate walks backward
+    through it in 0.5s steps, prepending each 2s window that still scores as him (bar 0.22: 99% of his
+    own clean windows pass it, TV tops out ~0.18), stopping at silence, another voice, or 5s.
+    `capture_start` moves back with it, so the worker's grouping and the data MCP's "when did he say
+    it" see the true start. `PREROLL_S`/`HISTORY_S`/`BACKFILL_*` are one setting written twice —
+    `server.py` and `wakefree.py`.
   - **Mac:** `voice-id/wakefree.py` (ECAPA local, on-demand).
   - **ESP:** the `jared-voice` Fly server runs the same ECAPA + the shared voiceprint (lazy-loaded on
     turn-on; the box is **2 GB** for it) and captures on energy instead of openWakeWord while on.

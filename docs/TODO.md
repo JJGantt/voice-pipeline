@@ -36,15 +36,41 @@ releasing partway through the dictation.
    window restarts when he stops talking?
 
 **Sibling bugs, same area:**
-- `wakefree.py` installs its SIGUSR1/SIGUSR2 handlers only after the model load (~3s). A pause or
-  resume arriving in that window kills the process, because that is Python's default for those
-  signals.
 - A listener self-restart mid-dictation unmutes the ESP through the boot write above.
 - The Fly server re-reads always-on on every frame, so a brake landing mid-capture switches that
   capture to plain silence detection and ships it without speaker verification (seen 18:10-18:11
   on 2026-09-10). Latch the mode when a capture starts.
 - Leaked dictations are recorded as ignored turns, and those count toward the 3-ignored brake, so
   one leak can help re-trip the brake (it did at 18:10:27).
+
+### TV audio still reaches the model: 321 ignored turns in the week to 2026-09-10
+
+203 ESP + 118 Mac captures that week passed the speaker gate, were transcribed, ran a Sonnet turn
+(with ~8k chars of conversation injected), and came back `__IGNORE__` — nearly all TV ("teach ISIS what
+furries are", "San Francisco area code"). Each costs a Groq call and a model turn, and every three
+within an hour trip the always-on brake. A 2s window of a TV voice fluking over 0.30 is enough today,
+because the speaker-gated path never re-scores the whole utterance at accept.
+
+Proposal: re-verify the WHOLE trimmed utterance at capture-accept (one ECAPA encode; a longer clip gives
+a far steadier embedding than any 2s window) and drop it under a bar to be chosen from data — his own
+clean 2s windows measure p5 0.27 / median 0.39, so the whole-clip bar can sit near the confirm bar
+without costing real commands. Second lever: enroll far-field exemplars from the ESP itself
+(`/enroll-start`, ARCHITECTURE.md) so his voice on that mic scores higher than the TV does.
+
+### The always-on brake kills a confirmed capture mid-flight
+
+2026-09-08 00:04:58 UTC: the brake tripped (three ignored turns) while `wakefree.py` had a confirmed
+capture open; `set_wakefree(False)` killed the process, its `voice_requests` row stayed `transcribing`
+until the worker's 90s sweep errored it, and the ESP blink + floor lamp stayed on for those 90s. The
+row for a capture that was already accepted should be closed by the process itself on the way out, or
+the stop should wait for the in-flight capture to finish before the kill.
+
+### `fly logs` for jared-voice holds only about a hundred lines
+
+At the old log rate (three lines per speaker check during TV) that was under a minute of history, so
+nothing about the ESP's behaviour during a command a few minutes earlier could be reconstructed. The
+per-check lines are now folded into one `sims a/b/c` summary per capture; if history is still too short
+in practice, ship the logs somewhere durable.
 
 ### Countdown on the red "blocked" state
 

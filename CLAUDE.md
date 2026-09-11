@@ -47,7 +47,9 @@ assembled from `worker/worker.py`. Do not read it for current behaviour and do n
 The ESP and the Mac hear the same sentence, and the worker collapses the pair by *recording-window
 overlap* (`_duplicate_of_recent`), keeping whichever arrived first. That only holds while the two agree
 on where the sentence ended, so the endpointing constants in `voice-id/wakefree.py` and
-`server/server.py` are one setting written twice — change both together.
+`server/server.py` are one setting written twice — change both together. The same goes for where a
+sentence STARTED: `PREROLL_S`, `HISTORY_S` and the `BACKFILL_*` constants (how far an accepted capture
+reaches back for the words spoken before its trigger) live in both files and must match.
 
 When they disagree the failure is silent and total. The mic that closes early enqueues a mid-sentence
 fragment; the fragment is discarded as a false positive; the other mic's *complete* capture then

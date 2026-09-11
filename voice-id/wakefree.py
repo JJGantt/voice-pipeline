@@ -25,6 +25,22 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+# Push-to-talk coordination: Hammerspoon sends SIGUSR1 (pause) / SIGUSR2 (resume) while you dictate to
+# Claude, so wake-free never fights the mic or executes your dictation. set = capturing; cleared = muted.
+# The pause is a SOFTWARE mute: frames keep arriving and are discarded. The stream is never stopped —
+# AudioDeviceStop from a paused state is what deadlocked in the HAL mutex on Jun 25 and froze this
+# process for six days. CoreAudio input is shared on macOS, so holding the stream open never blocks
+# the push-to-talk recorder itself.
+_resumed = threading.Event()
+_resumed.set()
+# Installed BEFORE the imports below: SIGUSR1/2 terminate a Python process that has no handler for them, and
+# the listener sends one whenever push-to-talk starts or stops — including during the seconds this process
+# spends importing torch and loading ECAPA. Respawns logged as rc=-30 / rc=-31 were exactly that window.
+signal.signal(signal.SIGUSR1, lambda *_: _resumed.clear())
+signal.signal(signal.SIGUSR2, lambda *_: _resumed.set())
+
+from collections import deque
+
 import numpy as np
 import sounddevice as sd
 import httpx
@@ -76,6 +92,18 @@ ABSENT_MISSES_MIN = 1        # short command: close on the first non-confirm (~2
 ABSENT_MISSES_MAX = 5        # ceiling — past this only MAX_UTTER_S is left to stop a runaway capture
 ABSENT_RAMP_S = 8.0          # +1 tolerated miss per this much speech (~2.0s of pause at the floor,
                              # ~4.8s at the ceiling — a 50s dictated command survives a 4s thinking-pause)
+PREROLL_S = 1.2              # audio kept from before the energy trigger (same as the ESP server). Was one
+                             # 100ms frame here, which clipped a soft first syllable the gate only caught
+                             # mid-word. Excluded from the VAD timing (seed_s) exactly as the server does.
+# Back-fill — see server/server.py for the full reasoning and the measurements behind BACKFILL_THR. A capture
+# that never confirms you inside VAD_NO_JARED_ABORT_S is dropped as noise; if you are mid-sentence the next
+# capture opens on the next frame and used to lose everything before it (56 of 184 Mac commands in the week
+# to 2026-09-10 began within 1s of such a drop). Now the raw audio before the trigger is kept, and an ACCEPTED
+# capture walks backward through it, prepending each 2s window that still scores as you. MUST match server.py.
+HISTORY_S = 8.0
+BACKFILL_MAX_S = 5.0
+BACKFILL_STEP_S = 0.5
+BACKFILL_THR = 0.22
 
 
 def absent_misses(audio_s: float) -> int:
@@ -84,15 +112,6 @@ def absent_misses(audio_s: float) -> int:
     differently depending on which one heard it and the pair stops collapsing into one command."""
     return min(ABSENT_MISSES_MAX, ABSENT_MISSES_MIN + int(audio_s // ABSENT_RAMP_S))
 
-
-# Push-to-talk coordination: Hammerspoon sends SIGUSR1 (pause) / SIGUSR2 (resume) while you dictate to
-# Claude, so wake-free never fights the mic or executes your dictation. set = capturing; cleared = muted.
-# The pause is a SOFTWARE mute: frames keep arriving and are discarded. The stream is never stopped —
-# AudioDeviceStop from a paused state is what deadlocked in the HAL mutex on Jun 25 and froze this
-# process for six days. CoreAudio input is shared on macOS, so holding the stream open never blocks
-# the push-to-talk recorder itself.
-_resumed = threading.Event()
-_resumed.set()
 
 # CoreAudio liveness: stream.read returns at a fixed hardware cadence (every 100ms), muted or not. The
 # watchdog fires only when that guaranteed cadence stops while we're actually reading — i.e. the stream
@@ -447,6 +466,22 @@ def trim_voiced(pcm: np.ndarray, gate: float, margin_s: float = 0.15) -> np.ndar
     return pcm[max(0, voiced[0] - m): min(len(pcm), voiced[-1] + step + m)]
 
 
+def backfill(history: np.ndarray, score) -> int:
+    """How many samples off the END of `history` (the audio right before a capture's trigger) are still you
+    talking. Walks back one BACKFILL_STEP_S at a time, scoring the VAD_WINDOW_S window that ends at each step,
+    and stops at the first window that is silence (under 0.4s voiced) or not you. One ECAPA encode per step,
+    only at capture-accept. Twin of server.py's _backfill()."""
+    step, win, cap = int(BACKFILL_STEP_S * SR), int(VAD_WINDOW_S * SR), int(BACKFILL_MAX_S * SR)
+    n, inc = len(history), 0
+    while inc + step <= min(n, cap):
+        end = n - inc
+        seg = trim_voiced(history[max(0, end - win):end], ENERGY_GATE)
+        if seg.size < int(0.4 * SR) or score(seg) < BACKFILL_THR:
+            break
+        inc += step
+    return inc
+
+
 def _load_bank():
     """Prefer the SHARED voiceprint (app_settings.voiceprint) — one bank for every mic, kept current by
     re-enrollment on any device (e.g. the ESP's /enroll-start). Falls back to the local exemplars.npy
@@ -502,14 +537,15 @@ def main() -> int:
 
     # Segment on speech ENERGY (any length), then verify the speaker ONCE on the trimmed utterance.
     frame = int(FRAME_S * SR)
-    # Push-to-talk mutes in software: SIGUSR1 discards frames, SIGUSR2 resumes. The stream never stops.
-    signal.signal(signal.SIGUSR1, lambda *_: _resumed.clear())
-    signal.signal(signal.SIGUSR2, lambda *_: _resumed.set())
     vad_pool = ThreadPoolExecutor(max_workers=1)   # off-thread speaker checks so audio capture never stalls
 
     global _last_frame
     seg: list[np.ndarray] = []
-    prev = np.zeros(frame, dtype=np.float32)   # 1-frame pre-roll so the first phoneme isn't clipped
+    history: deque = deque(maxlen=int(HISTORY_S / FRAME_S))   # rolling raw frames, kept capturing or not
+    preroll_n = int(PREROLL_S / FRAME_S)
+    history_snap = np.zeros(0, dtype=np.float32)   # audio older than the pre-roll, frozen at each trigger
+    seed_s = 0.0               # pre-roll seconds in seg — excluded from the VAD timing below
+    sims_seen: list[float] = []
     capturing = False
     t0 = 0.0
     vad_future = None          # in-flight speaker check (one at a time)
@@ -535,17 +571,23 @@ def main() -> int:
                     if not paused_logged:
                         log("paused (push-to-talk) — muted in software, stream stays open")
                         paused_logged = True
-                    prev = np.zeros(frame, dtype=np.float32)
+                    history.clear()            # nothing recorded around a dictation may be back-filled later
                     continue
                 if paused_logged:
                     paused_logged = False
                     log("resumed — listening")
                 now = time.monotonic()
+                history.append(chunk)
                 voiced = float(np.sqrt(np.mean(chunk ** 2))) >= ENERGY_GATE
 
                 if voiced and not capturing:
                     capturing = True
-                    seg = [prev, chunk]
+                    frames = list(history)
+                    seg = frames[-(preroll_n + 1):]          # pre-roll + this frame
+                    seed_s = (len(seg) - 1) * FRAME_S
+                    older = frames[:-(preroll_n + 1)]
+                    history_snap = np.concatenate(older) if older else np.zeros(0, dtype=np.float32)
+                    sims_seen = []
                     t0 = now
                     t0_wall = datetime.now(timezone.utc)   # wall-clock start of the recording window
                     vad_future, last_check, miss, jared_seen, last_confirm = None, 0.0, 0, False, None
@@ -553,7 +595,7 @@ def main() -> int:
                     warm_tts()      # speech started → warm TTS now so the spoken reply isn't cold-delayed
                 elif capturing:
                     seg.append(chunk)
-                    audio_s = sum(len(s) for s in seg) / SR
+                    audio_s = sum(len(s) for s in seg) / SR - seed_s   # post-trigger audio only
                     # Launch one speaker check at a time on the trailing window, OFF-thread so frame capture
                     # never stalls. The Mac is fast (~0.1s/check), so this stays real-time as you talk.
                     if vad_future is None and audio_s >= VAD_FIRST_CHECK_S and now - last_check >= VAD_CHECK_EVERY_S:
@@ -570,11 +612,12 @@ def main() -> int:
                             sim = 0.0
                         vad_future = None
                         thr = THRESHOLD - (KEEPALIVE_MARGIN if jared_seen else 0.0)
+                        sims_seen.append(sim)
                         if sim >= thr:
                             miss = 0
                             if not jared_seen:
                                 jared_seen = True
-                                log(f"Jared confirmed (sim={sim:.2f}) — tracking")
+                                log(f"Jared confirmed (sim={sim:.2f} after {audio_s:.1f}s) — tracking")
                             hud("locked")          # live 'it's you' — you're being heard right now
                             publish_presence(True)  # shared 'Hearing Jared' truth
                             last_confirm = datetime.now(timezone.utc)
@@ -593,12 +636,14 @@ def main() -> int:
                         if vad_future is not None:
                             vad_future.cancel()
                             vad_future = None
-                        pcm = trim_voiced(np.concatenate(seg), ENERGY_GATE)
+                        raw = np.concatenate(seg)
+                        pcm = trim_voiced(raw, ENERGY_GATE)
                         capturing = False
                         seg = []
                         if reason == "noise" or pcm.size < int(SR * MIN_UTTER_S):
                             if reason == "noise":
-                                log(f"never confirmed Jared ({audio_s:.1f}s) — skipped")
+                                log(f"never confirmed Jared ({audio_s:.1f}s, sims "
+                                    f"{'/'.join(f'{x:.2f}' for x in sims_seen) or 'none'}) — skipped")
                             hud("off")
                         elif SENSOR:
                             # Sensor mode: the confirm loop above already stamped heard_jared_at — that IS
@@ -617,6 +662,14 @@ def main() -> int:
                                     log("another mic still has you — suppressing this Mac partial")
                                     hud("off")
                                 else:
+                                    # Reach back for the start of the sentence the trigger (or a noise-abort
+                                    # restart) missed — see backfill().
+                                    back = backfill(history_snap, score) if history_snap.size else 0
+                                    if back:
+                                        raw = np.concatenate([history_snap[-back:], raw])
+                                        pcm = trim_voiced(raw, ENERGY_GATE)
+                                        t0_wall -= timedelta(seconds=back / SR)
+                                        log(f"back-filled {back / SR:.1f}s of your voice from before the trigger")
                                     # CAPTURE ACCEPTED — the command is committed from this instant:
                                     # open the lifecycle row (lamp amber) + blink the ESP NOW, pre-STT.
                                     # Inject mode has no hub lifecycle (paste-to-window), so skip both.
@@ -643,7 +696,6 @@ def main() -> int:
                             finally:
                                 _last_frame = time.monotonic()
                                 _expect_frames.set()
-                prev = chunk
 
 
 if __name__ == "__main__":

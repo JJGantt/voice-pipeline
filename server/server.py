@@ -95,6 +95,9 @@ _led_working = False     # set by the worker's /led-blink, cleared by /led-off (
 _led_capturing = False   # set while this ESP is recording an utterance
 _other_hearing_jared = False  # another mic (Mac) currently hears Jared → keep this ESP's LED solid too
 _other_clear_task = None      # timer that clears the above when the other mic goes stale
+_led_safety_task = None       # the ONE working-blink backstop timer (re-armed, never stacked)
+_led_last_sent = None         # last command actually sent to the device — the log records only changes
+PRESENCE_FRESH_S = 3.0        # a heard_jared_at younger than this (other-mic clock + realtime hop) counts as "now"
 
 SAMPLE_RATE = 16_000
 FRAME_SAMPLES = 1280          # 80 ms @ 16 kHz — openWakeWord's expected chunk
@@ -139,6 +142,20 @@ PREROLL_S = 1.2              # audio kept from BEFORE the energy trigger, so a s
                             # be safe. CRITICAL: the VAD timing below subtracts this (seed_len_s) so the pre-roll
                             # never counts toward the first-check / no-Jared-abort timers — measuring the speaker
                             # window on the INFLATED total is exactly what broke the earlier walk-back version.
+# Back-fill: a capture that never confirms him inside VAD_NO_JARED_ABORT_S is dropped as noise, and while he
+# is talking the next capture opens on the very next frame — mid-sentence. Until 2026-09-10 the dropped audio
+# was gone: 56 of 184 Mac commands that week began within 1s of such a drop, and their transcripts start
+# mid-sentence ("scoop of protein powder to the smoothie", "of the calf raises at 14 reps"). So the raw audio
+# from before the trigger is kept, and once a capture is ACCEPTED the ECAPA gate walks BACKWARD through it in
+# BACKFILL_STEP_S steps, prepending each VAD_WINDOW_S window that still scores as him, until it meets silence,
+# another voice, or BACKFILL_MAX_S. The bar is lower than the confirm bar on purpose: these windows are the
+# ones that failed 0.30 while he was audibly talking. Measured 2026-09-10 on 1,123 two-second windows of his
+# own close-mic recordings: 11.7% score under 0.30 and 0.9% under 0.22, while TV-only windows on this mic top
+# out around 0.18. MUST match voice-id/wakefree.py — both mics have to reach back the same way.
+HISTORY_S = 8.0              # raw audio retained from before the trigger (bounds the back-fill's reach)
+BACKFILL_MAX_S = 5.0         # never reach further back than this — covers a full 3.5s noise-abort plus the restart
+BACKFILL_STEP_S = 0.5
+BACKFILL_THR = 0.22
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("voice")
@@ -369,7 +386,7 @@ def _client_token(ws) -> str | None:
 
 
 async def connection(ws):
-    global _active_esp, _led_working, _led_capturing, _last_esp_frame
+    global _active_esp, _led_working, _led_capturing, _last_esp_frame, _led_last_sent
     peer = getattr(ws, "remote_address", "?")
     # Device-token gate: enforced only when VOICE_DEVICE_TOKEN is set, so existing
     # firmware that doesn't send a token keeps working until it's updated.
@@ -382,11 +399,16 @@ async def connection(ws):
     _active_esp = ws
     _led_working = False
     _led_capturing = False
+    _led_last_sent = None           # the firmware boots with the LED off
     oww.reset()
 
     pending = bytearray()           # raw bytes not yet aligned to a frame
-    preroll = bytearray()           # rolling pre-wake audio
+    history = bytearray()           # rolling RAW audio, always kept (capturing or not): the pre-roll is its tail,
+                                    # the back-fill reaches further into it
+    history_max = int(HISTORY_S * SAMPLE_RATE) * 2
+    history_snap = b""              # audio older than the pre-roll, frozen at each trigger for the back-fill
     preroll_max = int(PREROLL_S * SAMPLE_RATE) * 2
+    sims_seen: list = []            # every speaker-check score of the current capture (logged once, at its end)
     sense_buf = bytearray()         # brake-sensor rolling window (red mode only; preroll is too short for ECAPA)
     sense_max = int(VAD_WINDOW_S * SAMPLE_RATE) * 2
     sense_task = None               # in-flight sensor ECAPA check
@@ -457,15 +479,18 @@ async def connection(ws):
                         utterance = bytearray()
                         oww.reset()
                         _led_capturing = False
-                        await _render_led(ws)
+                        await _render_led(ws, "capture aborted by mute")
+                        history.clear()      # nothing recorded around a dictation may be back-filled later
                         continue
                 else:
+                    history.clear()
                     continue
 
+            history.extend(raw)
+            if len(history) > history_max:
+                del history[: len(history) - history_max]
+
             if not capturing:
-                preroll.extend(raw)
-                if len(preroll) > preroll_max:
-                    del preroll[: len(preroll) - preroll_max]
                 ambient.append(rms(frame))      # track the room's noise floor
                 floor = float(np.median(ambient)) if ambient else 0.0
                 speech_level = max(floor * FLOOR_MULT, floor + FLOOR_MIN_MARGIN)
@@ -508,9 +533,10 @@ async def connection(ws):
                     capture_floor = floor     # remember the room floor that set this threshold (diagnostics)
                     capturing = True          # wake-free: LED stays as-is until ECAPA confirms it's Jared
                                               # (raw energy is not confirmation); wake-word lights below
-                    utterance = bytearray(preroll)
+                    utterance = bytearray(history[-preroll_max:])
+                    history_snap = bytes(history[:-preroll_max]) if len(history) > preroll_max else b""
                     seed_len_s = len(utterance) / 2 / SAMPLE_RATE   # pre-roll length — excluded from VAD timing below
-                    preroll.clear()
+                    sims_seen = []
                     started = time.monotonic()
                     started_wall = datetime.now(timezone.utc)   # wall-clock start of the recording window
                     last_voice = started
@@ -524,7 +550,7 @@ async def connection(ws):
                         # Congruent with wake-free's confirmed state: the wake word IS the confirmation,
                         # so the LED goes solid ("hearing you") the instant it fires — not at capture close.
                         _led_capturing = True
-                        await _render_led(ws)
+                        await _render_led(ws, "wake word")
             else:
                 if not mute_flush:
                     utterance.extend(raw)   # post-mute audio is the dictation — never append it
@@ -558,16 +584,14 @@ async def connection(ws):
                             sim = 0.0
                         check_task = None
                         thr = min(_vthresh, VAD_KEEPALIVE_MIN) if jared_seen else _vthresh
-                        # DIAG: log every speaker check (sim vs thr) so a dropped command shows WHY —
-                        # too-low sim (bad match / clipping) vs a check that never ran in time (slow encode).
-                        log.info("wake-free: check sim=%.2f thr=%.2f seen=%s audio_s=%.1f", sim, thr, jared_seen, audio_s)
+                        sims_seen.append(sim)    # every score is reported once, on the capture's closing line
                         if sim >= thr:
                             miss = 0
                             if not jared_seen:
                                 jared_seen = True
-                                log.info("wake-free: Jared confirmed (sim=%.2f) — tracking", sim)
+                                log.info("wake-free: Jared confirmed (sim=%.2f after %.1fs) — tracking", sim, audio_s)
                                 _led_capturing = True        # LED → solid: confirmed it's YOU
-                                await _render_led(ws)
+                                await _render_led(ws, "confirmed Jared")
                             asyncio.create_task(_publish_presence(True))   # shared 'Hearing Jared' truth
                             last_confirm = datetime.now(timezone.utc)
                         elif jared_seen:
@@ -626,9 +650,10 @@ async def connection(ws):
                 # drop). The energy path (wake words) still verifies the whole utterance once, as before.
                 if speaker_gated:
                     if is_noise:
-                        log.info("wake-free: never confirmed Jared (%.1fs) — dropped", dur)
+                        log.info("wake-free: never confirmed Jared (%.1fs, sims %s) — dropped", dur,
+                                 "/".join(f"{x:.2f}" for x in sims_seen) or "none")
                         _led_capturing = False
-                        await _render_led(ws)
+                        await _render_led(ws, "noise-abort")
                         capturing = False
                         utterance = bytearray()
                         continue
@@ -646,7 +671,7 @@ async def connection(ws):
                         if (_n - other).total_seconds() <= 1.5 and other >= last_confirm - timedelta(seconds=0.3):
                             log.info("wake-free: another mic still has you — suppressing this ESP partial (%.1fs)", dur)
                             _led_capturing = False
-                            await _render_led(ws)
+                            await _render_led(ws, "partial suppressed")
                             capturing = False
                             utterance = bytearray()
                             continue
@@ -655,7 +680,7 @@ async def connection(ws):
                     if sim < _vthresh:
                         log.info("wake-free: not Jared (sim=%.2f) — dropped", sim)
                         _led_capturing = False
-                        await _render_led(ws)
+                        await _render_led(ws, "not Jared")
                         capturing = False
                         utterance = bytearray()
                         continue
@@ -666,11 +691,21 @@ async def connection(ws):
                 # flip the LED from solid (hearing you) to blink (working on it) NOW, before STT. The
                 # indicators answer "did my command go through?", so they start the moment we KNOW
                 # we're going to work, not when the worker eventually claims it.
+                # Reach back for the start of the sentence the trigger (or a noise-abort restart) missed.
+                if speaker_gated and history_snap:
+                    back = await asyncio.to_thread(_backfill, np.frombuffer(history_snap, dtype=np.int16))
+                    if back:
+                        utterance[:0] = history_snap[-back * 2:]
+                        back_s = back / SAMPLE_RATE
+                        seed_len_s += back_s
+                        started_wall -= timedelta(seconds=back_s)
+                        dur += back_s
+                        log.info("wake-free: back-filled %.1fs of his voice from before the trigger", back_s)
                 rid = await _open_request(started_wall.isoformat(), end_wall.isoformat())
                 _led_capturing = False
                 _led_working = True
-                await _render_led(ws)
-                asyncio.create_task(_led_safety(ws))  # backstop in case no done-ping ever arrives
+                await _render_led(ws, "capture accepted")
+                _arm_led_safety(ws)   # backstop in case no done ever arrives
                 enqueued = False
                 try:
                     text = await transcribe(bytes(utterance))
@@ -685,7 +720,7 @@ async def connection(ws):
                         asyncio.create_task(_close_request_error(rid, "empty or failed transcription"))
                     _led_working = False
                     _led_capturing = False
-                    await _render_led(ws)
+                    await _render_led(ws, "nothing to run")
                 capturing = False
                 utterance = bytearray()
                 oww.reset()
@@ -695,7 +730,9 @@ async def connection(ws):
     log.info("ESP32 disconnected: %s", peer)
 
 
-LED_SAFETY_S = 60.0  # clear the 'working' blink after this long even if the worker never pings
+LED_SAFETY_S = 180.0  # clear the 'working' blink after this long if no done ever arrives. Longer than any
+                      # command actually runs (Opus turns reach ~70s), because the lifecycle row is the real
+                      # off-switch — this only catches a lost ping AND a lost realtime event together.
 
 
 def _led_cmd() -> str:
@@ -715,7 +752,7 @@ async def _clear_other_hearing_after(delay: float = 1.6) -> None:
         await asyncio.sleep(delay)
         _other_hearing_jared = False
         if _active_esp is not None:
-            await _render_led(_active_esp)
+            await _render_led(_active_esp, "other mic went quiet")
     except asyncio.CancelledError:
         pass
 
@@ -732,36 +769,63 @@ def _on_presence(payload) -> None:
         return                                   # our own row — ignore
     hj = rec.get("heard_jared_at")
     try:
-        fresh = bool(hj) and (datetime.now(timezone.utc) - datetime.fromisoformat(hj)).total_seconds() <= 1.5
+        fresh = bool(hj) and (datetime.now(timezone.utc) - datetime.fromisoformat(hj)).total_seconds() <= PRESENCE_FRESH_S
     except Exception:  # noqa: BLE001
         fresh = False
     if not fresh:
         return
     _other_hearing_jared = True
     if _active_esp is not None:
-        asyncio.create_task(_render_led(_active_esp))
+        asyncio.create_task(_render_led(_active_esp, f"{rec.get('source')} hears Jared"))
     if _other_clear_task:
         _other_clear_task.cancel()
     _other_clear_task = asyncio.create_task(_clear_other_hearing_after())
 
 
-async def _render_led(ws) -> None:
+async def _render_led(ws, why: str = "") -> None:
     """The ONE place the LED is set, from the precedence state machine (working > capturing > idle).
-    Routing every change through here is what makes the indicator coherent — no two paths fight."""
+    Routing every change through here is what makes the indicator coherent — no two paths fight.
+    Every CHANGE of the device's state is logged with the reason, and a failed send is logged rather than
+    swallowed: an indicator that fails silently is indistinguishable from one that was never asked."""
+    global _led_last_sent
+    cmd = _led_cmd()
     try:
-        await ws.send(_led_cmd())
-    except Exception:  # noqa: BLE001
-        pass
+        await ws.send(cmd)
+    except Exception as e:  # noqa: BLE001
+        log.warning("LED %s NOT sent (%s): %s", cmd, why, e)
+        return
+    if cmd != _led_last_sent:
+        log.info("LED %s (%s)", cmd, why)
+        _led_last_sent = cmd
+
+
+def _arm_led_safety(ws) -> None:
+    """Start the ONE working-blink backstop, replacing any running one. Stacking was the old shape: every
+    blink ping started its own timer, so command A's timer switched the light off while command B was
+    still running."""
+    global _led_safety_task
+    if _led_safety_task is not None:
+        _led_safety_task.cancel()
+    _led_safety_task = asyncio.create_task(_led_safety(ws))
+
+
+def _cancel_led_safety() -> None:
+    global _led_safety_task
+    if _led_safety_task is not None:
+        _led_safety_task.cancel()
+        _led_safety_task = None
 
 
 async def _led_safety(ws):
-    """Backstop: clear the working blink after a while even if the worker's done-ping never arrives."""
+    """Backstop: clear the working blink if neither a done-ping nor the lifecycle row's done ever arrives."""
     global _led_working, _led_capturing
     try:
         await asyncio.sleep(LED_SAFETY_S)
         _led_working = False
         _led_capturing = False
-        await _render_led(ws)
+        await _render_led(ws, "safety timeout — no done arrived")
+    except asyncio.CancelledError:
+        pass
     except Exception:  # noqa: BLE001
         pass
 
@@ -834,7 +898,9 @@ def _embed(pcm_i16, min_voiced_s: float = 0.4):
         wav = wav * (0.9 / peak)
     _t = time.monotonic()
     e = _enc.encode_batch(torch.tensor(wav).unsqueeze(0)).squeeze().detach().cpu().numpy()
-    log.info("ECAPA encode: %.0fms for %.1fs voiced audio", (time.monotonic() - _t) * 1000, wav.size / SAMPLE_RATE)
+    ms = (time.monotonic() - _t) * 1000
+    if ms > 1000:   # normal is ~0.2s; seconds means the shared vCPU is thrashing and checks will miss the abort window
+        log.warning("ECAPA encode SLOW: %.0fms for %.1fs voiced audio", ms, wav.size / SAMPLE_RATE)
     return e / (np.linalg.norm(e) + 1e-9)
 
 
@@ -848,6 +914,22 @@ def _verify_jared(pcm_i16):
     sims = _bank @ e
     k = min(3, len(sims))
     return float(np.mean(np.sort(sims)[-k:]))
+
+
+def _backfill(history) -> int:
+    """How many samples off the END of `history` (the audio right before a capture's trigger) are still
+    Jared talking. Walks back one BACKFILL_STEP_S at a time, scoring the VAD_WINDOW_S window that ends at
+    each step, and stops at the first window that is silence (too little voiced audio → _verify_jared
+    returns 0) or not him. One ECAPA encode per step, only at capture-accept. Twin of wakefree.py's
+    backfill()."""
+    step, win, cap = int(BACKFILL_STEP_S * SAMPLE_RATE), int(VAD_WINDOW_S * SAMPLE_RATE), int(BACKFILL_MAX_S * SAMPLE_RATE)
+    n, inc = len(history), 0
+    while inc + step <= min(n, cap):
+        end = n - inc
+        if _verify_jared(history[max(0, end - win):end]) < BACKFILL_THR:
+            break
+        inc += step
+    return inc
 
 
 def _upload_voiceprint(bank) -> bool:
@@ -895,7 +977,7 @@ async def _enroll_sample(pcm_i16, floor_raw: float, ws) -> None:
         try:
             await ws.send("LED_ON")
             await asyncio.sleep(0.4)
-            await _render_led(ws)
+            await _render_led(ws, "enroll phrase accepted")
         except Exception:  # noqa: BLE001
             pass
     if _enroll_left > 0:
@@ -912,7 +994,7 @@ async def _enroll_sample(pcm_i16, floor_raw: float, ws) -> None:
         log.warning("enroll: upload FAILED — new exemplars kept in memory only for this process")
     _enroll_new = []
     if ws is not None:
-        await _render_led(ws)
+        await _render_led(ws, "enroll done")
 
 
 async def _check_speaker(window_i16, win_end):
@@ -1008,14 +1090,17 @@ async def process_request(connection, request):
         if u.path == "/led-blink":
             _led_working = True
             if _active_esp is not None:
-                asyncio.create_task(_led_safety(_active_esp))  # backstop: self-clear if no /led-off ever arrives
+                _arm_led_safety(_active_esp)  # backstop: self-clear if no /led-off ever arrives
         elif u.path == "/led-off":           # done → full reset (clears any lingering capture too)
             _led_working = False
             _led_capturing = False
+            _cancel_led_safety()
         elif u.path == "/led-on":
             _led_capturing = True
         if _active_esp is not None:
-            await _render_led(_active_esp)
+            await _render_led(_active_esp, f"http {u.path}")
+        else:
+            log.info("http %s with no ESP connected", u.path)
         return connection.respond(HTTPStatus.OK, "ok\n")
     if path.startswith("/capture-o"):     # /capture-off | /capture-on — global push-to-talk mute.
         # Instant fast-path; the SOURCE OF TRUTH is the voice_muted DB flag (read live by
@@ -1061,7 +1146,7 @@ async def process_request(connection, request):
             body = f'{{"left": {_enroll_left}, "collected": {len(_enroll_new)}}}\n'
             return connection.respond(HTTPStatus.OK, body)
         if _active_esp is not None:
-            await _render_led(_active_esp)
+            await _render_led(_active_esp, "enroll state")
         return connection.respond(HTTPStatus.OK, "ok\n")
     if path in ("/health", "/"):
         return connection.respond(HTTPStatus.OK, "ok\n")
@@ -1168,13 +1253,16 @@ async def _settings_listener() -> None:
                 status = str(rec.get("status") or "")
                 if status in ("transcribing", "pending", "claimed"):
                     _led_working = True
+                    if _active_esp is not None:
+                        _arm_led_safety(_active_esp)
                 elif status in ("done", "error"):
                     _led_working = False
                     _led_capturing = False
+                    _cancel_led_safety()
                 else:
                     return
                 if _active_esp is not None:
-                    asyncio.create_task(_render_led(_active_esp))
+                    asyncio.create_task(_render_led(_active_esp, f"request {status}"))
 
             ch.on_postgres_changes("UPDATE", callback=_cb, schema="public", table="app_settings")
             ch.on_postgres_changes("UPDATE", callback=_on_presence, schema="public", table="voice_presence")
