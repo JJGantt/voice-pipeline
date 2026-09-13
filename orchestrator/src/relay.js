@@ -25,25 +25,6 @@ async function rest(path, init = {}) {
   return r.json();
 }
 
-// The same switch that gates the voice worker's pushes (Settings → Push notifications), default on.
-async function pushEnabled() {
-  try {
-    const [row] = await rest('app_settings?key=eq.push_enabled&select=value');
-    return !row || !['0', 'false', 'off', 'no', ''].includes(String(row.value).trim().toLowerCase());
-  } catch { return true; }
-}
-
-async function notify(title, body) {
-  if (!(await pushEnabled())) return;
-  try {
-    await fetch(`${config.HUB_URL}/api/notify?token=${encodeURIComponent(config.HUB_TOKEN)}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ kind: 'voice', title, body: body.slice(0, 300) }),
-    });
-  } catch { /* the reply is already in the thread; a lost push costs nothing more */ }
-}
-
 /** Post a hub-dispatched session's reply into the hub thread, if it has not been already. */
 export async function relayFirstReply(sessionId, tail) {
   if (!tail?.lastReply || settled.has(sessionId)) return;
@@ -62,5 +43,7 @@ export async function relayFirstReply(sessionId, tail) {
                             session_id: sessionId, session_label: label }]),
   });
   settled.add(sessionId);
-  if (rows.length) await notify(label || 'Hub', text);
+  // No notification here: the hub pushes every session's finished reply, this one included, keyed by
+  // turn and carrying the session to open (status-hub /api/session-activity). A second push from here
+  // would buzz twice for one reply.
 }

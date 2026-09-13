@@ -110,7 +110,8 @@ function drain(st) {
 // has to notice that the turn ended and ask.
 function finish(st) {
   const tail = readTail(st.path);
-  if (tail.lastReply) push({ session: st.id, state: 'done', text: tail.lastReply.slice(0, 400) });
+  // `at` identifies the turn: the hub pushes each finished reply to the phone once, keyed by it.
+  if (tail.lastReply) push({ session: st.id, state: 'done', text: tail.lastReply.slice(0, 400), at: tail.replyAt || null });
   try { st.onTurnEnd(st.id, tail); } catch { /* the tick will write it 30s from now regardless */ }
 }
 
