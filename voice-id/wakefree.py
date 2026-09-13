@@ -64,7 +64,9 @@ VOICE_DAEMON = os.path.expanduser("~/scripts/voice_daemon.sh")  # warm Kokoro TT
 JARED_VOICE_URL = os.environ.get("JARED_VOICE_URL", "https://jared-voice.fly.dev").rstrip("/")
 # 'Heard you' cue for inject mode: inject bypasses the hub/worker and hands off to the focused window, so
 # it has no TV/Pi round-trip to signal you. Play the same cue locally on the Mac so you know it caught you.
-HEARD_WAV = os.path.expanduser(os.environ.get("HEARD_WAV", "~/voice/sfx-candidates/02_initial_message-pop.wav"))
+# heard.wav is byte-for-byte the hub's public/pop.wav, so the Mac and the TV make the same sound.
+HEARD_WAV = os.path.expanduser(os.environ.get(
+    "HEARD_WAV", os.path.join(os.path.dirname(os.path.abspath(__file__)), "heard.wav")))
 
 SR = 16000
 FRAME_S = 0.1          # 100ms capture frames — responsive endpointing
