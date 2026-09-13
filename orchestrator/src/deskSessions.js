@@ -23,6 +23,7 @@ import { liveClaudeSessions } from './discover.js';
 import { mirrorUp } from './mirror.js';
 import { readTail } from './transcripts.js';
 import { syncSessionWatch } from './sessionWatch.js';
+import { relayFirstReply } from './relay.js';
 
 // A tab is opened, the shell starts, then claude starts. Ending a session that is still coming up
 // would delete a job the instant it was dispatched.
@@ -149,6 +150,8 @@ async function reconcile(row, proc) {
   // this catches one it missed, since fs.watch drops events.
   const busy = proc && proc.busy != null ? proc.busy : !!(tail && tail.working);
   patch.working = alive && busy;
+  // The net under the watcher's relay, for a finished turn fs.watch dropped.
+  if (alive && tail && !busy) relayFirstReply(row.id, tail).catch((e) => console.error('[desk-sessions] relay:', e.message));
   // The record's time is the truth and is written as-is, so a wrong value cannot stick. The
   // transcript's is a reconstruction and may only move the row forward.
   const turnAt = proc && proc.statusAt ? proc.statusAt : later(tail && tail.turnAt, row.active_at);
@@ -223,6 +226,7 @@ async function tick() {
         active_at: tail.turnAt || new Date().toISOString(),
         last_seen: new Date().toISOString(),
       }).catch((e) => console.error('[desk-sessions] turn-end patch:', e.message));
+      relayFirstReply(id, tail).catch((e) => console.error('[desk-sessions] relay:', e.message));
     },
     (id, at) => {
       patchDeskSession(id, { working: true, active_at: at })

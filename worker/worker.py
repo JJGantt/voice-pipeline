@@ -1214,7 +1214,9 @@ def set_cmd_ts(value: str | None) -> None:
 
 def write_mcp_config() -> str:
     env = {"SUPABASE_URL": SUPABASE_URL, "SUPABASE_KEY": SUPABASE_KEY}
-    data_env = {**env, "DATA_TS_FILE": str(CMD_TS_FILE)}
+    # DATA_CALLER=hub marks sessions this worker dispatches, so their first reply is relayed back
+    # into the hub thread (data-layer startSession → orchestrator/src/relay.js).
+    data_env = {**env, "DATA_TS_FILE": str(CMD_TS_FILE), "DATA_CALLER": "hub"}
     cfg = {
         "mcpServers": {
             "data": {"command": "node", "args": [DATA_MCP_JS], "env": data_env},
@@ -1495,7 +1497,7 @@ class ApiRunner:
         # so a set logged through the fallback landed at pipeline-end rather than at Jared's
         # rest-clock moment. Same file, so both runners now agree.
         env = {**os.environ, "SUPABASE_URL": SUPABASE_URL, "SUPABASE_KEY": SUPABASE_KEY,
-               "DATA_TS_FILE": str(CMD_TS_FILE)}
+               "DATA_TS_FILE": str(CMD_TS_FILE), "DATA_CALLER": "hub"}
         specs = []   # (name, command, args) for stdio; (name, url, None) for an HTTP server
         if os.path.exists(DATA_MCP_JS):  specs.append(("data", "node", [DATA_MCP_JS]))
         if os.path.exists(VOICE_MCP_JS): specs.append(("voice", "node", [VOICE_MCP_JS]))

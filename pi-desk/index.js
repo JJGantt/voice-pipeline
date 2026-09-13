@@ -38,6 +38,7 @@ import { readTail, liveSessions, evict, pickEviction } from './sessions.js';
 // reads the same files for the same reason.
 import { sessionOf } from '../orchestrator/src/discover.js';
 import { syncSessionWatch } from '../orchestrator/src/sessionWatch.js';
+import { relayFirstReply } from '../orchestrator/src/relay.js';
 // Shared with the Mac rather than reimplemented: both halves of a transfer must agree byte for
 // byte on what a mirrored transcript is.
 import { mirrorUp, mirrorDown } from '../orchestrator/src/mirror.js';
@@ -302,6 +303,8 @@ async function reconcileSessions() {
         }]),
       });
     } catch (e) { console.error('[pi-desk] publish:', e.message); }
+    // The net under the watcher's relay below, for a finished turn fs.watch dropped.
+    if (!busy) relayFirstReply(name, tail).catch((e) => console.error('[pi-desk] relay:', e.message));
   }
 
   // Rows we publish that tmux no longer has: mark evicted rather than delete, so the transcript stays
@@ -336,6 +339,7 @@ async function reconcileSessions() {
           last_seen: new Date().toISOString(),
         }),
       }).catch((e) => console.error('[pi-desk] turn-end patch:', e.message));
+      relayFirstReply(id, tail).catch((e) => console.error('[pi-desk] relay:', e.message));
     },
     (id, at) => {
       sb(`desk_sessions?id=eq.${encodeURIComponent(id)}`, {
