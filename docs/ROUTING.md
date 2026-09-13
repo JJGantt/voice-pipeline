@@ -54,9 +54,32 @@ and their dated and note items, `create_list`, the whole session group (`start_s
 Every argument those take is either a number the user spoke or an id from a read — there is nothing in
 them a bigger model knows better.
 
-The web (`WebSearch`, `WebFetch`), Gmail and iMessage are on the fast path too, by the same rule: a
-search takes his question and a send takes his words. They are listed once in `OPEN_TOOLS` and spread
-into both lists. Lookups are answered in the turn itself; `start_session` is only for what needs his
+The web (`WebSearch`, `WebFetch`) and reading Gmail and iMessage are on the fast path too, by the same
+rule. They are listed once, tool by tool, in `OPEN_TOOLS` and spread into both lists.
+
+**Sending a text or an email (`SEND_TOOLS`) is decided per turn, by which mic heard it.** A pushed
+command — typed, the phone's button, the watch's — may send; one from the always-on room mics (source
+`fly`/`mac`) may not, because those hear the whole room and a sentence meant for someone else would
+reach a real person. The sends are on no allow list: the warm client's `_gate` callback allows them
+only when `SdkRunner.run(..., ambient=False)`, and every other runner gets `turn_tools(ambient)`
+(full-agent mode, which has no allow list, gets them as `--disallowedTools`).
+
+The fast path's list is enforced by a **PreToolUse hook** (`SdkRunner._fence`), not by `allowed_tools`
+alone. The warm client is Claude Code, which also applies the host user's settings, and the Mac's
+pre-approve every data, gmail and messages tool in auto mode — so `allowed_tools` let Sonnet on the Mac
+call gated nutrition tools directly and let a room-mic turn send email. A hook's deny outranks any
+allow rule. The `claude -p` runs get `--setting-sources project` for the same reason; the worker runs
+from its own directory, which has none.
+
+Room-mic turns also carry `ROOM_SEND_DIRECTIVE`, which tells the model not to reach a send another
+way — by escalating, or by starting a session whose own tools could send it. That last route is
+instruction-only: `start_session` stays on the room mics because dictating work to a session is
+what they are mostly used for.
+
+## Asking for Opus
+
+Escalation also fires on request: "escalate to Opus", "use Opus" makes Sonnet reply `__ESCALATE__`
+and the turn re-runs on Opus with his words unchanged. Lookups are answered in the turn itself; `start_session` is only for what needs his
 signed-in browser (acting on a site, or reading something behind his logins). **Destructiveness is not what the gate is for**; a wrong delete is a tool-description problem,
 and Sonnet already deletes list items and whole lists.
 

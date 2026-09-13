@@ -338,10 +338,30 @@ POWER_DIRECTIVE = (
 # gated. A tool whose every argument is already in front of the model — a number the user spoke, an id
 # from a read it just did — is on the fast path however destructive it is, because there is nothing there
 # for a bigger model to know better.
-# The web, his email and his texts are on BOTH lists. Nothing in them is a value the model invents: a
-# search takes his question, a send takes the words he said and a recipient from a read.
-OPEN_TOOLS = ["mcp__gmail", "mcp__messages", "WebSearch", "WebFetch"]
-ALL_TOOLS = ["mcp__data", "mcp__voice", "mcp__govee-lights", "mcp__petlibro-feeder", *OPEN_TOOLS]  # full toolset (Opus)
+# The web and reading his email and texts are on BOTH lists. Nothing in them is a value the model
+# invents: a search takes his question, a read takes what he asked for. Named tool by tool rather than
+# by server so the two sends can be held apart; a tool either server adds later is visible but denied
+# until it is listed here.
+OPEN_TOOLS = [
+    "mcp__gmail__search_email", "mcp__gmail__get_email", "mcp__gmail__get_email_thread",
+    "mcp__gmail__list_labels", "mcp__gmail__find_email_contact", "mcp__gmail__create_draft",
+    "mcp__gmail__modify_email",
+    "mcp__messages__list_chats", "mcp__messages__get_thread", "mcp__messages__search_messages",
+    "mcp__messages__list_contacts",
+    "WebSearch", "WebFetch",
+]
+# Sending a text or an email reaches another person, so it is decided per TURN, not per list: allowed
+# when he pushed a button or typed, never from the always-on room mics, which hear the whole room and
+# would send a sentence that was never meant for the assistant. See turn_tools() and SdkRunner._gate.
+SEND_TOOLS = ["mcp__messages__send_message", "mcp__gmail__send_email"]
+ALL_TOOLS = ["mcp__data", "mcp__voice", "mcp__govee-lights", "mcp__petlibro-feeder", *OPEN_TOOLS, *SEND_TOOLS]  # full toolset (Opus)
+
+
+def turn_tools(ambient: bool, base: "list | None" = None) -> list:
+    """A turn's allow list: `base` (the full toolset by default) with the sends added for a pushed
+    command and removed for one from a room mic."""
+    tools = [t for t in (base or ALL_TOOLS) if t not in SEND_TOOLS]
+    return tools if ambient else tools + SEND_TOOLS
 
 # Sonnet's allow list.  ⚠️  See docs/ROUTING.md before changing this.
 #
@@ -475,7 +495,9 @@ ESCALATE_DIRECTIVE = (
     "to a list is a list request no matter what was being discussed a minute ago. "
     "If the current instruction genuinely needs a gated tool, do NOT attempt it and do NOT say you "
     f"can't — reply with EXACTLY '{ESCALATE_SENTINEL}' and nothing else, and it is handed to the "
-    "capable model. Handle everything else yourself.]"
+    "capable model. The same when he asks for that model himself — 'escalate to Opus', 'use Opus', "
+    f"'have Opus do it': reply '{ESCALATE_SENTINEL}' alone, whatever the rest of the request is, and "
+    "his words go to Opus unchanged. Handle everything else yourself.]"
 )
 
 # Photo turns (attachments on the request): the photos are downloaded locally, their paths ride the
@@ -522,6 +544,15 @@ ADDRESSING_DIRECTIVE = (
     "it — the mic keeps hearing the room long after he has stopped talking to you, and forwarding that "
     "into a live session is the worst thing you can do here. Anything later needs him to hand it over: "
     "'tell it to', 'send a follow-up', 'reply to it'.]"
+)
+
+# The room mics can never send a text or an email. The send tools are denied on those turns by every
+# runner (SdkRunner._fence, turn_tools, --disallowedTools); this closes the ways around that the model
+# could still reach for — escalating, or starting a session whose own tools would send it.
+ROOM_SEND_DIRECTIVE = (
+    "\n\n[This came from an always-on room mic, which cannot send texts or email. If it asks you to "
+    "send, reply to or forward a text or an email, do not do it by any route — no session, no "
+    f"'{ESCALATE_SENTINEL}' — and say it has to come from the button on his phone or watch.]"
 )
 
 # Voice (ESP/Mac) turns: the worker speaks the final WRITTEN reply itself — programmatically, via the Pi
@@ -1266,7 +1297,8 @@ def write_mcp_config() -> str:
 
 def run_claude(transcript: str, resume_session_id: str | None, on_event=None, system_append: str = "",
                model: str = HUB_MODEL, agent: bool = False, cwd: str | None = None,
-               allow_read: bool = False, allowed_tools: "list | None" = None) -> dict:
+               allow_read: bool = False, allowed_tools: "list | None" = None,
+               deny_tools: "list | None" = None) -> dict:
     """Run `claude -p` headless and STREAM the stream-json output, parsing events as they arrive.
 
     on_event(kind, payload) fires live during the run so progress can be surfaced — currently
@@ -1298,6 +1330,14 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
         if allow_read:
             allowed.append("Read")   # photo turns only: Read is how the CLI views image files
         cmd += ["--allowedTools", *allowed]   # a tool not listed is DENIED (not prompted) in -p mode
+        # Only this run's flags decide what it may do. Claude Code otherwise also applies the host
+        # user's settings, and the Mac's pre-approve the data, gmail and messages tools in auto mode,
+        # which widens the list above. The worker runs from its own directory, so "project" loads none.
+        cmd += ["--setting-sources", "project"]
+    if deny_tools:
+        # A room-mic turn drops the sends from the schema outright: a deny beats any allow rule, and no
+        # escalation hangs on seeing these, so removing them loses nothing.
+        cmd += ["--disallowedTools", *deny_tools]
     if system_append:
         cmd += ["--append-system-prompt", system_append]
     timeout_s = AGENT_TIMEOUT_S if agent else CLAUDE_TIMEOUT_S
@@ -1711,6 +1751,7 @@ class SdkRunner:
     def __init__(self):
         self._loop = None
         self._client = None
+        self._ambient = True   # the turn in flight came from a room mic; set by run() before each turn
 
     def _start_loop(self):
         if self._loop is None:
@@ -1720,14 +1761,40 @@ class SdkRunner:
     async def _ensure(self):
         if self._client is not None:
             return
-        from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, PermissionResultDeny
+        from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, HookMatcher, PermissionResultDeny
+
+        gated = "This tool is gated on the fast path. If the request needs it, reply __ESCALATE__ (alone)."
+        exact = set(SAFE_TOOLS)
+        servers = tuple(t + "__" for t in SAFE_TOOLS if t.startswith("mcp__") and t.count("__") == 1)
+
+        def _decide(decision, reason=None):
+            out = {"hookEventName": "PreToolUse", "permissionDecision": decision}
+            if reason:
+                out["permissionDecisionReason"] = reason
+            return {"hookSpecificOutput": out}
+
+        async def _fence(input_data, tool_use_id, context):  # noqa: ARG001
+            # The fast path's allow list, enforced BEFORE any permission rule. This client is Claude
+            # Code, which also applies the host user's own settings — and the Mac's pre-approve every
+            # data, gmail and messages tool in auto mode. With allowed_tools alone, Sonnet on the Mac
+            # could call the gated nutrition tools directly, and a room-mic turn sent an email in the
+            # first test of the send rule. A hook's deny outranks any allow rule, so the list holds here.
+            name = input_data.get("tool_name") or ""
+            if name in SEND_TOOLS:
+                # The one per-turn decision: the client is warm across turns, so only the flag run()
+                # sets can say which mic this turn came from.
+                if self._ambient:
+                    return _decide("deny", "Sending texts and email is off for the always-on room mics. "
+                                           "He can send it with the button on his phone or watch, or by typing it.")
+                return _decide("allow")
+            if name in exact or name.startswith(servers):
+                return {}
+            return _decide("deny", gated)
 
         async def _deny(tool_name, tool_input, context):  # noqa: ARG001
-            # SAFE_TOOLS are pre-approved via allowed_tools and never reach this callback; anything
-            # that does is gated — deny it and point the model at the escalation contract. (Without a
-            # callback the SDK raises on a permission request, failing the whole turn.)
-            return PermissionResultDeny(message="This tool is gated on the fast path. If the request "
-                                                "needs it, reply __ESCALATE__ (alone).")
+            # Reached only by a tool the fence let through without pre-approval; there is none today.
+            # (Without a callback the SDK raises on a permission request, failing the whole turn.)
+            return PermissionResultDeny(message=gated)
 
         opts = ClaudeAgentOptions(
             model="sonnet",
@@ -1740,6 +1807,7 @@ class SdkRunner:
                            "exclude_dynamic_sections": True},
             env={"ENABLE_TOOL_SEARCH": "false"},   # all schemas inline, same as the -p path
             can_use_tool=_deny,
+            hooks={"PreToolUse": [HookMatcher(matcher=None, hooks=[_fence])]},
             cwd=os.path.expanduser("~"),
         )
         client = ClaudeSDKClient(options=opts)
@@ -1801,8 +1869,11 @@ class SdkRunner:
             return {"session_id": None, "text": "", "result": "", "ok": False, "used_tools": True,
                     "raw_error": f"sdk run failed: {e}"}
 
-    def run(self, transcript, on_event=None) -> dict:
+    def run(self, transcript, on_event=None, ambient=True) -> dict:
+        """`ambient` says the turn came from a room mic, which is what _gate reads for the sends.
+        Turns run one at a time, so a flag on the runner is exactly one turn's."""
         self._start_loop()
+        self._ambient = ambient
         result = self._attempt(transcript, on_event)
         if result.get("ok"):
             return result
@@ -2244,7 +2315,7 @@ def process_request(db: Supabase, req: dict) -> None:
                    "depends on where he is (near me, directions, local hours, a pickup point), and "
                    "never mention it otherwise.]")
     if ambient:
-        prompt += ADDRESSING_DIRECTIVE
+        prompt += ADDRESSING_DIRECTIVE + ROOM_SEND_DIRECTIVE
     if quick:
         prompt += QUICK_REPLY_DIRECTIVE
     if source in ("fly", "mac"):
@@ -2290,9 +2361,11 @@ def process_request(db: Supabase, req: dict) -> None:
     # Otherwise: Sonnet (warm SDK client, subscription) with the safe toolset; a gated need → a FRESH
     # Opus on the subscription; a fast-path ERROR falls sideways to API Sonnet — never up to Opus.
     hub_prompt = ctx + prompt   # ctx is "" in agent mode (uses --resume) or when there's no live conversation
+    room_deny = SEND_TOOLS if ambient else None   # the room mics never send a text or an email
     if use_agent:
         result = run_claude(prompt, resume_id, on_event=_emit, system_append=sys_ctx, model="opus",
-                            agent=True, cwd=ag["cwd"], allow_read=bool(att_paths))
+                            agent=True, cwd=ag["cwd"], allow_read=bool(att_paths),
+                            deny_tools=room_deny)
     elif attachments and WORKER_ID == "fly":
         # Photos are subscription-only (vision via Read; the API bills money). Reaching Fly means Mac AND Pi
         # are down → refuse, don't run on the API. local means local.
@@ -2304,11 +2377,11 @@ def process_request(db: Supabase, req: dict) -> None:
         # Fly last resort: no subscription → Opus on the API (the ApiRunner is ungated; Opus is the safe
         # choice, and Fly is rare enough the speed win doesn't matter).
         result = API.run(hub_prompt + POWER_DIRECTIVE, system_append=sys_ctx, on_event=_emit,
-                         model="opus", think=True, effort=effort, fresh=True)
+                         model="opus", think=True, effort=effort, fresh=True, allowed=turn_tools(ambient))
     elif attachments:
         # Photos → straight to Opus (vision needs the capable model + Read; Sonnet would only escalate).
         result = run_claude(hub_prompt + POWER_DIRECTIVE, None, on_event=_emit, system_append=sys_ctx,
-                            model="opus", allow_read=bool(att_paths))
+                            model="opus", allow_read=bool(att_paths), allowed_tools=turn_tools(ambient), deny_tools=room_deny)
     else:
         # FAST PATH — Sonnet on the WARM SDK client, safe toolset only, billed to the SUBSCRIPTION.
         # Not a per-command `claude -p`: that spawn (CLI + four stdio MCP servers) measured 3.6s on the
@@ -2318,12 +2391,12 @@ def process_request(db: Supabase, req: dict) -> None:
         # Console balance, and the then error-escalation turned every noise judgment into a fresh
         # subscription Opus spawn — 291 in one evening. Errors must never upgrade the model.
         fast_prompt = ((govee + "\n\n") if govee else "") + hub_prompt + ESCALATE_DIRECTIVE
-        result = SDK.run(fast_prompt, on_event=_emit)
+        result = SDK.run(fast_prompt, on_event=_emit, ambient=ambient)
         if not result.get("ok"):
             log(f"subscription fast path failed ({result.get('raw_error')}) — API Sonnet fallback")
             alert_failure("subscription", result.get("raw_error") or "")
             result = API.run(hub_prompt + ESCALATE_DIRECTIVE, system_append=sys_ctx, on_event=_emit,
-                             model="sonnet", allowed=SAFE_TOOLS, fresh=True)
+                             model="sonnet", allowed=turn_tools(ambient, SAFE_TOOLS), fresh=True)
         st = (result.get("text") or "").strip().lower()
         escalate = ("__escalate__" in st) or (re.sub(r"[^a-z]", "", st) == "escalate")
         # Escalate ONLY on the sentinel — a gated need. A turn that failed on both Sonnet paths
@@ -2338,12 +2411,13 @@ def process_request(db: Supabase, req: dict) -> None:
             # start is noise here. Mac and Pi both have it; Fly is intercepted earlier. If the
             # subscription run fails anyway, finish on the API (the fallback) rather than drop.
             result = run_claude(hub_prompt + POWER_DIRECTIVE, None, on_event=_emit, system_append=sys_ctx,
-                                model="opus", allow_read=bool(att_paths))
+                                model="opus", allow_read=bool(att_paths), allowed_tools=turn_tools(ambient), deny_tools=room_deny)
             if not result.get("ok"):
                 log(f"subscription Opus failed ({result.get('raw_error')}) — completing on the API")
                 alert_failure("subscription", result.get("raw_error") or "")
                 result = API.run(hub_prompt + POWER_DIRECTIVE, system_append=sys_ctx, on_event=_emit,
-                                 model="opus", think=True, effort=effort, fresh=True)
+                                 model="opus", think=True, effort=effort, fresh=True,
+                                 allowed=turn_tools(ambient))
 
     if att_tmp:
         shutil.rmtree(att_tmp, ignore_errors=True)   # staged photos served their turn
@@ -2361,7 +2435,7 @@ def process_request(db: Supabase, req: dict) -> None:
         log("result leaked __ESCALATE__ → clean Opus re-run (no context)")
         push_activity("Escalated to Opus", "escalate")
         result = run_claude(prompt, None, on_event=_emit, system_append=sys_ctx,
-                            model="opus", allow_read=bool(att_paths))
+                            model="opus", allow_read=bool(att_paths), allowed_tools=turn_tools(ambient), deny_tools=room_deny)
         text = (result.get("text") or "").strip()
 
     # Tag every row with the mode so the hub UI can show this mode's thread separately and switch live.
