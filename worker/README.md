@@ -50,6 +50,9 @@ routed once it gets here is `../docs/ROUTING.md`.
 | `DATA_MCP_JS` | `~/repos/data-layer/dist/mcp.js` | The **built** data MCP entrypoint — a source change there does nothing until `npm run build`. |
 | `VOICE_MCP_JS` | `~/repos/voice-pipeline/mcp-voice/src/index.js` | The voice MCP (`say`, `set_focus`, `list_sessions`). |
 | `GOVEE_MCP_PY` / `GOVEE_PY` | `~/repos/govee-mcp/govee_mcp.py`, `python3.11` | The lights MCP and the interpreter that has its deps. |
+| `GMAIL_MCP_PY` / `GMAIL_PY` | `~/repos/gmail-mcp/gmail_mcp.py`, its `.venv` python | Gmail read/draft/send. Skipped when the script is absent (Fly). |
+| `MESSAGES_MCP_URL` | `http://127.0.0.1:27187/mcp` on the Mac, empty elsewhere | iMessage, always over HTTP: only the Mac's `messages-http` job has the Full Disk Access `chat.db` needs, so a stdio copy spawned here would fail every read. The Pi sets the Mac's address. |
+| `MESSAGES_MCP_TOKEN` | *(none)* | That endpoint's bearer token, the same value as in `messages-mcp/.env`. Without it (or the URL) the iMessage tools are left out entirely. |
 | `ORCH_URL` / `ORCH_TOKEN` | `http://localhost:7682` | The Mac orchestrator, for injecting into a focused session. |
 | `CLAUDE_TIMEOUT_S` | `300` | Max seconds for a single hub run. |
 | `AGENT_TIMEOUT_S` | `900` | Full-agent (coding) runs get a longer leash. |

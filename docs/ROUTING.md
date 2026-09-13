@@ -52,7 +52,12 @@ and their dated and note items, `create_list`, the whole session group (`start_s
 `log_set`/`update_set`/`remove_set`, the rep watcher, and
 `commit_staged`/`remove_staged`/`delete_nutrition_entry`, and the recipe reads plus `log_recipe`.
 Every argument those take is either a number the user spoke or an id from a read — there is nothing in
-them a bigger model knows better. **Destructiveness is not what the gate is for**; a wrong delete is a tool-description problem,
+them a bigger model knows better.
+
+The web (`WebSearch`, `WebFetch`), Gmail and iMessage are on the fast path too, by the same rule: a
+search takes his question and a send takes his words. They are listed once in `OPEN_TOOLS` and spread
+into both lists. Lookups are answered in the turn itself; `start_session` is only for what needs his
+signed-in browser (acting on a site, or reading something behind his logins). **Destructiveness is not what the gate is for**; a wrong delete is a tool-description problem,
 and Sonnet already deletes list items and whole lists.
 
 `create_list` is on the fast path for the same reason, despite making something new: it takes a name

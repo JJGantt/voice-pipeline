@@ -103,6 +103,24 @@ GOVEE_MCP_PY = os.environ.get("GOVEE_MCP_PY", "/Users/jaredgantt/repos/govee-mcp
 PETLIBRO_PY = os.environ.get("PETLIBRO_PY", "/Users/jaredgantt/repos/petlibro-mcp/.venv/bin/python")
 PETLIBRO_MCP_PY = os.environ.get("PETLIBRO_MCP_PY", "/Users/jaredgantt/repos/petlibro-mcp/petlibro_mcp.py")
 
+# Gmail MCP (search, read, draft, send). Plain HTTPS against the Gmail API with the refresh token in
+# its own .env, so it runs anywhere its checkout exists — the Pi overrides the paths via env.
+GMAIL_PY = os.environ.get("GMAIL_PY", "/Users/jaredgantt/repos/gmail-mcp/.venv/bin/python")
+GMAIL_MCP_PY = os.environ.get("GMAIL_MCP_PY", "/Users/jaredgantt/repos/gmail-mcp/gmail_mcp.py")
+
+# iMessage MCP, always over HTTP. It reads chat.db, which needs Full Disk Access, and only the Mac's
+# messages-http launchd job holds that — a stdio copy spawned by this worker would start fine and fail
+# every read. So the Mac talks to its own job on loopback and the Pi sets the Mac's address in .env.
+# Empty (Fly, or a Pi without the setting) means no iMessage tools rather than a server that can't connect.
+MESSAGES_MCP_URL = os.environ.get(
+    "MESSAGES_MCP_URL", "http://127.0.0.1:27187/mcp" if WORKER_ID == "mac" else ""
+)
+# The endpoint refuses anything without its bearer token (messages-mcp serve_http.py). Same value as
+# MESSAGES_MCP_TOKEN in messages-mcp/.env; it lives in this worker's .env on each machine.
+MESSAGES_MCP_TOKEN = os.environ.get("MESSAGES_MCP_TOKEN", "")
+MESSAGES_HEADERS = {"Authorization": f"Bearer {MESSAGES_MCP_TOKEN}"}
+HAS_MESSAGES = bool(MESSAGES_MCP_URL and MESSAGES_MCP_TOKEN)
+
 # Low-latency activity push to the status-hub server: transient "what Jarvis is doing" events go
 # straight to the SSE clients (bypassing Supabase realtime) so the on-screen activity bar tracks
 # tool calls in real time. Authenticated by the hub's kiosk token in the URL.
@@ -320,7 +338,10 @@ POWER_DIRECTIVE = (
 # gated. A tool whose every argument is already in front of the model — a number the user spoke, an id
 # from a read it just did — is on the fast path however destructive it is, because there is nothing there
 # for a bigger model to know better.
-ALL_TOOLS = ["mcp__data", "mcp__voice", "mcp__govee-lights", "mcp__petlibro-feeder"]  # full toolset (Opus)
+# The web, his email and his texts are on BOTH lists. Nothing in them is a value the model invents: a
+# search takes his question, a send takes the words he said and a recipient from a read.
+OPEN_TOOLS = ["mcp__gmail", "mcp__messages", "WebSearch", "WebFetch"]
+ALL_TOOLS = ["mcp__data", "mcp__voice", "mcp__govee-lights", "mcp__petlibro-feeder", *OPEN_TOOLS]  # full toolset (Opus)
 
 # Sonnet's allow list.  ⚠️  See docs/ROUTING.md before changing this.
 #
@@ -382,6 +403,7 @@ SAFE_TOOLS = [
     "mcp__data__follow_up", "mcp__data__rename_session", "mcp__data__focus_session",
     "mcp__data__unfocus_session",
     "mcp__data__set_wall",
+    *OPEN_TOOLS,
 ]
 
 def validate_safe_tools(mcp_js: str) -> None:
@@ -426,18 +448,22 @@ ESCALATE_DIRECTIVE = (
     "not have yet. Everything whose arguments are already in front of you is YOURS, and you should just "
     "do it: read anything (get_*/list_*); manage lists, notes and dated items; log a weight or height he "
     "stated as a number; commit, remove or delete an entry by its id; log, edit or remove a SET; set or "
-    "clear the rep watcher; and drive the lights, feeder, TV and voice settings. "
+    "clear the rep watcher; drive the lights, feeder, TV and voice settings; and read and send his "
+    "email (gmail tools) and his texts (messages tools). "
     "When he calls a meal one of HIS — 'my oatmeal', 'my gochujang tofu' — check list_recipes: a SAVED "
     "recipe is logged or staged with log_recipe, which is yours, because its macros were estimated once "
     "when it was saved and you are only naming it. Only a meal that is NOT saved needs the capable model. "
     "For sets, call get_workout_catalog first and pass the matching exercise's ID — however he said it, "
     "plural or singular. If the movement is NOT in the catalog at all it needs a muscle map you would "
     "have to invent — escalate instead. "
-    "Anything that needs a WEBSITE — looking something up on one (Metacritic, Reddit, a store, a "
-    "score, a listing) or acting on one (his Amazon cart, an order, a form) — is a start_session on "
-    "the Pi with his request passed through. That is YOURS: start_session is on your toolset, it is "
-    "not an escalation, and the session has a real browser signed in to his accounts. Never answer a "
-    "site question out of your own memory, and never tell him you cannot browse. "
+    "LOOKING SOMETHING UP is yours, done right here with WebSearch and WebFetch: a fact, a score, a "
+    "listing, opening hours, a place, anything current. Search, read the pages you need, and answer in "
+    "your reply. A session is only for what needs his SIGNED-IN browser: ACTING on a site (his Amazon "
+    "or Walmart cart, an order, a ride, a booking, a form) or reading something behind his logins (an "
+    "order's status, what is in a cart). That is a start_session on the Pi with his request passed "
+    "through, and it is YOURS too: start_session is on your toolset, it is not an escalation. Never "
+    "answer a question about the current world out of your own memory, and never tell him you cannot "
+    "browse. "
     "Decide this from the CURRENT instruction ALONE. The recent conversation above is background: that "
     "it was about food, weight or workouts does not make THIS turn one, and a request to add something "
     "to a list is a list request no matter what was being discussed a minute ago. "
@@ -512,9 +538,10 @@ VOICE_REPLY_DIRECTIVE = (
 # actually is. It deliberately gives NO per-tool guidance — each tool's schema documents its own use.
 HUB_SYSTEM = (
     "You are the assistant behind Jared's personal life-data hub. This is NOT a coding session and you "
-    "are NOT exploring a codebase. Your sole job is to fulfill each request by calling the MCP tools you "
-    "have been given to read and update his life data (nutrition, workouts, weight, "
-    "smart lights, the cat feeder, and the like). The tools are the only way to act, and each tool's own "
+    "are NOT exploring a codebase. Your sole job is to fulfill each request by calling the tools you "
+    "have been given: to read and update his life data (nutrition, workouts, weight, "
+    "smart lights, the cat feeder, and the like), to read and send his email and texts, and to search "
+    "and read the web. The tools are the only way to act, and each tool's own "
     "description tells you how to use it — follow those. Bash, curl, a shell, the filesystem, and file "
     "editing are NOT available to you; never attempt them. "
     "GOLDEN RULE: when a request clearly maps to your tools, COMPLETE it in one shot — fill in any "
@@ -1196,6 +1223,10 @@ def write_mcp_config() -> str:
             "petlibro-feeder": {"command": PETLIBRO_PY, "args": [PETLIBRO_MCP_PY], "env": env},
         }
     }
+    if os.path.exists(GMAIL_MCP_PY):
+        cfg["mcpServers"]["gmail"] = {"command": GMAIL_PY, "args": [GMAIL_MCP_PY]}
+    if HAS_MESSAGES:
+        cfg["mcpServers"]["messages"] = {"type": "http", "url": MESSAGES_MCP_URL, "headers": MESSAGES_HEADERS}
     fd, path = tempfile.mkstemp(prefix="voice-mcp-", suffix=".json")
     with os.fdopen(fd, "w") as f:
         json.dump(cfg, f)
@@ -1394,14 +1425,14 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
 
 
 # --------------------------------------------------------------------------- #
-# Stripped-down API agent — ONLY the MCP tools, nothing else.
+# Stripped-down API agent — the MCP tools plus the API's web tools, nothing else.
 #
 # `claude -p` (and the warm Agent SDK on the claude_code preset) hand the model the whole Claude Code
 # toolset — Bash, WebSearch, WebFetch, ToolSearch, Write, Cron, ~30 tools — and only DENY the
 # non-allowlisted ones at execution time. The model still SEES them and reaches for ToolSearch/Bash,
 # which is noise (and invites a tiny model like Haiku to hallucinate). This runner instead calls the
-# Anthropic Messages API directly with exactly the data/voice/govee MCP tools as `tools=`, and nothing
-# else: no built-ins, no tool discovery, no coding-agent system prompt.
+# Anthropic Messages API directly with exactly the MCP tools as `tools=`, plus web search and fetch as
+# server tools: no other built-ins, no tool discovery, no coding-agent system prompt.
 #
 # It's a real agentic loop, not one-shot — the model can chain sequential tool calls and always ends
 # with a user-facing text reply. MCP servers are started ONCE (warm stdio sessions) and their schemas
@@ -1458,22 +1489,29 @@ class ApiRunner:
         from contextlib import AsyncExitStack
         from mcp import ClientSession, StdioServerParameters
         from mcp.client.stdio import stdio_client
+        from mcp.client.streamable_http import streamablehttp_client
         # DATA_TS_FILE for the same reason the SDK path needs it, and these sessions are warm too
         # (`if self._sessions: return` above) — but note this path never carried the override at all,
         # so a set logged through the fallback landed at pipeline-end rather than at Jared's
         # rest-clock moment. Same file, so both runners now agree.
         env = {**os.environ, "SUPABASE_URL": SUPABASE_URL, "SUPABASE_KEY": SUPABASE_KEY,
                "DATA_TS_FILE": str(CMD_TS_FILE)}
-        specs = []
+        specs = []   # (name, command, args) for stdio; (name, url, None) for an HTTP server
         if os.path.exists(DATA_MCP_JS):  specs.append(("data", "node", [DATA_MCP_JS]))
         if os.path.exists(VOICE_MCP_JS): specs.append(("voice", "node", [VOICE_MCP_JS]))
         if os.path.exists(GOVEE_MCP_PY): specs.append(("govee", GOVEE_PY, [GOVEE_MCP_PY]))
         if os.path.exists(PETLIBRO_MCP_PY): specs.append(("petlibro", PETLIBRO_PY, [PETLIBRO_MCP_PY]))
+        if os.path.exists(GMAIL_MCP_PY): specs.append(("gmail", GMAIL_PY, [GMAIL_MCP_PY]))
+        if HAS_MESSAGES: specs.append(("messages", MESSAGES_MCP_URL, None))
         self._stack = AsyncExitStack()
         for name, cmd, args in specs:
-            params = StdioServerParameters(command=cmd, args=args, env=env)
             try:
-                read, write = await self._stack.enter_async_context(stdio_client(params))
+                if args is None:
+                    read, write, _ = await self._stack.enter_async_context(
+                        streamablehttp_client(cmd, headers=MESSAGES_HEADERS))
+                else:
+                    params = StdioServerParameters(command=cmd, args=args, env=env)
+                    read, write = await self._stack.enter_async_context(stdio_client(params))
                 session = await self._stack.enter_async_context(ClientSession(read, write))
                 await session.initialize()
                 tools = (await session.list_tools()).tools
@@ -1535,6 +1573,15 @@ class ApiRunner:
             tools = [t for t in self._tools
                      if t["name"].split("__", 1)[0] in _srv or t["name"] in _exact]
         model_id = API_MODEL_IDS.get(model, model)
+        # The CLI paths get WebSearch/WebFetch as Claude Code built-ins; here they are the API's own
+        # server tools, run on Anthropic's side, so there is nothing to dispatch. Haiku predates the
+        # dynamic-filtering variants and takes the basic ones.
+        if allowed is None or "WebSearch" in allowed:
+            tools = tools + [{"type": "web_search_20250305" if "haiku" in model_id else "web_search_20260209",
+                              "name": "web_search"}]
+        if allowed is None or "WebFetch" in allowed:
+            tools = tools + [{"type": "web_fetch_20250910" if "haiku" in model_id else "web_fetch_20260209",
+                              "name": "web_fetch"}]
         kwargs = dict(model=model_id, system=sys_param,
                       tools=tools, messages=self._messages,
                       max_tokens=API_MAX_TOKENS.get(model_id, 64000),
@@ -1558,10 +1605,15 @@ class ApiRunner:
                 logged_cache = True
             self._messages.append({"role": "assistant", "content": resp.content})  # preserves thinking/tool blocks
             tool_results = []
+            # The reply is the text AFTER the last tool block. A cited web answer arrives as several
+            # adjacent text blocks, so they are joined; text before a search ("let me look") is not it.
+            tail = []
             for b in resp.content:
                 if b.type == "text":
-                    final_text = b.text
-                elif b.type == "tool_use":
+                    tail.append(b.text)
+                    continue
+                tail = []
+                if b.type == "tool_use":
                     if on_event:
                         try:
                             on_event("tool", {"name": b.name, "input": b.input})
@@ -1570,8 +1622,15 @@ class ApiRunner:
                     server, real = self._dispatch.get(b.name, (None, None))
                     out = await self._call_tool(server, real, b.input) if server else "tool not found"
                     tool_results.append({"type": "tool_result", "tool_use_id": b.id, "content": out})
+            if tail:
+                final_text = "".join(tail)
             if resp.stop_reason == "tool_use" and tool_results:
                 self._messages.append({"role": "user", "content": tool_results})
+                kwargs["messages"] = self._messages
+                continue
+            # The server-side search loop hit its own iteration cap. Re-sending the conversation as it
+            # stands resumes it; the trailing server_tool_use block is what tells the API to carry on.
+            if resp.stop_reason == "pause_turn":
                 kwargs["messages"] = self._messages
                 continue
             break
@@ -1676,6 +1735,9 @@ class SdkRunner:
                     if isinstance(b, TextBlock):
                         chunks.append(b.text)
                     elif isinstance(b, ToolUseBlock):
+                        # The reply is what the model says after its LAST tool call. Text before one
+                        # ("searching now") is narration, and on a voice turn it would be read aloud.
+                        chunks = []
                         used_tools = True   # gates the retry in run(); tracked even with no on_event
                         if on_event:
                             try:

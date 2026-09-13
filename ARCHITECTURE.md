@@ -35,7 +35,8 @@ Which runner a turn uses is **not** a per-machine choice — the runners are sta
 and every ordinary stage bills the **subscription**:
 
 - **`SdkRunner`** — the warm Claude Agent SDK client: one long-lived headless Claude Code process
-  holding the four stdio MCP servers, pinned to Sonnet + `SAFE_TOOLS` at connect. Each hub turn is a
+  holding the MCP servers (data, voice, lights, feeder and Gmail over stdio; iMessage over HTTP to the
+  Mac), pinned to Sonnet + `SAFE_TOOLS` at connect, which include WebSearch and WebFetch. Each hub turn is a
   fresh `session_id` on that warm process, with the recent hub conversation replayed into the prompt.
   This is the **fast path** on the Mac and the Pi: the spawn cost `claude -p` pays per command — CLI
   plus four MCP servers, 3.6s on the Pi, ~42% of a simple turn before the model sees a token — is
@@ -46,7 +47,7 @@ and every ordinary stage bills the **subscription**:
   CLI's `Read`), and full-agent turns.
 - **`ApiRunner`** — the direct `anthropic` Messages API on the Console key. Warm MCP stdio sessions
   started once, tool schemas inlined with the prompt, full agentic loop, no built-in Claude Code
-  tools; the stable prefix (schemas + system, ~8k tokens) is **prompt-cached for 1 hour**
+  tools (web search and fetch are the API's server tools instead); the stable prefix (schemas + system, ~8k tokens) is **prompt-cached for 1 hour**
   (`cache_control ttl:1h` + the `extended-cache-ttl` beta). It is the funded **fallback**: it runs
   only when a subscription path errors, at the SAME model tier — errors never upgrade the model —
   and it is the only runner on Fly (no subscription login there), which runs Opus on it.
