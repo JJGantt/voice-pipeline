@@ -27,7 +27,10 @@ DEVICES (claim order pi → mac → fly):
 ```
 
 Inputs are thin by design: they capture and enqueue one row, and nothing about which device heard the
-command survives into how it is processed.
+command survives into how it is processed. The one thing a device adds is where it was
+(`voice_requests.location`, sent by the watch and the browser): the worker puts it on the prompt as a
+single line of context and writes it to `STATE_DIR/cmd_loc`, which the data MCP appends to any
+session the turn starts.
 
 ## Worker execution strategies
 

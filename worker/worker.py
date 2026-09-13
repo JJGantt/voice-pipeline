@@ -359,6 +359,7 @@ SAFE_TOOLS = [
     "mcp__data__get_nutrition", "mcp__data__get_nutrition_targets", "mcp__data__get_workout",
     "mcp__data__get_workout_catalog", "mcp__data__get_exercise_history", "mcp__data__get_weekly_volume",
     "mcp__data__get_health_profile", "mcp__data__get_rep_watcher", "mcp__data__list_workouts",
+    "mcp__data__get_surf",
     "mcp__data__list_staged", "mcp__data__reload_wall",                     # reads + the wall reload
     # lists / notes / dated items: low-stakes writes needing no domain knowledge → fast path.
     # Neither reminders nor notes have tools of their own any more — a reminder is a list item with a
@@ -1214,11 +1215,34 @@ def set_cmd_ts(value: str | None) -> None:
         log(f"cmd_ts write failed: {e}")   # a stale stamp is worse than none, so this is never fatal
 
 
+# Where Jared was for the in-flight command, one line, for the data MCP to hand a session it starts.
+# A file for the same warm-session reason as CMD_TS_FILE; rewritten (emptied when the device sent no
+# position) at every command, so it can never be a previous turn's.
+CMD_LOC_FILE = STATE_DIR / "cmd_loc"
+
+
+def describe_location(loc) -> str:
+    """The device's place name when it gave one, then the fix itself — or '' with no position."""
+    if not isinstance(loc, dict) or loc.get("lat") is None or loc.get("lon") is None:
+        return ""
+    fix = f"{loc['lat']}, {loc['lon']}" + (f" (within about {loc['acc']} m)" if loc.get("acc") is not None else "")
+    return f"{loc['place']} ({fix})" if loc.get("place") else fix
+
+
+def set_cmd_loc(line: str) -> None:
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        CMD_LOC_FILE.write_text(line or "")
+    except Exception as e:  # noqa: BLE001
+        log(f"cmd_loc write failed: {e}")
+
+
 def write_mcp_config() -> str:
     env = {"SUPABASE_URL": SUPABASE_URL, "SUPABASE_KEY": SUPABASE_KEY}
     # DATA_CALLER=hub marks sessions this worker dispatches, so their first reply is relayed back
     # into the hub thread (data-layer startSession → orchestrator/src/relay.js).
-    data_env = {**env, "DATA_TS_FILE": str(CMD_TS_FILE), "DATA_CALLER": "hub"}
+    data_env = {**env, "DATA_TS_FILE": str(CMD_TS_FILE), "DATA_LOC_FILE": str(CMD_LOC_FILE),
+                "DATA_CALLER": "hub"}
     cfg = {
         "mcpServers": {
             "data": {"command": "node", "args": [DATA_MCP_JS], "env": data_env},
@@ -1499,7 +1523,8 @@ class ApiRunner:
         # so a set logged through the fallback landed at pipeline-end rather than at Jared's
         # rest-clock moment. Same file, so both runners now agree.
         env = {**os.environ, "SUPABASE_URL": SUPABASE_URL, "SUPABASE_KEY": SUPABASE_KEY,
-               "DATA_TS_FILE": str(CMD_TS_FILE), "DATA_CALLER": "hub"}
+               "DATA_TS_FILE": str(CMD_TS_FILE), "DATA_LOC_FILE": str(CMD_LOC_FILE),
+               "DATA_CALLER": "hub"}
         specs = []   # (name, command, args) for stdio; (name, url, None) for an HTTP server
         if os.path.exists(DATA_MCP_JS):  specs.append(("data", "node", [DATA_MCP_JS]))
         if os.path.exists(VOICE_MCP_JS): specs.append(("voice", "node", [VOICE_MCP_JS]))
@@ -2207,6 +2232,14 @@ def process_request(db: Supabase, req: dict) -> None:
                "different time named), pass this exact moment as occurred_at (YYYY-MM-DDTHH:MM:SS) to the "
                "logging tool explicitly rather than omitting it — the tool's own clock may not be wherever "
                "this was actually said/typed.]")
+    # Where he was, when the device sent it (voice_requests.location). One line on the prompt, and the
+    # same line for the data MCP to pass to any session this turn starts.
+    where = describe_location(req.get("location"))
+    set_cmd_loc(where)
+    if where:
+        prompt += ("\n\n[Where he was when he said this: " + where + ". Use it only when the request "
+                   "depends on where he is (near me, directions, local hours, a pickup point), and "
+                   "never mention it otherwise.]")
     if ambient:
         prompt += ADDRESSING_DIRECTIVE
     if quick:
