@@ -37,7 +37,7 @@ import { readTail, liveSessions, evict, pickEviction } from './sessions.js';
 // Which conversation a process is in, from Claude Code's own record — shared with the Mac, which
 // reads the same files for the same reason.
 import { sessionOf } from '../orchestrator/src/discover.js';
-import { syncSessionWatch } from '../orchestrator/src/sessionWatch.js';
+import { syncSessionWatch, reportTurnEnd } from '../orchestrator/src/sessionWatch.js';
 import { relayFirstReply } from '../orchestrator/src/relay.js';
 // Shared with the Mac rather than reimplemented: both halves of a transfer must agree byte for
 // byte on what a mirrored transcript is.
@@ -248,6 +248,11 @@ async function reconcileSessions() {
     // and on a long turn whose prompt has scrolled out of readTail's window it reads as idle — which
     // the reaper and pickEviction would take as leave to close the session mid-thought.
     const busy = s && s.busy != null ? s.busy : tail.working;
+    // The net under the watcher for the reply's notification, as on the Mac: a finished turn newer than
+    // the one this row records, and newer than the row (a resume's inherited history is not news), is
+    // one fs.watch dropped.
+    const at = (t) => (t ? Date.parse(t) : 0);
+    if (row && tail.replyAt && at(tail.replyAt) > Math.max(at(row.reply_at), at(row.started))) reportTurnEnd(name, tail);
     // Mirror at the end of a turn — the only moment the transcript is a complete thought — so this
     // session can be picked up on the Mac later, including while this machine is unreachable.
     let mirrored = null;

@@ -110,9 +110,18 @@ function drain(st) {
 // has to notice that the turn ended and ask.
 function finish(st) {
   const tail = readTail(st.path);
-  // `at` identifies the turn: the hub pushes each finished reply to the phone once, keyed by it.
-  if (tail.lastReply) push({ session: st.id, state: 'done', text: tail.lastReply.slice(0, 400), at: tail.replyAt || null });
+  reportTurnEnd(st.id, tail);
   try { st.onTurnEnd(st.id, tail); } catch { /* the tick will write it 30s from now regardless */ }
+}
+
+/**
+ * Tell the hub a turn finished: the wall redraws the session and the hub pushes its reply to the
+ * phone. The watcher calls this the moment a turn ends, and each host's reconcile tick calls it for a
+ * turn end fs.watch dropped. `at` identifies the turn and the hub pushes each one once, so both
+ * calling it for the same turn is harmless.
+ */
+export function reportTurnEnd(id, tail) {
+  if (tail?.lastReply) push({ session: id, state: 'done', text: tail.lastReply.slice(0, 400), at: tail.replyAt || null });
 }
 
 function attach(st) {

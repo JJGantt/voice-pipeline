@@ -22,7 +22,7 @@ import { sweepStashedPrompts } from './applescript.js';
 import { liveClaudeSessions } from './discover.js';
 import { mirrorUp } from './mirror.js';
 import { readTail } from './transcripts.js';
-import { syncSessionWatch } from './sessionWatch.js';
+import { syncSessionWatch, reportTurnEnd } from './sessionWatch.js';
 import { relayFirstReply } from './relay.js';
 
 // A tab is opened, the shell starts, then claude starts. Ending a session that is still coming up
@@ -152,6 +152,11 @@ async function reconcile(row, proc) {
   patch.working = alive && busy;
   // The net under the watcher's relay, for a finished turn fs.watch dropped.
   if (alive && tail && !busy) relayFirstReply(row.id, tail).catch((e) => console.error('[desk-sessions] relay:', e.message));
+  // The same net for the reply's notification. A finished turn newer than the one this row records is
+  // one the watcher never reported, and without this the phone would never hear of it. Newer than the
+  // row itself too: a resumed session's new row starts with no reply recorded, and the last turn of
+  // the history it inherited is not news.
+  if (tail && tail.replyAt && ms(tail.replyAt) > Math.max(ms(row.reply_at), ms(row.started))) reportTurnEnd(row.id, tail);
   // The record's time is the truth and is written as-is, so a wrong value cannot stick. The
   // transcript's is a reconstruction and may only move the row forward.
   const turnAt = proc && proc.statusAt ? proc.statusAt : later(tail && tail.turnAt, row.active_at);
