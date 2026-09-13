@@ -360,6 +360,9 @@ SAFE_TOOLS = [
     "mcp__data__get_workout_catalog", "mcp__data__get_exercise_history", "mcp__data__get_weekly_volume",
     "mcp__data__get_health_profile", "mcp__data__get_rep_watcher", "mcp__data__list_workouts",
     "mcp__data__get_surf",
+    # The saved shopping catalogue and the recorded Walmart cart: reads, so "what's in my cart" is
+    # answered here instead of costing an Opus escalation.
+    "mcp__data__get_shopping_items", "mcp__data__get_walmart_cart",
     "mcp__data__list_staged", "mcp__data__reload_wall",                     # reads + the wall reload
     # lists / notes / dated items: low-stakes writes needing no domain knowledge → fast path.
     # Neither reminders nor notes have tools of their own any more — a reminder is a list item with a
