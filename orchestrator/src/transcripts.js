@@ -63,6 +63,8 @@ export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
   let finalReply = null, replyAt = null;
   let anyAssistantText = null;  // fallback when no turn ever completed
   let promptAt = null;          // when a turn was last started — see turnAt below
+  let turnPrompt = null;        // what started the current turn
+  let finalPrompt = null;       // what started the turn finalReply ended, so the two always pair
 
   for (const line of lines) {
     if (!line.trim()) continue;
@@ -86,7 +88,15 @@ export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
       const blocks = d.message?.content;
       const isToolResult = Array.isArray(blocks) && blocks.length > 0
         && blocks.every((b) => b?.type === 'tool_result');
-      if (!isToolResult) { working = true; turnText = []; promptAt = d.timestamp || promptAt; }
+      if (!isToolResult) {
+        working = true; turnText = []; promptAt = d.timestamp || promptAt;
+        // What he asked, as text. Claude Code's own injected context (`isMeta`) is not a prompt.
+        if (!d.isMeta) {
+          turnPrompt = typeof blocks === 'string' ? (blocks.trim() || null)
+            : Array.isArray(blocks) ? (blocks.filter((b) => b?.type === 'text').map((b) => b.text).join('\n').trim() || null)
+            : null;
+        }
+      }
       continue;
     }
     const msg = d.message || {};
@@ -98,7 +108,7 @@ export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
     if (msg.stop_reason === 'end_turn') {
       working = false;
       const joined = turnText.join('\n\n').trim();
-      if (joined) { finalReply = joined; replyAt = d.timestamp || null; }
+      if (joined) { finalReply = joined; replyAt = d.timestamp || null; finalPrompt = turnPrompt; }
     }
   }
 
@@ -127,7 +137,10 @@ export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
   // call, so two working sessions would trade places mid-turn and "session two" would name a different
   // session by the time the sentence saying it was resolved.
   const turnAt = [promptAt, replyAt].filter(Boolean).sort().pop() || null;
-  return { working, lastReply: finalReply ?? anyAssistantText, replyAt, turnAt,
+  // lastPrompt is the prompt of the turn lastReply ended, or null when the reply is only the fallback
+  // text of a turn that never finished (its prompt would not be the one it answers).
+  return { working, lastReply: finalReply ?? anyAssistantText, lastPrompt: finalReply !== null ? finalPrompt : null,
+           replyAt, turnAt,
            title: customTitle || aiTitle, customTitle,
            bytes: st.size, lastActivity: newestTs || st.mtimeMs };
 }

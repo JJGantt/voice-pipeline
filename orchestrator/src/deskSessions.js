@@ -89,6 +89,7 @@ async function adopt(s, rows) {
     label: tail.title ? tail.title.slice(0, 60) : null,
     started: startedIso,
     working: s.busy ?? tail.working, last_reply: tail.lastReply ? tail.lastReply.slice(0, 4000) : null,
+    last_prompt: tail.lastPrompt ? tail.lastPrompt.slice(0, 4000) : null,
     reply_at: tail.replyAt || null,
     active_at: s.statusAt || tail.turnAt || startedIso,
   });
@@ -110,9 +111,10 @@ async function reconcile(row, proc) {
       patch.mirror_offset = 0;
       // What the old conversation last said is not what this one said: read afresh below, or blank.
       patch.last_reply = null;
+      patch.last_prompt = null;
       patch.reply_at = null;
       Object.assign(row, { claude_session_id: proc.claudeId, transcript_path: proc.transcriptPath, mirror_offset: 0,
-                           last_reply: null, reply_at: null });
+                           last_reply: null, last_prompt: null, reply_at: null });
       console.log(`[desk-sessions] ${row.id} is in conversation ${proc.claudeId.slice(0, 8)} now`);
     }
   }
@@ -121,7 +123,12 @@ async function reconcile(row, proc) {
   if (tail) {
     // Carry the old reply forward rather than blanking it: a transcript that momentarily reads as
     // empty (mid-write, or a rotated file) must not erase what the session already said.
-    if (tail.lastReply) { patch.last_reply = tail.lastReply.slice(0, 4000); patch.reply_at = tail.replyAt || row.reply_at || null; }
+    // The prompt goes with its reply: replaced only when the reply is, blank when it is not in the window.
+    if (tail.lastReply) {
+      patch.last_reply = tail.lastReply.slice(0, 4000);
+      patch.last_prompt = tail.lastPrompt ? tail.lastPrompt.slice(0, 4000) : null;
+      patch.reply_at = tail.replyAt || row.reply_at || null;
+    }
     // What a session is CALLED, in order of authority:
     //   1. a name Jared typed himself (ctrl-R in the session picker, written to the transcript as a
     //      `custom-title` record) — an explicit act, so it outranks everything, dispatched or not;
@@ -211,6 +218,7 @@ async function tick() {
       patchDeskSession(id, {
         working: false,
         last_reply: tail.lastReply ? tail.lastReply.slice(0, 4000) : null,
+        last_prompt: tail.lastPrompt ? tail.lastPrompt.slice(0, 4000) : null,
         reply_at: tail.replyAt || null,
         active_at: tail.turnAt || new Date().toISOString(),
         last_seen: new Date().toISOString(),

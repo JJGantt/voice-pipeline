@@ -282,6 +282,10 @@ async function reconcileSessions() {
           // Separately, so a tab can show the repo unless Jared named the session himself.
           custom_title: tail.customTitle ? tail.customTitle.slice(0, 60) : (row?.custom_title || null),
           last_reply: tail.lastReply ? tail.lastReply.slice(0, 4000) : (rebound ? null : row?.last_reply || null),
+          // The prompt that reply answers, and carried by the same rule: it belongs to the reply, so it
+          // is replaced only when the reply is.
+          last_prompt: tail.lastReply ? (tail.lastPrompt ? tail.lastPrompt.slice(0, 4000) : null)
+                                      : (rebound ? null : row?.last_prompt || null),
           // last_reply is the FINAL message of a turn; `working` is what says whether a newer one is
           // still being written. Without it a reader cannot tell an answer from a stale one.
           working: busy,
@@ -326,6 +330,7 @@ async function reconcileSessions() {
         body: JSON.stringify({
           working: false,
           last_reply: tail.lastReply ? tail.lastReply.slice(0, 4000) : null,
+          last_prompt: tail.lastPrompt ? tail.lastPrompt.slice(0, 4000) : null,
           reply_at: tail.replyAt || null,
           active_at: tail.turnAt || new Date().toISOString(),
           last_seen: new Date().toISOString(),
@@ -420,7 +425,15 @@ async function runQueue(residents) {
   } catch { return; }
 
   try {
-    const detail = await startSession({ name: next.repo, prompt: next.prompt, report: next.report === true, label: next.label || null });
+    // A queued resume names its conversation; everything else about it comes from the parked row.
+    let args = { name: next.repo, prompt: next.prompt, report: next.report === true, label: next.label || null };
+    if (next.resume_id) {
+      const parked = await sb(`desk_sessions?claude_session_id=eq.${encodeURIComponent(next.resume_id)}` +
+        '&select=*&order=started.desc.nullslast&limit=1').catch(() => null);
+      args = parked?.[0] ? resumeArgs(parked[0], { prompt: next.prompt, report: next.report === true })
+                         : { ...args, resumeId: next.resume_id };
+    }
+    const detail = await startSession(args);
     console.log(`[pi-desk] from queue -> ${detail}`);
   } catch (e) {
     console.error('[pi-desk] queued launch failed:', e.message);
@@ -600,6 +613,17 @@ async function bindWhenUp(session, { attempts = 90, delayMs = 1000 } = {}) {
  * for (it is generated inside the process), so it is recovered by finding the transcript Claude Code
  * writes at startup — the filename IS the id.
  */
+// Launch arguments for resuming one of this machine's own conversations. Its id is already known —
+// `claude --resume` keeps it — and so is the transcript it appends to, so the row is published with
+// both at launch instead of a tick later. That is what lets the hub see the conversation running again
+// at once and never resume it a second time, which would put two processes on one transcript.
+function resumeArgs(row, { prompt = null, report = false, commandId = null } = {}) {
+  return { name: row.repo, prompt: prompt || '', resumeId: row.claude_session_id, commandId, report,
+           label: row.label || null, origin: row.origin || null,
+           knownClaudeId: row.claude_session_id, transcriptPath: row.transcript_path || null,
+           mirrorOffset: row.mirror_offset || 0 };
+}
+
 async function startSession({ name, prompt, resumeId = null, commandId = null, report = false, label = null,
                               knownClaudeId = null, transcriptPath = null, mirrorOffset = null, origin = null }) {
   const { dir, warning } = await ensureRepo(name);
@@ -631,7 +655,7 @@ async function startSession({ name, prompt, resumeId = null, commandId = null, r
   // nothing to search for, and searching would be wrong: the file was written a moment ago by the
   // mirror, not by Claude starting up.
   if (knownClaudeId) {
-    return `tmux ${session} in ${dir} (resumed from the Mac)${warning ? ' (stale checkout)' : ''} (trust: ${trust})`;
+    return `tmux ${session} in ${dir} (resumed ${knownClaudeId.slice(0, 8)})${warning ? ' (stale checkout)' : ''} (trust: ${trust})`;
   }
 
   // Which conversation it is, from the process's own record once claude is up. Async on purpose — the
@@ -703,7 +727,24 @@ async function run(cmd) {
       return `${id} was already running — ${await typeInto(id, prompt)}`;
     }
     if (!row.claude_session_id) throw new Error(`${id} has no recorded claude session id — cannot resume`);
-    return startSession({ name: row.repo, prompt: (cmd.payload || {}).prompt || '', resumeId: row.claude_session_id, commandId: cmd.id, report: (cmd.payload || {}).report === true });
+    const prompt = String((cmd.payload || {}).prompt || '').trim() || null;
+    const report = (cmd.payload || {}).report === true;
+    // A resume takes a slot like any other session. On a full Pi it waits in the queue instead of
+    // becoming a third resident — two idle sessions have already been OOM-killed here (transcripts.js)
+    // — and runQueue resumes it when one frees, evicting the longest-idle as it does for new work.
+    const residents = (await liveSessions()).filter((l) => l.alive);
+    const pressure = memoryPressure();
+    if (residents.length >= RESIDENT_MAX || pressure) {
+      await sb('desk_queue', {
+        method: 'POST', headers: { Prefer: 'return=minimal' },
+        body: JSON.stringify([{ id: randomUUID(), worker: WORKER, repo: row.repo, prompt, report,
+                                label: row.label || null, resume_id: row.claude_session_id }]),
+      });
+      return residents.length >= RESIDENT_MAX
+        ? `queued resume of ${id} behind ${residents.length} resident session(s)`
+        : `queued resume of ${id} — ${pressure}`;
+    }
+    return startSession(resumeArgs(row, { prompt, report, commandId: cmd.id }));
   }
 
   // SOURCE half of a handover: this machine owns the session and is giving it up.
@@ -762,8 +803,9 @@ async function run(cmd) {
   if (!name) throw new Error(`unusable project name: ${JSON.stringify(payload.name)}`);
 
   // Capacity is checked HERE, not inside startSession, so a request that cannot run right now becomes
-  // a queued row rather than being dropped or forced onto a full machine. Resumes and the queue
-  // runner call startSession directly and are deliberately not gated by this.
+  // a queued row rather than being dropped or forced onto a full machine. A resume checks the same
+  // limits in its own handler (resume_session, above); the queue runner calls startSession directly
+  // because it has just made the room.
   const residents = (await liveSessions()).filter((l) => l.alive);
   const pressure = memoryPressure();
   if (residents.length >= RESIDENT_MAX || pressure) {
