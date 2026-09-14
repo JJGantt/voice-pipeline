@@ -36,6 +36,9 @@ async function push(body) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+      // Bounded: one session's pushes go one after another (send), so a request that never returned
+      // would hold back every step and reply after it for as long as the process lived.
+      signal: AbortSignal.timeout(10000),
     });
   } catch { /* the wall's backstop poll covers a dropped push; never let it break the watcher */ }
 }
@@ -137,8 +140,10 @@ function finish(st) {
   // The row first, then the news, and both after the steps still in flight. A surface told `done`
   // fetches the reply at once (the watch's open session does), and one that asks before the host
   // has written the row gets the previous reply and keeps showing it.
+  // The wait for the write is bounded for the same reason as push: nothing in the host's client times
+  // out, and a write that never returned would hold back this reply and every step after it.
   st.chain = st.chain
-    .then(() => st.onTurnEnd(st.id, tail))
+    .then(() => Promise.race([st.onTurnEnd(st.id, tail), new Promise((r) => setTimeout(r, 10000))]))
     .catch(() => { /* the tick will write it 30s from now regardless */ })
     .then(() => reportTurnEnd(st.id, tail));
 }
