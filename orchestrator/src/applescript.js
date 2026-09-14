@@ -219,8 +219,16 @@ const handoff = (file) =>
   + 'reply with its full text verbatim first so it is visible here, then do what it asks. '
   + 'Leave the file alone afterwards; it is cleaned up on its own.]';
 
+// `do script` writes the text and its return into the tty in ONE chunk, and Claude Code reads a long
+// chunk as a paste: the return lands inside it and the message sits in the composer unsent. Measured
+// against an idle session: 8 characters submit, 105 do not. Bracketed-paste markers say exactly where
+// the text ends, so the return after them is a keypress whatever the length. (The Pi has the same
+// problem through tmux and sends Enter as a second call instead.)
+const ESC = 'character id 27';
+
 export async function sendToTty(tty, text) {
-  const body = String(text);
+  // An escape in the words could close the paste early; nothing dictated needs one.
+  const body = String(text).replace(/\x1b/g, '');
   // Newlines go by file too, whatever the length: an AppleScript string literal cannot contain a raw
   // one, so a multi-line message typed directly is a syntax error rather than a delivery.
   const line = (body.length > TTY_INPUT_MAX || /[\r\n]/.test(body))
@@ -232,7 +240,7 @@ export async function sendToTty(tty, text) {
       repeat with w in windows
         repeat with t in tabs of w
           if tty of t is "${tty}" then
-            do script "${escaped}" in t
+            do script (${ESC}) & "[200~${escaped}" & (${ESC}) & "[201~" in t
             set found to true
           end if
         end repeat

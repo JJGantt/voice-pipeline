@@ -210,6 +210,12 @@ the shell on an unterminated quote and no session at all. Both directions now go
   stashed in `~/.claude-desk-prompts/` and the session is told to read it, **echo it back verbatim
   first**, then act. The echo is what keeps the words visible in the session; without it the terminal
   shows a stub and the request lives only in a file.
+- **Whatever is typed goes inside bracketed-paste markers.** `do script` writes the text and its
+  return as one chunk, and Claude Code reads a long chunk as a paste, so the return lands inside it
+  and the message sits in the composer unsent while the command reports `done`. Measured on an idle
+  session: 8 characters submitted, 105 did not. With `ESC[200~ … ESC[201~` around the text the return
+  is a keypress at any length, and a slash command (`/rename`) still runs. The Pi hits the same thing
+  through tmux and sends Enter as a separate call.
 
 Three approaches that look right and are not: chunking (`do script` appends a return, so every chunk
 submits as its own message), System Events `keystroke` (types without a return, but needs
