@@ -100,6 +100,9 @@ function drain(st) {
       if (b?.type === 'tool_use') push({ session: st.id, state: 'tool', text: toolLine(b) });
       // What it says between tool calls. The final message's text carries `end_turn` and reaches the
       // surfaces as the reply on `done`, so only text from a record that goes on to a tool is progress.
+      // Only as reliable as Claude Code's own record, whose format is internal and undocumented: on
+      // 2.1.270 sessions stopped writing this text mid-session (tool calls, thinking and the final
+      // reply still written), and no hook exposes it. When it is missing, nothing here is broken.
       else if (b?.type === 'text' && msg.stop_reason !== 'end_turn' && String(b.text || '').trim()) {
         push({ session: st.id, state: 'text', text: String(b.text).trim() });
       }
