@@ -252,7 +252,9 @@ async function reconcileSessions() {
     // the one this row records, and newer than the row (a resume's inherited history is not news), is
     // one fs.watch dropped.
     const at = (t) => (t ? Date.parse(t) : 0);
-    if (row && tail.replyAt && at(tail.replyAt) > Math.max(at(row.reply_at), at(row.started))) reportTurnEnd(name, tail);
+    // Reported only once the row below is written, as the watcher does: a surface told `done` fetches
+    // the reply at once, and asked first it gets the previous one.
+    const unreported = row && tail.replyAt && at(tail.replyAt) > Math.max(at(row.reply_at), at(row.started));
     // Mirror at the end of a turn — the only moment the transcript is a complete thought — so this
     // session can be picked up on the Mac later, including while this machine is unreachable.
     let mirrored = null;
@@ -308,6 +310,7 @@ async function reconcileSessions() {
         }]),
       });
     } catch (e) { console.error('[pi-desk] publish:', e.message); }
+    if (unreported) reportTurnEnd(name, tail);
     // The net under the watcher's relay below, for a finished turn fs.watch dropped.
     if (!busy) relayFirstReply(name, tail).catch((e) => console.error('[pi-desk] relay:', e.message));
   }
@@ -333,7 +336,9 @@ async function reconcileSessions() {
   syncSessionWatch(
     residents.map((r) => ({ id: r.name, status: 'resident', transcript_path: r.tpath })),
     (id, tail) => {
-      sb(`desk_sessions?id=eq.${encodeURIComponent(id)}`, {
+      relayFirstReply(id, tail).catch((e) => console.error('[pi-desk] relay:', e.message));
+      // Returned: the watcher sends `done` only once the row holds the reply.
+      return sb(`desk_sessions?id=eq.${encodeURIComponent(id)}`, {
         method: 'PATCH', headers: { Prefer: 'return=minimal' },
         body: JSON.stringify({
           working: false,
@@ -344,7 +349,6 @@ async function reconcileSessions() {
           last_seen: new Date().toISOString(),
         }),
       }).catch((e) => console.error('[pi-desk] turn-end patch:', e.message));
-      relayFirstReply(id, tail).catch((e) => console.error('[pi-desk] relay:', e.message));
     },
     (id, at) => {
       sb(`desk_sessions?id=eq.${encodeURIComponent(id)}`, {

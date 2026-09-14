@@ -156,7 +156,9 @@ async function reconcile(row, proc) {
   // one the watcher never reported, and without this the phone would never hear of it. Newer than the
   // row itself too: a resumed session's new row starts with no reply recorded, and the last turn of
   // the history it inherited is not news.
-  if (tail && tail.replyAt && ms(tail.replyAt) > Math.max(ms(row.reply_at), ms(row.started))) reportTurnEnd(row.id, tail);
+  // Reported only once the patch below is written, as the watcher does: a surface told `done` fetches
+  // the reply at once, and asked first it gets the previous one.
+  const unreported = tail && tail.replyAt && ms(tail.replyAt) > Math.max(ms(row.reply_at), ms(row.started));
   // The record's time is the truth and is written as-is, so a wrong value cannot stick. The
   // transcript's is a reconstruction and may only move the row forward.
   const turnAt = proc && proc.statusAt ? proc.statusAt : later(tail && tail.turnAt, row.active_at);
@@ -186,6 +188,7 @@ async function reconcile(row, proc) {
     console.log(`[desk-sessions] ${row.id} ${patch.status} (its process has exited)`);
   }
   await patchDeskSession(row.id, patch);
+  if (unreported) reportTurnEnd(row.id, tail);
 }
 
 async function tick() {
@@ -223,7 +226,9 @@ async function tick() {
   // then does reaches the wall the instant it happens, without waiting for the next one.
   syncSessionWatch(residents,
     (id, tail) => {
-      patchDeskSession(id, {
+      relayFirstReply(id, tail).catch((e) => console.error('[desk-sessions] relay:', e.message));
+      // Returned: the watcher sends `done` only once the row holds the reply.
+      return patchDeskSession(id, {
         working: false,
         last_reply: tail.lastReply ? tail.lastReply.slice(0, 4000) : null,
         last_prompt: tail.lastPrompt ? tail.lastPrompt.slice(0, 4000) : null,
@@ -231,7 +236,6 @@ async function tick() {
         active_at: tail.turnAt || new Date().toISOString(),
         last_seen: new Date().toISOString(),
       }).catch((e) => console.error('[desk-sessions] turn-end patch:', e.message));
-      relayFirstReply(id, tail).catch((e) => console.error('[desk-sessions] relay:', e.message));
     },
     (id, at) => {
       patchDeskSession(id, { working: true, active_at: at })

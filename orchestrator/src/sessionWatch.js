@@ -134,8 +134,13 @@ function drain(st) {
 // has to notice that the turn ended and ask.
 function finish(st) {
   const tail = readTail(st.path);
-  st.chain = st.chain.then(() => reportTurnEnd(st.id, tail));   // after the steps still in flight
-  try { st.onTurnEnd(st.id, tail); } catch { /* the tick will write it 30s from now regardless */ }
+  // The row first, then the news, and both after the steps still in flight. A surface told `done`
+  // fetches the reply at once (the watch's open session does), and one that asks before the host
+  // has written the row gets the previous reply and keeps showing it.
+  st.chain = st.chain
+    .then(() => st.onTurnEnd(st.id, tail))
+    .catch(() => { /* the tick will write it 30s from now regardless */ })
+    .then(() => reportTurnEnd(st.id, tail));
 }
 
 /**
