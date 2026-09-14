@@ -354,6 +354,13 @@ OPEN_TOOLS = [
 # when he pushed a button or typed, never from the always-on room mics, which hear the whole room and
 # would send a sentence that was never meant for the assistant. See turn_tools() and SdkRunner._gate.
 SEND_TOOLS = ["mcp__messages__send_message", "mcp__gmail__send_email"]
+# Tools that only mean something next to his signed-in browser, which this worker does not have: a cart
+# URL has to be opened there, a cart recording is what its /cart page showed, and an item id is read off
+# the retailer's site. Here they could only be called with made-up values. They are REMOVED from every
+# runner's schema rather than gated, because a gated tool is what makes Sonnet escalate — and a cart
+# request has to become a start_session, never an Opus turn with no browser.
+SESSION_TOOLS = ["mcp__data__build_walmart_cart_url", "mcp__data__record_walmart_cart",
+                 "mcp__data__save_shopping_item"]
 ALL_TOOLS = ["mcp__data", "mcp__voice", "mcp__govee-lights", "mcp__petlibro-feeder", *OPEN_TOOLS, *SEND_TOOLS]  # full toolset (Opus)
 
 
@@ -456,7 +463,7 @@ def validate_safe_tools(mcp_js: str) -> None:
     dead = sorted(listed - real)
     if dead:
         log(f"[tools] SAFE_TOOLS names {len(dead)} tool(s) that no longer exist: {', '.join(dead)}")
-    ungated = sorted(real - listed)
+    ungated = sorted(real - listed - {t.split("__")[-1] for t in SESSION_TOOLS})
     if ungated:
         log(f"[tools] not on the fast path (gated or forgotten): {', '.join(ungated)}")
 
@@ -1339,10 +1346,10 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
         # user's settings, and the Mac's pre-approve the data, gmail and messages tools in auto mode,
         # which widens the list above. The worker runs from its own directory, so "project" loads none.
         cmd += ["--setting-sources", "project"]
-    if deny_tools:
-        # A room-mic turn drops the sends from the schema outright: a deny beats any allow rule, and no
-        # escalation hangs on seeing these, so removing them loses nothing.
-        cmd += ["--disallowedTools", *deny_tools]
+    # Out of the schema, not just refused: the browser-only tools on every run, and the sends on a
+    # room-mic turn. A deny beats any allow rule, and neither is something a turn should escalate for,
+    # so taking them out of sight loses nothing.
+    cmd += ["--disallowedTools", *SESSION_TOOLS, *(deny_tools or [])]
     if system_append:
         cmd += ["--append-system-prompt", system_append]
     timeout_s = AGENT_TIMEOUT_S if agent else CLAUDE_TIMEOUT_S
@@ -1607,6 +1614,8 @@ class ApiRunner:
                 continue
             self._sessions[name] = session
             for t in tools:
+                if f"mcp__{name}__{t.name}" in SESSION_TOOLS:
+                    continue   # browser-only; see SESSION_TOOLS
                 aname = (name + "__" + t.name)[:64]
                 self._tools.append({
                     "name": aname,
@@ -1815,6 +1824,7 @@ class SdkRunner:
             model="sonnet",
             mcp_servers=write_mcp_config(),
             allowed_tools=list(SAFE_TOOLS),
+            disallowed_tools=list(SESSION_TOOLS),   # browser-only: out of sight, so never a reason to escalate
             # The stable hub framing lives here so the prefix caches across turns; per-turn context
             # (the govee device list, the replayed conversation) rides on the prompt instead.
             system_prompt={"type": "preset", "preset": "claude_code",

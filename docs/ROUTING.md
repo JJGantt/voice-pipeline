@@ -78,6 +78,17 @@ way — by escalating, or by starting a session whose own tools could send it. T
 instruction-only: `start_session` stays on the room mics because dictating work to a session is
 what they are mostly used for.
 
+## Browser-only tools are removed, not gated
+
+`build_walmart_cart_url`, `record_walmart_cart` and `save_shopping_item` (`SESSION_TOOLS`) only mean
+something next to the signed-in browser, which no worker runner has. They are taken out of every
+runner's schema (`disallowed_tools` on the warm client, `--disallowedTools` on `claude -p`, skipped
+by the `ApiRunner`) — the one place `--disallowedTools` is right. Left merely gated, they would be
+visible-but-denied, which is exactly what makes Sonnet escalate, and a cart request would reach an
+Opus turn that can only call them with made-up values. Out of sight, a cart request is a
+`start_session`, where a browser exists. The reads (`get_shopping_items`, `get_walmart_cart`) stay on
+the fast path.
+
 ## Asking for Opus
 
 Escalation also fires on request: "escalate to Opus", "use Opus" makes Sonnet reply `__ESCALATE__`
