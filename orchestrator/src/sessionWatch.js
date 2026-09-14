@@ -40,6 +40,12 @@ async function push(body) {
   } catch { /* the wall's backstop poll covers a dropped push; never let it break the watcher */ }
 }
 
+// One session's pushes, one after another. Fired unawaited they can overtake each other in flight,
+// and a thought landing after the tool call it led to, or a step after the turn's `done`, reads wrong.
+function send(st, body) {
+  st.chain = st.chain.then(() => push(body));
+}
+
 /**
  * One line describing a tool call.
  *
@@ -89,6 +95,7 @@ function drain(st) {
       // own work coming back — the same distinction readTail draws.
       const blocks = d.message?.content;
       const toolResult = Array.isArray(blocks) && blocks.length > 0 && blocks.every((b) => b?.type === 'tool_result');
+      if (!toolResult) st.said = null;
       if (!toolResult && typeof d.timestamp === 'string') {
         try { st.onActivity(st.id, d.timestamp); } catch { /* the tick writes it regardless */ }
       }
@@ -96,20 +103,28 @@ function drain(st) {
     }
     if (d.type !== 'assistant') continue;
     const msg = d.message || {};
+    // What it says between tool calls. Claude Code writes a message one block per record, in order, so
+    // a step's words arrive before its tool call; they are held until that call and sent just ahead of
+    // it: the text if Claude Code recorded it, else the summary of its thinking. From 2.1.268 Claude
+    // Code records a turn's opening text and its final reply but not text written after a tool result
+    // (measured across every transcript on the Mac: 1 in 540 records on 268-270, against hundreds per
+    // version on 267 and before), so for most steps the thinking summary is the only account written.
+    // The transcript format is internal and undocumented, so this is only as good as what it holds.
+    // A message that ends the turn is the reply, which arrives on `done`; what it held is dropped.
+    if (st.said?.id !== msg.id) st.said = { id: msg.id, text: [], thought: [] };
     for (const b of Array.isArray(msg.content) ? msg.content : []) {
-      if (b?.type === 'tool_use') push({ session: st.id, state: 'tool', text: toolLine(b) });
-      // What it says between tool calls. The final message's text carries `end_turn` and reaches the
-      // surfaces as the reply on `done`, so only text from a record that goes on to a tool is progress.
-      // Only as reliable as Claude Code's own record, whose format is internal and undocumented: on
-      // 2.1.270 sessions stopped writing this text mid-session (tool calls, thinking and the final
-      // reply still written), and no hook exposes it. When it is missing, nothing here is broken.
-      else if (b?.type === 'text' && msg.stop_reason !== 'end_turn' && String(b.text || '').trim()) {
-        push({ session: st.id, state: 'text', text: String(b.text).trim() });
+      if (b?.type === 'text' && String(b.text || '').trim()) st.said.text.push(String(b.text).trim());
+      else if (b?.type === 'thinking' && String(b.thinking || '').trim()) st.said.thought.push(String(b.thinking).trim());
+      else if (b?.type === 'tool_use') {
+        const words = st.said.text.length ? st.said.text : st.said.thought;
+        if (words.length) send(st, { session: st.id, state: 'text', text: words.join('\n\n') });
+        st.said = { id: msg.id, text: [], thought: [] };
+        send(st, { session: st.id, state: 'tool', text: toolLine(b) });
       }
     }
     // Claude Code writes one record per content block, each carrying the message's stop_reason, and
     // a turn ends with `end_turn` — the same marker readTail keys off.
-    if (msg.stop_reason === 'end_turn') ended = true;
+    if (msg.stop_reason === 'end_turn') { ended = true; st.said = null; }
   }
   if (ended) finish(st);
 }
@@ -119,7 +134,7 @@ function drain(st) {
 // has to notice that the turn ended and ask.
 function finish(st) {
   const tail = readTail(st.path);
-  reportTurnEnd(st.id, tail);
+  st.chain = st.chain.then(() => reportTurnEnd(st.id, tail));   // after the steps still in flight
   try { st.onTurnEnd(st.id, tail); } catch { /* the tick will write it 30s from now regardless */ }
 }
 
@@ -130,7 +145,8 @@ function finish(st) {
  * calling it for the same turn is harmless.
  */
 export function reportTurnEnd(id, tail) {
-  if (tail?.lastReply) push({ session: id, state: 'done', text: tail.lastReply.slice(0, 400), at: tail.replyAt || null });
+  if (tail?.lastReply) return push({ session: id, state: 'done', text: tail.lastReply.slice(0, 400), at: tail.replyAt || null });
+  return Promise.resolve();
 }
 
 function attach(st) {
@@ -177,7 +193,8 @@ export function syncSessionWatch(rows, onTurnEnd, onActivity = () => {}) {
     // tool calls onto the wall as though they were happening now.
     let offset = 0;
     try { offset = fs.statSync(r.transcript_path).size; } catch { continue; }
-    const st = { id: r.id, path: r.transcript_path, offset, rest: '', watcher: null, timer: null, onTurnEnd, onActivity };
+    const st = { id: r.id, path: r.transcript_path, offset, rest: '', watcher: null, timer: null, onTurnEnd, onActivity,
+                 said: null, chain: Promise.resolve() };
     watched.set(r.id, st);
     attach(st);
   }

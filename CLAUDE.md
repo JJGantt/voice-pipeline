@@ -228,7 +228,9 @@ characters in, 3000 out.
 
 `orchestrator/src/transcripts.js` is shared by both machines. `readTail` reports the FINAL message of
 a turn, identified by the transcript record whose `stop_reason` is `end_turn` — not "the last
-assistant text", which mid-turn is a half-written thought. `working` is what separates them: a reply
+assistant text", which mid-turn is a half-written thought. And only the text after the turn's last tool
+call: text before one is narration, which `sessionWatch.js` streams as progress, and joined onto the
+reply it opened every answer and reply notification with "Checking X first...". `working` is what separates them: a reply
 is final only when `working` is false.
 
 It reads only the last 512KB. These files reach tens of megabytes — one project directory here holds

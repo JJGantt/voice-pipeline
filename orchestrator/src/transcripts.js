@@ -102,6 +102,10 @@ export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
     const msg = d.message || {};
     const blocks = msg.content;
     if (Array.isArray(blocks)) {
+      // The reply is what the model says after its LAST tool call. Text before one is narration: it
+      // streams as progress (sessionWatch), and joined onto the reply it made the answer open with
+      // "Checking the logs first..." on the watch and in the notification.
+      if (blocks.some((b) => b?.type === 'tool_use')) turnText = [];
       const txt = blocks.filter((b) => b?.type === 'text').map((b) => b.text).join('').trim();
       if (txt) { turnText.push(txt); anyAssistantText = txt; }
     }
