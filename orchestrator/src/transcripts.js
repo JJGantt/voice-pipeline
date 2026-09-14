@@ -95,6 +95,10 @@ export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
           turnPrompt = typeof blocks === 'string' ? (blocks.trim() || null)
             : Array.isArray(blocks) ? (blocks.filter((b) => b?.type === 'text').map((b) => b.text).join('\n').trim() || null)
             : null;
+          // A background task finishing starts a turn of its own with a `<task-notification>` block.
+          // That turn is real, but its prompt is not something he said, and shown as "his last message"
+          // above the reply it read as a wall of markup.
+          if (turnPrompt && turnPrompt.startsWith('<task-notification>')) turnPrompt = null;
         }
       }
       continue;
