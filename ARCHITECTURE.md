@@ -45,7 +45,7 @@ and every ordinary stage bills the **subscription**:
   plus four MCP servers, 3.6s on the Pi, ~42% of a simple turn before the model sees a token — is
   paid once at connect.
 - **`run_claude`** — headless `claude -p`, also on the subscription. It streams `stream-json`, so
-  tool calls surface live on the activity bar. This runs the **escalation** (Opus, full toolset —
+  tool calls (and the text between them) surface live on the activity bar. This runs the **escalation** (Opus, full toolset —
   rare, and already slow enough that the CLI cold start is noise), photo turns (vision needs the
   CLI's `Read`), and full-agent turns.
 - **`ApiRunner`** — the direct `anthropic` Messages API on the Console key. Warm MCP stdio sessions

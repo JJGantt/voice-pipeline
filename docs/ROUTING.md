@@ -18,8 +18,10 @@ mic → transcript → voice_requests (Supabase)
                                  on Opus + ALL_TOOLS
 ```
 
-The bottom activity bar shows the prompt, tool calls, and escalations (an `OPUS` chip stays lit for
-the rest of an escalated command). Photo turns skip Sonnet entirely and are not escalations.
+The bottom activity bar shows the prompt, tool calls, what the model says between them, and
+escalations (an `OPUS` chip stays lit for the rest of an escalated command). All three runners report
+in-between text the same way: held until the next tool call, dropped if none follows, since text after
+the last tool call is the reply. Photo turns skip Sonnet entirely and are not escalations.
 
 ## `SAFE_TOOLS` must be an allow list — never `--disallowedTools`
 

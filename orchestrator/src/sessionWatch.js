@@ -9,6 +9,7 @@
 //
 //   a prompt    → the host writes `active_at` (and `working`) to the row: a turn has started
 //   tool_use    → the hub's /api/session-activity, transient, straight out to the wall over SSE
+//   text        → the same, state 'text': what it says between tool calls (never the final reply)
 //   end_turn    → the same, carrying the reply, AND the host writes `last_reply` to the row
 //
 // The tick still runs and still does both of those. It is the NET now, not the mechanism, and it
@@ -97,6 +98,11 @@ function drain(st) {
     const msg = d.message || {};
     for (const b of Array.isArray(msg.content) ? msg.content : []) {
       if (b?.type === 'tool_use') push({ session: st.id, state: 'tool', text: toolLine(b) });
+      // What it says between tool calls. The final message's text carries `end_turn` and reaches the
+      // surfaces as the reply on `done`, so only text from a record that goes on to a tool is progress.
+      else if (b?.type === 'text' && msg.stop_reason !== 'end_turn' && String(b.text || '').trim()) {
+        push({ session: st.id, state: 'text', text: String(b.text).trim() });
+      }
     }
     // Claude Code writes one record per content block, each carrying the message's stop_reason, and
     // a turn ends with `end_turn` — the same marker readTail keys off.

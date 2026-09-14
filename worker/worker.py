@@ -598,7 +598,10 @@ HUB_SYSTEM = (
     "EVERY PART OF THE REQUEST: a single sentence often contains several instructions joined by 'and then', "
     "'and also', or a comma. Do all of them. Before replying, re-read the request and confirm each separate "
     "instruction was carried out; a trailing clause is the one most easily dropped. If you did only some of "
-    "it, say which parts you did and which you did not, rather than reporting success for the whole."
+    "it, say which parts you did and which you did not, rather than reporting success for the whole. "
+    "YOUR LAST MESSAGE IS THE WHOLE ANSWER: anything you write between tool calls is shown only as passing "
+    "progress and is not kept, so the final message must stand on its own. Restate in it whatever it "
+    "depends on from earlier in the turn; never point back at it."
 )
 
 # Full-agent framing — the opposite of HUB_SYSTEM. Used only on the subscription path when "Full agent
@@ -617,7 +620,9 @@ AGENT_SYSTEM = (
     "refusing or asking him to clarify; only ask when it's genuinely unclear WHAT he wants. "
     "Requests come from "
     "speech-to-text, so expect occasional mis-hearings; if a request is genuinely unintelligible, say so. "
-    "Keep spoken replies brief and to the point."
+    "Keep spoken replies brief and to the point. "
+    "Your last message is the whole answer: anything you write between tool calls is shown only as passing "
+    "progress and is not kept, so restate in the final message whatever it depends on from earlier in the turn."
 )
 
 
@@ -1395,6 +1400,7 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
         threading.Thread(target=_drain_err, daemon=True).start()
 
         # Stream events as claude emits them (one JSON object per line).
+        said = []   # text since the last tool call: progress once a tool follows it, else the reply
         for line in proc.stdout:
             line = line.strip()
             if not line:
@@ -1420,14 +1426,18 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
                         continue
                     if block.get("type") == "text":
                         assistant_chunks.append(block.get("text", ""))
+                        said.append(block.get("text", ""))
                     elif block.get("type") == "tool_use":
                         n_tools += 1
                         tname = block.get("name", "")
                         if on_event:
                             try:
+                                if "".join(said).strip():
+                                    on_event("text", {"text": "\n".join(said)})
                                 on_event("tool", {"name": tname, "input": block.get("input")})
                             except Exception:  # noqa: BLE001
                                 pass
+                        said = []
                 if ev.get("session_id"):
                     session_id = ev["session_id"]
 
@@ -1684,6 +1694,11 @@ class ApiRunner:
                 if b.type == "text":
                     tail.append(b.text)
                     continue
+                if b.type == "tool_use" and on_event and "".join(tail).strip():
+                    try:
+                        on_event("text", {"text": "".join(tail)})   # said on the way to a tool: progress
+                    except Exception:  # noqa: BLE001
+                        pass
                 tail = []
                 if b.type == "tool_use":
                     if on_event:
@@ -1836,11 +1851,15 @@ class SdkRunner:
                         chunks.append(b.text)
                     elif isinstance(b, ToolUseBlock):
                         # The reply is what the model says after its LAST tool call. Text before one
-                        # ("searching now") is narration, and on a voice turn it would be read aloud.
+                        # ("searching now") is narration, and on a voice turn it would be read aloud;
+                        # it goes to the activity stream as progress instead.
+                        said = "\n".join(chunks).strip()
                         chunks = []
                         used_tools = True   # gates the retry in run(); tracked even with no on_event
                         if on_event:
                             try:
+                                if said:
+                                    on_event("text", {"text": said})
                                 on_event("tool", {"name": b.name, "input": b.input})
                             except Exception:  # noqa: BLE001
                                 pass
@@ -2242,6 +2261,13 @@ def process_request(db: Supabase, req: dict) -> None:
     # Surface tool calls live by pushing them straight to the hub's activity bar (transient — not
     # stored in voice_messages, so they never appear in the conversation thread).
     def _emit(kind, payload):
+        if kind == "text":
+            # What the model says between tool calls. The runners report only text a tool call
+            # followed, so the final reply never arrives here; that is the thread message.
+            said = str(payload.get("text") or "").strip()
+            if said:
+                push_activity(said[:2000], "text")
+            return
         if kind != "tool":
             return
         name = str(payload.get("name") or "")
