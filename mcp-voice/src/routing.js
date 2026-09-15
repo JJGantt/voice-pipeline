@@ -1,7 +1,7 @@
 // Voice route/mode tools backed by Supabase app_settings. The conversational route is now DYNAMIC
 // (Sonnet handles simple turns and escalates to Opus for careful data writes — there are no more
-// model/thinking/runner knobs), so this just reports that route and toggles the two live voice modes:
-// always-on (wake-free) and voice-inject. The single FAB button drives the one dynamic route.
+// model/thinking/runner knobs), so this just reports that route and toggles the two live voice modes
+// (always-on / wake-free and voice-inject) plus JaredBot. The single FAB button drives the one dynamic route.
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
@@ -57,4 +57,12 @@ export async function setInjectMode(on) {
   const v = truthy(on);
   await writeSettings({ voice_inject_mode: v ? '1' : '0' });
   return `Voice-inject mode ${v ? 'enabled' : 'disabled'}.`;
+}
+
+// JaredBot, the group-chat auto-replier (messages-mcp jaredbot.py) — toggles jaredbot_enabled,
+// which it reads before every decision.
+export async function setJaredBot(on) {
+  const v = truthy(on);
+  await writeSettings({ jaredbot_enabled: v ? '1' : '0' });
+  return `JaredBot ${v ? 'enabled' : 'disabled'}.`;
 }

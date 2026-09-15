@@ -6,7 +6,7 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { getRouting, setAlwaysOn, setInjectMode } from './routing.js';
+import { getRouting, setAlwaysOn, setInjectMode, setJaredBot } from './routing.js';
 
 const server = new Server({ name: 'voice', version: '1.0.0' }, { capabilities: { tools: {} } });
 
@@ -38,6 +38,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['on'],
       },
     },
+    {
+      name: 'set_jaredbot',
+      description:
+        "Turn JaredBot on or off. JaredBot is the AI that auto-replies on Jared's behalf in a group text. 'Turn off JaredBot', 'stop the group chat bot', 'turn the auto-replies back on' all map here. Pass `on: true` to enable, `on: false` to disable.",
+      inputSchema: {
+        type: 'object',
+        properties: { on: { type: 'boolean', description: 'true = let JaredBot reply, false = silence it' } },
+        required: ['on'],
+      },
+    },
   ],
 }));
 
@@ -58,6 +68,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     if (name === 'set_inject_mode') {
       return text(await setInjectMode(a.on));
+    }
+    if (name === 'set_jaredbot') {
+      return text(await setJaredBot(a.on));
     }
     return text(`Unknown tool: ${name}`);
   } catch (err) {
