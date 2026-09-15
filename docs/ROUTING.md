@@ -202,8 +202,14 @@ line**; a new tool is invisible to the fast path until it appears here.
 
 ## The addressing directive
 
-Transcribed turns (never typed ones) get `ADDRESSING_DIRECTIVE` appended, because the mic is always on
-and hears the whole room.
+Room-mic turns (sources `fly` and `mac`) get `ADDRESSING_DIRECTIVE` appended, because those mics are
+always on and hear the whole room. The phone's push-to-talk button (`web-quick`) and typed text never
+do: he pressed the button or typed it, so it was meant.
+
+Only a room-mic turn may be ignored silently. A deliberate command can still come back as `__IGNORE__`
+when what arrived was unintelligible (a clip transcribed as Icelandic did), and the worker then keeps
+the words in the thread and shows `UNHEARD_REPLY` as a failure, rather than sending the raw sentinel as
+the reply.
 
 It carries only what the model cannot work out from the text itself:
 

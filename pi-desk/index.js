@@ -909,6 +909,29 @@ async function forget(rows, why) {
   }
 }
 
+// The phone recordings behind those requests: the hub keeps each command's clip in the voice-clips bucket
+// so a bad transcription can be listened to. Same lifetime as the request row, so neither outlives the other.
+const CLIP_BUCKET = 'voice-clips';
+async function sweepClips() {
+  const cutoff = Date.now() - KEEP_REQUEST_DAYS * 86400000;
+  const headers = { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, 'Content-Type': 'application/json' };
+  for (;;) {
+    const r = await fetch(`${SUPABASE_URL}/storage/v1/object/list/${CLIP_BUCKET}`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ prefix: '', limit: 1000, sortBy: { column: 'created_at', order: 'asc' } }),
+    });
+    if (!r.ok) throw new Error(`clip list failed (${r.status})`);
+    const old = (await r.json()).filter((o) => o.name && Date.parse(o.created_at) < cutoff).map((o) => o.name);
+    if (!old.length) return;
+    const d = await fetch(`${SUPABASE_URL}/storage/v1/object/${CLIP_BUCKET}`, {
+      method: 'DELETE', headers, body: JSON.stringify({ prefixes: old }),
+    });
+    if (!d.ok) throw new Error(`clip delete failed (${d.status})`);
+    console.log(`[pi-desk] deleted ${old.length} phone clip(s) older than ${KEEP_REQUEST_DAYS} days`);
+    if (old.length < 1000) return;   // sorted oldest first, so a partly-old page means nothing older remains
+  }
+}
+
 async function sweepRetention() {
   try {
     await forget(await sb(`desk_sessions?status=in.(ended,transferred)&ended=lt.${ago(KEEP_CLOSED_DAYS)}&select=id,claude_session_id`),
@@ -919,6 +942,7 @@ async function sweepRetention() {
     // and a retried or dismissed one is a decision he made, which is small and worth keeping.
     await sb(`desk_commands?created=lt.${ago(KEEP_COMMAND_DAYS)}`, { method: 'DELETE', headers: { Prefer: 'return=minimal' } });
     await sb(`voice_requests?created_at=lt.${ago(KEEP_REQUEST_DAYS)}`, { method: 'DELETE', headers: { Prefer: 'return=minimal' } });
+    await sweepClips();
   } catch (e) { console.error('[pi-desk] retention:', e.message); }
 }
 

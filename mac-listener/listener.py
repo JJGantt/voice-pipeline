@@ -815,7 +815,8 @@ def _groq_transcribe(path: str):
                 "https://api.groq.com/openai/v1/audio/transcriptions",
                 headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
                 files={"file": ("clip.wav", f, "audio/wav")},
-                data={"model": GROQ_MODEL, "response_format": "text"},
+                # English, always: auto-detection guesses per clip and has produced Icelandic.
+                data={"model": GROQ_MODEL, "response_format": "text", "language": "en"},
                 timeout=30.0,
             )
         if r.status_code == 200:

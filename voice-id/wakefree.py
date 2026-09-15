@@ -330,7 +330,9 @@ def transcribe(pcm_f32: np.ndarray) -> str:
             r = httpx.post("https://api.groq.com/openai/v1/audio/transcriptions",
                            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
                            files={"file": ("clip.wav", f, "audio/wav")},
-                           data={"model": GROQ_MODEL, "response_format": "text"}, timeout=30.0)
+                           # English, always: auto-detection guesses per clip and has produced Icelandic.
+                           data={"model": GROQ_MODEL, "response_format": "text", "language": "en"},
+                           timeout=30.0)
         return r.text.strip() if r.status_code == 200 else ""
     except Exception as e:  # noqa: BLE001
         log(f"transcribe failed: {e}")

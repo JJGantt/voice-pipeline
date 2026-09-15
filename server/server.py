@@ -248,6 +248,8 @@ async def transcribe(pcm: bytes) -> str:
             file=("utterance.wav", wav),
             model=GROQ_MODEL,
             response_format="text",
+            # English, always: auto-detection guesses per clip and has turned English speech into Icelandic.
+            language="en",
         )
     try:
         result = await asyncio.to_thread(_call)

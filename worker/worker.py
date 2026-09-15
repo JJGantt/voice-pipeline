@@ -530,6 +530,10 @@ ATTACH_DIRECTIVE = (
 # Sentinel the model emits to silently drop a turn (wake-word false positive). Matched loosely below.
 IGNORE_SENTINEL = "__IGNORE__"
 
+# What a deliberate command the model could not make sense of shows as: the phone's own line for a clip
+# that transcribed to nothing, so both kinds of unheard command read the same.
+UNHEARD_REPLY = "Didn’t catch that — try again"
+
 # Always-on mics hear the WHOLE room — the TV, Jared talking to his cats, other people talking to or
 # near him — and speaker-ID can't tell "a command for the assistant" from "Jared said a sentence out
 # loud." Almost none of it is gibberish; it's real, grammatical speech that simply isn't ADDRESSED to
@@ -2493,6 +2497,23 @@ def process_request(db: Supabase, req: dict) -> None:
                  {"status": "done", "result": "(ignored: wake-word false positive)", "updated_at": now_iso()})
         log(f"ignored likely false-positive (kept in thread): {transcript[:60]!r}")
         maybe_auto_disable_wakefree()
+        return
+
+    # A command he meant (typed, or pushed on the phone's button) that still came back as the ignore
+    # sentinel, because what arrived was unintelligible: a clip transcribed as Icelandic did exactly this,
+    # and the raw sentinel went out as the reply. Only the room mics may be ignored silently. Here the
+    # words stay in the thread and the phone shows a failure, not "__IGNORE__".
+    if not ambient and ("__ignore__" in text.lower() or re.sub(r"[^a-z]", "", text.lower()) == "ignore"):
+        push_activity(UNHEARD_REPLY, "error")
+        db.post("voice_messages",
+                {"request_id": rid, "focus": "hub", "mode": msg_mode, "role": "user", "text": transcript,
+                 "done": True, **({"attachments": attachments} if attachments else {})})
+        db.post("voice_messages",
+                {"request_id": rid, "focus": "hub", "mode": msg_mode, "role": "assistant",
+                 "text": UNHEARD_REPLY, "done": True, "worker": WORKER_ID})
+        db.patch("voice_requests", f"id=eq.{rid}",
+                 {"status": "error", "error": UNHEARD_REPLY, "updated_at": now_iso()})
+        log(f"could not understand a deliberate command: {transcript[:60]!r}")
         return
 
     # Real turn → now write the user bubble (deferred past the noise check), then close the activity bar.
