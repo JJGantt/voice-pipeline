@@ -6,7 +6,7 @@ real Mac `claude` session piped into a web terminal (xterm.js on the Pi). It als
 publishes the list of focusable sessions.
 
 ```
-voice_focus(id=1).focus ──poll(2s)──▶ orchestrator
+voice_focus(id=1).focus ──realtime──▶ orchestrator   (60s poll = backstop; 10s while the socket is down)
    = 'hub'        → kill pty, re-open the desk Terminal tab, terminal_url = null
    = <session id> → close that desk tab, spawn `claude --resume <id>` in a pty,
                     terminal_url = ws://MAC_HOST:PORT/term?token=ORCH_TOKEN
