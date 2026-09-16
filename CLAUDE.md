@@ -69,6 +69,13 @@ Realtime is the pickup path everywhere here; every poll cadence is a backstop an
 `isHealthy()` says realtime is down. At 1s the three workers cost ~280k empty reads a day against the
 free-plan quota. If pickup feels slow, fix the subscription — do not shorten the poll.
 
+**An idle cycle asks ONE question: is anything pending?** `IDLE_POLL_S` is 60s. The two other reads it
+used to make — "does a live context window belong to someone else?" (`should_defer` → `context_owner`)
+and "are there orphaned claims?" (`reclaim_stale`) — answer nothing while there is nothing to claim, so
+`claim_one` reads `pending` FIRST and those two run on their own 60s clocks. Deferring is still decided
+fresh, before any claim, the instant something IS pending. Putting either back on the cycle costs
+~14k reads a day to learn nothing.
+
 Supabase realtime channels do not self-heal: supabase-js leaves a dead channel in `CHANNEL_ERROR`
 forever. Subscribe through `orchestrator/src/realtime.js`'s `watchTable` (the worker's
 `RealtimeWaker` is the Python twin) rather than calling `.channel()` directly, and pass an explicit
@@ -129,7 +136,10 @@ revives that row rather than making a new one, which is what a manual `claude --
 
 **A session outlives its transcript.** `/clear` starts a fresh file while the process keeps running.
 Each tick reads the process's record again and rebinds the row to whatever conversation it names,
-resetting `mirror_offset` because the mirror is keyed by session id. A session's NAME is refreshed
+resetting `mirror_offset` because the mirror is keyed by session id — and clearing the ABANDONED
+conversation's mirror (`mirrorReset`) as it goes. Nothing will ever point at those parts again: the row
+names a different conversation from that moment, so retention cannot reach them either. Without that
+they stay in the bucket for ever; 65 conversations and 104MB had accumulated by 2026-09-16. A session's NAME is refreshed
 every tick too, in order of authority: a name Jared chose himself beats the label the router wrote
 at dispatch, which beats Claude Code's own generated title.
 

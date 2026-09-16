@@ -34,8 +34,11 @@ routed once it gets here is `../docs/ROUTING.md`.
    - Run the turn, parse `stream-json`, capture the `session_id` and the final text.
    - Write the assistant turn to `voice_messages` and mark the request `done`
      (or `error` on any failure).
-4. Idle-poll every `IDLE_POLL_S` (15s), tightening to 2s only while realtime is
-   down and 120s while deferring. Clean shutdown on SIGINT/SIGTERM.
+4. Idle-poll every `IDLE_POLL_S` (60s), tightening to 2s only while realtime is
+   down and 120s while deferring. An idle cycle costs ONE read: `pending` is read
+   first, and the defer check and the orphan-claim sweep run on their own 60s
+   clocks instead of every cycle, because neither answers anything while there is
+   nothing to claim. Clean shutdown on SIGINT/SIGTERM.
 
 ## Environment variables
 
