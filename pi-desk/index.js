@@ -51,6 +51,13 @@ const sameColumn = (col, next, current) => (TS_COLUMNS.has(col)
 // `last_seen` is a clock reading, not news — the reasoning is on the same constant in the Mac's
 // orchestrator/src/deskSessions.js, and the two must not drift apart.
 const LAST_SEEN_REFRESH_MS = 10 * 60 * 1000;
+
+// The queue is empty essentially always — 14 rows have ever been written to it — and `desk_queue` is
+// in the realtime publication now (data-layer 00104), so the tick reads it only when something has
+// actually been queued. Starts true so a row queued while this process was down is still found.
+let queueDirty = true;
+let lastQueueRead = 0;
+const QUEUE_BACKSTOP_MS = 10 * 60 * 1000;
 // The same self-healing subscription the Mac's orchestrator uses. Shared rather than reimplemented:
 // its header documents a hard-won lesson — supabase-js does not reliably recover a dead channel, and
 // callers that fall back to a tight poll burn ~20k reads a day without noticing.
@@ -418,6 +425,12 @@ async function reapIdleSessions(residents) {
 // not fire hours later. A queued SESSION is the opposite — it is waiting on purpose, and must never
 // expire. It waits as long as it takes for a slot.
 async function runQueue(residents) {
+  // Realtime says when something is queued; this read is what acts on it. Between events there is
+  // nothing to act on, so the tick no longer asks — it asked every 30s for ever against a queue that
+  // is almost always empty. The backstop covers an event missed while the socket was deaf.
+  if (!queueDirty && Date.now() - lastQueueRead < QUEUE_BACKSTOP_MS) return;
+  queueDirty = false;
+  lastQueueRead = Date.now();
   let queued;
   try { queued = await sb(`desk_queue?worker=eq.${WORKER}&claimed=is.null&select=*&order=created.asc&limit=1`); }
   catch { return; }
@@ -993,6 +1006,14 @@ setInterval(heartbeat, PRESENCE_MS);
 // than waiting out a poll interval. Both INSERT (a new command) and UPDATE (a queued row released)
 // matter, so the subscription is not narrowed to inserts.
 const rt = watchTable({ channel: 'pi-desk-commands', table: 'desk_commands', event: '*', onChange: drain, tag: 'pi-desk' });
+// A queued session gets its own subscription rather than a poll. Reconciling straight away means a
+// freed slot is taken the moment the row lands instead of up to a tick later, and the flag is what
+// makes the read happen at all — see runQueue.
+watchTable({ channel: 'pi-desk-queue', table: 'desk_queue', event: '*', tag: 'pi-desk-queue',
+  onChange: () => {
+    queueDirty = true;
+    reconcileSessions().catch((e) => console.error('[pi-desk] queue reconcile:', e.message));
+  } });
 
 drain();
 // The backstop stretches out while realtime is healthy and tightens when it is not, so a subscription
