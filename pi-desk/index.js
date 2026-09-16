@@ -255,6 +255,14 @@ async function reconcileSessions() {
     let rebound = false;   // what the old conversation last said is not what this one said
     const s = pid ? sessionOf(pid) : null;
     if (s && s.claudeId !== cid) {
+      // `/clear` leaves the OLD conversation's uploaded parts with nothing pointing at them: the row
+      // is about to name the new one, and the mirror is keyed by conversation id. Clear them here or
+      // they sit in the bucket for ever — retention cannot reach them, because by then the row it
+      // sweeps names a different conversation entirely.
+      const abandoned = cid;
+      if (abandoned) {
+        mirrorReset(abandoned).catch((e) => console.error('[pi-desk] mirror reset on rebind:', e.message));
+      }
       tpath = s.transcriptPath; cid = s.claudeId; rebound = true;
       mirrorFrom = 0;   // the mirror is keyed by conversation id, so a new one uploads from zero
       console.log(`[pi-desk] ${name} is in conversation ${cid.slice(0, 8)} now`);

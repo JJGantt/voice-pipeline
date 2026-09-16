@@ -20,7 +20,7 @@ import { config } from './config.js';
 import { deskSessionsFor, patchDeskSession, upsertDeskSession } from './supabase.js';
 import { sweepStashedPrompts } from './applescript.js';
 import { liveClaudeSessions } from './discover.js';
-import { mirrorUp } from './mirror.js';
+import { mirrorUp, mirrorReset } from './mirror.js';
 import { readTail } from './transcripts.js';
 import { syncSessionWatch, reportTurnEnd } from './sessionWatch.js';
 import { relayFirstReply } from './relay.js';
@@ -140,6 +140,14 @@ async function reconcile(row, proc) {
       patch.last_reply = null;
       patch.last_prompt = null;
       patch.reply_at = null;
+      // The OLD conversation's uploaded parts are unreachable the moment this row names the new one —
+      // the mirror is keyed by conversation id, and nothing else refers to it. Throw them away here or
+      // they stay in the bucket for ever: retention cannot reach them, because the row it eventually
+      // sweeps names a different conversation by then.
+      if (row.claude_session_id) {
+        mirrorReset(row.claude_session_id)
+          .catch((e) => console.error('[desk-sessions] mirror reset on rebind:', e.message));
+      }
       Object.assign(row, { claude_session_id: proc.claudeId, transcript_path: proc.transcriptPath, mirror_offset: 0,
                            last_reply: null, last_prompt: null, reply_at: null });
       console.log(`[desk-sessions] ${row.id} is in conversation ${proc.claudeId.slice(0, 8)} now`);
