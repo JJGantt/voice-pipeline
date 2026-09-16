@@ -41,7 +41,16 @@ import { syncSessionWatch, reportTurnEnd } from '../orchestrator/src/sessionWatc
 import { relayFirstReply } from '../orchestrator/src/relay.js';
 // Shared with the Mac rather than reimplemented: both halves of a transfer must agree byte for
 // byte on what a mirrored transcript is.
-import { mirrorUp, mirrorDown } from '../orchestrator/src/mirror.js';
+import { mirrorUp, mirrorDown, mirrorReset } from '../orchestrator/src/mirror.js';
+
+// Postgres and JS spell the same instant differently, so timestamps are compared as instants.
+const TS_COLUMNS = new Set(['reply_at', 'active_at', 'ended', 'mirror_at', 'last_seen']);
+const sameColumn = (col, next, current) => (TS_COLUMNS.has(col)
+  ? (next ? Date.parse(next) : 0) === (current ? Date.parse(current) : 0)
+  : (next ?? null) === (current ?? null));
+// `last_seen` is a clock reading, not news — the reasoning is on the same constant in the Mac's
+// orchestrator/src/deskSessions.js, and the two must not drift apart.
+const LAST_SEEN_REFRESH_MS = 10 * 60 * 1000;
 // The same self-healing subscription the Mac's orchestrator uses. Shared rather than reimplemented:
 // its header documents a hard-won lesson — supabase-js does not reliably recover a dead channel, and
 // callers that fall back to a tight poll burn ~20k reads a day without noticing.
@@ -270,12 +279,9 @@ async function reconcileSessions() {
     // not been published yet, and the watcher would otherwise not start on it until the next tick.
     residents.push({ name, working: busy, bytes: tail.bytes, lastActivity: tail.lastActivity, created, row, tpath });
 
-    try {
-      await sb('desk_sessions?on_conflict=id', {
-        method: 'POST', headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
-        // Upsert, not patch-if-known: a session tmux is running that the table never saw must still
-        // appear, or "tmux is the source of truth" is not true.
-        body: JSON.stringify([{
+    // Upsert, not patch-if-known: a session tmux is running that the table never saw must still
+    // appear, or "tmux is the source of truth" is not true.
+    const payload = {
           id: name, worker: WORKER, status: 'resident',
           repo: row?.repo || name.replace(/^hub-/, '').replace(/-[^-]*$/, ''),
           claude_session_id: cid,
@@ -307,9 +313,22 @@ async function reconcileSessions() {
           mirror_offset: mirrored ?? mirrorFrom,
           ...(mirrored ? { mirror_at: new Date().toISOString() } : {}),
           last_seen: new Date().toISOString(),
-        }]),
-      });
-    } catch (e) { console.error('[pi-desk] publish:', e.message); }
+    };
+    // Realtime carries every real change the moment it happens; this tick is only the net under it. So
+    // an unchanged session is not republished: the unconditional upsert rewrote rows nothing had
+    // touched every 30s, and once `desk_sessions` is in the realtime publication each of those writes
+    // also becomes a broadcast to every open screen.
+    const same = row && Object.entries(payload)
+      .every(([k, v]) => k === 'last_seen' || sameColumn(k, v, row[k]));
+    const seenStale = !row || Date.now() - (row.last_seen ? Date.parse(row.last_seen) : 0) > LAST_SEEN_REFRESH_MS;
+    if (!same || seenStale) {
+      try {
+        await sb('desk_sessions?on_conflict=id', {
+          method: 'POST', headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
+          body: JSON.stringify([payload]),
+        });
+      } catch (e) { console.error('[pi-desk] publish:', e.message); }
+    }
     if (unreported) reportTurnEnd(name, tail);
     // The net under the watcher's relay below, for a finished turn fs.watch dropped.
     if (!busy) relayFirstReply(name, tail).catch((e) => console.error('[pi-desk] relay:', e.message));

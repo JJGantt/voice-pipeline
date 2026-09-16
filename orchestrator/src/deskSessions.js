@@ -97,9 +97,35 @@ async function adopt(s, rows) {
   console.log(`[desk-sessions] adopted ${s.repo} in ${s.tty} (${tail.title || 'untitled'})`);
 }
 
+// Postgres and JS spell the same instant differently (`+00:00` vs `Z`, microseconds), so timestamps
+// are compared as instants and never as strings.
+const TS_FIELDS = new Set(['reply_at', 'active_at', 'ended', 'mirror_at', 'last_seen']);
+const unchanged = (field, next, current) =>
+  (TS_FIELDS.has(field) ? ms(next) === ms(current) : (next ?? null) === (current ?? null));
+
+// `last_seen` is a clock reading, not news. Its only consumer is pi-desk's retention sweep over PARKED
+// rows, whose stamp freezes at eviction anyway, and every list surface orders by `active_at` and
+// explicitly refuses `last_seen` because a per-tick touch reshuffles the list. So it rides along with a
+// real change, or is refreshed on this much slower cadence, and is never a reason to write on its own.
+const LAST_SEEN_REFRESH_MS = 10 * 60 * 1000;
+
+/** What of `patch` the row does not already say. Compared against the row as it was READ. */
+function realChanges(before, patch) {
+  const out = {};
+  for (const [k, v] of Object.entries(patch)) {
+    if (k === 'last_seen') continue;
+    if (!unchanged(k, v, before[k])) out[k] = v;
+  }
+  return out;
+}
+
 async function reconcile(row, proc) {
   const alive = !!proc;
   const ageS = (Date.now() - ms(row.started)) / 1000;
+  // Snapshot BEFORE anything below mutates `row` — the rebind path and the close path both write back
+  // into it, and a change compared against an already-mutated row reads as no change and is then never
+  // persisted.
+  const before = { ...row };
   const patch = { last_seen: new Date().toISOString() };
 
   if (proc) {
@@ -187,7 +213,14 @@ async function reconcile(row, proc) {
     row.status = patch.status;   // stop watching it on this tick, not the next
     console.log(`[desk-sessions] ${row.id} ${patch.status} (its process has exited)`);
   }
-  await patchDeskSession(row.id, patch);
+  // The watcher pushes every real change the moment it happens; this tick is the net under it. So a
+  // tick that found nothing new writes nothing: an unconditional PATCH per resident session every 30s
+  // was ~19k writes/day that no reader could tell apart from silence.
+  const changes = realChanges(before, patch);
+  const seenStale = Date.now() - ms(before.last_seen) > LAST_SEEN_REFRESH_MS;
+  if (Object.keys(changes).length || seenStale) {
+    await patchDeskSession(row.id, { ...changes, last_seen: patch.last_seen });
+  }
   if (unreported) reportTurnEnd(row.id, tail);
 }
 
