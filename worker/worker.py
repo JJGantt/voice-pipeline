@@ -265,7 +265,13 @@ HEARTBEAT_INTERVAL_S = 30.0
 # safety net, so while the subscription is healthy it can be slow — at 1s the three workers were
 # hammering Supabase with ~280k reads/day of empty [] (a real chunk of the free-plan egress quota).
 # When realtime is down/degraded the poll IS the pickup path, so it tightens to stay snappy.
-IDLE_POLL_S = 15.0            # realtime subscribed — backstop poll; caps pickup lag if realtime half-opens between recycles
+IDLE_POLL_S = 60.0            # realtime subscribed — pure backstop; the socket recycles every 300s, so this only has to catch an event lost between recycles
+# An idle cycle asks ONE question: is there anything pending? The two other reads it used to make —
+# "should I defer?" and "are there orphaned claims?" — answer nothing while there is nothing to claim,
+# so they run on their own slow clocks instead of on every cycle. That is what took an idle worker from
+# ~3 reads a cycle (~20k/day) to one.
+STANDBY_CHECK_S = 60.0        # re-evaluate standby while idle this often (it only sets the cadence)
+RECLAIM_SWEEP_S = 60.0        # orphan-claim sweep: a backstop for a worker that died mid-command
 IDLE_POLL_DEGRADED_S = 2.0    # realtime down — polling is the only pickup path, stay snappy
 HEARTBEAT_FRESH_S = 90.0      # a higher-priority worker counts as "present" within this (≥3× the beat)
 # Standby stand-down: a worker that's deferring to a healthy higher-priority worker (normally the Mac)
@@ -1957,6 +1963,23 @@ def inject_to_terminal(text: str) -> tuple[bool, str | None]:
 
 
 _last_transcribing_sweep = 0.0
+_last_reclaim_sweep = 0.0
+_last_standby_check = 0.0
+
+
+def refresh_standby(db: Supabase) -> None:
+    """Re-evaluate standby on an IDLE cycle, rarely.
+
+    `_standby` only chooses this worker's poll cadence — the claim decision is made fresh in
+    `claim_one` the moment something is actually pending, so a minute-stale flag here can cost nothing
+    but a cycle at the wrong interval. Asking every cycle meant a `voice_requests` read (via
+    `context_owner`) plus sometimes a `worker_presence` read, for ever, to learn nothing."""
+    global _standby, _last_standby_check
+    now_mono = time.monotonic()
+    if now_mono - _last_standby_check < STANDBY_CHECK_S:
+        return
+    _last_standby_check = now_mono
+    _standby = should_defer(db)
 
 
 def sweep_stuck_transcribing(db: Supabase) -> None:
@@ -1996,6 +2019,11 @@ def reclaim_stale(db: Supabase) -> dict | None:
     Fresh-enough orphans (within the hub's own session_reset_s staleness boundary) are re-claimed and
     re-run; older ones are closed as errors — replaying a command from hours ago would be worse than
     dropping it. The re-claim PATCH is guarded on (status, claimed_by) so two reclaimers can't both win."""
+    global _last_reclaim_sweep
+    now_mono = time.monotonic()
+    if now_mono - _last_reclaim_sweep < RECLAIM_SWEEP_S:
+        return None
+    _last_reclaim_sweep = now_mono
     rows = db.get(
         "voice_requests",
         "status=eq.claimed&order=created_at.asc&limit=5"
@@ -2083,11 +2111,11 @@ def claim_one(db: Supabase) -> dict | None:
     """Find one pending request and atomically claim it. Returns the row or None."""
     global _standby
     sweep_stuck_transcribing(db)
-    if should_defer(db):
-        _standby = True   # a higher-priority worker is handling things → stand down to the slow cadence
-        return None
-    _standby = False      # I'm eligible to claim → run the active cadence
 
+    # PENDING FIRST. Deferring is about who claims a request, so with nothing to claim the answer
+    # changes nothing — and asking cost a voice_requests read on every idle cycle for ever. While idle
+    # the standby flag is refreshed on its own slow clock, which is all its consumer (the poll cadence)
+    # needs; the instant there IS something pending, it is decided fresh, before any claim.
     global _holding
     pending = db.get(
         "voice_requests",
@@ -2096,7 +2124,13 @@ def claim_one(db: Supabase) -> dict | None:
     )
     if not pending:
         _holding = False
+        refresh_standby(db)
         return reclaim_stale(db)
+
+    if should_defer(db):
+        _standby = True   # a higher-priority worker is handling things → stand down to the slow cadence
+        return None
+    _standby = False      # I'm eligible to claim → run the active cadence
 
     # HOLD WHILE HE IS STILL TALKING. One utterance reaches the queue as several rows — mics endpoint
     # at different pauses — and acting on the first one to arrive is how half a sentence becomes a
