@@ -17,6 +17,81 @@ export function projectDir(cwd) {
 }
 
 /**
+ * A `user` record as the start of a turn: null when it is not one, else `{ prompt }`, whose prompt is
+ * null when the turn was started by something he did not say.
+ */
+function turnStart(d) {
+  // Tool results are recorded as user records too. They are the model's own work coming back, not
+  // Jared saying something, so they must not look like the start of a new turn.
+  const blocks = d.message?.content;
+  if (Array.isArray(blocks) && blocks.length > 0 && blocks.every((b) => b?.type === 'tool_result')) return null;
+  // Claude Code's own injected context (`isMeta`) starts a turn without being a prompt. So does the
+  // summary it writes when it compacts a conversation mid-turn (`isCompactSummary`): pages of its
+  // own recap, recorded as a user record, which is not something he said.
+  if (d.isMeta || d.isCompactSummary) return { prompt: null, meta: true };
+  const text = typeof blocks === 'string' ? blocks.trim()
+    : Array.isArray(blocks) ? blocks.filter((b) => b?.type === 'text').map((b) => b.text).join('\n').trim()
+    : '';
+  // A background task finishing starts a turn of its own with a `<task-notification>` block. That
+  // turn is real, but its prompt is not something he said, and shown as "his last message" above the
+  // reply it read as a wall of markup.
+  return { prompt: text && !text.startsWith('<task-notification>') ? text : null };
+}
+
+/**
+ * The start of the turn that was under way at byte `end`, found by reading BACKWARDS from there.
+ *
+ * A turn of tool calls is routinely several megabytes — 2.7MB measured, against the 512KB readTail
+ * reads — so the prompt that opened it is outside the window exactly when the turn was a long one,
+ * which is when the reply most needs its question beside it. Widening the window instead would parse
+ * every record of those megabytes to find one; this reads a megabyte at a time, stops at the first
+ * turn start it meets, and parses only the lines that could be one.
+ *
+ * Bytes, not strings, until a line is chosen: a chunk boundary can fall inside a multi-byte character,
+ * and a newline byte never does. Returns undefined when no turn start is within `maxBytes`.
+ */
+function turnStartBefore(transcriptPath, end, { chunk = 1024 * 1024, maxBytes = 64 * 1024 * 1024 } = {}) {
+  let fd;
+  try { fd = fs.openSync(transcriptPath, 'r'); } catch { return undefined; }
+  try {
+    let pos = end, carry = Buffer.alloc(0);   // carry: the head of a line whose start is further back
+    while (pos > 0 && end - pos < maxBytes) {
+      const n = Math.min(chunk, pos);
+      pos -= n;
+      const buf = Buffer.allocUnsafe(n);
+      fs.readSync(fd, buf, 0, n, pos);
+      const data = Buffer.concat([buf, carry]);
+      // Everything before the first newline belongs to a line that began earlier, unless this is
+      // the top of the file.
+      const first = pos === 0 ? -1 : data.indexOf(0x0a);
+      if (first === -1 && pos > 0) { carry = data; continue; }
+      carry = data.subarray(0, first + 1);
+      let hi = data.length;
+      while (hi > first + 1) {
+        const nl = data.lastIndexOf(0x0a, hi - 2);
+        const lo = Math.max(nl, first) + 1;
+        const line = data.subarray(lo, hi);
+        hi = lo;
+        if (!line.includes('"type":"user"')) continue;
+        let d;
+        try { d = JSON.parse(line.toString('utf8')); } catch { continue; }
+        const start = d.type === 'user' ? turnStart(d) : null;
+        // Injected context is passed over, as readTail passes over it going forwards: the prompt
+        // before it is the one that stands.
+        if (start && !start.meta) return start;
+      }
+    }
+  } catch { /* unreadable: the same as not found */ } finally { fs.closeSync(fd); }
+  return undefined;
+}
+
+// What turnStartBefore found, per transcript, for the turn that ended at `replyAt` — so a long turn is
+// searched for once when it ends, not on every tick for as long as the session then sits idle. A miss
+// is kept too: a turn start beyond the search's reach would otherwise be searched for every 30s.
+const promptCache = new Map();   // transcript path -> { replyAt, prompt }
+const PROMPT_CACHE_MAX = 200;
+
+/**
  * Read a transcript's tail: whether a turn is in flight, and the FINAL message of the last one.
  *
  * THIS IS THE IDLE SIGNAL, and it has to come from here rather than from CPU. A session waiting on
@@ -47,11 +122,15 @@ export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
   // text — and the reply reported is the last COMPLETED turn's, which is then further back.
   let lines;
   const from = Math.max(0, st.size - maxBytes);
+  let windowStart = from;
   try {
     const fd = fs.openSync(transcriptPath, 'r');
     try {
       const buf = Buffer.allocUnsafe(st.size - from);
       fs.readSync(fd, buf, 0, buf.length, from);
+      // Where the first WHOLE line starts, which is where a backwards search for a turn's opening
+      // has to begin: the fragment dropped below may itself be that record.
+      if (from > 0) windowStart = from + buf.indexOf(0x0a) + 1;
       lines = buf.toString('utf8').split('\n');
     } finally { fs.closeSync(fd); }
   } catch { return empty; }
@@ -65,6 +144,8 @@ export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
   let promptAt = null;          // when a turn was last started — see turnAt below
   let turnPrompt = null;        // what started the current turn
   let finalPrompt = null;       // what started the turn finalReply ended, so the two always pair
+  let startSeen = false;        // a turn has started inside the window
+  let finalStartSeen = false;   // ...before the end of the turn finalReply ended
 
   for (const line of lines) {
     if (!line.trim()) continue;
@@ -83,23 +164,12 @@ export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
     const t = d.type;
     if (t !== 'user' && t !== 'assistant') continue;
     if (t === 'user') {
-      // Tool results are recorded as user records too. They are the model's own work coming back,
-      // not Jared saying something, so they must not look like the start of a new turn.
-      const blocks = d.message?.content;
-      const isToolResult = Array.isArray(blocks) && blocks.length > 0
-        && blocks.every((b) => b?.type === 'tool_result');
-      if (!isToolResult) {
+      const start = turnStart(d);
+      if (start) {
         working = true; turnText = []; promptAt = d.timestamp || promptAt;
-        // What he asked, as text. Claude Code's own injected context (`isMeta`) is not a prompt.
-        if (!d.isMeta) {
-          turnPrompt = typeof blocks === 'string' ? (blocks.trim() || null)
-            : Array.isArray(blocks) ? (blocks.filter((b) => b?.type === 'text').map((b) => b.text).join('\n').trim() || null)
-            : null;
-          // A background task finishing starts a turn of its own with a `<task-notification>` block.
-          // That turn is real, but its prompt is not something he said, and shown as "his last message"
-          // above the reply it read as a wall of markup.
-          if (turnPrompt && turnPrompt.startsWith('<task-notification>')) turnPrompt = null;
-        }
+        startSeen = true;
+        // Injected context starts a turn without saying anything: the prompt before it stands.
+        if (!start.meta) turnPrompt = start.prompt;
       }
       continue;
     }
@@ -116,11 +186,23 @@ export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
     if (msg.stop_reason === 'end_turn') {
       working = false;
       const joined = turnText.join('\n\n').trim();
-      if (joined) { finalReply = joined; replyAt = d.timestamp || null; finalPrompt = turnPrompt; }
+      if (joined) { finalReply = joined; replyAt = d.timestamp || null; finalPrompt = turnPrompt; finalStartSeen = startSeen; }
     }
   }
 
   if (finalReply === null && from > 0) return readTail(transcriptPath, { maxBytes: maxBytes * 4 });
+
+  // The reply is in the window and the turn's opening is not: look further back for it, once.
+  if (finalReply !== null && !finalStartSeen && from > 0) {
+    const hit = promptCache.get(transcriptPath);
+    if (replyAt && hit && hit.replyAt === replyAt) finalPrompt = hit.prompt;
+    else {
+      finalPrompt = turnStartBefore(transcriptPath, windowStart)?.prompt ?? null;
+      promptCache.delete(transcriptPath);
+      promptCache.set(transcriptPath, { replyAt, prompt: finalPrompt });
+      if (promptCache.size > PROMPT_CACHE_MAX) promptCache.delete(promptCache.keys().next().value);
+    }
+  }
 
   // lastActivity is when this conversation last did something — the signal the idle reaper and
   // pickEviction both run on. It is the newest record TIMESTAMP, and it must not be the file's mtime.
