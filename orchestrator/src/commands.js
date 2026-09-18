@@ -28,7 +28,7 @@ import { beginLaunch, endLaunch } from './deskSessions.js';
 import { watchTable } from './realtime.js';
 import { isKnownRepo } from './repos.js';
 import { ensureTrusted } from './trust.js';
-import { openFreshTab, sendToTty, closeTabForTty } from './applescript.js';
+import { openFreshTab, sendToTty, closeTabForTty, fetchAttachment } from './applescript.js';
 import { mirrorUp, mirrorDown } from './mirror.js';
 
 // Appended only when a dispatch ASKED for a write-up (`report` on the command payload, set by the
@@ -76,7 +76,23 @@ async function run(cmd) {
   // Type a follow-up into a session this machine already has open, addressed by its tab's tty.
   if (cmd.kind === 'follow_up') {
     const session = String((cmd.payload || {}).session || '').trim();
-    const prompt = String((cmd.payload || {}).prompt || '').trim();
+    let prompt = String((cmd.payload || {}).prompt || '').trim();
+    // PICTURES arrive as object names. They are pulled down here — the session's own machine — and the
+    // prompt gains the local paths, because a tty carries text and the session reads the files itself.
+    // A picture with no words is a whole message; the line below is what tells the session to look.
+    const shots = Array.isArray((cmd.payload || {}).attachments) ? (cmd.payload || {}).attachments : [];
+    if (shots.length) {
+      const paths = [];
+      for (const n of shots) {
+        try { paths.push(await fetchAttachment(n, config.HUB_TOKEN, config.HUB_URL)); }
+        catch (e) { console.error('[commands] attachment:', e.message); }
+      }
+      if (paths.length) {
+        prompt = `[Jared attached ${paths.length === 1 ? 'a picture' : paths.length + ' pictures'}: `
+          + `${paths.join(', ')} — read ${paths.length === 1 ? 'it' : 'them'} now.]`
+          + (prompt ? `\n\n${prompt}` : '');
+      }
+    }
     if (!prompt) throw new Error('no prompt to send');
     const row = await deskSession(session);
     const tty = row && row.tty;

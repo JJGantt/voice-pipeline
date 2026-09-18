@@ -221,6 +221,25 @@ export function sweepStashedPrompts(maxAgeMs = 30 * 86400000) {
   }
 }
 
+/**
+ * Pull an attached picture down beside the stashed prompts, and return its local path.
+ *
+ * A tty is typed into, so an image cannot be sent to a session — a PATH can, and the session reads the
+ * file itself. The bytes live in the hub's attachment bucket (the same one the chat composer fills);
+ * this is the machine that owns the session fetching them once, to a directory that is already the
+ * place a message waits to be read.
+ */
+export async function fetchAttachment(name, token, host) {
+  if (!/^[\w.-]+$/.test(String(name || ''))) throw new Error(`unusable attachment name: ${name}`);
+  fs.mkdirSync(PROMPT_DIR, { recursive: true, mode: 0o700 });
+  const r = await fetch(`${host}/api/attachment?path=${encodeURIComponent(name)}`,
+                        { headers: { 'X-Hub-Token': token } });
+  if (!r.ok) throw new Error(`attachment ${name}: ${r.status}`);
+  const file = path.join(PROMPT_DIR, name);
+  fs.writeFileSync(file, Buffer.from(await r.arrayBuffer()), { mode: 0o600 });
+  return file;
+}
+
 const handoff = (file) =>
   `[A message from Jared, too long to type into this terminal. It is in ${file} — read that file now, `
   + 'reply with its full text verbatim first so it is visible here, then do what it asks. '
