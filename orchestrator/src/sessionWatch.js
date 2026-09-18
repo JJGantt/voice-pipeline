@@ -93,16 +93,22 @@ function drain(st) {
     if (!line.trim()) continue;
     let d;
     try { d = JSON.parse(line); } catch { continue; }
-    // TYPED WHILE A TURN IS RUNNING. Claude Code QUEUES it and writes a `queue-operation` record; the
-    // `user` record only appears later, when the turn consumes it. So a mid-turn prompt reached a live
-    // view minutes after it was sent, or not at all — the one case this frame exists for.
-    // Remembered so the `user` record that follows does not say the same thing a second time.
-    if (d.type === 'queue-operation' && d.operation === 'enqueue') {
+    // TYPED WHILE A TURN IS RUNNING. Claude Code QUEUES it and writes `queue-operation` records; there
+    // is no `user` record at all for one absorbed into a running turn. Two moments, and they are
+    // different facts:
+    //
+    //   enqueue — he has SENT it; the model has not seen it. `queued`, and a view holds it at the
+    //             bottom, because putting it among the steps would claim it was read there.
+    //   remove  — `absorbed_mid_turn`, and it carries the same content: THIS is when the model saw
+    //             it, so this is where it belongs in the stream.
+    //
+    // (`dequeue` is the other ending — it started a turn of its own — and carries no content, so the
+    // `user` record that follows is what reports it.)
+    if (d.type === 'queue-operation') {
       const said = resolvePrompt(d.content);
-      if (said.prompt) {
-        send(st, { session: st.id, state: 'said', text: said.prompt });
-        st.queued = (st.queued || []).concat(said.prompt).slice(-8);
-        st.echo = said.stashed ? gist(said.prompt) : st.echo;
+      if (said.prompt && (d.operation === 'enqueue' || d.operation === 'remove')) {
+        send(st, { session: st.id, state: d.operation === 'enqueue' ? 'queued' : 'said', text: said.prompt });
+        if (said.stashed) st.echo = gist(said.prompt);
       }
       continue;
     }
@@ -121,18 +127,17 @@ function drain(st) {
       // own entry, it lands in the stream where it actually happened.
       // `turnStart` is the same rule readTail uses: tool results, injected context and compact
       // summaries are not him speaking, and a message stashed to a file resolves to its real text.
+      // A prompt that started its OWN turn: this record is its ingestion. One that was absorbed
+      // mid-turn never reaches here — the `remove` above already reported it.
       const said = toolResult ? null : turnStart(d);
-      // Unless it was already sent when it was queued.
-      const already = said && said.prompt && (st.queued || []).includes(said.prompt);
-      if (already) st.queued = st.queued.filter((q) => q !== said.prompt);
-      if (said && said.prompt && !already) send(st, { session: st.id, state: 'said', text: said.prompt });
+      if (said && said.prompt) send(st, { session: st.id, state: 'said', text: said.prompt });
       // A message too long for the tty is typed as a stub that ASKS the session to reply with the
       // words verbatim, so they are visible in the terminal. They are visible in the hub already —
       // `said` above carries them — so the echo is the same paragraph twice, and the whole point of
       // resolving the stub was that there be no trace of the workaround here. Held so the text frame
       // that quotes it can be recognised and dropped.
       if (said && said.stashed) st.echo = gist(said.prompt);
-      else if (said && said.prompt && !already) st.echo = null;
+      else if (said && said.prompt) st.echo = null;
       continue;
     }
     if (d.type !== 'assistant') continue;
