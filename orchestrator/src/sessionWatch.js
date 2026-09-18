@@ -20,6 +20,7 @@
 // Shared by both hosts. The Mac's deskSessions.js and the Pi's pi-desk each call syncSessionWatch
 // with whatever they currently believe is running, and hand in their own way of writing the row.
 import fs from 'node:fs';
+import { spawn } from 'node:child_process';
 import { config } from './config.js';
 import { readTail, turnStart, resolvePrompt, gist, flatten } from './transcripts.js';
 
@@ -195,8 +196,59 @@ function finish(st) {
  * calling it for the same turn is harmless.
  */
 export function reportTurnEnd(id, tail) {
-  if (tail?.lastReply) return push({ session: id, state: 'done', text: tail.lastReply.slice(0, 400), at: tail.replyAt || null });
-  return Promise.resolve();
+  if (!tail?.lastReply) return Promise.resolve();
+  // `done` goes out AT ONCE — it is what makes a live view stop showing the caret and fetch the reply.
+  // The notification does not ride on it: `summary_coming` tells the hub to hold it for the frame
+  // below, which arrives seconds later carrying a sentence worth putting on a lock screen. A host that
+  // does not send one (the Pi, today) simply omits the flag and the hub notifies from `done` as before.
+  const p = push({ session: id, state: 'done', text: tail.lastReply.slice(0, 400),
+                   at: tail.replyAt || null, summary_coming: true });
+  summarise(tail.lastReply).then((summary) => push({
+    session: id, state: 'summary', text: tail.lastReply.slice(0, 400), at: tail.replyAt || null, summary,
+  })).catch(() => {});
+  return p;
+}
+
+// ---- the sentence that lands on a lock screen -------------------------------
+//
+// A finished answer is written for a screen; an iOS banner shows about two lines of it, which is
+// usually the preamble. So this asks for ONE sentence saying what happened — "Reverted the polling
+// timer and deployed the Hammerspoon alternative" — and the hub uses it as the notification body.
+//
+// Run through the `claude` CLI on this machine rather than an API: it is the Claude that is already
+// set up here, so this adds no key anywhere. Haiku because it is the cheapest thing that can read a
+// page and say what it was, and this runs on every finished turn.
+//
+// Never required. Any failure — no CLI, a timeout, empty output — resolves to null, and the hub falls
+// back to the reply itself, which is exactly what it sends today.
+const SUMMARY_SYSTEM =
+  'Summarise this finished reply as ONE short sentence for a phone notification banner, which shows '
+  + 'about two lines. Say what was DONE and the outcome. Past tense, terse, addressed to nobody: no '
+  + '"you", no "I", never "the assistant". No line breaks, no markdown, no bullets, no preamble, no '
+  + 'quotes. Aim for 100 characters and never exceed 160. If the reply asks a question or needs a '
+  + 'decision, the sentence is that question. Output only the sentence.';
+const SUMMARY_MAX = 160;
+function summarise(reply) {
+  const body = String(reply || '').trim();
+  if (body.length < 200) return Promise.resolve(null);   // short answers are already their own summary
+  return new Promise((resolve) => {
+    let out = '', done = false;
+    const finish = (v) => { if (!done) { done = true; resolve(v); } };
+    let child;
+    try {
+      child = spawn('claude', ['-p', '--model', 'haiku'], { stdio: ['pipe', 'pipe', 'ignore'] });
+    } catch (_) { return finish(null); }
+    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch (_) {} finish(null); }, 45000);
+    child.stdout.on('data', (c) => { out += c; if (out.length > 4000) out = out.slice(0, 4000); });
+    child.on('error', () => { clearTimeout(timer); finish(null); });
+    child.on('close', () => {
+      clearTimeout(timer);
+      const line = out.replace(/\s+/g, ' ').trim().replace(/^["']|["']$/g, '');
+      finish(line ? line.slice(0, SUMMARY_MAX) : null);
+    });
+    try { child.stdin.end(`${SUMMARY_SYSTEM}\n\n---\n\n${body.slice(0, 12000)}`); }
+    catch (_) { clearTimeout(timer); finish(null); }
+  });
 }
 
 function attach(st) {
