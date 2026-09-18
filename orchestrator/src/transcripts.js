@@ -20,7 +20,7 @@ export function projectDir(cwd) {
  * A `user` record as the start of a turn: null when it is not one, else `{ prompt }`, whose prompt is
  * null when the turn was started by something he did not say.
  */
-function turnStart(d) {
+export function turnStart(d) {
   // Tool results are recorded as user records too. They are the model's own work coming back, not
   // Jared saying something, so they must not look like the start of a new turn.
   const blocks = d.message?.content;
@@ -35,7 +35,34 @@ function turnStart(d) {
   // A background task finishing starts a turn of its own with a `<task-notification>` block. That
   // turn is real, but its prompt is not something he said, and shown as "his last message" above the
   // reply it read as a wall of markup.
-  return { prompt: text && !text.startsWith('<task-notification>') ? text : null };
+  return { prompt: text && !text.startsWith('<task-notification>') ? text : unstash(text) };
+}
+
+// A DICTATED MESSAGE TOO LONG FOR THE TERMINAL IS STILL THE MESSAGE.
+//
+// A long or multi-line prompt cannot be typed into a tty — Claude Code reads a long chunk as a paste
+// and the return lands inside it — so `sendToTty` parks the words in ~/.claude-desk-prompts and types
+// a one-line stub naming the file. That stub is what lands in the transcript, so every surface that
+// draws "his last message" drew the stub: the session list, the session view, the wall, `desk_turns`.
+//
+// Resolved HERE because this is the single place a user record becomes prompt text, so one
+// substitution covers all of them — the message is displayed the same as one short enough to type.
+//
+// Only paths inside the stash directory are read. The path arrives inside transcript text, which is
+// not a place to take a filename from on trust.
+const STASH_DIR = path.join(os.homedir(), '.claude-desk-prompts');
+const STASH_RE = /^\[A message from Jared, too long to type into this terminal\. It is in (\S+) /;
+const stashed = new Map();   // path -> text. The file is written once and never rewritten.
+function unstash(text) {
+  const m = STASH_RE.exec(String(text || ''));
+  if (!m) return null;
+  const file = path.resolve(m[1]);
+  if (path.dirname(file) !== STASH_DIR) return null;
+  if (stashed.has(file)) return stashed.get(file);
+  let body = null;
+  try { body = fs.readFileSync(file, 'utf8').trim() || null; } catch (_) { /* swept, or never written */ }
+  if (body) stashed.set(file, body);
+  return body;
 }
 
 /**

@@ -204,8 +204,15 @@ function stashPrompt(text, tag) {
   return f;
 }
 
-/** Drop stashed messages older than a day. Nothing reads them after that, and they are dictated speech. */
-export function sweepStashedPrompts(maxAgeMs = 86400000) {
+/**
+ * Drop stashed messages older than the window below.
+ *
+ * NOT a day, which is what this was: the stub typed into the tty names this file, and `unstash` in
+ * transcripts.js reads it back so every surface shows the words instead of the stub. Sweeping it
+ * while the session is still on screen turns his message back into "[A message from Jared, too long
+ * to type…]" wherever it is drawn. They are a few KB of text each.
+ */
+export function sweepStashedPrompts(maxAgeMs = 30 * 86400000) {
   let names;
   try { names = fs.readdirSync(PROMPT_DIR); } catch { return; }
   for (const n of names) {

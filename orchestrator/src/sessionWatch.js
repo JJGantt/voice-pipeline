@@ -21,7 +21,7 @@
 // with whatever they currently believe is running, and hand in their own way of writing the row.
 import fs from 'node:fs';
 import { config } from './config.js';
-import { readTail } from './transcripts.js';
+import { readTail, turnStart } from './transcripts.js';
 
 // fs.watch fires several times for one append, so coalesce. Long enough to batch a write, far short
 // of anything a person notices.
@@ -102,6 +102,14 @@ function drain(st) {
       if (!toolResult && typeof d.timestamp === 'string') {
         try { st.onActivity(st.id, d.timestamp); } catch { /* the tick writes it regardless */ }
       }
+      // HIS WORDS, AT THE MOMENT THEY ARRIVE. A prompt sent while a turn is running used to send no
+      // frame at all, so a live view learned of it only when the turn ended — and then drew it at the
+      // TOP of that turn, above tool calls that had already happened before he typed it. Sent as its
+      // own entry, it lands in the stream where it actually happened.
+      // `turnStart` is the same rule readTail uses: tool results, injected context and compact
+      // summaries are not him speaking, and a message stashed to a file resolves to its real text.
+      const said = toolResult ? null : turnStart(d);
+      if (said && said.prompt) send(st, { session: st.id, state: 'said', text: said.prompt });
       continue;
     }
     if (d.type !== 'assistant') continue;
