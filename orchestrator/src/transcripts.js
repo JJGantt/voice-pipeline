@@ -36,11 +36,7 @@ export function turnStart(d) {
   // turn is real, but its prompt is not something he said, and shown as "his last message" above the
   // reply it read as a wall of markup.
   if (!text || text.startsWith('<task-notification>')) return { prompt: null };
-  // A stub naming a stashed file resolves to the words it stands for; anything else is already them.
-  // `stashed` travels with it so a caller can recognise the session's own echo of those words — the
-  // stub asks for one, and it is the only place a reply quotes a whole prompt back.
-  const body = unstash(text);
-  return body ? { prompt: body, stashed: true } : { prompt: text };
+  return resolvePrompt(text);
 }
 
 // A DICTATED MESSAGE TOO LONG FOR THE TERMINAL IS STILL THE MESSAGE.
@@ -55,6 +51,21 @@ export function turnStart(d) {
 //
 // Only paths inside the stash directory are read. The path arrives inside transcript text, which is
 // not a place to take a filename from on trust.
+/**
+ * What he actually said, from whatever text was recorded.
+ *
+ * A stub naming a stashed file resolves to the words it stands for; anything else is already them.
+ * `stashed` travels with it so a caller can recognise the session's own echo of those words — the stub
+ * asks for one, and it is the only place a reply quotes a whole prompt back.
+ *
+ * Its own function because a prompt reaches the transcript two ways: as a `user` record when a turn
+ * consumes it, and as a `queue-operation` when it is typed while one is already running.
+ */
+export function resolvePrompt(text) {
+  const body = unstash(text);
+  return body ? { prompt: body, stashed: true } : { prompt: String(text || '') || null };
+}
+
 const STASH_DIR = path.join(os.homedir(), '.claude-desk-prompts');
 const STASH_RE = /^\[A message from Jared, too long to type into this terminal\. It is in (\S+) /;
 const stashed = new Map();   // path -> text. The file is written once and never rewritten.
