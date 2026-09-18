@@ -232,8 +232,10 @@ export function sweepStashedPrompts(maxAgeMs = 30 * 86400000) {
 export async function fetchAttachment(name, token, host) {
   if (!/^[\w.-]+$/.test(String(name || ''))) throw new Error(`unusable attachment name: ${name}`);
   fs.mkdirSync(PROMPT_DIR, { recursive: true, mode: 0o700 });
-  const r = await fetch(`${host}/api/attachment?path=${encodeURIComponent(name)}`,
-                        { headers: { 'X-Hub-Token': token } });
+  // `?token=` — the same way everything else on this machine reaches the hub (see sessionWatch). The
+  // X-Hub-Token header is the derived one the iOS app carries, and this token is not that.
+  const r = await fetch(`${host}/api/attachment?path=${encodeURIComponent(name)}`
+                        + `&token=${encodeURIComponent(token)}`);
   if (!r.ok) throw new Error(`attachment ${name}: ${r.status}`);
   const file = path.join(PROMPT_DIR, name);
   fs.writeFileSync(file, Buffer.from(await r.arrayBuffer()), { mode: 0o600 });
