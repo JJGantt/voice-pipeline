@@ -122,30 +122,6 @@ async function claudePidOnTty(tty) {
   } catch { return null; }
 }
 
-/**
- * The session tab Jared is LOOKING AT right now, as a tty — or '' when he is not looking at one.
- *
- * This is the closest thing there is to reading the terminal's unread bell. Terminal.app sets that
- * bell from a BEL character and clears it when the tab is selected, and its AppleScript dictionary
- * exposes no bell property at all — a tab offers `busy`, `selected`, `tty`, `custom title` and
- * nothing else. So the bell itself cannot be read or cleared. What CAN be observed is the thing that
- * clears it: the tab being frontmost. Same moment, same reason, different handle.
- *
- * Both halves are required. `selected` is per WINDOW, so every window's open tab reports true; and a
- * Terminal tab in the background of another app is not being read. Frontmost app plus front window's
- * selected tab is the one tab on screen with his attention.
- */
-export async function frontSessionTty() {
-  const fg = await osascript(
-    'tell application "System Events" to get name of first application process whose frontmost is true'
-  ).catch(() => '');
-  if (String(fg).trim() !== 'Terminal') return '';
-  const tty = await osascript(
-    'tell application "Terminal" to return tty of selected tab of front window'
-  ).catch(() => '');
-  return String(tty || '').trim();
-}
-
 export async function closeTabForTty(tty) {
   if (!tty) return false;
   const running = await osascript(

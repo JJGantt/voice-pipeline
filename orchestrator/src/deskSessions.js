@@ -18,7 +18,7 @@
 // own.
 import { config } from './config.js';
 import { deskSessionsFor, patchDeskSession, upsertDeskSession } from './supabase.js';
-import { sweepStashedPrompts, frontSessionTty } from './applescript.js';
+import { sweepStashedPrompts } from './applescript.js';
 import { liveClaudeSessions } from './discover.js';
 import { mirrorUp, mirrorReset } from './mirror.js';
 import { readTail } from './transcripts.js';
@@ -232,19 +232,6 @@ async function reconcile(row, proc) {
   if (unreported) reportTurnEnd(row.id, tail);
 }
 
-/** Stamp `seen_at` on whichever session's tab is frontmost, if its reply is still unread. */
-async function readFront(residents) {
-  const unread = residents.filter((r) => r.tty && r.reply_at
-    && (!r.seen_at || Date.parse(r.reply_at) > Date.parse(r.seen_at)));
-  if (!unread.length) return;
-  const tty = await frontSessionTty();
-  if (!tty) return;
-  const row = unread.find((r) => r.tty === tty);
-  if (!row) return;
-  await patchDeskSession(row.id, { seen_at: new Date().toISOString() });
-  console.log(`[desk-sessions] ${row.id} read on screen (${tty})`);
-}
-
 async function tick() {
   // Messages handed to a session by file. A day is far longer than any session takes to read one,
   // and they are dictated speech — not something to leave lying in a home directory for ever.
@@ -275,19 +262,6 @@ async function tick() {
       catch (e) { console.error('[desk-sessions] adopt:', e.message); }
     }
   }
-
-  // READING IT HERE COUNTS AS READING IT. A session's reply is unread until `seen_at` catches up with
-  // `reply_at` (status-hub, buildSessions), and until now only opening it on the phone could say so —
-  // which left the Mac, where the answer is most often actually read, unable to clear its own mark.
-  //
-  // The terminal's bell cannot be asked: Terminal.app sets it from a BEL and clears it on selection,
-  // and its dictionary has no property for it. So this watches what CLEARS the bell instead — the tab
-  // being frontmost — which happens at the same moment for the same reason.
-  //
-  // Gated on there being something unread, so the ordinary tick costs no AppleScript at all: two
-  // osascript calls only when a row is actually waiting to be read.
-  try { await readFront(residents); }
-  catch (e) { console.error('[desk-sessions] front tab:', e.message); }
 
   // Watch what is running. The tick's job here is only to NOTICE a session — everything the session
   // then does reaches the wall the instant it happens, without waiting for the next one.
