@@ -82,7 +82,11 @@ function recordProblems(r) {
   const bad = [];
   if (typeof r.sessionId !== 'string' || !r.sessionId) bad.push('sessionId missing');
   if (typeof r.cwd !== 'string' || !r.cwd) bad.push('cwd missing');
-  if (r.status !== 'busy' && r.status !== 'idle') bad.push(`status is ${JSON.stringify(r.status)}, expected busy|idle`);
+  // The point of this check is a field the orchestrators read going MISSING, not the arrival of a
+  // new state — Claude Code adds those (2.1.276 brought 'shell' and 'waiting') and a hardcoded pair
+  // turns every one of them into a false FAIL. deskSessions.js never branches on the value, only on
+  // statusUpdatedAt, so any non-empty string is fine and only absence is a finding.
+  if (typeof r.status !== 'string' || !r.status) bad.push(`status is ${JSON.stringify(r.status)}, expected a state string`);
   if (!Number.isFinite(r.statusUpdatedAt)) bad.push('statusUpdatedAt missing');
   return bad;
 }
