@@ -35,7 +35,12 @@ export function turnStart(d) {
   // A background task finishing starts a turn of its own with a `<task-notification>` block. That
   // turn is real, but its prompt is not something he said, and shown as "his last message" above the
   // reply it read as a wall of markup.
-  return { prompt: text && !text.startsWith('<task-notification>') ? text : unstash(text) };
+  if (!text || text.startsWith('<task-notification>')) return { prompt: null };
+  // A stub naming a stashed file resolves to the words it stands for; anything else is already them.
+  // `stashed` travels with it so a caller can recognise the session's own echo of those words — the
+  // stub asks for one, and it is the only place a reply quotes a whole prompt back.
+  const body = unstash(text);
+  return body ? { prompt: body, stashed: true } : { prompt: text };
 }
 
 // A DICTATED MESSAGE TOO LONG FOR THE TERMINAL IS STILL THE MESSAGE.
@@ -53,6 +58,20 @@ export function turnStart(d) {
 const STASH_DIR = path.join(os.homedir(), '.claude-desk-prompts');
 const STASH_RE = /^\[A message from Jared, too long to type into this terminal\. It is in (\S+) /;
 const stashed = new Map();   // path -> text. The file is written once and never rewritten.
+
+/**
+ * A distinctive middle slice of some text, whitespace-flattened — for asking "does this contain that".
+ *
+ * From a fifth of the way in, because the two ends are where a quotation differs: a reply prefixes its
+ * own words and a blockquote adds a marker to the first line, while the middle of a dictated paragraph
+ * is reproduced exactly.
+ */
+export function gist(text, len = 60) {
+  const flat = String(text || '').replace(/\s+/g, ' ').trim();
+  if (flat.length < len) return null;
+  return flat.slice(Math.floor(flat.length / 5), Math.floor(flat.length / 5) + len);
+}
+export const flatten = (t) => String(t || '').replace(/\s+/g, ' ').trim();
 function unstash(text) {
   const m = STASH_RE.exec(String(text || ''));
   if (!m) return null;

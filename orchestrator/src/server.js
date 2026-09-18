@@ -16,6 +16,7 @@ import { config } from './config.js';
 import { attachClient, handleClientMessage, inject, hasActive } from './pty.js';
 import { startFocusWatcher } from './focus.js';
 import { startRegistry } from './registry.js';
+import { markTtyRead } from './deskSessions.js';
 import { startRepos } from './repos.js';
 import { startCommands } from './commands.js';
 import { startDeskSessions } from './deskSessions.js';
@@ -46,6 +47,20 @@ const server = http.createServer((req, res) => {
   if (req.method === 'GET' && url.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true, active: hasActive() }));
+    return;
+  }
+
+  // WHICH SESSION TAB IS ON SCREEN, reported by Hammerspoon the moment it changes — Terminal being
+  // activated, a window focused, a tab's title changing (session-read.lua). Looking at the tab is what
+  // clears the terminal's unread bell, so it is also what marks the session's reply read everywhere
+  // else: the phone drops its amber within a second, off the realtime push the write makes.
+  //
+  // Here rather than in the hub because the mapping from a tty to a session row is this machine's own
+  // knowledge, and localhost needs no hub credential in a Hammerspoon config.
+  if (req.method === 'POST' && url.pathname === '/session-read') {
+    const tty = String(url.searchParams.get('tty') || '');
+    markTtyRead(tty).catch((e) => console.error('[orchestrator] session-read:', e.message));
+    res.writeHead(204).end();   // fire and forget: nothing on the other end waits on the answer
     return;
   }
 

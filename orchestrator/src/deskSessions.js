@@ -232,6 +232,29 @@ async function reconcile(row, proc) {
   if (unreported) reportTurnEnd(row.id, tail);
 }
 
+/**
+ * Mark whichever session owns `tty` as read, if its reply is still unread.
+ *
+ * Called when Hammerspoon sees the Terminal tab change (session-read.lua), which is an EVENT — app
+ * activation, window focus, tab title. The terminal's own unread bell cannot be asked for: Terminal.app
+ * sets it from a BEL and clears it on selection, and its AppleScript dictionary has no property for it.
+ * So what is reported is the thing that CLEARS the bell — the tab being frontmost — at the moment it
+ * happens rather than on anyone's timer.
+ *
+ * Writes only when it would change something, so a tab switched to repeatedly costs one write.
+ */
+export async function markTtyRead(tty) {
+  if (!tty) return false;
+  let rows;
+  try { rows = await deskSessionsFor('desk', 'resident'); } catch (_) { return false; }
+  const row = (rows || []).find((r) => r.tty === tty);
+  if (!row || !row.reply_at) return false;
+  if (row.seen_at && Date.parse(row.seen_at) >= Date.parse(row.reply_at)) return false;
+  await patchDeskSession(row.id, { seen_at: new Date().toISOString() });
+  console.log(`[desk-sessions] ${row.id} read on screen (${tty})`);
+  return true;
+}
+
 async function tick() {
   // Messages handed to a session by file. A day is far longer than any session takes to read one,
   // and they are dictated speech — not something to leave lying in a home directory for ever.

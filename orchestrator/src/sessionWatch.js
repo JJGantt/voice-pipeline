@@ -21,7 +21,7 @@
 // with whatever they currently believe is running, and hand in their own way of writing the row.
 import fs from 'node:fs';
 import { config } from './config.js';
-import { readTail, turnStart } from './transcripts.js';
+import { readTail, turnStart, gist, flatten } from './transcripts.js';
 
 // fs.watch fires several times for one append, so coalesce. Long enough to batch a write, far short
 // of anything a person notices.
@@ -110,6 +110,12 @@ function drain(st) {
       // summaries are not him speaking, and a message stashed to a file resolves to its real text.
       const said = toolResult ? null : turnStart(d);
       if (said && said.prompt) send(st, { session: st.id, state: 'said', text: said.prompt });
+      // A message too long for the tty is typed as a stub that ASKS the session to reply with the
+      // words verbatim, so they are visible in the terminal. They are visible in the hub already —
+      // `said` above carries them — so the echo is the same paragraph twice, and the whole point of
+      // resolving the stub was that there be no trace of the workaround here. Held so the text frame
+      // that quotes it can be recognised and dropped.
+      st.echo = said && said.stashed ? gist(said.prompt) : null;
       continue;
     }
     if (d.type !== 'assistant') continue;
@@ -128,7 +134,11 @@ function drain(st) {
       else if (b?.type === 'thinking' && String(b.thinking || '').trim()) st.said.thought.push(String(b.thinking).trim());
       else if (b?.type === 'tool_use') {
         const words = st.said.text.length ? st.said.text : st.said.thought;
-        if (words.length) send(st, { session: st.id, state: 'text', text: words.join('\n\n') });
+        const text = words.join('\n\n');
+        // Not the session reading his own stashed message back to him — see `st.echo` above.
+        if (words.length && !(st.echo && flatten(text).includes(st.echo))) {
+          send(st, { session: st.id, state: 'text', text });
+        }
         st.said = { id: msg.id, text: [], thought: [] };
         send(st, { session: st.id, state: 'tool', text: toolLine(b) });
       }
