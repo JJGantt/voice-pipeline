@@ -314,7 +314,7 @@ async function runInNewTerminal(shellCmd) {
 
 // Re-open a desk tab and resume the session "right where it was".
 export async function reopenDeskTab(cwd, id) {
-  return runInNewTerminal(`cd ${shQuote(cwd)}; ${shQuote(config.CLAUDE_BIN)} --resume ${shQuote(id)}`);
+  return runInNewTerminal(`cd ${shQuote(cwd)}; ${shQuote(config.CLAUDE_BIN)} --model ${shQuote(config.DESK_MODEL)} --resume ${shQuote(id)}`);
 }
 
 // Start a FRESH session in `cwd` with Remote Control on, named after the repo (plus a unique
@@ -342,7 +342,8 @@ export async function openFreshTab(cwd, name, prompt, sessionId = null, resumeId
   // Resuming a transcript that was mirrored from the other machine: same flags as a fresh session,
   // so a handed-over session is reachable and identifiable exactly like any other.
   const resume = resumeId ? ` --resume ${shQuote(resumeId)}` : '';
-  return runInNewTerminal(`cd ${shQuote(cwd)}; ${env}${shQuote(config.CLAUDE_BIN)}${resume}${rc}${first}`);
+  const model = ` --model ${shQuote(config.DESK_MODEL)}`;
+  return runInNewTerminal(`cd ${shQuote(cwd)}; ${env}${shQuote(config.CLAUDE_BIN)}${model}${resume}${rc}${first}`);
 }
 
 /**

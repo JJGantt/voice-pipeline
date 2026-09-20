@@ -14,11 +14,11 @@ export function activeInfo() {
   return active ? { id: active.id, cwd: active.cwd } : null;
 }
 
-// Spawn `claude --resume <id>` in cwd and make it the active pty, replacing
+// Spawn `claude --model <DESK_MODEL> --resume <id>` in cwd and make it the active pty, replacing
 // (and killing) any previous one.
 export function startSession(id, cwd) {
   killActive();
-  const pty = spawn(config.CLAUDE_BIN, ['--resume', id], {
+  const pty = spawn(config.CLAUDE_BIN, ['--model', config.DESK_MODEL, '--resume', id], {
     name: 'xterm-256color',
     cols: config.PTY_COLS,
     rows: config.PTY_ROWS,

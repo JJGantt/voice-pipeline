@@ -23,6 +23,14 @@ export const config = {
   HUB_URL: process.env.HUB_URL || 'https://jared-status-hub.fly.dev',
   HUB_TOKEN: process.env.HUB_TOKEN || 'REDACTED',
   CLAUDE_BIN: process.env.CLAUDE_BIN || path.join(HOME, '.local/bin/claude'),
+  // Model for every session this orchestrator opens, named explicitly rather than left to settings.
+  // A session started here is unattended, and the machine default is whatever `/model` last wrote to
+  // ~/.claude/settings.json. That default is invisible from an interactive session in ~, because
+  // ~/.claude/settings.local.json doubles as the PROJECT settings for the project rooted at the home
+  // directory and outranks it — so the default can be wrong for months while every session Jared
+  // opens himself looks right. Desk sessions run in a repo, where nothing shadows it. (pi-desk pins
+  // the same way, in launch.sh.)
+  DESK_MODEL: process.env.DESK_MODEL || 'opus',
 
   // Where Claude Code stores per-session transcripts.
   PROJECTS_DIR: process.env.CLAUDE_PROJECTS_DIR || path.join(HOME, '.claude/projects'),
