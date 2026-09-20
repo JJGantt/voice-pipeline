@@ -63,7 +63,25 @@ export function turnStart(d) {
  */
 export function resolvePrompt(text) {
   const body = unstash(text);
-  return body ? { prompt: body, stashed: true } : { prompt: String(text || '') || null };
+  return body ? { prompt: unwrapPastes(body), stashed: true }
+              : { prompt: unwrapPastes(text) || null };
+}
+
+// A PASTE IS STILL HIS WORDS, NOT MARKUP.
+//
+// Claude Code wraps pasted input in <pasted_content id="N">…</pasted_content id="N"> — the id is
+// random per block and the closing tag repeats it. That wrapper is an artifact of how the words
+// reached the terminal, so persisting it puts the tags on screen and makes the same message look
+// like a second, different one beside the clean copy the live path already showed. Measured in
+// desk_turns: a 525-byte prompt stored with the opening tag still on the front of it.
+//
+// The tags are removed and the content kept, rather than the block being extracted, because a
+// message can be part typed and part pasted and both halves are his. An unpaired tag is stripped
+// too: a prompt can be stored truncated, and half a wrapper is no more readable than a whole one.
+const PASTE_BLOCK = /<pasted_content\b[^>]*>\r?\n?([\s\S]*?)\r?\n?<\/pasted_content\b[^>]*>/g;
+const PASTE_ORPHAN = /<\/?pasted_content\b[^>]*>\r?\n?/g;
+export function unwrapPastes(text) {
+  return String(text || '').replace(PASTE_BLOCK, '$1').replace(PASTE_ORPHAN, '').trim();
 }
 
 const STASH_DIR = path.join(os.homedir(), '.claude-desk-prompts');
