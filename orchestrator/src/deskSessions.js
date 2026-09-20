@@ -65,6 +65,20 @@ function processOf(row, live, byPid, claimed) {
  * A session nothing dispatched — Jared opened it himself. It joins the same table and gets the same
  * treatment, and never touches `desk_focus`: a session appearing is not him choosing to talk to it.
  */
+/**
+ * What to call a session nobody has named yet: the terminal it is in and when it opened.
+ *
+ * Both are things he can act on — the tty is how the window is found and the time is how two on the
+ * same tty are told apart. Deliberately not a guess at what the session is FOR: it has not said
+ * anything yet, so any such guess would be invented.
+ */
+function placeholderLabel(tty, startedAt) {
+  const where = String(tty || '').split('/').pop() || 'tty';
+  const when = new Date(startedAt || Date.now())
+    .toLocaleTimeString('en-US', { timeZone: 'America/New_York', hour: 'numeric', minute: '2-digit' });
+  return `${where} · ${when}`;
+}
+
 async function adopt(s, rows) {
   const tail = readTail(s.transcriptPath);
   const startedIso = new Date(s.startedAt).toISOString();
@@ -87,7 +101,18 @@ async function adopt(s, rows) {
     tty: s.tty, pid: s.pid, transcript_path: s.transcriptPath, claude_session_id: s.claudeId,
     // Claude Code's own name for the conversation. A dispatched session gets a label written by
     // the router; this is the only description one nobody dispatched ever has.
-    label: tail.title ? tail.title.slice(0, 60) : null,
+    //
+    // PLACEHOLDER RATHER THAN NULL. Claude Code does not generate a title until the first exchange
+    // finishes, so a session opened by hand has no name for its whole first turn — and none ever if
+    // it is opened and abandoned, which is what a dozen rows in the list were. A null label left
+    // every surface falling back to the repo, so they read `root (root on the Mac)`: the working
+    // directory wearing a name's place. Where and when it started is at least true and identifies
+    // the window.
+    //
+    // Safe to write because the tick REPLACES it: `named` prefers a typed custom-title, then Claude
+    // Code's generated one, and overwrites the label the moment either appears. The placeholder only
+    // ever survives on a session that never said anything.
+    label: tail.title ? tail.title.slice(0, 60) : placeholderLabel(s.tty, s.startedAt),
     started: startedIso,
     working: s.busy ?? tail.working, last_reply: tail.lastReply ? tail.lastReply.slice(0, 4000) : null,
     last_prompt: tail.lastPrompt ? tail.lastPrompt.slice(0, 4000) : null,
