@@ -1,0 +1,8 @@
+# The Mac's wake-free env (.venv). torch/torchaudio are pinned because speechbrain 1.1.0 calls
+# torchaudio APIs that later torchaudio releases removed.
+torch==2.5.1
+torchaudio==2.5.1
+speechbrain==1.1.0
+numpy==1.26.4
+httpx==0.27.2
+sounddevice

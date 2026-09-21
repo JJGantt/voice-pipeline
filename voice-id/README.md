@@ -14,6 +14,17 @@ Everything runs on-device; no audio leaves the machine. Model: **ECAPA-TDNN**
 | `exemplars.npy` | The voiceprint: an `(N, 192)` bank of per-phrase ECAPA embeddings. `reference.npy` is the averaged centroid (fallback). |
 | `.venv/`, `.model/` | Python env (torch + speechbrain + sounddevice) and the cached ECAPA weights. |
 
+`.venv` is ~800 MB and looks like a disposable build artifact, but it is what `run-wakefree.sh`
+executes (`./.venv/bin/python`, a relative path a grep for `voice-id/.venv` does not find). Delete it
+and the Mac mic goes deaf: every spawn exits at once, the listener re-execs itself every ~25s calling
+it a wedged audio stack, and the hub shows the Mac red. Rebuild with:
+
+```
+/opt/homebrew/bin/python3.11 -m venv .venv && .venv/bin/pip install -r requirements.txt
+```
+
+The listener picks it up on its next respawn; nothing needs restarting.
+
 ## Enrollment
 
 ```
