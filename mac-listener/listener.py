@@ -236,7 +236,13 @@ def _apply_mute(on: bool) -> None:
     command in flight = every source goes deaf. The ESP gets it two ways: an instant HTTP ping AND the
     `voice_muted` DB flag (the source of truth the Fly server reads). Driving it off the DB flag means
     the mute is held EXACTLY as long as push-to-talk is active — no arbitrary timeout can wake the ESP
-    mid-dictation (that 90s auto-clear was the bug)."""
+    mid-dictation (that 90s auto-clear was the bug).
+
+    THE MUTE IS HELD BY NAME, not set. This Mac writes `voice_mute_mac`; the hub recomputes
+    `voice_muted` from every holder, so a watch or a phone finishing its own recording cannot wake the
+    room while a dictation here is still running. That is exactly what happened on 2026-09-23: a watch
+    recording ended 0.7s after push-to-talk muted, wrote the old single flag to 0, and wake-free heard
+    the rest of the dictation and ran it as a command."""
     if on == _muted.is_set():
         return
     (_muted.set if on else _muted.clear)()
@@ -245,7 +251,8 @@ def _apply_mute(on: bool) -> None:
         subprocess.Popen(["pkill", "-USR1" if on else "-USR2", "-f", "wakefree.py"],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     threading.Thread(target=_ping_esp_capture, args=(on,), daemon=True).start()
-    threading.Thread(target=_write_setting, args=("voice_muted", "1" if on else "0"), daemon=True).start()
+    held = datetime.now(timezone.utc).isoformat() if on else ""
+    threading.Thread(target=_write_setting, args=("voice_mute_mac", held), daemon=True).start()
 
 
 def set_mac_mic(on: bool) -> None:
@@ -1021,10 +1028,10 @@ def main() -> int:
         set_sensor(True)
     set_inject_mode(_read_setting("voice_inject_mode"))  # apply persisted inject toggle (forces wake-free on if set)
     set_speak_replies(_read_setting("voice_speak_replies"))  # apply persisted speech toggle (default off)
-    # Clear any stale global mute on boot: push-to-talk mutes are Mac-local, so a fresh listener means
-    # nothing is dictating. This un-sticks a voice_muted left set by a crash mid-dictation — the only
-    # safety we need now that the server's arbitrary 90s auto-clear is gone.
-    _write_setting("voice_muted", "0")
+    # Give back THIS Mac's mute on boot: push-to-talk mutes are Mac-local, so a fresh listener means
+    # nothing is dictating here. Only its own holder — another device may be capturing right now, and
+    # the hub recomputes `voice_muted` from what is left.
+    _write_setting("voice_mute_mac", "")
     # Same self-heal for the HUD: a prior instance that died mid-capture (watchdog os._exit, SIGKILL, or
     # a forced sleep) can leave the 'listening' pill frozen on screen. A fresh listener means the mic is
     # idle, so clear it now — every (re)start un-sticks a stale overlay.
