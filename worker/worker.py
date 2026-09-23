@@ -415,7 +415,9 @@ SAFE_TOOLS = [
     "mcp__data__list_recipes", "mcp__data__get_recipe", "mcp__data__log_recipe", "mcp__data__delete_recipe",
     # Body figures the user says out loud. log_weight refuses anything it was not explicitly given;
     # set_height is inches. Nothing to estimate, so nothing the capable model would do better.
-    "mcp__data__log_weight", "mcp__data__set_height",
+    # update_weight and remove_weight take the entry ID from get_health_profile, so neither can pick a
+    # weigh-in by date and neither writes a number he did not say.
+    "mcp__data__log_weight", "mcp__data__set_height", "mcp__data__update_weight", "mcp__data__remove_weight",
     # Sets. An exercise is named by its CATALOG ID (migration 00075), so none of these can invent a
     # movement or land on the wrong one: an id from get_workout_catalog either exists or the call
     # fails. Registering a genuinely new movement means inventing a muscle map, which is real
