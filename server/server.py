@@ -48,6 +48,8 @@ SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
 VOICE_DEVICE_TOKEN = os.environ.get("VOICE_DEVICE_TOKEN")
 # Shared secret the worker uses to ping POST /led-off when the model finishes (turns the ESP LED off).
 LED_TOKEN = os.environ.get("LED_TOKEN", "")
+# Shared with the hub, which asks /verify whether an uploaded clip sounds like Jared.
+VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "")
 # The currently-connected ESP, so the /led-off HTTP handler can reach it. One device → one global ref.
 _active_esp = None
 # Push-to-talk active anywhere (Hammerspoon dictation) → the ESP ignores ALL audio: the mute is global,
@@ -1153,6 +1155,41 @@ async def process_request(connection, request):
         else:
             log.info("http %s with no ESP connected", u.path)
         return connection.respond(HTTPStatus.OK, "ok\n")
+    if path.startswith("/verify"):
+        # SPEAKER ID FOR THE DEVICES THAT UPLOAD A CLIP rather than stream. The Mac and the ESP score
+        # every utterance against the voiceprint before it becomes a command; the phone and the watch
+        # could not, because the model lives here and they only ever hand the hub a finished file. The
+        # hub converts that file to 16k mono WAV, puts it in the voice-clips bucket and asks here.
+        #
+        # Answers the top-3 cosine as text, and 0 when there is no model or no voiceprint loaded — the
+        # hub treats that as "cannot tell", and lets the command through rather than eating it.
+        from urllib.parse import urlparse, parse_qs
+        u = urlparse(path)
+        q = parse_qs(u.query)
+        if VERIFY_TOKEN and q.get("token", [None])[0] != VERIFY_TOKEN:
+            return connection.respond(HTTPStatus.FORBIDDEN, "forbidden\n")
+        obj = (q.get("p", [""])[0] or "").strip()
+        if not obj or ".." in obj:
+            return connection.respond(HTTPStatus.BAD_REQUEST, "p required\n")
+        if _enc is None or _bank is None:
+            _load_voiceid()
+        try:
+            async with httpx.AsyncClient(timeout=20) as c:
+                r = await c.get(f"{SUPABASE_URL}/storage/v1/object/{obj}",
+                                headers={"apikey": SUPABASE_SERVICE_KEY,
+                                         "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"})
+                r.raise_for_status()
+            with wave.open(io.BytesIO(r.content), "rb") as w:   # the hub sends 16k mono, which is what ECAPA is fed
+                rate, channels = w.getframerate(), w.getnchannels()
+                pcm = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+            if channels > 1:
+                pcm = pcm[::channels]
+            sim = await asyncio.to_thread(_verify_jared, pcm)
+            log.info("verify %s: sim=%.2f (%.1fs @ %dHz)", obj, sim, pcm.size / max(rate, 1), rate)
+            return connection.respond(HTTPStatus.OK, f"{sim:.4f}\n")
+        except Exception as e:  # noqa: BLE001 — a verification that cannot run must not eat a command
+            log.warning("verify %s failed: %s", obj, e)
+            return connection.respond(HTTPStatus.OK, "0\n")
     if path.startswith("/capture-o"):     # /capture-off | /capture-on — global push-to-talk mute.
         # Instant fast-path; the SOURCE OF TRUTH is the voice_muted DB flag (read live by
         # _settings_listener), which holds the mute exactly as long as push-to-talk is active. No
