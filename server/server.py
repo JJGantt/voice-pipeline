@@ -242,6 +242,16 @@ def rms(frame: np.ndarray) -> float:
     return float(np.sqrt(np.mean(frame.astype(np.float32) ** 2)))
 
 
+# WHISPER WRITES "Thank you." FOR A CLIP WITH NO SPEECH IN IT: silence, breath, a room. A transcript
+# that is that phrase and nothing else is treated as nothing heard, so it never becomes a command. The
+# cost is that saying only "thank you" is dropped too. The same rule is in mac-listener/listener.py and status-hub's server/lib/transcribe.js.
+_NOTHING_SAID = re.compile(r"^\W*thank\s+you\W*$", re.IGNORECASE)
+
+
+def _heard(text: str) -> str:
+    return "" if _NOTHING_SAID.match(text) else text
+
+
 async def transcribe(pcm: bytes) -> str:
     wav = pcm_to_wav(pcm)
     # Groq SDK is sync; run off the event loop.
@@ -259,7 +269,7 @@ async def transcribe(pcm: bytes) -> str:
         log.warning("Groq transcription failed (%s) — retrying once", e)
         await asyncio.sleep(0.5)
         result = await asyncio.to_thread(_call)   # a second failure propagates to the caller
-    return (result if isinstance(result, str) else getattr(result, "text", "")).strip()
+    return _heard((result if isinstance(result, str) else getattr(result, "text", "")).strip())
 
 
 async def _notify_transcribe_failure() -> None:

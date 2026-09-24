@@ -834,6 +834,16 @@ def _groq_transcribe(path: str):
     return None
 
 
+# WHISPER WRITES "Thank you." FOR A CLIP WITH NO SPEECH IN IT: silence, breath, a room. A transcript
+# that is that phrase and nothing else is treated as nothing heard, so it never becomes a command. The
+# cost is that saying only "thank you" is dropped too. The same rule is in server/server.py and status-hub's server/lib/transcribe.js.
+_NOTHING_SAID = re.compile(r"^\W*thank\s+you\W*$", re.IGNORECASE)
+
+
+def _heard(text: str) -> str:
+    return "" if _NOTHING_SAID.match(text) else text
+
+
 def transcribe(pcm: np.ndarray) -> str:
     """Groq (fast + accurate) when GROQ_API_KEY is set; else local whisper.cpp. '' if too short/failed."""
     if pcm.size < int(SAMPLE_RATE * MIN_UTTER_S):
@@ -843,12 +853,12 @@ def transcribe(pcm: np.ndarray) -> str:
         if GROQ_API_KEY:
             text = _groq_transcribe(path)
             if text is not None:
-                return text
+                return _heard(text)
         out = subprocess.run(
             [WHISPER_BIN, "-m", WHISPER_MODEL, "-f", path, "--no-prints", "-nt", "-l", "en"],
             capture_output=True, text=True, timeout=90,
         )
-        return out.stdout.strip()
+        return _heard(out.stdout.strip())
     except Exception as e:  # noqa: BLE001
         log(f"transcribe failed: {e}")
         return ""
