@@ -25,13 +25,36 @@ import { projectDir } from './transcripts.js';
 const exec = promisify(execFile);
 const SESSIONS_DIR = process.env.CLAUDE_SESSIONS_DIR || path.join(os.homedir(), '.claude', 'sessions');
 
+function readRecord(file) {
+  try { return JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, file), 'utf8')); }
+  catch { return null; }
+}
+
+/**
+ * A session sent to the background keeps its terminal process, but the conversation goes on in a
+ * separate `bg` process under a NEW id: the terminal's record keeps the old id and names the job as
+ * `parkedJobId`, and the job's own record (`kind: "bg"`, the same `jobId`) holds the conversation
+ * actually being had, with its own transcript and busy state. Read the terminal's record alone and the
+ * row watches a transcript nothing writes to any more: no replies, no activity, sorted by the moment it
+ * was backgrounded.
+ */
+function jobRecord(jobId) {
+  let files;
+  try { files = fs.readdirSync(SESSIONS_DIR); } catch { return null; }
+  for (const f of files) {
+    if (!f.endsWith('.json')) continue;
+    const d = readRecord(f);
+    if (d && d.kind === 'bg' && d.jobId === jobId) return d;
+  }
+  return null;
+}
+
 /** The conversation process `pid` is in, from Claude Code's own record; null when it has none. */
 export function sessionOf(pid) {
-  let d;
   // No file: not a Claude Code process, or one that has not written its record yet (it does within
   // a second of starting, so the next look finds it).
-  try { d = JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, `${pid}.json`), 'utf8')); }
-  catch { return null; }
+  let d = readRecord(`${pid}.json`);
+  if (d && typeof d.parkedJobId === 'string') d = jobRecord(d.parkedJobId) || d;
   if (!d || typeof d.sessionId !== 'string' || typeof d.cwd !== 'string') return null;
   return {
     claudeId: d.sessionId, cwd: d.cwd,
