@@ -308,6 +308,7 @@ AGENT_SESSION_FILE = STATE_DIR / "agent_session.json"   # full-agent mode: a SEP
 # Sentinel the hub UI enqueues to force a fresh Claude session (manual "Reset context").
 # Must match VOICE_RESET_SENTINEL in the status-hub server.
 RESET_SENTINEL = "__RESET_CONTEXT__"
+_NOTHING_SAID = re.compile(r"^\W*thank\s+you\W*$", re.IGNORECASE)
 
 # Quick-add requests (source 'web-quick', from the hub's bottom-right mic FAB) show their reply in a
 # tiny status chip that holds only a few words before it fades. Append this directive to the turn so
@@ -2256,6 +2257,15 @@ def process_request(db: Supabase, req: dict) -> None:
         db.patch("voice_requests", f"id=eq.{rid}",
                  {"status": "done", "result": "(context reset)", "updated_at": now_iso()})
         log(f"{'agent' if reset_agent else 'hub'} context reset — session dropped")
+        return
+
+    # A command that is only "thank you" is never run: from a microphone it is what Whisper writes for a
+    # clip with no speech in it, and typed it asks for nothing. The transcribers already drop it (server.py,
+    # mac-listener, status-hub's transcribe.js); this catches every other way a row gets here.
+    if _NOTHING_SAID.match(transcript):
+        db.patch("voice_requests", f"id=eq.{rid}",
+                 {"status": "error", "error": "nothing said", "updated_at": now_iso()})
+        log(f"ignored {transcript!r}: nothing said")
         return
 
     focus = get_focus(db)
