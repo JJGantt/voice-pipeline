@@ -41,9 +41,9 @@ export function turnStart(d) {
 
 // A DICTATED MESSAGE TOO LONG FOR THE TERMINAL IS STILL THE MESSAGE.
 //
-// A long or multi-line prompt cannot be typed into a tty — Claude Code reads a long chunk as a paste
-// and the return lands inside it — so `sendToTty` parks the words in ~/.claude-desk-prompts and types
-// a one-line stub naming the file. That stub is what lands in the transcript, so every surface that
+// A prompt over TTY_INPUT_MAX characters is not typed into the tty (AppleScript cannot hand it over in
+// one go), so `sendToTty` parks the words in ~/.claude-desk-prompts and types a one-line stub naming the
+// file. Line breaks alone do not do this; they are typed. That stub is what lands in the transcript, so every surface that
 // draws "his last message" drew the stub: the session list, the session view, the wall, `desk_turns`.
 //
 // Resolved HERE because this is the single place a user record becomes prompt text, so one

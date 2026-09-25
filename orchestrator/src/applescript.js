@@ -257,12 +257,13 @@ const ESC = 'character id 27';
 export async function sendToTty(tty, text) {
   // An escape in the words could close the paste early; nothing dictated needs one.
   const body = String(text).replace(/\x1b/g, '');
-  // Newlines go by file too, whatever the length: an AppleScript string literal cannot contain a raw
-  // one, so a multi-line message typed directly is a syntax error rather than a delivery.
-  const line = (body.length > TTY_INPUT_MAX || /[\r\n]/.test(body))
-    ? handoff(stashPrompt(body, tty.replace('/dev/', '')))
-    : body;
-  const escaped = line.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  // Only LENGTH sends a message by file. A line break is typed like any other character: an AppleScript
+  // string literal cannot hold a raw one, so each is written as `linefeed` joined into the string, and
+  // inside the bracketed paste it lands in the composer as a line break, not a submit. Treating line
+  // breaks as a reason for a file would hand over every spoken-reply follow-up that way (the watch puts
+  // its note after a blank line), however short.
+  const line = body.length > TTY_INPUT_MAX ? handoff(stashPrompt(body, tty.replace('/dev/', ''))) : body;
+  const escaped = line.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r\n|\r|\n/g, '" & linefeed & "');
   await osascript(`tell application "Terminal"
       set found to false
       repeat with w in windows
