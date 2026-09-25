@@ -32,11 +32,18 @@ export function turnStart(d) {
   const text = typeof blocks === 'string' ? blocks.trim()
     : Array.isArray(blocks) ? blocks.filter((b) => b?.type === 'text').map((b) => b.text).join('\n').trim()
     : '';
-  // A background task finishing starts a turn of its own with a `<task-notification>` block. That
-  // turn is real, but its prompt is not something he said, and shown as "his last message" above the
-  // reply it read as a wall of markup.
-  if (!text || text.startsWith('<task-notification>')) return { prompt: null };
+  if (!text || !fromHim(text)) return { prompt: null };
   return resolvePrompt(text);
+}
+
+/**
+ * Whether text recorded as a user message is something he said. A background task finishing delivers
+ * a `<task-notification>` block the same way, as a turn of its own or queued into the one running; it
+ * is real, but it is not him, and shown as his words it is a wall of markup in his colour. Both places
+ * a user message becomes his words (a turn's prompt here, and a queued message in sessionWatch) ask this.
+ */
+export function fromHim(text) {
+  return !String(text || '').trimStart().startsWith('<task-notification>');
 }
 
 // A DICTATED MESSAGE TOO LONG FOR THE TERMINAL IS STILL THE MESSAGE.

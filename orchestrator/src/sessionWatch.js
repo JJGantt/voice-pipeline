@@ -22,7 +22,7 @@
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
 import { config } from './config.js';
-import { readTail, turnStart, resolvePrompt, gist, flatten } from './transcripts.js';
+import { readTail, turnStart, resolvePrompt, gist, flatten, fromHim } from './transcripts.js';
 
 // fs.watch fires several times for one append, so coalesce. Long enough to batch a write, far short
 // of anything a person notices.
@@ -106,6 +106,7 @@ function drain(st) {
     // (`dequeue` is the other ending — it started a turn of its own — and carries no content, so the
     // `user` record that follows is what reports it.)
     if (d.type === 'queue-operation') {
+      if (!fromHim(d.content)) continue;
       const said = resolvePrompt(d.content);
       if (said.prompt && (d.operation === 'enqueue' || d.operation === 'remove')) {
         send(st, { session: st.id, state: d.operation === 'enqueue' ? 'queued' : 'said', text: said.prompt });
