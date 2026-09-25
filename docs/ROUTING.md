@@ -126,7 +126,7 @@ all, only error.
 
 ### Judge the instruction, not the conversation
 
-`recent_context()` prepends the recent hub conversation to the prompt, so the escalation decision is
+`recent_context()` prepends the day's hub conversation (since 4 AM, timestamped) to the prompt, so the escalation decision is
 made over a blob that often contains the last few nutrition turns. Sonnet used to read that and
 escalate a to-do add because the previous minute had been about food. The directive now says to decide
 from the current instruction alone; if escalations for lights and list adds reappear, that clause is

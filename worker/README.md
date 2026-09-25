@@ -124,15 +124,17 @@ Hub mode and full-agent mode keep **separate**, independently-persisted sessions
 `agent_mode` toggle changes which one a request resumes; it never clobbers the
 other's context.
 
-The hub window is **reset** (started fresh) when any of these hold:
+**The hub agent sees the whole day.** Every hub turn is a fresh run with the
+conversation replayed into its prompt (`recent_context()`): everything said
+since the day began at **4 AM Eastern** (`day_start`, `TZ_DISPLAY`, the hub's own
+"today"), or since the last manual "Reset context" (`voice_reset_at`) if that is
+later, oldest first, each line with its time, room chatter marked as ignored. An
+idle gap does not cut it, and the Fly worker's UTC clock does not move the
+boundary. A heavy day is about 12k tokens. `session_reset_s` still bounds which
+worker owns the conversation (affinity) and the API fallback's own buffer; it no
+longer bounds what the agent remembers.
 
-- no stored session id yet, **or**
-- last activity was longer ago than `app_settings.session_reset_s` (default
-  **300s**), **or**
-- last activity was on a **different calendar day** than now, **or**
-- the hub enqueued the `__RESET_CONTEXT__` sentinel ("Reset context").
-
-The agent session resets only on that manual reset.
+The agent session resets only on a manual reset.
 
 ## allowedTools (blast-radius note)
 

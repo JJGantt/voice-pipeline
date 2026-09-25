@@ -19,11 +19,10 @@ Design notes:
 - Serialized: exactly one request is processed at a time, never concurrent.
 - Defensive: every Supabase call is wrapped so a transient HTTP error logs and
   is swallowed rather than killing the loop.
-- Hub mode and full-agent mode keep SEPARATE, independently-persisted `claude` sessions (hub_session.json /
-  agent_session.json), each resumed via `--resume`. The hub session resets on an idle gap or calendar-day
-  rollover (session_reset_s) or manually; the agent session resets ONLY on a manual "Reset context". Switching
-  the agent_mode toggle just changes which session a request resumes — it never clobbers the other's context.
-  See should_reset_session() / session_file().
+- Hub turns are fresh runs with the day's conversation replayed into the prompt (recent_context: since 4 AM
+  Eastern or the last manual reset, timestamped). Full-agent mode keeps a persisted `claude` session
+  (agent_session.json) resumed via `--resume`, reset ONLY on a manual "Reset context". Switching the
+  agent_mode toggle never clobbers the other's context. See should_reset_session() / session_file().
 """
 
 import asyncio
@@ -40,6 +39,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone, date, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import httpx
@@ -1181,43 +1181,69 @@ def should_reset_session(state: dict | None, agent: bool = False) -> bool:
     return False
 
 
+# The hub agent's day: it begins at 4 AM in Jared's own timezone, not at midnight and not in the host's
+# zone (the Fly worker runs in UTC). The same boundary the hub uses for every "today" (lib/dates.js).
+DAY_TZ = ZoneInfo(os.environ.get("TZ_DISPLAY", "America/New_York"))
+DAY_STARTS_HOUR = 4
+
+
+def day_start(now: datetime) -> datetime:
+    """The start of the day `now` belongs to, as an aware datetime."""
+    local = now.astimezone(DAY_TZ)
+    start = local.replace(hour=DAY_STARTS_HOUR, minute=0, second=0, microsecond=0)
+    return start - timedelta(days=1) if local < start else start
+
+
 def recent_context(db: Supabase) -> str:
-    """Replay the CURRENT hub conversation into a FRESH claude run instead of using --resume. We keep our
-    own clean transcript in voice_messages (each turn's user prompt + final assistant reply), so a fresh
-    process gets exactly the conversation and NONE of the CLI-session baggage — tool schemas, thinking
-    blocks, the __ESCALATE__ sentinel — that let the two models cross-contaminate one shared session.
-    Bounded by the SAME rule the old session used: back to the last idle gap (> session_reset_s) or a
-    calendar-day rollover. Tool RESULTS are deliberately omitted — a follow-up that needs live data just
-    re-fetches with a tool (the fresh run has them all)."""
+    """THE WHOLE DAY, replayed into a FRESH claude run instead of using --resume. We keep our own clean
+    transcript in voice_messages (each turn's user prompt + final assistant reply), so a fresh process
+    gets exactly the conversation and NONE of the CLI-session baggage — tool schemas, thinking blocks,
+    the __ESCALATE__ sentinel — that let the two models cross-contaminate one shared session.
+
+    Everything since the day began (4 AM, `day_start`), or since a manual reset from the hub if that is
+    later, oldest first, each line with its time — so he can refer back to anything said earlier today,
+    from any surface. An idle gap does not cut it: a quiet afternoon is still today. A day is small: a
+    heavy one measured ~4.5k tokens of real exchanges plus ~6k of marked room chatter. Tool RESULTS are
+    deliberately omitted — a follow-up that needs live data just re-fetches with a tool."""
+    now = datetime.now(timezone.utc)
+    since = day_start(now)
     try:
-        rows = db.get("voice_messages",
-                      "focus=eq.hub&mode=eq.hub&role=in.(user,assistant)&done=eq.true"
-                      "&order=created_at.desc&limit=40&select=role,text,created_at,ignored")
+        reset = db.get("app_settings", "key=eq.voice_reset_at&select=value")
+        at = _parse_ts((reset or [{}])[0].get("value") or "") if reset else None
+        if at and at > since:
+            since = at
+    except Exception:  # noqa: BLE001
+        pass
+    rows: list = []
+    try:
+        while True:
+            page = db.get("voice_messages",
+                          "focus=eq.hub&mode=eq.hub&role=in.(user,assistant)&done=eq.true"
+                          f"&created_at=gte.{since.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z')}"
+                          f"&order=created_at.asc&limit=1000&offset={len(rows)}&select=role,text,created_at,ignored")
+            rows += page or []
+            if not page or len(page) < 1000:
+                break
     except Exception:  # noqa: BLE001
         return ""
-    if not rows:
-        return ""
-    budget = session_reset_s()
-    now = datetime.now(timezone.utc)
-    kept, prev = [], now
-    for r in rows:                       # newest → oldest, stop at the session boundary
-        ts = _parse_ts(r.get("created_at") or "")
-        if (not ts or (prev - ts).total_seconds() > budget
-                or ts.astimezone().date() != now.astimezone().date()):
-            break
-        kept.append(r); prev = ts
     # An ignored turn is marked rather than hidden. Unmarked, room chatter would replay as things Jared
     # said TO the assistant; marked, he can point at one — "do the one you ignored" — and the model can
     # see both what was said and that nothing was done about it.
     def _line(r):
+        ts = _parse_ts(r.get("created_at") or "")
+        when = ts.astimezone(DAY_TZ).strftime("%-I:%M %p") if ts else "?"
         who = 'You' if r.get('role') == 'user' else 'Raspy'
         txt = (r.get('text') or '').strip()
-        return f"You (ignored as room noise, not acted on): {txt}" if r.get('ignored') else f"{who}: {txt}"
-    lines = [_line(r) for r in reversed(kept) if (r.get('text') or '').strip()]
+        if r.get('ignored'):
+            return f"[{when}] You (ignored as room noise, not acted on): {txt}"
+        return f"[{when}] {who}: {txt}"
+    lines = [_line(r) for r in rows if (r.get('text') or '').strip()]
     if not lines:
         return ""
-    return ("[Recent conversation so far — context only; tool RESULTS are not included, so call a tool "
-            "if you need current data:\n" + "\n".join(lines) + "]\n\n")
+    now_local = now.astimezone(DAY_TZ).strftime("%-I:%M %p")
+    return ("[Today so far: everything said between you since the day began, oldest first, each line "
+            "with its time. Context only; tool RESULTS are not included, so call a tool if you need "
+            f"current data. It is now {now_local}.\n" + "\n".join(lines) + "]\n\n")
 
 
 # --------------------------------------------------------------------------- #
