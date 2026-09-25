@@ -137,7 +137,14 @@ async function run(cmd) {
     const id = String((cmd.payload || {}).session || '').trim();
     const row = await deskSession(id);
     if (!row) throw new Error(`no such session: ${id}`);
-    if (row.status === 'resident') throw new Error(`${id} is still running`);
+    // Already open: resuming it is just talking to it, the same as the Pi does. Refusing here threw
+    // away every follow-up that named a running session.
+    if (row.status === 'resident') {
+      const words = String((cmd.payload || {}).prompt || '').trim();
+      if (!words) return `${id} was already running`;
+      if (!row.tty) throw new Error(`no terminal recorded for ${id}`);
+      return `${id} was already running — sent ${words.length} chars to ${row.tty} (${await sendToTty(row.tty, words)})`;
+    }
     if (!row.claude_session_id) throw new Error(`${id} has no transcript recorded — cannot resume`);
     const dir = repoDir(row.repo);
     ensureTrusted(dir);
