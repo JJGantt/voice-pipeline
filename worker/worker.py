@@ -540,16 +540,14 @@ ATTACH_DIRECTIVE = (
 # Sentinel the model emits to silently drop a turn (wake-word false positive). Matched loosely below.
 IGNORE_SENTINEL = "__IGNORE__"
 
-# Appended to every command he meant (pressed, typed, sent from the watch or the phone): unlike a room
-# mic, nothing here may be dropped. Without it the model still reached for the ignore sentinel on a test
-# or a garbled clip, since the day's replayed history is full of room chatter marked as ignored.
-# There is deliberately no canned "didn't understand" reply to fall back on: offered one, the model used
-# it as an exit on clear speech that merely ended without a literal question.
+# Appended to every command he meant (pressed, typed, sent from the watch or the phone). These turns are
+# never told the ignore sentinel exists — only ADDRESSING_DIRECTIVE teaches it, on room-mic turns — so
+# there is nothing to skip with. Nor is there a canned "didn't understand" reply: offered one, the model
+# used it as an exit on clear speech that merely ended without a literal question.
 DELIBERATE_DIRECTIVE = (
-    "\n\n[He said this to you on purpose. Always answer it. Never reply with "
-    f"'{IGNORE_SENTINEL}': that is only for room mics. When he describes something without asking "
-    "outright, answer what he evidently wants to know. Only if you genuinely cannot tell what he means, "
-    "say so in your own words and ask him.]"
+    "\n\n[He said this to you on purpose. When he describes something without asking outright, answer "
+    "what he evidently wants to know. Only if you genuinely cannot tell what he means, say so in your "
+    "own words and ask him.]"
 )
 
 # Always-on mics hear the WHOLE room — the TV, Jared talking to his cats, other people talking to or
@@ -2583,14 +2581,6 @@ def process_request(db: Supabase, req: dict) -> None:
         log(f"ignored likely false-positive (kept in thread): {transcript[:60]!r}")
         maybe_auto_disable_wakefree()
         return
-
-    # A command he meant that still came back as the ignore sentinel despite DELIBERATE_DIRECTIVE: it is
-    # answered, never dropped or failed, by the same clean no-context Opus re-run the escalate leak gets.
-    if not ambient and ("__ignore__" in text.lower() or re.sub(r"[^a-z]", "", text.lower()) == "ignore"):
-        log(f"deliberate command came back as __IGNORE__ → clean Opus re-run: {transcript[:60]!r}")
-        result = run_claude(prompt, None, on_event=_emit, system_append=sys_ctx,
-                            model="opus", allow_read=bool(att_paths), allowed_tools=turn_tools(ambient), deny_tools=room_deny)
-        text = (result.get("text") or "").strip()
 
     # Real turn → now write the user bubble (deferred past the noise check), then close the activity bar.
     db.post("voice_messages",
