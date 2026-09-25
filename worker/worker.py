@@ -540,9 +540,19 @@ ATTACH_DIRECTIVE = (
 # Sentinel the model emits to silently drop a turn (wake-word false positive). Matched loosely below.
 IGNORE_SENTINEL = "__IGNORE__"
 
-# What a deliberate command the model could not make sense of shows as: the phone's own line for a clip
-# that transcribed to nothing, so both kinds of unheard command read the same.
-UNHEARD_REPLY = "Didn’t catch that — try again"
+# A deliberate command is always ANSWERED, never ignored and never failed: when what arrived cannot be
+# made out (an accidental press, a test, a clip that transcribed to "." or "Bye."), this is the answer.
+# His words for it.
+UNHEARD_REPLY = "I didn't understand it."
+
+# Appended to every command he meant (pressed, typed, sent from the watch or the phone): unlike a room
+# mic, nothing here may be dropped. Without it the model still reached for the ignore sentinel on a test
+# or a garbled clip, since the day's replayed history is full of room chatter marked as ignored.
+DELIBERATE_DIRECTIVE = (
+    "\n\n[He said this to you on purpose. Always answer it. Never reply with "
+    f"'{IGNORE_SENTINEL}': that is only for room mics. If you cannot make out what he meant, reply "
+    f"exactly: {UNHEARD_REPLY}]"
+)
 
 # Always-on mics hear the WHOLE room — the TV, Jared talking to his cats, other people talking to or
 # near him — and speaker-ID can't tell "a command for the assistant" from "Jared said a sentence out
@@ -2380,7 +2390,9 @@ def process_request(db: Supabase, req: dict) -> None:
     # assistant and a turn may legitimately be dropped as noise. The phone's quick button is
     # PUSH-TO-TALK: he held it and spoke, so every utterance from it is meant, however conversational
     # it sounds. Judging one of those "not for you" threw away "So I've never done better than 3 by 10."
-    ambient = source in ("fly", "mac")
+    # The room mics: the puck, the Mac's listener, and the watch's always-on listener (`watch`; a press on
+    # the watch is `watch-cmd`). What they pick up may be ignored silently.
+    ambient = source in ("fly", "mac", "watch")
     prompt = transcript
     # Give the model a clock so any relative date/time resolves correctly — without it the model defaults
     # to its training era (e.g. logging "yesterday" against 2024). Pure wall-clock, no timezone concept.
@@ -2429,6 +2441,8 @@ def process_request(db: Supabase, req: dict) -> None:
                    "never mention it otherwise.]")
     if ambient:
         prompt += ADDRESSING_DIRECTIVE + ROOM_SEND_DIRECTIVE
+    else:
+        prompt += DELIBERATE_DIRECTIVE
     if quick:
         prompt += QUICK_REPLY_DIRECTIVE
     if source in ("fly", "mac"):
@@ -2572,22 +2586,12 @@ def process_request(db: Supabase, req: dict) -> None:
         maybe_auto_disable_wakefree()
         return
 
-    # A command he meant (typed, or pushed on the phone's button) that still came back as the ignore
-    # sentinel, because what arrived was unintelligible: a clip transcribed as Icelandic did exactly this,
-    # and the raw sentinel went out as the reply. Only the room mics may be ignored silently. Here the
-    # words stay in the thread and the phone shows a failure, not "__IGNORE__".
+    # A command he meant that still came back as the ignore sentinel despite DELIBERATE_DIRECTIVE: it is
+    # answered, as the directive asks, rather than failed. Only the room mics may be ignored silently, and
+    # a failure here offered a Retry that would only send the same unreadable words again.
     if not ambient and ("__ignore__" in text.lower() or re.sub(r"[^a-z]", "", text.lower()) == "ignore"):
-        push_activity(UNHEARD_REPLY, "error")
-        db.post("voice_messages",
-                {"request_id": rid, "focus": "hub", "mode": msg_mode, "role": "user", "text": transcript,
-                 "done": True, **({"attachments": attachments} if attachments else {})})
-        db.post("voice_messages",
-                {"request_id": rid, "focus": "hub", "mode": msg_mode, "role": "assistant",
-                 "text": UNHEARD_REPLY, "done": True, "worker": WORKER_ID})
-        db.patch("voice_requests", f"id=eq.{rid}",
-                 {"status": "error", "error": UNHEARD_REPLY, "updated_at": now_iso()})
-        log(f"could not understand a deliberate command: {transcript[:60]!r}")
-        return
+        log(f"deliberate command answered as not understood: {transcript[:60]!r}")
+        text = UNHEARD_REPLY
 
     # Real turn → now write the user bubble (deferred past the noise check), then close the activity bar.
     db.post("voice_messages",
