@@ -501,16 +501,22 @@ def _read_setting(key: str, default: bool = False) -> bool:
 
 
 def _write_setting(key: str, value: str) -> None:
-    """Write a hub setting. Used to make push-to-talk's global mute a DB flag (`voice_muted`) the Fly
-    server reads, so the ESP mute is gated on real state instead of an arbitrary server-side timeout."""
+    """Write a hub setting, CREATING it if it is not there yet. This is how the Mac holds the global mute
+    (`voice_mute_mac`, which the hub folds into `voice_muted`), and an update alone does nothing to a row
+    that does not exist: the hold never reached the table, `voice_muted` stayed 0, and the Fly server's
+    settings backstop took that 0 as a missed update and unmuted the ESP mid-dictation, so the puck heard
+    the rest and ran it as a command."""
     try:
-        httpx.patch(f"{SUPABASE_URL}/rest/v1/app_settings",
-                    params={"key": f"eq.{key}"},
-                    headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
-                             "Content-Type": "application/json", "Prefer": "return=minimal"},
-                    json={"value": value}, timeout=8)
-    except Exception:  # noqa: BLE001
-        pass
+        r = httpx.post(f"{SUPABASE_URL}/rest/v1/app_settings",
+                       params={"on_conflict": "key"},
+                       headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                                "Content-Type": "application/json",
+                                "Prefer": "resolution=merge-duplicates,return=minimal"},
+                       json={"key": key, "value": value}, timeout=8)
+        if r.status_code >= 300:
+            log(f"setting {key} not written: {r.status_code} {r.text[:120]}")
+    except Exception as e:  # noqa: BLE001
+        log(f"setting {key} not written: {e}")
 
 
 def _reconcile_settings() -> None:
