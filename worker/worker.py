@@ -2580,8 +2580,12 @@ def process_request(db: Supabase, req: dict) -> None:
             f"id=eq.{rid}",
             {"status": "done", "result": text, "updated_at": now_iso()},
         )
+        # Pushed to the phone (and from there the watch) when nothing else will tell him: a room mic has
+        # no screen, and the watch app is suspended the moment the wrist drops, so a command sent from it
+        # would otherwise finish with no word to him until he looks again.
+        if source in ("fly", "mac", "watch-cmd") and text:
+            notify_phone(text)
         if source in ("fly", "mac") and text:
-            notify_phone(text)   # ambient voice command → push the past-tense result to Jared's phone
             # Speak it: Mac-synth→Pi when enabled (faster), else the Pi synthesizes from voice_speech. The
             # Mac path returns False on any failure, so voice_speech (Pi synth) stays the safety net.
             if not (WORKER_ID == "mac" and synth_on_mac() and speak_via_mac(text)):
