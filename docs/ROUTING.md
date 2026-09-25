@@ -206,10 +206,11 @@ Room-mic turns (sources `fly` and `mac`) get `ADDRESSING_DIRECTIVE` appended, be
 always on and hear the whole room. The phone's push-to-talk button (`web-quick`) and typed text never
 do: he pressed the button or typed it, so it was meant.
 
-Only a room-mic turn may be ignored silently. A deliberate command can still come back as `__IGNORE__`
-when what arrived was unintelligible (a clip transcribed as Icelandic did), and the worker then keeps
-the words in the thread and shows `UNHEARD_REPLY` as a failure, rather than sending the raw sentinel as
-the reply.
+Only a room-mic turn may be ignored silently. Every other turn gets `DELIBERATE_DIRECTIVE`: answer it,
+work out the implied question when he describes something without asking one, and if he truly cannot be
+understood say so in the model's own words. There is no canned "didn't understand" line; offered one, the
+model used it on clear speech. A deliberate turn that still returns `__IGNORE__` is re-run on a fresh
+Opus with no context, like a leaked `__ESCALATE__`.
 
 It carries only what the model cannot work out from the text itself:
 

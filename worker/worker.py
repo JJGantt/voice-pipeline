@@ -540,18 +540,16 @@ ATTACH_DIRECTIVE = (
 # Sentinel the model emits to silently drop a turn (wake-word false positive). Matched loosely below.
 IGNORE_SENTINEL = "__IGNORE__"
 
-# A deliberate command is always ANSWERED, never ignored and never failed: when what arrived cannot be
-# made out (an accidental press, a test, a clip that transcribed to "." or "Bye."), this is the answer.
-# His words for it.
-UNHEARD_REPLY = "I didn't understand it."
-
 # Appended to every command he meant (pressed, typed, sent from the watch or the phone): unlike a room
 # mic, nothing here may be dropped. Without it the model still reached for the ignore sentinel on a test
 # or a garbled clip, since the day's replayed history is full of room chatter marked as ignored.
+# There is deliberately no canned "didn't understand" reply to fall back on: offered one, the model used
+# it as an exit on clear speech that merely ended without a literal question.
 DELIBERATE_DIRECTIVE = (
     "\n\n[He said this to you on purpose. Always answer it. Never reply with "
-    f"'{IGNORE_SENTINEL}': that is only for room mics. If you cannot make out what he meant, reply "
-    f"exactly: {UNHEARD_REPLY}]"
+    f"'{IGNORE_SENTINEL}': that is only for room mics. When he describes something without asking "
+    "outright, answer what he evidently wants to know. Only if you genuinely cannot tell what he means, "
+    "say so in your own words and ask him.]"
 )
 
 # Always-on mics hear the WHOLE room — the TV, Jared talking to his cats, other people talking to or
@@ -2587,11 +2585,12 @@ def process_request(db: Supabase, req: dict) -> None:
         return
 
     # A command he meant that still came back as the ignore sentinel despite DELIBERATE_DIRECTIVE: it is
-    # answered, as the directive asks, rather than failed. Only the room mics may be ignored silently, and
-    # a failure here offered a Retry that would only send the same unreadable words again.
+    # answered, never dropped or failed, by the same clean no-context Opus re-run the escalate leak gets.
     if not ambient and ("__ignore__" in text.lower() or re.sub(r"[^a-z]", "", text.lower()) == "ignore"):
-        log(f"deliberate command answered as not understood: {transcript[:60]!r}")
-        text = UNHEARD_REPLY
+        log(f"deliberate command came back as __IGNORE__ → clean Opus re-run: {transcript[:60]!r}")
+        result = run_claude(prompt, None, on_event=_emit, system_append=sys_ctx,
+                            model="opus", allow_read=bool(att_paths), allowed_tools=turn_tools(ambient), deny_tools=room_deny)
+        text = (result.get("text") or "").strip()
 
     # Real turn → now write the user bubble (deferred past the noise check), then close the activity bar.
     db.post("voice_messages",
