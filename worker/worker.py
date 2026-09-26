@@ -67,10 +67,11 @@ WORKER_PRIORITY = [
 STATE_DIR = Path(os.path.expanduser(os.environ.get("STATE_DIR", "~/.voice-worker")))
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 
-# The Console API key is the FALLBACK billing path, not the default. Pop it out of the environment at
-# import so no subprocess — the SDK/CLI runners, the MCP servers — can inherit it and silently bill the
-# API; the ApiRunner (the one legitimate consumer) reads it from this variable instead.
-_API_KEY = os.environ.pop("ANTHROPIC_API_KEY", "")
+# The worker never bills the Console API: every turn runs on the Claude subscription, and a failure is
+# retried and then surfaced, never finished on the key. The key may still be in the environment (older
+# .env files, the Fly secret), so it is popped at import — a subprocess that inherited it would quietly
+# bill the API instead of the subscription.
+os.environ.pop("ANTHROPIC_API_KEY", None)
 # synth-on-Mac (hub setting `synth_on_mac`, default OFF): the Mac's PyTorch Kokoro synthesizes ~4x faster
 # than the Pi's CPU ONNX, so when on, the Mac worker turns the reply to PCM here and ships it to the Pi to
 # play — instead of writing voice_speech for the Pi to synthesize (slow). Falls back to voice_speech on
@@ -186,10 +187,9 @@ def notify_phone(body: str, title: str = "Hub") -> None:
     threading.Thread(target=_send, daemon=True).start()
 
 
-# Failure alerts. A request is not allowed to fail silently: the subscription path failing is pushed
-# the moment it happens, even when the API fallback rescues the turn, because a revoked or expired
-# token is a standing condition that every later request pays for; a request that fails on both paths
-# is pushed with its error. One push per host per (stage, class) per ALERT_COOLDOWN_S, so a burst of
+# Failure alerts. A request is not allowed to fail silently: a subscription run that still fails after
+# its retries (`run_subscription`) is pushed with its error, because a revoked or expired token is a
+# standing condition that every later request pays for. One push per host per (stage, class) per ALERT_COOLDOWN_S, so a burst of
 # the same fault does not flood the phone. Deliberately bypasses push_enabled — that toggle is for
 # command results, not outages.
 ALERT_COOLDOWN_S = float(os.environ.get("ALERT_COOLDOWN_S", "3600"))
@@ -205,6 +205,39 @@ def classify_failure(err: str) -> str:
     if "429" in e or "rate limit" in e or "overloaded" in e:
         return "rate-limit"
     return "error"
+
+
+# A subscription run that fails for a reason that passes on its own — Anthropic overloaded or erroring,
+# a rate limit, the network — is tried again after each of these pauses before the turn is given up.
+# There is no paid fallback behind it: waiting a little is free, and on 2026-09-21 a single "529
+# Overloaded" sent an Opus turn to the Console key. An auth or billing failure is not retried; waiting
+# cannot fix a revoked login.
+SUBSCRIPTION_RETRY_S = (3, 8, 15)
+
+
+def transient_failure(err: str) -> bool:
+    e = (err or "").lower()
+    if classify_failure(err) == "rate-limit":
+        return True
+    return any(t in e for t in ("529", "500", "502", "503", "504", "internal server error", "timed out",
+                                "timeout", "connection", "network", "temporarily"))
+
+
+def run_subscription(run, label: str) -> dict:
+    """`run()` (a subscription turn), retried through SUBSCRIPTION_RETRY_S while it fails transiently.
+    Returns the last result; the caller surfaces it if it is still a failure."""
+    result = run()
+    for pause in SUBSCRIPTION_RETRY_S:
+        if result.get("ok") or not transient_failure(result.get("raw_error") or ""):
+            break
+        log(f"{label} failed ({result.get('raw_error')}) — retrying on the subscription in {pause}s")
+        push_activity(f"Retrying ({classify_failure(result.get('raw_error') or '')})")
+        time.sleep(pause)
+        result = run()
+    if not result.get("ok"):
+        log(f"{label} failed ({result.get('raw_error')}) — giving up, no paid fallback")
+        alert_failure("subscription", result.get("raw_error") or "")
+    return result
 
 
 def alert_failure(stage: str, err: str) -> None:
@@ -1290,8 +1323,8 @@ def fetch_attachments(paths: list) -> tuple[str | None, list[str]]:
 # command. The data MCP's now() reads it so a voice-logged SET lands at when Jared actually spoke — his
 # rest-clock reference — not ~30s later when the command finishes the pipeline.
 #
-# It is a FILE and not an env value, and that distinction is the whole point. The fast path (ApiRunner)
-# starts its MCP servers ONCE per worker lifetime as warm stdio sessions, so anything placed in the
+# It is a FILE and not an env value, and that distinction is the whole point. The warm fast path
+# (SdkRunner) starts its MCP servers ONCE per worker lifetime as warm stdio sessions, so anything placed in the
 # subprocess environment is fixed for as long as the worker runs: passing the timestamp that way froze
 # it at one moment and stamped 29 hours of writes with it (Aug 31, found 2026-09-01). The path is
 # constant — safe to bake into a warm session — while the contents change per command.
@@ -1413,8 +1446,7 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
     n_tools = 0
 
     # Subscription path: `claude -p` uses the logged-in Claude subscription. ANTHROPIC_API_KEY is popped
-    # from the environment at import (it is the fallback billing path, held in _API_KEY for the
-    # ApiRunner only), so no subprocess can inherit it and silently bill the API.
+    # from the environment at import, so no subprocess can inherit it and silently bill the API.
     sub_env = os.environ.copy()
     # Load ALL MCP tool schemas inline every turn — no lazy tool-search/discovery round-trip. This is a
     # tool-centric agent (its whole job is calling these tools), and the trimmed toolset is well under the
@@ -1553,269 +1585,15 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
 # --------------------------------------------------------------------------- #
 
 
-# --------------------------------------------------------------------------- #
-# (The old warm-Agent-SDK path was removed — it used the claude_code preset, i.e. the full Claude Code
-# toolset, and didn't belong to either route. The two strategies are now run_claude + ApiRunner.)
-
-
-# --------------------------------------------------------------------------- #
-# Stripped-down API agent — the MCP tools plus the API's web tools, nothing else.
-#
-# `claude -p` (and the warm Agent SDK on the claude_code preset) hand the model the whole Claude Code
-# toolset — Bash, WebSearch, WebFetch, ToolSearch, Write, Cron, ~30 tools — and only DENY the
-# non-allowlisted ones at execution time. The model still SEES them and reaches for ToolSearch/Bash,
-# which is noise (and invites a tiny model like Haiku to hallucinate). This runner instead calls the
-# Anthropic Messages API directly with exactly the MCP tools as `tools=`, plus web search and fetch as
-# server tools: no other built-ins, no tool discovery, no coding-agent system prompt.
-#
-# It's a real agentic loop, not one-shot — the model can chain sequential tool calls and always ends
-# with a user-facing text reply. MCP servers are started ONCE (warm stdio sessions) and their schemas
-# are inlined with the prompt, so a turn is one round-trip (+ tool round-trips), no spin-up per request.
-API_MODEL_IDS = {"haiku": "claude-haiku-4-5", "sonnet": "claude-sonnet-5", "opus": "claude-opus-5"}
-# The API requires a max_tokens, so it is each model's own ceiling — never a shorter number picked
-# here. It exists to bound a runaway, and a reply ends when the model is done, not when a budget
-# runs out. Values this large need the streaming call below or the request outlives its HTTP timeout.
-API_MAX_TOKENS = {"claude-opus-5": 128000, "claude-sonnet-5": 128000, "claude-haiku-4-5": 64000}
-
-
-def _api_allowed_names(allowed):
-    """SAFE_TOOLS is CLI-shaped — "mcp__data__get_workout", or "mcp__voice" for a whole server. The api
-    runner names tools "<server>__<tool>" and uses shorter server prefixes. Translate one into the other,
-    returning (whole servers allowed, individual tools allowed)."""
-    alias = {"govee-lights": "govee", "petlibro-feeder": "petlibro"}
-    servers, exact = set(), set()
-    for entry in allowed:
-        parts = entry.split("__")
-        if len(parts) < 2 or parts[0] != "mcp":
-            continue
-        srv = alias.get(parts[1], parts[1])
-        if len(parts) == 2:
-            servers.add(srv)                                  # every tool on this server
-        else:
-            exact.add(srv + "__" + "__".join(parts[2:]))
-    return servers, exact
-
-
-class ApiRunner:
-    def __init__(self):
-        self._loop = None
-        self._client = None
-        self._stack = None        # AsyncExitStack holding the warm MCP stdio sessions
-        self._last_allowed = None  # toolset of the previous turn; a change invalidates the history
-        self._sessions = {}       # server name -> mcp ClientSession
-        self._tools = []          # Anthropic tool schemas (only the MCP tools)
-        self._dispatch = {}       # anthropic tool name -> (server, real MCP tool name)
-        self._messages = []       # conversation history (reset on idle / day rollover)
-        self._last = 0.0
-        self._day = None
-
-    def _start_loop(self):
-        if self._loop is None:
-            self._loop = asyncio.new_event_loop()
-            threading.Thread(target=self._loop.run_forever, name="api-loop", daemon=True).start()
-
-    async def _ensure(self):
-        if self._client is None:
-            from anthropic import AsyncAnthropic
-            self._client = AsyncAnthropic(api_key=_API_KEY)
-        if self._sessions:
-            return
-        from contextlib import AsyncExitStack
-        from mcp import ClientSession, StdioServerParameters
-        from mcp.client.stdio import stdio_client
-        from mcp.client.streamable_http import streamablehttp_client
-        # DATA_TS_FILE for the same reason the SDK path needs it, and these sessions are warm too
-        # (`if self._sessions: return` above) — but note this path never carried the override at all,
-        # so a set logged through the fallback landed at pipeline-end rather than at Jared's
-        # rest-clock moment. Same file, so both runners now agree.
-        env = {**os.environ, "SUPABASE_URL": SUPABASE_URL, "SUPABASE_KEY": SUPABASE_KEY,
-               "DATA_TS_FILE": str(CMD_TS_FILE), "DATA_LOC_FILE": str(CMD_LOC_FILE),
-               "DATA_CALLER": "hub"}
-        specs = []   # (name, command, args) for stdio; (name, url, None) for an HTTP server
-        if os.path.exists(DATA_MCP_JS):  specs.append(("data", "node", [DATA_MCP_JS]))
-        if os.path.exists(VOICE_MCP_JS): specs.append(("voice", "node", [VOICE_MCP_JS]))
-        if os.path.exists(GOVEE_MCP_PY): specs.append(("govee", GOVEE_PY, [GOVEE_MCP_PY]))
-        if os.path.exists(PETLIBRO_MCP_PY): specs.append(("petlibro", PETLIBRO_PY, [PETLIBRO_MCP_PY]))
-        if os.path.exists(GMAIL_MCP_PY): specs.append(("gmail", GMAIL_PY, [GMAIL_MCP_PY]))
-        if HAS_MESSAGES: specs.append(("messages", MESSAGES_MCP_URL, None))
-        self._stack = AsyncExitStack()
-        for name, cmd, args in specs:
-            try:
-                if args is None:
-                    read, write, _ = await self._stack.enter_async_context(
-                        streamablehttp_client(cmd, headers=MESSAGES_HEADERS))
-                else:
-                    params = StdioServerParameters(command=cmd, args=args, env=env)
-                    read, write = await self._stack.enter_async_context(stdio_client(params))
-                session = await self._stack.enter_async_context(ClientSession(read, write))
-                await session.initialize()
-                tools = (await session.list_tools()).tools
-            except Exception as e:  # noqa: BLE001
-                # One MCP server that won't start must NOT take the whole runner down — `claude -p`
-                # tolerates a dead server and so must we. Observed: the Pi's petlibro venv was missing
-                # the `mcp` package, and that single ImportError failed EVERY command with
-                # "Connection closed" and bounced it to Opus. A broken feeder should cost you the
-                # feeder, not the fast path.
-                log(f"api agent: MCP server {name!r} failed to start ({e}) — continuing without it")
-                continue
-            self._sessions[name] = session
-            for t in tools:
-                if f"mcp__{name}__{t.name}" in SESSION_TOOLS:
-                    continue   # browser-only; see SESSION_TOOLS
-                aname = (name + "__" + t.name)[:64]
-                self._tools.append({
-                    "name": aname,
-                    "description": (t.description or ""),
-                    "input_schema": t.inputSchema or {"type": "object", "properties": {}},
-                })
-                self._dispatch[aname] = (name, t.name)
-        log(f"api agent: {len(self._tools)} MCP tools warm ({', '.join(self._sessions)})")
-
-    async def _close(self):
-        if self._stack is not None:
-            try:
-                await self._stack.aclose()
-            except Exception:  # noqa: BLE001
-                pass
-        self._stack = None
-        self._sessions, self._tools, self._dispatch = {}, [], {}
-
-    def reset(self):
-        self._messages = []   # keep MCP warm; just forget the conversation
-
-    async def _call_tool(self, server, real, args):
-        try:
-            r = await self._sessions[server].call_tool(real, args or {})
-            parts = [getattr(c, "text", None) or str(c) for c in (r.content or [])]
-            return "\n".join(p for p in parts if p) or "(no output)"
-        except Exception as e:  # noqa: BLE001
-            return f"tool error: {e}"
-
-    async def _run(self, prompt, system, model, think, on_event, effort="high", allowed=None):
-        await self._ensure()
-        self._messages.append({"role": "user", "content": prompt})
-        # Cache the stable prefix — the tool schemas (~10k tokens) + system — for 1 hour, so warm hits
-        # cost ~10% of input instead of full price every command. The breakpoint sits on the system
-        # block; tools precede it in the cache-prefix order (tools → system → messages), so they're
-        # cached too. The per-turn directives ride on the USER message (not system), so this prefix
-        # stays byte-identical across commands. 1h TTL survives the gaps between voice commands.
-        sys_param = ([{"type": "text", "text": system,
-                       "cache_control": {"type": "ephemeral", "ttl": "1h"}}] if system else system)
-        # Gate by what the model is HANDED, not by refusing it later: on the fast path only SAFE_TOOLS
-        # reach `tools=`, so a gated write isn't denied — it doesn't exist to be called. Same safety
-        # property `--allowedTools` gave the `-p` path, enforced one step earlier.
-        tools = self._tools
-        if allowed is not None:
-            _srv, _exact = _api_allowed_names(allowed)
-            tools = [t for t in self._tools
-                     if t["name"].split("__", 1)[0] in _srv or t["name"] in _exact]
-        model_id = API_MODEL_IDS.get(model, model)
-        # The CLI paths get WebSearch/WebFetch as Claude Code built-ins; here they are the API's own
-        # server tools, run on Anthropic's side, so there is nothing to dispatch. Haiku predates the
-        # dynamic-filtering variants and takes the basic ones.
-        if allowed is None or "WebSearch" in allowed:
-            tools = tools + [{"type": "web_search_20250305" if "haiku" in model_id else "web_search_20260209",
-                              "name": "web_search"}]
-        if allowed is None or "WebFetch" in allowed:
-            tools = tools + [{"type": "web_fetch_20250910" if "haiku" in model_id else "web_fetch_20260209",
-                              "name": "web_fetch"}]
-        kwargs = dict(model=model_id, system=sys_param,
-                      tools=tools, messages=self._messages,
-                      max_tokens=API_MAX_TOKENS.get(model_id, 64000),
-                      extra_headers={"anthropic-beta": "extended-cache-ttl-2025-04-11"})
-        if think:  # adaptive thinking (budget_tokens is rejected on 4.8); effort sets the depth
-            kwargs["thinking"] = {"type": "adaptive"}
-            kwargs["output_config"] = {"effort": effort}
-        final_text = ""
-        logged_cache = False
-        for _ in range(8):  # agentic loop: chain tool calls until a final text reply
-            # Streamed, not `create`: max_tokens is the model's full ceiling, and the SDK rejects a
-            # non-streaming request that large because it can outrun the HTTP timeout. The stream is
-            # collected into the same final Message the rest of this loop reads.
-            async with self._client.messages.stream(**kwargs) as _s:
-                resp = await _s.get_final_message()
-            if not logged_cache:  # verify caching engages: creation on cold, read on warm
-                u = getattr(resp, "usage", None)
-                if u is not None:
-                    log(f"cache: create={getattr(u, 'cache_creation_input_tokens', 0)} "
-                        f"read={getattr(u, 'cache_read_input_tokens', 0)} in={getattr(u, 'input_tokens', 0)}")
-                logged_cache = True
-            self._messages.append({"role": "assistant", "content": resp.content})  # preserves thinking/tool blocks
-            tool_results = []
-            # The reply is the text AFTER the last tool block. A cited web answer arrives as several
-            # adjacent text blocks, so they are joined; text before a search ("let me look") is not it.
-            tail = []
-            for b in resp.content:
-                if b.type == "text":
-                    tail.append(b.text)
-                    continue
-                if b.type == "tool_use" and on_event and "".join(tail).strip():
-                    try:
-                        on_event("text", {"text": "".join(tail)})   # said on the way to a tool: progress
-                    except Exception:  # noqa: BLE001
-                        pass
-                tail = []
-                if b.type == "tool_use":
-                    if on_event:
-                        try:
-                            on_event("tool", {"name": b.name, "input": b.input})
-                        except Exception:  # noqa: BLE001
-                            pass
-                    server, real = self._dispatch.get(b.name, (None, None))
-                    out = await self._call_tool(server, real, b.input) if server else "tool not found"
-                    tool_results.append({"type": "tool_result", "tool_use_id": b.id, "content": out})
-            if tail:
-                final_text = "".join(tail)
-            if resp.stop_reason == "tool_use" and tool_results:
-                self._messages.append({"role": "user", "content": tool_results})
-                kwargs["messages"] = self._messages
-                continue
-            # The server-side search loop hit its own iteration cap. Re-sending the conversation as it
-            # stands resumes it; the trailing server_tool_use block is what tells the API to carry on.
-            if resp.stop_reason == "pause_turn":
-                kwargs["messages"] = self._messages
-                continue
-            break
-        return {"session_id": None, "text": final_text.strip(), "result": final_text.strip(),
-                "ok": bool(final_text.strip()), "raw_error": None}
-
-    def run(self, transcript, system_append="", on_event=None, model="haiku", think=False, effort="high",
-            allowed=None, fresh=False) -> dict:
-        """`fresh` drops this runner's own message history before the turn. Hub turns MUST set it: the
-        caller already prepends the replayed conversation (`ctx`) to the prompt, so keeping an internal
-        history too sends every exchange twice and grows uncached input ~2.2k tokens per turn. It also
-        keeps the documented hub contract — fresh runs over a bounded replayed window, not a session."""
-        self._start_loop()
-        if fresh:
-            self.reset()
-        now = time.monotonic()
-        today = datetime.now().astimezone().date()
-        # A toolset change also resets: replayed tool_use blocks would reference tools no longer in
-        # `tools=`, and the cached prefix is keyed on the schema list anyway.
-        if self._messages and (now - self._last > session_reset_s() or self._day != today
-                               or allowed != self._last_allowed):
-            self.reset()
-        self._last, self._day, self._last_allowed = now, today, allowed
-        try:
-            fut = asyncio.run_coroutine_threadsafe(
-                self._run(transcript, system_append, model, think, on_event, effort, allowed), self._loop)
-            return fut.result(timeout=CLAUDE_TIMEOUT_S + 30)
-        except Exception as e:  # noqa: BLE001 — never wedge the worker
-            self.reset()
-            return {"session_id": None, "text": "", "result": "", "ok": False, "raw_error": f"api run failed: {e}"}
-
-
 class SdkRunner:
     """Warm Claude Agent SDK client — the PRIMARY fast path, billed to the subscription.
 
     One long-lived headless Claude Code process holds the four MCP servers, so the per-command spawn
-    cost the ApiRunner was built to avoid is paid once, not per turn. Each hub turn runs in a FRESH
-    session (a new session_id on the same warm process): the caller replays the hub conversation into
-    the prompt — the same contract as the ApiRunner's `fresh` runs. Pinned to Sonnet + SAFE_TOOLS at
-    connect; escalation and full-agent turns keep their own `claude -p` spawns (full toolset).
-
-    The ApiRunner is the FALLBACK: same model tier, Console-billed, used only when this path errors
-    (rate-limited subscription, expired login, wedged process). Errors never upgrade the model.
+    spawn cost is paid once, not per turn. Each hub turn runs in a FRESH session (a new session_id on
+    the same warm process): the caller replays the hub conversation into the prompt. Pinned to Sonnet +
+    SAFE_TOOLS at connect; escalation and full-agent turns keep their own `claude -p` spawns (full
+    toolset). A failed turn is retried by `run_subscription` and then surfaced; errors never upgrade the
+    model and never move a turn onto the paid API.
     """
 
     def __init__(self):
@@ -1970,7 +1748,6 @@ class SdkRunner:
         return retry
 
 
-API = ApiRunner()
 SDK = SdkRunner()
 
 
@@ -2285,7 +2062,6 @@ def process_request(db: Supabase, req: dict) -> None:
             session_file(reset_agent).unlink(missing_ok=True)
         except Exception as e:
             log(f"reset: unlink session failed: {e}")
-        API.reset()   # drop the API agent's conversation
         db.patch("voice_requests", f"id=eq.{rid}",
                  {"status": "done", "result": "(context reset)", "updated_at": now_iso()})
         log(f"{'agent' if reset_agent else 'hub'} context reset — session dropped")
@@ -2454,7 +2230,6 @@ def process_request(db: Supabase, req: dict) -> None:
             attachments = json.loads(attachments)
         except Exception:  # noqa: BLE001
             attachments = []
-    effort = "high"      # API thinking depth on the Fly path
     use_agent = session_agent   # full-agent (coding) mode → the unrestricted agent, on its own session
     log(f"route={'agent' if use_agent else ('photo→opus' if attachments else 'dynamic sonnet→opus')} src={source}")
     ping_esp_led("blink")   # working — the ESP light blinks for EVERY command, not just ESP-sourced ones
@@ -2467,9 +2242,9 @@ def process_request(db: Supabase, req: dict) -> None:
     if govee:
         sys_ctx += "\n\n" + govee
     # Photo turns: pull the attachment objects local so Read can view them, and put the paths + the ONE-item
-    # framing on the prompt. Photos go straight to Opus in the dispatch below (except Fly, intercepted first).
+    # framing on the prompt. Photos go straight to Opus in the dispatch below.
     att_tmp, att_paths = None, []
-    if attachments and WORKER_ID != "fly":
+    if attachments:
         att_tmp, att_paths = fetch_attachments(attachments)
         if att_paths:
             prompt += ATTACH_DIRECTIVE.format(n=len(att_paths), paths="\n".join(att_paths))
@@ -2478,69 +2253,51 @@ def process_request(db: Supabase, req: dict) -> None:
             prompt += ("\n\n[The user attached photo(s), but they could not be retrieved — tell them "
                        "that briefly instead of guessing at the contents.]")
 
-    # Dispatch — one dynamic route. `ctx` (the replayed hub conversation) rides on the FRESH run; there is no
-    # --resume for hub turns, so the two models never share a session. agent → the unrestricted coding agent
-    # (its own --resume session). Fly (Mac+Pi down) → Opus on the API. Photos → Opus (vision via Read).
-    # Otherwise: Sonnet (warm SDK client, subscription) with the safe toolset; a gated need → a FRESH
-    # Opus on the subscription; a fast-path ERROR falls sideways to API Sonnet — never up to Opus.
+    # Dispatch — one dynamic route, the same on every worker (Pi, Mac, and Fly, which holds its own
+    # subscription token). Everything runs on the Claude SUBSCRIPTION; there is no paid path. A run that
+    # fails transiently is retried (`run_subscription`), and one that still fails surfaces as an error.
+    # `ctx` (the replayed hub conversation) rides on the FRESH run; there is no --resume for hub turns, so
+    # the two models never share a session. agent → the unrestricted coding agent (its own --resume
+    # session). Photos → Opus (vision via Read). Otherwise: Sonnet (warm SDK client) with the safe toolset;
+    # a gated need → a FRESH Opus. Errors never upgrade the model.
     hub_prompt = ctx + prompt   # ctx is "" in agent mode (uses --resume) or when there's no live conversation
     room_deny = SEND_TOOLS if ambient else None   # the room mics never send a text or an email
     if use_agent:
         result = run_claude(prompt, resume_id, on_event=_emit, system_append=sys_ctx, model="opus",
                             agent=True, cwd=ag["cwd"], allow_read=bool(att_paths),
                             deny_tools=room_deny)
-    elif attachments and WORKER_ID == "fly":
-        # Photos are subscription-only (vision via Read; the API bills money). Reaching Fly means Mac AND Pi
-        # are down → refuse, don't run on the API. local means local.
-        log("photo request reached Fly (Mac+Pi down) — refusing the API; photos are subscription-only")
-        result = {"ok": False, "text": "",
-                  "result": "(photo request — no subscription worker up; not run on the API)",
-                  "raw_error": "no-subscription-worker", "session_id": None}
-    elif WORKER_ID == "fly":
-        # Fly last resort: no subscription → Opus on the API (the ApiRunner is ungated; Opus is the safe
-        # choice, and Fly is rare enough the speed win doesn't matter).
-        result = API.run(hub_prompt + POWER_DIRECTIVE, system_append=sys_ctx, on_event=_emit,
-                         model="opus", think=True, effort=effort, fresh=True, allowed=turn_tools(ambient))
     elif attachments:
         # Photos → straight to Opus (vision needs the capable model + Read; Sonnet would only escalate).
-        result = run_claude(hub_prompt + POWER_DIRECTIVE, None, on_event=_emit, system_append=sys_ctx,
-                            model="opus", allow_read=bool(att_paths), allowed_tools=turn_tools(ambient), deny_tools=room_deny)
+        result = run_subscription(
+            lambda: run_claude(hub_prompt + POWER_DIRECTIVE, None, on_event=_emit, system_append=sys_ctx,
+                               model="opus", allow_read=bool(att_paths), allowed_tools=turn_tools(ambient),
+                               deny_tools=room_deny),
+            "subscription Opus (photo)")
     else:
-        # FAST PATH — Sonnet on the WARM SDK client, safe toolset only, billed to the SUBSCRIPTION.
-        # Not a per-command `claude -p`: that spawn (CLI + four stdio MCP servers) measured 3.6s on the
-        # Pi (~42% of a simple turn) before the model saw a token; the warm client pays it once. The
-        # ApiRunner (Console-billed) is the FALLBACK, at the SAME tier, only when this path errors.
-        # Why this way round: on 2026-08-30 the inverse arrangement (API-billed fast path) drained the
-        # Console balance, and the then error-escalation turned every noise judgment into a fresh
-        # subscription Opus spawn — 291 in one evening. Errors must never upgrade the model.
+        # FAST PATH — Sonnet on the WARM SDK client, safe toolset only. Not a per-command `claude -p`: that
+        # spawn (CLI + four stdio MCP servers) measured 3.6s on the Pi (~42% of a simple turn) before the
+        # model saw a token; the warm client pays it once.
+        # Errors never upgrade the model: on 2026-08-30 an error-escalation turned every noise judgment
+        # into a fresh Opus spawn — 291 in one evening.
         fast_prompt = ((govee + "\n\n") if govee else "") + hub_prompt + ESCALATE_DIRECTIVE
-        result = SDK.run(fast_prompt, on_event=_emit, ambient=ambient)
-        if not result.get("ok"):
-            log(f"subscription fast path failed ({result.get('raw_error')}) — API Sonnet fallback")
-            alert_failure("subscription", result.get("raw_error") or "")
-            result = API.run(hub_prompt + ESCALATE_DIRECTIVE, system_append=sys_ctx, on_event=_emit,
-                             model="sonnet", allowed=turn_tools(ambient, SAFE_TOOLS), fresh=True)
+        result = run_subscription(lambda: SDK.run(fast_prompt, on_event=_emit, ambient=ambient),
+                                  "subscription fast path")
         st = (result.get("text") or "").strip().lower()
         escalate = ("__escalate__" in st) or (re.sub(r"[^a-z]", "", st) == "escalate")
-        # Escalate ONLY on the sentinel — a gated need. A turn that failed on both Sonnet paths
-        # surfaces as an error below; it does not buy an Opus run.
+        # Escalate ONLY on the sentinel — a gated need. A failed fast path surfaces as an error below; it
+        # does not buy an Opus run.
         if escalate:
             log("dynamic → Opus (full toolset): __ESCALATE__")
             # Surface the hop itself: the bottom activity bar shows "escalated to Opus" and keeps an OPUS
             # chip up for the rest of the run, so a turn that quietly changed models is visible on the wall
             # instead of looking like an unexplained pause between the prompt and the first Opus tool call.
             push_activity("Escalated to Opus", "escalate")
-            # Escalation runs on the SUBSCRIPTION: these turns are rare and already slow, so the CLI cold
-            # start is noise here. Mac and Pi both have it; Fly is intercepted earlier. If the
-            # subscription run fails anyway, finish on the API (the fallback) rather than drop.
-            result = run_claude(hub_prompt + POWER_DIRECTIVE, None, on_event=_emit, system_append=sys_ctx,
-                                model="opus", allow_read=bool(att_paths), allowed_tools=turn_tools(ambient), deny_tools=room_deny)
-            if not result.get("ok"):
-                log(f"subscription Opus failed ({result.get('raw_error')}) — completing on the API")
-                alert_failure("subscription", result.get("raw_error") or "")
-                result = API.run(hub_prompt + POWER_DIRECTIVE, system_append=sys_ctx, on_event=_emit,
-                                 model="opus", think=True, effort=effort, fresh=True,
-                                 allowed=turn_tools(ambient))
+            # These turns are rare and already slow, so the CLI cold start is noise here.
+            result = run_subscription(
+                lambda: run_claude(hub_prompt + POWER_DIRECTIVE, None, on_event=_emit, system_append=sys_ctx,
+                                   model="opus", allow_read=bool(att_paths), allowed_tools=turn_tools(ambient),
+                                   deny_tools=room_deny),
+                "subscription Opus")
 
     if att_tmp:
         shutil.rmtree(att_tmp, ignore_errors=True)   # staged photos served their turn

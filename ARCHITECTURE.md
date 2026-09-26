@@ -48,15 +48,10 @@ and every ordinary stage bills the **subscription**:
   tool calls (and the text between them) surface live on the activity bar. This runs the **escalation** (Opus, full toolset —
   rare, and already slow enough that the CLI cold start is noise), photo turns (vision needs the
   CLI's `Read`), and full-agent turns.
-- **`ApiRunner`** — the direct `anthropic` Messages API on the Console key. Warm MCP stdio sessions
-  started once, tool schemas inlined with the prompt, full agentic loop, no built-in Claude Code
-  tools (web search and fetch are the API's server tools instead); the stable prefix (schemas + system, ~8k tokens) is **prompt-cached for 1 hour**
-  (`cache_control ttl:1h` + the `extended-cache-ttl` beta). It is the funded **fallback**: it runs
-  only when a subscription path errors, at the SAME model tier — errors never upgrade the model —
-  and it is the only runner on Fly (no subscription login there), which runs Opus on it.
-
-Photo turns are subscription-only: the CLI's `Read` tool is how a model views an image file, so a
-photo request that reaches Fly is refused rather than run blind.
+There is no API-billed runner. Both runners bill the subscription on every worker, Fly included (it
+holds its own `CLAUDE_CODE_OAUTH_TOKEN`). A run that fails transiently is retried on the subscription
+(`run_subscription`) and otherwise surfaces as an error. Photo turns go to Opus through `run_claude`,
+whose `Read` tool is how a model views an image file.
 
 ## Device fallback
 

@@ -87,10 +87,9 @@ SUPABASE_KEY=<service-role-key> ./run.sh --once
 `python3` does **not** have `httpx` installed.
 
 `run.sh` loads a gitignored `.env` beside it. `worker.py` pops `ANTHROPIC_API_KEY`
-out of the environment at import: the Console key is the FALLBACK billing path
-(read only by the `ApiRunner`), and popping it means no spawned subprocess — the
-warm SDK client, `claude -p`, the MCP servers — can inherit it and silently bill
-the API instead of the subscription.
+out of the environment at import and never uses it: the worker only runs on the
+subscription, and popping it means no spawned subprocess — the warm SDK client,
+`claude -p`, the MCP servers — can inherit it and silently bill the API.
 
 ### On the Pi: systemd
 
@@ -131,8 +130,8 @@ since the day began at **4 AM Eastern** (`day_start`, `TZ_DISPLAY`, the hub's ow
 later, oldest first, each line with its time, room chatter marked as ignored. An
 idle gap does not cut it, and the Fly worker's UTC clock does not move the
 boundary. A heavy day is about 12k tokens. `session_reset_s` still bounds which
-worker owns the conversation (affinity) and the API fallback's own buffer; it no
-longer bounds what the agent remembers.
+worker owns the conversation (affinity); it no longer bounds what the agent
+remembers.
 
 The agent session resets only on a manual reset.
 
@@ -152,9 +151,9 @@ gated behind the `agent_mode` setting.
 
 ## Failure alerts
 
-The worker pushes to Jared's phone (hub `/api/notify`, title `Voice worker`) when the subscription
-path fails — even if the API fallback then completes the request — and when a request fails on both
-paths. Body: `<host> · <stage> · <class> · <error>`, stage ∈ `subscription`/`request`, class ∈
+The worker pushes to Jared's phone (hub `/api/notify`, title `Voice worker`) when a subscription run
+still fails after its retries (overloaded, 5xx, rate limit and network errors are retried a few times
+first; auth and billing are not). Body: `<host> · <stage> · <class> · <error>`, stage ∈ `subscription`/`request`, class ∈
 `auth`/`billing`/`rate-limit`/`error`. One push per host per (stage, class) per `ALERT_COOLDOWN_S`
 (default 3600). Not gated by the hub's push toggle; that toggle is for command results.
 
@@ -163,5 +162,5 @@ What the classes mean on the phone:
 - `auth` — the setup token is revoked or expired. Re-mint: `claude setup-token` → this `.env` on
   every host + `fly secrets set CLAUDE_CODE_OAUTH_TOKEN=… -a jared-voice` → restart. A Google
   password change revokes it (the claude.ai account signs in with Google).
-- `billing` — the Console balance is empty; the API fallback cannot complete anything.
-- `rate-limit` — transient; nothing to do unless it persists.
+- `billing` — the subscription reports a billing problem.
+- `rate-limit` — transient and already retried; nothing to do unless it persists.

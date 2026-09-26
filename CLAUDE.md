@@ -17,15 +17,17 @@ two things that break silently:
 wake words ("Hey Rhasspy" / "Hey Jarvis") are equivalent triggers — routing is the worker's dynamic
 dispatch, and `app_settings.wakefree_route` is likewise an inert leftover row.
 
-## `ANTHROPIC_API_KEY` is the fallback billing path — only `ApiRunner` may touch it
+## The worker never bills the API — `ANTHROPIC_API_KEY` is discarded
 
-The CLI and the Agent SDK silently prefer the key over the subscription login and bill the API.
-`worker.py` pops it from the environment at import (into `_API_KEY`, read only by `ApiRunner`), so
-nothing it spawns — the warm SDK client, `claude -p`, the MCP servers — can inherit it.
-`pi-desk/launch.sh` strips it separately (it sources the worker's `.env` itself). The subscription is
-the primary path on every machine; the Console key exists to be a funded fallback at the SAME model
-tier when a subscription path errors (and Fly's last resort), never a silent upgrade — the dispatch
-comment in `worker.py` has the 2026-08-30 incident that fixed this shape.
+Every turn, on every worker (Pi, Mac, and Fly, which holds its own `CLAUDE_CODE_OAUTH_TOKEN`), runs on
+the Claude subscription. A run that fails transiently (overloaded, 5xx, rate limit, network) is retried
+on the subscription (`run_subscription`, `SUBSCRIPTION_RETRY_S`) and then surfaced as an error; there
+is no paid fallback: one at the same model tier turns a passing "529 Overloaded" on an Opus turn into
+a Console-billed Opus run with thinking and the full toolset.
+
+The CLI and the Agent SDK silently prefer the key over the subscription login and bill the API, so
+`worker.py` pops it from the environment at import and never reads it; nothing it spawns can inherit
+it. `pi-desk/launch.sh` strips it separately (it sources the worker's `.env` itself).
 
 ## `server/` is a build context, not source
 

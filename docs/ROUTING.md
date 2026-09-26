@@ -82,8 +82,7 @@ what they are mostly used for.
 
 `build_walmart_cart_url`, `record_walmart_cart` and `save_shopping_item` (`SESSION_TOOLS`) only mean
 something next to the signed-in browser, which no worker runner has. They are taken out of every
-runner's schema (`disallowed_tools` on the warm client, `--disallowedTools` on `claude -p`, skipped
-by the `ApiRunner`) — the one place `--disallowedTools` is right. Left merely gated, they would be
+runner's schema (`disallowed_tools` on the warm client, `--disallowedTools` on `claude -p`) — the one place `--disallowedTools` is right. Left merely gated, they would be
 visible-but-denied, which is exactly what makes Sonnet escalate, and a cart request would reach an
 Opus turn that can only call them with made-up values. Out of sight, a cart request is a
 `start_session`, where a browser exists. The reads (`get_shopping_items`, `get_walmart_cart`) stay on
@@ -134,13 +133,13 @@ what regressed.
 
 ## What the split is for — and how it bills
 
-**Everything runs on the subscription; the API key is the funded FALLBACK.** Sonnet runs on the warm
-`SdkRunner` (a long-lived headless Claude Code process holding the MCP servers); escalation runs Opus
-through `claude -p`. Both bill the subscription. The Console-billed `ApiRunner` still exists but runs
-only when a subscription path errors — at the SAME model tier, never as an upgrade. (The inverse — an
-API-billed fast path — is attractive because it spares the subscription window, and it fails: the
-Console balance drains at conversation volume, and any error path that upgrades the model turns every
-noise judgment into an Opus run. The dispatch comment in `worker.py` records the 2026-08-30 incident.)
+**Everything runs on the subscription, and nothing else.** Sonnet runs on the warm `SdkRunner` (a
+long-lived headless Claude Code process holding the MCP servers); escalation runs Opus through
+`claude -p`. A failed run is retried on the subscription and then surfaced as an error — there is no
+paid path. An API-billed path is attractive twice over and fails both times: as the fast path it drains
+the Console balance at conversation volume, and as a fallback at the same tier it turns a passing
+"overloaded" on an Opus turn into a Console-billed Opus run. Errors also never upgrade the model: an
+error path that did turned every noise judgment into an Opus run (the dispatch comment in `worker.py`).
 
 So the reasons the split exists, in the order they hold:
 
@@ -181,15 +180,14 @@ already does exactly that.
 
 The mic is always on, so the input that trips a refusal is usually room audio nobody addressed to the
 assistant — and the commands that die behind it are unrelated. On 2026-09-02 one false-triggered
-ambient capture wedged the client for 85 minutes; roughly fifteen commands failed, and the `ApiRunner`
-could not cover them because the Console balance was empty.
+ambient capture wedged the client for 85 minutes and roughly fifteen commands failed.
 
 So `SdkRunner.run()` recycles the client after **any** failed turn, not just a timeout or transport
 error — a refusal arrives through the ordinary `ResultMessage` path with `is_error` set, so an
 `except` block never sees it. It then re-runs the turn once on the cold client, but only when the
 failed attempt called no tool (`used_tools`): a refusal fails before any tool call, so that re-run has
 no side effects, while a turn that already acted is never replayed. A genuinely refusable turn just
-fails twice, quickly, and falls through to the fallback as before.
+fails twice, quickly, and surfaces as an error.
 
 ## Keeping the list honest
 
