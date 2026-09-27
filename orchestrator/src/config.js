@@ -45,6 +45,7 @@ export const config = {
   REPO_POLL_MS: parseInt(process.env.REPO_POLL_MS || '60000', 10),
   COMMAND_POLL_MS: parseInt(process.env.COMMAND_POLL_MS || '30000', 10),
   PRESENCE_MS: parseInt(process.env.PRESENCE_MS || '30000', 10),
+  PRESENCE_FAIL_EXIT_MS: parseInt(process.env.PRESENCE_FAIL_EXIT_MS || '300000', 10),
 
   // pty default geometry.
   PTY_COLS: parseInt(process.env.PTY_COLS || '200', 10),

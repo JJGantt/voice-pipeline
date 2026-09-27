@@ -117,9 +117,27 @@ async function tick() {
   }
 }
 
+// A process whose fetches have all gone bad stays alive and keeps failing — every call answering
+// `fetch failed` while a fresh node on the same Mac connects at once — and the hub, reading the
+// silence, refuses every follow-up with "the Mac is not responding". Nothing inside the process
+// recovers from that state, so once presence has failed continuously for PRESENCE_FAIL_EXIT_MS it
+// exits and launchd (KeepAlive) starts a clean one. A Mac that is genuinely offline just restarts
+// every few minutes, which costs nothing.
+let failingSince = null;
+
 async function beat() {
-  try { await heartbeatDesk('desk', { host: os.hostname() }); }
-  catch (e) { console.error('[repos] presence error:', e.message); }
+  try {
+    await heartbeatDesk('desk', { host: os.hostname() });
+    failingSince = null;
+  } catch (e) {
+    const cause = e.cause ? ` (${e.cause.code || e.cause.message || e.cause})` : '';
+    console.error(`[repos] presence error ${new Date().toISOString()}: ${e.message}${cause}`);
+    failingSince ??= Date.now();
+    if (Date.now() - failingSince >= config.PRESENCE_FAIL_EXIT_MS) {
+      console.error(`[repos] presence failing since ${new Date(failingSince).toISOString()} — exiting for launchd to restart`);
+      process.exit(1);
+    }
+  }
 }
 
 export function startRepos() {
