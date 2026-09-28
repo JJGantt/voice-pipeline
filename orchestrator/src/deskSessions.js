@@ -18,7 +18,7 @@
 // own.
 import { config } from './config.js';
 import { deskSessionsFor, patchDeskSession, upsertDeskSession } from './supabase.js';
-import { sweepStashedPrompts } from './applescript.js';
+import { sweepStashedPrompts } from './handoff.js';
 import { liveClaudeSessions } from './discover.js';
 import { mirrorUp, mirrorReset } from './mirror.js';
 import { readTail } from './transcripts.js';
@@ -281,8 +281,8 @@ export async function markTtyRead(tty) {
 }
 
 async function tick() {
-  // Messages handed to a session by file. A day is far longer than any session takes to read one,
-  // and they are dictated speech — not something to leave lying in a home directory for ever.
+  // Messages and pictures handed to a session by file. They are dictated speech and his photos — not
+  // something to leave lying in a home directory for ever (the window is on sweepStashedPrompts).
   sweepStashedPrompts();
 
   // Retention lives on the Pi (`sweepRetention` in pi-desk), which is always on — one rule in one

@@ -12,6 +12,8 @@
 // last resort, taken only when a new session needs a slot.
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { awaitSession } from '../orchestrator/src/discover.js';
+import { typeable, transcriptSize, awaitSubmitted } from '../orchestrator/src/handoff.js';
 
 const exec = promisify(execFile);
 
@@ -46,6 +48,55 @@ export async function liveSessions() {
     out.push({ name, alive, created, pid });
   }
   return out;
+}
+
+/**
+ * Type into a session that is already running, and return only once it has been SUBMITTED.
+ *
+ * Pasted with tmux's own bracketed paste (`paste-buffer -p`), then Enter as a separate keypress. The
+ * markers tell Claude Code exactly where the text ends, so the Enter cannot be read as part of it —
+ * `send-keys <text>` gave no such boundary, and it also read a message that happened to be a key name
+ * ("Enter", "Up", "C-c") as that key. `-r` keeps line breaks as line breaks rather than returns, so
+ * nothing submits early if the markers are ever not honoured.
+ *
+ * What is pasted is decided by `typeable` (handoff.js, shared with the Mac): a long or many-line message
+ * goes by file, because Claude Code frames such input as a paste and the model treats it as material
+ * rather than as his request.
+ *
+ * The transcript is the receipt (`awaitSubmitted`). Typing reports nothing, and on 2026-09-28 three
+ * follow-ups were logged here as "sent" while two sat in the composer and one vanished; nothing reached
+ * the conversation. Unconfirmed, it presses Enter once more — the case where the return was taken as a
+ * line break — and if that does not submit it either, it throws, so the command is recorded as failed
+ * and dead-lettered with his words instead of reported as delivered.
+ *
+ * A session busy mid-turn needs no waiting: Claude Code queues a submitted message and writes it to the
+ * transcript at once. A session blocked on a permission prompt is refused, because the keys would go to
+ * the dialog and the Enter would answer it. The drain loop runs commands one at a time and this does not
+ * return until the message is confirmed, which is what serialises two messages to one session.
+ */
+export async function typeInto(target, text, { expect = null } = {}) {
+  const pane = (await liveSessions()).find((l) => l.name === target && l.alive);
+  if (!pane?.pid) throw new Error(`${target} is not running`);
+  // A session launched a moment ago may not have written its record yet; it does within a second.
+  const s = await awaitSession(pane.pid);
+  if (!s) throw new Error(`${target} has no Claude Code session record — it has not started`);
+  if (s.waiting) throw new Error(`${target} is waiting on a ${s.waiting} — not typing into it`);
+
+  const from = transcriptSize(s.transcriptPath);
+  const { line, how } = typeable(text, target);
+  const buf = `pd-${target}`;
+  await exec('tmux', ['set-buffer', '-b', buf, '--', line], { timeout: 10000 });
+  await exec('tmux', ['paste-buffer', '-p', '-r', '-d', '-b', buf, '-t', target], { timeout: 10000 });
+  await new Promise((r) => setTimeout(r, 300));
+  await exec('tmux', ['send-keys', '-t', target, 'Enter'], { timeout: 10000 });
+  const want = expect || line;
+  if (await awaitSubmitted(s.transcriptPath, from, want)) return `sent ${text.length} chars to ${target} (${how})`;
+
+  await exec('tmux', ['send-keys', '-t', target, 'Enter'], { timeout: 10000 });
+  if (await awaitSubmitted(s.transcriptPath, from, want)) {
+    return `sent ${text.length} chars to ${target} (${how}, on a second Enter)`;
+  }
+  throw new Error(`typed into ${target} but it never reached the transcript — likely sitting unsent in the composer`);
 }
 
 /**

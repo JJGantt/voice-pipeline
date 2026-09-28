@@ -16,6 +16,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { config } from './config.js';
 import { findSessionFile } from './sessions.js';
+import { typeable } from './handoff.js';
 
 const execFileP = promisify(execFile);
 
@@ -159,110 +160,36 @@ export async function closeTabForTty(tty) {
   return true;
 }
 
-// Run a shell command in a new Terminal tab, falling back to a new window.
-//
-// Terminal.app has no scriptable "new tab" — the only way is a Cmd-T keystroke through System
-// Events, which needs ACCESSIBILITY permission. The interactive shell inherits Terminal.app's
-// grant, but this daemon is spawned by launchd and has none, so from here the keystroke fails with
-// "osascript is not allowed to send keystrokes (1002)". A plain `do script` with no `in` clause
-// opens a new WINDOW and needs only Automation permission, which the daemon does have.
-//
-// So: try the tab, and on any failure open a window instead. Either way the caller gets a live
-// shell running the command, which is all that matters.
 /**
  * Type text into an already-running session, addressed by the tty of its tab.
  *
  * The tty is the only stable handle a Terminal tab has: tab indexes shift as tabs open and close, and
  * "front window" is whatever Jared last clicked — which is exactly the mistake to avoid, since a
  * dictated follow-up landing in the wrong terminal is worse than one that fails.
- */
-// A tty accepts 1024 bytes of input at once and discards the rest, so what gets TYPED here has to
-// stay short whatever Jared said. Long messages are handed over by reference instead: the text goes
-// to a file and the session is told to read it, echo it back verbatim, then act on it.
-//
-// The echo is the point. Without it the words exist only in a file nobody looks at, and the terminal
-// shows an instruction rather than the request — so anyone reading the session sees a stub. With it,
-// the full message appears in the session's own output within a second or two and the file stops
-// mattering, which is why the file is disposable.
-//
-// The alternatives all fail on this end. `do script` always appends a return, so chunking submits
-// each piece as a separate message. System Events can type without one, but needs Accessibility
-// permission a launchd daemon does not have. And `claude --resume <id> "$(cat file)"` in a fresh tab
-// — the trick the LAUNCH path uses, since that goes through a shell — forks a live session: resume
-// starts a second process replaying the same transcript, so the conversation becomes two copies with
-// one id and a message typed into one is invisible in the other.
-const TTY_INPUT_MAX = 900;   // 1024 with room for the escaping the AppleScript adds
-// Not /tmp: a busy session may not get to the message for a long time, and periodic cleaning there
-// would take the words with it. (They are never ONLY here — the payload is in desk_commands.)
-const PROMPT_DIR = path.join(os.homedir(), '.claude-desk-prompts');
-
-/** Park a message on disk for a session to read, and return its path. */
-function stashPrompt(text, tag) {
-  fs.mkdirSync(PROMPT_DIR, { recursive: true, mode: 0o700 });
-  const f = path.join(PROMPT_DIR, `${String(tag || 'msg').replace(/[^A-Za-z0-9._-]/g, '')}-${Date.now().toString(36)}.txt`);
-  fs.writeFileSync(f, String(text), { mode: 0o600 });
-  return f;
-}
-
-/**
- * Drop stashed messages older than the window below.
  *
- * NOT a day, which is what this was: the stub typed into the tty names this file, and `unstash` in
- * transcripts.js reads it back so every surface shows the words instead of the stub. Sweeping it
- * while the session is still on screen turns his message back into "[A message from Jared, too long
- * to type…]" wherever it is drawn. They are a few KB of text each.
- */
-export function sweepStashedPrompts(maxAgeMs = 30 * 86400000) {
-  let names;
-  try { names = fs.readdirSync(PROMPT_DIR); } catch { return; }
-  for (const n of names) {
-    const f = path.join(PROMPT_DIR, n);
-    try { if (Date.now() - fs.statSync(f).mtimeMs > maxAgeMs) fs.unlinkSync(f); } catch { /* gone already */ }
-  }
-}
-
-/**
- * Pull an attached picture down beside the stashed prompts, and return its local path.
+ * What gets typed is decided by `typeable` (handoff.js), shared with the Pi: a long or many-line message
+ * is parked in a file and the session is typed a one-line stub, because Claude Code frames such input as
+ * a paste rather than as his request. That also keeps the typed line far inside the tty's 1024-byte
+ * input limit. Whether it then SUBMITTED is the caller's to confirm, from the transcript.
  *
- * A tty is typed into, so an image cannot be sent to a session — a PATH can, and the session reads the
- * file itself. The bytes live in the hub's attachment bucket (the same one the chat composer fills);
- * this is the machine that owns the session fetching them once, to a directory that is already the
- * place a message waits to be read.
+ * The alternatives for a long message all fail on this end. `do script` always appends a return, so
+ * chunking submits each piece as a separate message. System Events can type without one, but needs
+ * Accessibility permission a launchd daemon does not have. And `claude --resume <id> "$(cat file)"` in a
+ * fresh tab — the trick the LAUNCH path uses, since that goes through a shell — forks a live session:
+ * resume starts a second process replaying the same transcript, so the conversation becomes two copies
+ * with one id and a message typed into one is invisible in the other.
  */
-export async function fetchAttachment(name, token, host) {
-  if (!/^[\w.-]+$/.test(String(name || ''))) throw new Error(`unusable attachment name: ${name}`);
-  fs.mkdirSync(PROMPT_DIR, { recursive: true, mode: 0o700 });
-  // `?token=` — the same way everything else on this machine reaches the hub (see sessionWatch). The
-  // X-Hub-Token header is the derived one the iOS app carries, and this token is not that.
-  const r = await fetch(`${host}/api/attachment?path=${encodeURIComponent(name)}`
-                        + `&token=${encodeURIComponent(token)}`);
-  if (!r.ok) throw new Error(`attachment ${name}: ${r.status}`);
-  const file = path.join(PROMPT_DIR, name);
-  fs.writeFileSync(file, Buffer.from(await r.arrayBuffer()), { mode: 0o600 });
-  return file;
-}
-
-const handoff = (file) =>
-  `[A message from Jared, too long to type into this terminal. It is in ${file} — read that file now, `
-  + 'reply with its full text verbatim first so it is visible here, then do what it asks. '
-  + 'Leave the file alone afterwards; it is cleaned up on its own.]';
-
 // `do script` writes the text and its return into the tty in ONE chunk, and Claude Code reads a long
 // chunk as a paste: the return lands inside it and the message sits in the composer unsent. Measured
 // against an idle session: 8 characters submit, 105 do not. Bracketed-paste markers say exactly where
-// the text ends, so the return after them is a keypress whatever the length. (The Pi has the same
-// problem through tmux and sends Enter as a second call instead.)
+// the text ends, so the return after them is a keypress whatever the length. (The Pi pastes through
+// tmux's own bracketed paste for the same reason.)
 const ESC = 'character id 27';
 
 export async function sendToTty(tty, text) {
-  // An escape in the words could close the paste early; nothing dictated needs one.
-  const body = String(text).replace(/\x1b/g, '');
-  // Only LENGTH sends a message by file. A line break is typed like any other character: an AppleScript
-  // string literal cannot hold a raw one, so each is written as `linefeed` joined into the string, and
-  // inside the bracketed paste it lands in the composer as a line break, not a submit. Treating line
-  // breaks as a reason for a file would hand over every spoken-reply follow-up that way (the watch puts
-  // its note after a blank line), however short.
-  const line = body.length > TTY_INPUT_MAX ? handoff(stashPrompt(body, tty.replace('/dev/', ''))) : body;
+  const { line, how } = typeable(text, tty.replace('/dev/', ''));
+  // An AppleScript string literal cannot hold a raw line break, so each is written as `linefeed` joined
+  // into the string; inside the bracketed paste it lands in the composer as a line break, not a submit.
   const escaped = line.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r\n|\r|\n/g, '" & linefeed & "');
   await osascript(`tell application "Terminal"
       set found to false
@@ -277,9 +204,19 @@ export async function sendToTty(tty, text) {
       if not found then error "no tab with tty ${tty}"
     end tell
     return "sent"`);
-  return line === body ? 'typed' : 'handed over by file';
+  return { line, how };
 }
 
+// Run a shell command in a new Terminal tab, falling back to a new window.
+//
+// Terminal.app has no scriptable "new tab" — the only way is a Cmd-T keystroke through System
+// Events, which needs ACCESSIBILITY permission. The interactive shell inherits Terminal.app's
+// grant, but this daemon is spawned by launchd and has none, so from here the keystroke fails with
+// "osascript is not allowed to send keystrokes (1002)". A plain `do script` with no `in` clause
+// opens a new WINDOW and needs only Automation permission, which the daemon does have.
+//
+// So: try the tab, and on any failure open a window instead. Either way the caller gets a live
+// shell running the command, which is all that matters.
 async function runInNewTerminal(shellCmd) {
   // AppleScript string-escape: backslash + quote.
   const escaped = shellCmd.replace(/\\/g, '\\\\').replace(/"/g, '\\"');

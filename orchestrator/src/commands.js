@@ -23,12 +23,13 @@ import { config } from './config.js';
 const exec = promisify(execFile);
 import { pendingCommands, claimCommand, finishCommand, upsertDeskSession, deskSession,
          patchDeskSession, deadLetterCommand, abandonedClaims, insertCommand } from './supabase.js';
-import { awaitSessionOn } from './discover.js';
+import { awaitSessionOn, sessionOf } from './discover.js';
 import { beginLaunch, endLaunch } from './deskSessions.js';
 import { watchTable } from './realtime.js';
 import { isKnownRepo } from './repos.js';
 import { ensureTrusted } from './trust.js';
-import { openFreshTab, sendToTty, closeTabForTty, fetchAttachment } from './applescript.js';
+import { openFreshTab, sendToTty, closeTabForTty } from './applescript.js';
+import { withAttachments, transcriptSize, awaitSubmitted } from './handoff.js';
 import { mirrorUp, mirrorDown } from './mirror.js';
 
 // Appended only when a dispatch ASKED for a write-up (`report` on the command payload, set by the
@@ -72,36 +73,40 @@ function repoDir(name) {
   return dir;
 }
 
+/**
+ * Type `text` into a running session and confirm it was submitted.
+ *
+ * "Sent" is reported only once the session's transcript holds the prompt (handoff.js): typing itself
+ * reports nothing, and text can sit in the composer unsent while everything looks like it worked. A
+ * session blocked on a permission prompt is refused rather than typed into, since the keys would answer
+ * the dialog. `expect` is what the transcript will hold when that differs from the text typed.
+ */
+async function deliver(row, text, { expect = null } = {}) {
+  if (!row) throw new Error('no such session');
+  if (!row.tty) throw new Error(`no terminal recorded for ${row.id}`);
+  const s = row.pid ? sessionOf(row.pid) : null;
+  if (s?.waiting) throw new Error(`${row.id} is waiting on a ${s.waiting} — not typing into it`);
+  const tpath = s?.transcriptPath || row.transcript_path || null;
+  const from = tpath ? transcriptSize(tpath) : 0;
+  const { line, how } = await sendToTty(row.tty, text);
+  if (!tpath) return `sent ${text.length} chars to ${row.tty} (${how}, unconfirmed: no transcript bound yet)`;
+  if (!(await awaitSubmitted(tpath, from, expect || line))) {
+    throw new Error(`typed into ${row.tty} but it never reached the transcript — likely sitting unsent in the composer`);
+  }
+  return `sent ${text.length} chars to ${row.tty} (${how})`;
+}
+
 async function run(cmd) {
   // Type a follow-up into a session this machine already has open, addressed by its tab's tty.
   if (cmd.kind === 'follow_up') {
     const session = String((cmd.payload || {}).session || '').trim();
-    let prompt = String((cmd.payload || {}).prompt || '').trim();
-    // PICTURES arrive as object names. They are pulled down here — the session's own machine — and the
-    // prompt gains the local paths, because a tty carries text and the session reads the files itself.
-    // A picture with no words is a whole message; the line below is what tells the session to look.
-    const shots = Array.isArray((cmd.payload || {}).attachments) ? (cmd.payload || {}).attachments : [];
-    if (shots.length) {
-      const paths = [];
-      for (const n of shots) {
-        try { paths.push(await fetchAttachment(n, config.HUB_TOKEN, config.HUB_URL)); }
-        catch (e) { console.error('[commands] attachment:', e.message); }
-      }
-      if (paths.length) {
-        prompt = `[Jared attached ${paths.length === 1 ? 'a picture' : paths.length + ' pictures'}: `
-          + `${paths.join(', ')} — read ${paths.length === 1 ? 'it' : 'them'} now.]`
-          + (prompt ? `\n\n${prompt}` : '');
-      }
-    }
+    const prompt = await withAttachments((cmd.payload || {}).prompt, cmd.payload);
     if (!prompt) throw new Error('no prompt to send');
     const row = await deskSession(session);
-    const tty = row && row.tty;
-    if (!tty) throw new Error(`no terminal recorded for ${session}`);
     // A session the reconciler has already found dead has no tab to type into. Fail here rather than
     // letting AppleScript hunt for a tty that a later tab may have been given.
-    if (row.status !== 'resident') throw new Error(`${session} has ended`);
-    const how = await sendToTty(tty, prompt);
-    return `sent ${prompt.length} chars to ${tty} (${how})`;
+    if (row && row.status !== 'resident') throw new Error(`${session} has ended`);
+    return deliver(row, prompt);
   }
 
   // Name the session itself. `/rename` is the command Jared types, so this is the same act rather than
@@ -113,9 +118,9 @@ async function run(cmd) {
     if (!name) throw new Error('no name to set');
     const row = await deskSession(id);
     if (!row) throw new Error(`no such session: ${id}`);
-    if (!row.tty) throw new Error(`no terminal recorded for ${id}`);
     if (row.status !== 'resident') throw new Error(`${id} is not running`);
-    await sendToTty(row.tty, `/rename ${name}`);
+    // The receipt is the `custom-title` record carrying the name, not the command text.
+    await deliver(row, `/rename ${name}`, { expect: name });
     return `renamed ${id} to ${name}`;
   }
 
@@ -139,18 +144,16 @@ async function run(cmd) {
     if (!row) throw new Error(`no such session: ${id}`);
     // Already open: resuming it is just talking to it, the same as the Pi does. Refusing here threw
     // away every follow-up that named a running session.
+    const prompt = await withAttachments((cmd.payload || {}).prompt, cmd.payload) || null;
     if (row.status === 'resident') {
-      const words = String((cmd.payload || {}).prompt || '').trim();
-      if (!words) return `${id} was already running`;
-      if (!row.tty) throw new Error(`no terminal recorded for ${id}`);
-      return `${id} was already running — sent ${words.length} chars to ${row.tty} (${await sendToTty(row.tty, words)})`;
+      if (!prompt) return `${id} was already running`;
+      return `${id} was already running — ${await deliver(row, prompt)}`;
     }
     if (!row.claude_session_id) throw new Error(`${id} has no transcript recorded — cannot resume`);
     const dir = repoDir(row.repo);
     ensureTrusted(dir);
     if (row.repo !== 'root') await pull(dir);
     const sessionId = `mac-${cmd.id.slice(0, 8)}`;
-    const prompt = String((cmd.payload || {}).prompt || '').trim() || null;
     beginLaunch();   // until the row exists — see open_session below
     try {
       const raw = await openFreshTab(dir, row.repo, prompt, sessionId, row.claude_session_id);
@@ -247,7 +250,7 @@ async function run(cmd) {
   // base. Non-fatal: a checkout that cannot fast-forward (local changes, diverged) still opens, and
   // the warning rides along in the prompt so the session knows rather than silently building on it.
   const staleWarning = isRoot ? null : await pull(target);
-  const spoken = String((cmd.payload || {}).prompt || '').trim();
+  const spoken = await withAttachments((cmd.payload || {}).prompt, cmd.payload);
   const wantsReport = (cmd.payload || {}).report === true;
   const prompt = [staleWarning, spoken, (wantsReport && spoken) ? REPORT_DIRECTIVE : null].filter(Boolean).join('\n\n') || null;
   const startedAt = Date.now() - 1000;   // slack: ps reports a start time to the whole second

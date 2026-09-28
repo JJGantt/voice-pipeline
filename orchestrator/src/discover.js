@@ -65,7 +65,27 @@ export function sessionOf(pid) {
     // reads is still reported as working, and as active from when it began. Null when not recorded.
     busy: d.status === 'busy' ? true : d.status === 'idle' ? false : null,
     statusAt: Number.isFinite(d.statusUpdatedAt) ? new Date(d.statusUpdatedAt).toISOString() : null,
+    // What it is blocked on ('permission prompt'), or null. Typing into it then is not a message: the
+    // keys go to the dialog, and a return there answers it.
+    waiting: d.status === 'waiting' ? (d.waitingFor || 'input') : null,
   };
+}
+
+/**
+ * `sessionOf(pid)`, waiting up to `timeoutMs` for Claude Code to write the record if it has not yet.
+ * Woken by the sessions directory changing; the timeout only bounds a process that never writes one.
+ */
+export function awaitSession(pid, timeoutMs = 15000) {
+  const now = sessionOf(pid);
+  if (now) return Promise.resolve(now);
+  return new Promise((resolve) => {
+    let watcher = null;
+    const done = (s) => { clearTimeout(timer); try { watcher?.close(); } catch {} resolve(s); };
+    const timer = setTimeout(() => done(sessionOf(pid)), timeoutMs);
+    try {
+      watcher = fs.watch(SESSIONS_DIR, () => { const s = sessionOf(pid); if (s) done(s); });
+    } catch { /* no directory — the timeout's own check is all there is */ }
+  });
 }
 
 /**

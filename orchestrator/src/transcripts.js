@@ -55,10 +55,10 @@ export function fromHim(text) {
 
 // A DICTATED MESSAGE TOO LONG FOR THE TERMINAL IS STILL THE MESSAGE.
 //
-// A prompt over TTY_INPUT_MAX characters is not typed into the tty (AppleScript cannot hand it over in
-// one go), so `sendToTty` parks the words in ~/.claude-desk-prompts and types a one-line stub naming the
-// file. Line breaks alone do not do this; they are typed. That stub is what lands in the transcript, so every surface that
-// draws "his last message" drew the stub: the session list, the session view, the wall, `desk_turns`.
+// A message too long or too many-lined to type as a message (`typeable` in handoff.js, on both machines)
+// is parked in ~/.claude-desk-prompts and the session is typed a one-line stub naming the file. That stub
+// is what lands in the transcript, so every surface that draws "his last message" would draw the stub:
+// the session list, the session view, the wall, `desk_turns`.
 //
 // Resolved HERE because this is the single place a user record becomes prompt text, so one
 // substitution covers all of them — the message is displayed the same as one short enough to type.

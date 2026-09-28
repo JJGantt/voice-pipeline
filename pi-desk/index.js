@@ -33,7 +33,9 @@ import { randomUUID } from 'node:crypto';
 // Shared with the Mac orchestrator rather than copied: it only writes ~/.claude.json and has nothing
 // platform-specific in it, and two copies of "which keys make a project entry complete" would drift.
 import { ensureTrusted } from '../orchestrator/src/trust.js';
-import { readTail, liveSessions, evict, pickEviction } from './sessions.js';
+import { readTail, liveSessions, evict, pickEviction, typeInto } from './sessions.js';
+// Pictures attached in the hub, fetched to this machine for the session to read — shared with the Mac.
+import { withAttachments, sweepStashedPrompts } from '../orchestrator/src/handoff.js';
 // Which conversation a process is in, from Claude Code's own record — shared with the Mac, which
 // reads the same files for the same reason.
 import { sessionOf } from '../orchestrator/src/discover.js';
@@ -561,23 +563,17 @@ const REPORT_DIRECTIVE =
   + 'you did — that is how Jared reads the outcome on his phone. Then answer normally here as '
   + 'well: the report is an extra artifact, never a replacement for replying.]';
 
-// Type into a session that is already running.
-//
-// Text and Enter as SEPARATE send-keys calls. Combined, tmux types the text but the Enter does not
-// submit it — the prompt sits in the composer unsent while everything looks like it worked.
-async function typeInto(target, prompt) {
-  await exec('tmux', ['send-keys', '-t', target, prompt], { timeout: 15000 });
-  await new Promise((r) => setTimeout(r, 600));
-  await exec('tmux', ['send-keys', '-t', target, 'Enter'], { timeout: 10000 });
-  return `sent ${prompt.length} chars to ${target}`;
-}
-
 // ---- launching ------------------------------------------------------------
-function launch(dir, name, prompt, resumeId = null) {
-  const session = `hub-${name}-${Date.now().toString(36)}`;
+function launch(dir, name, prompt, resumeId = null, reuse = null) {
+  const session = reuse || `hub-${name}-${Date.now().toString(36)}`;
   // The Remote Control name is an IDENTITY in the Claude app and must be unique per SESSION. The
   // tmux name already carries a timestamp suffix for exactly that reason, so the RC name reuses it
   // rather than passing the bare repo — which made every session on a repo register as that repo.
+  //
+  // A resume passes the parked session's own name (`reuse`), so the conversation comes back under the
+  // identity it had: same tmux name, same Remote Control name, same row. It is the same session, and
+  // naming it afresh made the Claude app list it as a different one. Unique still holds — the caller
+  // has made sure nothing by that name is running.
   const rcName = session.slice(4);
   const here = path.dirname(new URL(import.meta.url).pathname);
   const launcher = path.join(here, 'launch.sh');
@@ -672,13 +668,23 @@ async function bindWhenUp(session, { attempts = 90, delayMs = 1000 } = {}) {
 // at once and never resume it a second time, which would put two processes on one transcript.
 function resumeArgs(row, { prompt = null, report = false, commandId = null } = {}) {
   return { name: row.repo, prompt: prompt || '', resumeId: row.claude_session_id, commandId, report,
+           // Only one of this machine's own names can come back as itself; a Mac row's id is not a tmux name.
+           reuse: row.worker === WORKER && /^hub-[A-Za-z0-9._-]+$/.test(row.id) ? row.id : null,
            label: row.label || null, origin: row.origin || null,
            knownClaudeId: row.claude_session_id, transcriptPath: row.transcript_path || null,
            mirrorOffset: row.mirror_offset || 0 };
 }
 
 async function startSession({ name, prompt, resumeId = null, commandId = null, report = false, label = null,
-                              knownClaudeId = null, transcriptPath = null, mirrorOffset = null, origin = null }) {
+                              knownClaudeId = null, transcriptPath = null, mirrorOffset = null, origin = null,
+                              reuse = null }) {
+  if (reuse) {
+    const same = (await liveSessions()).find((l) => l.name === reuse);
+    // Running already: a second process on one transcript forks the conversation (see resume_session).
+    if (same?.alive) throw new Error(`${reuse} is already running`);
+    // A husk — tmux still holding the name after claude exited — would make new-session fail.
+    if (same) await exec('tmux', ['kill-session', '-t', `=${reuse}`], { timeout: 10000 }).catch(() => {});
+  }
   const { dir, warning } = await ensureRepo(name);
   // Without this the session opens onto "Do you trust the files in this folder?" and waits for a
   // click nobody is there to make. Matters most on a fresh clone, which by definition is unseen.
@@ -688,7 +694,7 @@ async function startSession({ name, prompt, resumeId = null, commandId = null, r
   // doing, and a report on a one-line change is noise — so it is opt-in, set by the voice tool
   // when Jared actually asks. A bare session with no prompt has nothing to report on either way.
   const full = [warning, spoken, (report && spoken) ? REPORT_DIRECTIVE : null].filter(Boolean).join('\n\n');
-  const session = launch(dir, name, full, resumeId);
+  const session = launch(dir, name, full, resumeId, reuse);
 
   // Published immediately so the indicator lights up when work starts, not a poll later.
   await sb('desk_sessions?on_conflict=id', {
@@ -696,8 +702,9 @@ async function startSession({ name, prompt, resumeId = null, commandId = null, r
     // command_id is what lets a follow-up find this session: the dispatch that created it is the
     // only durable handle the caller had at the time, since the session did not exist yet.
     // The most recently active session from the moment it exists: it is the work he just asked for.
+    // `ended: null` for a resume under its own name: the row was parked, and is running again.
     body: JSON.stringify([{ id: session, worker: WORKER, repo: name, status: 'resident', command_id: commandId,
-                            label: label || null, active_at: new Date().toISOString(),
+                            label: label || null, active_at: new Date().toISOString(), ended: null,
                             ...(origin ? { origin } : {}),
                             ...(knownClaudeId ? { claude_session_id: knownClaudeId, transcript_path: transcriptPath,
                                                   mirror_offset: mirrorOffset ?? 0 } : {}),
@@ -727,8 +734,8 @@ async function run(cmd) {
   // to the conversation that is already there, with all of its context.
   if (cmd.kind === 'follow_up') {
     const target = String((cmd.payload || {}).session || '').trim();
-    const prompt = String((cmd.payload || {}).prompt || '').trim();
     if (!/^hub-[A-Za-z0-9._-]+$/.test(target)) throw new Error(`unusable session name: ${target}`);
+    const prompt = await withAttachments((cmd.payload || {}).prompt, cmd.payload);
     if (!prompt) throw new Error('no prompt to send');
     return typeInto(target, prompt);
   }
@@ -740,7 +747,8 @@ async function run(cmd) {
     const name = String((cmd.payload || {}).name || '').replace(/[\r\n]+/g, ' ').trim().slice(0, 60);
     if (!/^hub-[A-Za-z0-9._-]+$/.test(target)) throw new Error(`unusable session name: ${target}`);
     if (!name) throw new Error('no name to set');
-    await typeInto(target, `/rename ${name}`);
+    // The receipt is the `custom-title` record carrying the name, not the command text.
+    await typeInto(target, `/rename ${name}`, { expect: name });
     return `renamed ${target} to ${name}`;
   }
 
@@ -773,14 +781,13 @@ async function run(cmd) {
     // reattach — it starts a second process replaying the same transcript, so the conversation forks
     // into two copies with one id, and a follow-up typed into one is invisible to the other. Whoever
     // is watching the original sees their message vanish.
+    const prompt = await withAttachments((cmd.payload || {}).prompt, cmd.payload) || null;
     const alreadyUp = (await liveSessions()).some((l) => l.name === id && l.alive);
     if (alreadyUp) {
-      const prompt = String((cmd.payload || {}).prompt || '').trim();
       if (!prompt) return `${id} is already running`;
       return `${id} was already running — ${await typeInto(id, prompt)}`;
     }
     if (!row.claude_session_id) throw new Error(`${id} has no recorded claude session id — cannot resume`);
-    const prompt = String((cmd.payload || {}).prompt || '').trim() || null;
     const report = (cmd.payload || {}).report === true;
     // A resume takes a slot like any other session. On a full Pi it waits in the queue instead of
     // becoming a third resident — two idle sessions have already been OOM-killed here (transcripts.js)
@@ -859,13 +866,15 @@ async function run(cmd) {
   // a queued row rather than being dropped or forced onto a full machine. A resume checks the same
   // limits in its own handler (resume_session, above); the queue runner calls startSession directly
   // because it has just made the room.
+  // Fetched now, before a possible wait in the queue: the prompt stored there is what gets launched.
+  const spoken = await withAttachments(payload.prompt, payload);
   const residents = (await liveSessions()).filter((l) => l.alive);
   const pressure = memoryPressure();
   if (residents.length >= RESIDENT_MAX || pressure) {
     await sb('desk_queue', {
       method: 'POST', headers: { Prefer: 'return=minimal' },
       body: JSON.stringify([{ id: randomUUID(), worker: WORKER, repo: name,
-                              prompt: String(payload.prompt || '').trim() || null,
+                              prompt: spoken || null,
                               report: payload.report === true,
                               label: payload.label || null }]),
     });
@@ -873,7 +882,7 @@ async function run(cmd) {
       ? `queued behind ${residents.length} resident session(s)`
       : `queued — ${pressure}`;
   }
-  return startSession({ name, prompt: payload.prompt, commandId: cmd.id, report: payload.report === true, label: payload.label || null });
+  return startSession({ name, prompt: spoken, commandId: cmd.id, report: payload.report === true, label: payload.label || null });
 }
 
 let draining = false;
@@ -983,6 +992,8 @@ async function sweepRetention() {
     await sb(`desk_commands?created=lt.${ago(KEEP_COMMAND_DAYS)}`, { method: 'DELETE', headers: { Prefer: 'return=minimal' } });
     await sb(`voice_requests?created_at=lt.${ago(KEEP_REQUEST_DAYS)}`, { method: 'DELETE', headers: { Prefer: 'return=minimal' } });
     await sweepClips();
+    // Messages handed to sessions by file, and the pictures fetched for them (handoff.js).
+    sweepStashedPrompts();
   } catch (e) { console.error('[pi-desk] retention:', e.message); }
 }
 

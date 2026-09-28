@@ -211,34 +211,47 @@ Closing a session on the Mac is `/exit` typed into the tab, then SIGTERM if it i
 TAB does not understand AppleScript's `close` (it answers -1708), which is why `closeTabForTty` used
 to report failure and close nothing; the window is closed only when that tab is the last one in it.
 
-## A tty takes 1024 bytes, so nothing long is ever typed at the Mac
+## Typing into a running session: short text only, and "sent" means the transcript has it
 
-`do script` writes into a Terminal tab's tty, and a tty accepts 1024 bytes of input and silently
-discards the rest — a 2500-character dispatch arrived as exactly 1024 characters, mid-word, leaving
-the shell on an unterminated quote and no session at all. Both directions now go by reference:
+Both machines put a follow-up into a live session by typing it — the Mac into a Terminal tab's tty
+(`sendToTty`), the Pi into a tmux pane (`typeInto` in `pi-desk/sessions.js`). What they type and how
+they confirm it is one contract, in `orchestrator/src/handoff.js`:
 
-- **Launching** puts the prompt in a file and lets the SHELL read it (`"$(cat …)"`), so the typed
-  line is ~214 characters whatever was said. Same idea as the file `pi-desk` hands tmux.
-- **A follow-up** cannot do that — it goes to Claude Code's composer, not a shell — so over ~900
-  characters (or with any newline, which an AppleScript string literal cannot hold) the text is
-  stashed in `~/.claude-desk-prompts/` and the session is told to read it, **echo it back verbatim
-  first**, then act. The echo is what keeps the words visible in the session; without it the terminal
-  shows a stub and the request lives only in a file.
-- **Whatever is typed goes inside bracketed-paste markers.** `do script` writes the text and its
-  return as one chunk, and Claude Code reads a long chunk as a paste, so the return lands inside it
-  and the message sits in the composer unsent while the command reports `done`. Measured on an idle
-  session: 8 characters submitted, 105 did not. With `ESC[200~ … ESC[201~` around the text the return
-  is a keypress at any length, and a slash command (`/rename`) still runs. The Pi hits the same thing
-  through tmux and sends Enter as a separate call.
+- **Only short text is typed as a message.** Claude Code decides by shape whether input is a paste,
+  and a paste reaches the model wrapped in `<pasted_content>` — framed as material, not as his request.
+  Measured on 2.1.284: 790 characters arrive plain, 810 arrive wrapped; three lines plain, four
+  wrapped; the same for bracketed paste and for plain keystrokes. A wrapped follow-up gets "your message
+  was only the pasted block — you didn't ask me to follow it". So over `TYPE_MAX_CHARS` (700) or
+  `TYPE_MAX_LINES` (3) the text is stashed in `~/.claude-desk-prompts/` and the session is typed a
+  one-line stub telling it to read the file, **echo it back verbatim first**, then act. The echo keeps
+  the words visible in the session; `transcripts.js` also resolves the stub back to the words for every
+  surface. That limit also keeps the Mac inside a tty's 1024-byte input buffer, which silently drops the
+  rest.
+- **Whatever is typed goes inside bracketed-paste markers, and Enter follows as a keypress.** Without a
+  boundary Claude Code can read the return as part of the text and leave the message in the composer.
+  The Mac wraps the text in `ESC[200~ … ESC[201~` itself; the Pi uses `tmux paste-buffer -p -r`. The Pi
+  must not go back to `send-keys <text>`: it gives no boundary, and a message that is a key name
+  ("Enter", "Up") is sent as that key.
+- **"Sent" is reported only once the transcript has it** (`awaitSubmitted`). Claude Code writes a
+  `user` record at once when idle, and a `queue-operation` enqueue carrying the text at once when a turn
+  is running — a busy session queues a typed message just as it does one from Remote Control, so there is
+  nothing to wait for. Unconfirmed after 8s, the Pi presses Enter once more (the Mac does not); an
+  unconfirmed command fails and is dead-lettered with his words. Typing reports nothing on its own —
+  text can sit unsent in the composer, or vanish, while the call that typed it succeeds.
+- **A session waiting on a permission prompt is refused.** The keys would go to the dialog and the Enter
+  would answer it. The state comes from the session's record (`waiting` in `discover.js`).
+- **Pictures** in a command's `payload.attachments` are fetched from the hub on the machine that owns
+  the session and named in the prompt (`withAttachments`), for `follow_up`, `resume_session` and
+  `open_session` alike, on both machines.
 
-Three approaches that look right and are not: chunking (`do script` appends a return, so every chunk
-submits as its own message), System Events `keystroke` (types without a return, but needs
+Launching is different: the prompt goes in a file the SHELL reads (`"$(cat …)"` on the Mac, `launch.sh`
+on the Pi) and reaches claude as an argument, which is neither typed nor treated as a paste.
+
+Three approaches for long text that look right and are not: chunking (`do script` appends a return, so
+every chunk submits as its own message), System Events `keystroke` (types without a return, but needs
 Accessibility permission a launchd daemon does not have), and `claude --resume <id> "$(cat …)"` in a
 fresh tab (resume on a LIVE session starts a second process replaying the same transcript, so the
 conversation forks into two copies with one id).
-
-The Pi needs none of this: tmux writes into the pane with its own flow control — measured, 3000
-characters in, 3000 out.
 
 `orchestrator/src/transcripts.js` is shared by both machines. `readTail` reports the FINAL message of
 a turn, identified by the transcript record whose `stop_reason` is `end_turn` — not "the last
@@ -253,6 +266,11 @@ It reads only the last 512KB. These files reach tens of megabytes — one projec
 A closed session means the same thing on both machines: **`evicted` is parked and resumable** (a new
 tab on the Mac, a new tmux session on the Pi), and `ended` means no transcript was ever bound, so
 there is nothing to bring back.
+
+The Pi resumes one of its own sessions **under the name it had**: same tmux name, same Remote Control
+name, same row, flipped back to `resident`. The Remote Control name is the session's identity in the
+Claude app, and a fresh one made a reaped-and-resumed conversation show up there as a different
+session. The Mac still opens a resume as a new row with a new name.
 
 The Mac's `deskSessions.js` tick is still smaller than the Pi's: no residency cap and no eviction of
 its own. Those exist because a headless 4GB machine must decide what to close; on the Mac Jared can
