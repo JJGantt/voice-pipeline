@@ -42,8 +42,15 @@ export function turnStart(d) {
  * is real, but it is not him, and shown as his words it is a wall of markup in his colour. Both places
  * a user message becomes his words (a turn's prompt here, and a queued message in sessionWatch) ask this.
  */
+// Every synthetic wrapper the harness can inject as a user-turn's text, none of them him: a finished
+// background task, and a subagent's own final report handed back into the turn that spawned it (the
+// same shape, and the same reason — its content is model output addressed to the session, not to him).
+// Measured leaking through this check with only the first excluded: a subagent hand-back, its own
+// opening line saying plainly it is "NOT a message from the user", displayed on the wrist as his words.
+const NOT_HIM = ['<task-notification>', '<agent-message'];
 export function fromHim(text) {
-  return !String(text || '').trimStart().startsWith('<task-notification>');
+  const t = String(text || '').trimStart();
+  return !NOT_HIM.some((tag) => t.startsWith(tag));
 }
 
 // A DICTATED MESSAGE TOO LONG FOR THE TERMINAL IS STILL THE MESSAGE.
