@@ -57,6 +57,10 @@ function send(st, body) {
  * the short tool name, then its arguments compacted. Two surfaces showing tool calls should read the
  * same way, or the wall teaches two vocabularies for one thing.
  */
+function readsStash(block) {
+  try { return JSON.stringify(block.input || {}).includes('.claude-desk-prompts/'); } catch { return false; }
+}
+
 function toolLine(block) {
   const name = String(block.name || '');
   const short = name.includes('__') ? name.split('__').pop() : name;
@@ -117,10 +121,10 @@ function drain(st) {
     if (d.type === 'user') {
       // A prompt starts a turn. Tool results are recorded as user records too, and are the model's
       // own work coming back — the same distinction readTail draws.
-      const blocks = d.message?.content;
-      const toolResult = Array.isArray(blocks) && blocks.length > 0 && blocks.every((b) => b?.type === 'tool_result');
-      if (!toolResult) st.said = null;
-      if (!toolResult && typeof d.timestamp === 'string') {
+      // turnStart is null for both, and for a terminal-local command and its output.
+      const said = turnStart(d);
+      if (said) st.said = null;
+      if (said && typeof d.timestamp === 'string') {
         try { st.onActivity(st.id, d.timestamp); } catch { /* the tick writes it regardless */ }
       }
       // HIS WORDS, AT THE MOMENT THEY ARRIVE. A prompt sent while a turn is running used to send no
@@ -131,7 +135,6 @@ function drain(st) {
       // summaries are not him speaking, and a message stashed to a file resolves to its real text.
       // A prompt that started its OWN turn: this record is its ingestion. One that was absorbed
       // mid-turn never reaches here — the `remove` above already reported it.
-      const said = toolResult ? null : turnStart(d);
       if (said && said.prompt) send(st, { session: st.id, state: 'said', text: said.prompt });
       // A message too long for the tty is typed as a stub that ASKS the session to reply with the
       // words verbatim, so they are visible in the terminal. They are visible in the hub already —
@@ -164,6 +167,9 @@ function drain(st) {
           send(st, { session: st.id, state: 'text', text });
         }
         st.said = { id: msg.id, text: [], thought: [] };
+        // Nor the session opening the stash file itself: a path into ~/.claude-desk-prompts on the wrist
+        // is the workaround showing through, and his words already arrived as `said`.
+        if (readsStash(b)) continue;
         send(st, { session: st.id, state: 'tool', text: toolLine(b) });
       }
     }

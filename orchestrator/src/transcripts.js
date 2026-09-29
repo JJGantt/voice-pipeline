@@ -29,6 +29,16 @@ export function turnStart(d) {
   // summary it writes when it compacts a conversation mid-turn (`isCompactSummary`): pages of its
   // own recap, recorded as a user record, which is not something he said.
   if (d.isMeta || d.isCompactSummary) return { prompt: null, meta: true };
+  // A shell command run in the terminal (`!ls`) and the terminal's own output for it or for a local
+  // slash command (`/chrome`) are recorded as user records. None of them is a turn.
+  const raw = typeof blocks === 'string' ? blocks.trimStart() : '';
+  if (LOCAL_OUTPUT.some((tag) => raw.startsWith(tag))) return null;
+  // A slash command is recorded as markup around what he typed; what he typed is the prompt.
+  const cmd = raw.startsWith('<command-name>') && raw.match(/<command-name>([^<]*)<\/command-name>/);
+  if (cmd) {
+    const args = (raw.match(/<command-args>([^<]*)<\/command-args>/) || [])[1] || '';
+    return { prompt: `${cmd[1].trim()}${args.trim() ? ` ${args.trim()}` : ''}` };
+  }
   const text = typeof blocks === 'string' ? blocks.trim()
     : Array.isArray(blocks) ? blocks.filter((b) => b?.type === 'text').map((b) => b.text).join('\n').trim()
     : '';
@@ -48,6 +58,7 @@ export function turnStart(d) {
 // Measured leaking through this check with only the first excluded: a subagent hand-back, its own
 // opening line saying plainly it is "NOT a message from the user", displayed on the wrist as his words.
 const NOT_HIM = ['<task-notification>', '<agent-message'];
+const LOCAL_OUTPUT = ['<local-command-stdout>', '<local-command-stderr>', '<bash-input>', '<bash-stdout>', '<bash-stderr>'];
 export function fromHim(text) {
   const t = String(text || '').trimStart();
   return !NOT_HIM.some((tag) => t.startsWith(tag));
@@ -115,6 +126,27 @@ export function gist(text, len = 60) {
   return flat.slice(Math.floor(flat.length / 5), Math.floor(flat.length / 5) + len);
 }
 export const flatten = (t) => String(t || '').replace(/\s+/g, ' ').trim();
+
+/**
+ * A reply with the session's echo of a stashed message taken off its front.
+ *
+ * The stub asks the session to reply with the message verbatim first, so the words are visible in the
+ * terminal. When the answer needs no tool call after that, the echo lands in the FINAL reply — shown
+ * on the wrist under the very words it repeats, and read aloud in full before the answer. The echo is
+ * recognised by his first and last lines appearing in order near the front; anything short of that is
+ * left alone, because cutting the wrong text out of an answer is worse than a repeated paragraph.
+ */
+export function dropEcho(reply, prompt) {
+  const lines = String(prompt || '').split('\n').map((l) => l.trim()).filter(Boolean);
+  if (!lines.length || !reply) return reply;
+  const start = reply.indexOf(lines[0]);
+  if (start === -1 || start > 300) return reply;
+  const last = lines[lines.length - 1];
+  const end = reply.indexOf(last, start);
+  if (end === -1) return reply;
+  const rest = reply.slice(end + last.length).replace(/^\s*(```|["\u201d])?\s*/, '');
+  return rest || reply;
+}
 function unstash(text) {
   const m = STASH_RE.exec(String(text || ''));
   if (!m) return null;
@@ -232,7 +264,9 @@ export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
   let anyAssistantText = null;  // fallback when no turn ever completed
   let promptAt = null;          // when a turn was last started — see turnAt below
   let turnPrompt = null;        // what started the current turn
+  let turnStashed = false;      // ...and whether it was a stub resolved from the stash (dropEcho)
   let finalPrompt = null;       // what started the turn finalReply ended, so the two always pair
+  let finalStashed = false;
   let startSeen = false;        // a turn has started inside the window
   let finalStartSeen = false;   // ...before the end of the turn finalReply ended
 
@@ -256,9 +290,11 @@ export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
       const start = turnStart(d);
       if (start) {
         working = true; turnText = []; promptAt = d.timestamp || promptAt;
-        startSeen = true;
-        // Injected context starts a turn without saying anything: the prompt before it stands.
-        if (!start.meta) turnPrompt = start.prompt;
+        // Injected context starts a turn without saying anything: the prompt before it stands. It
+        // must not count as the turn's start being seen either — a skill loading mid-turn is one of
+        // these, and counted, a turn longer than the window skipped the search further back and was
+        // stored with no prompt at all, so its reply opened on every surface with no question above it.
+        if (!start.meta) { turnPrompt = start.prompt; turnStashed = !!start.stashed; startSeen = true; }
       }
       continue;
     }
@@ -275,7 +311,10 @@ export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
     if (msg.stop_reason === 'end_turn') {
       working = false;
       const joined = turnText.join('\n\n').trim();
-      if (joined) { finalReply = joined; replyAt = d.timestamp || null; finalPrompt = turnPrompt; finalStartSeen = startSeen; }
+      if (joined) {
+        finalReply = joined; replyAt = d.timestamp || null;
+        finalPrompt = turnPrompt; finalStashed = turnStashed; finalStartSeen = startSeen;
+      }
     }
   }
 
@@ -284,11 +323,13 @@ export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
   // The reply is in the window and the turn's opening is not: look further back for it, once.
   if (finalReply !== null && !finalStartSeen && from > 0) {
     const hit = promptCache.get(transcriptPath);
-    if (replyAt && hit && hit.replyAt === replyAt) finalPrompt = hit.prompt;
+    if (replyAt && hit && hit.replyAt === replyAt) { finalPrompt = hit.prompt; finalStashed = hit.stashed; }
     else {
-      finalPrompt = turnStartBefore(transcriptPath, windowStart)?.prompt ?? null;
+      const start = turnStartBefore(transcriptPath, windowStart);
+      finalPrompt = start?.prompt ?? null;
+      finalStashed = !!start?.stashed;
       promptCache.delete(transcriptPath);
-      promptCache.set(transcriptPath, { replyAt, prompt: finalPrompt });
+      promptCache.set(transcriptPath, { replyAt, prompt: finalPrompt, stashed: finalStashed });
       if (promptCache.size > PROMPT_CACHE_MAX) promptCache.delete(promptCache.keys().next().value);
     }
   }
@@ -318,6 +359,7 @@ export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
   const turnAt = [promptAt, replyAt].filter(Boolean).sort().pop() || null;
   // lastPrompt is the prompt of the turn lastReply ended, or null when the reply is only the fallback
   // text of a turn that never finished (its prompt would not be the one it answers).
+  if (finalReply !== null && finalStashed) finalReply = dropEcho(finalReply, finalPrompt);
   return { working, lastReply: finalReply ?? anyAssistantText, lastPrompt: finalReply !== null ? finalPrompt : null,
            replyAt, turnAt,
            title: customTitle || aiTitle, customTitle,

@@ -225,7 +225,10 @@ they confirm it is one contract, in `orchestrator/src/handoff.js`:
   `TYPE_MAX_LINES` (3) the text is stashed in `~/.claude-desk-prompts/` and the session is typed a
   one-line stub telling it to read the file, **echo it back verbatim first**, then act. The echo keeps
   the words visible in the session; `transcripts.js` also resolves the stub back to the words for every
-  surface. That limit also keeps the Mac inside a tty's 1024-byte input buffer, which silently drops the
+  surface, and the rest of the workaround is kept off them too: the session's `Read` of the stash file
+  is not streamed as a tool line, a text frame quoting the words is dropped, and an echo that lands in
+  the final reply is cut off its front (`dropEcho`) — otherwise the watch shows, and speaks, his message
+  a second time above the answer. That limit also keeps the Mac inside a tty's 1024-byte input buffer, which silently drops the
   rest.
 - **Whatever is typed goes inside bracketed-paste markers, and Enter follows as a keypress.** Without a
   boundary Claude Code can read the return as part of the text and leave the message in the composer.
