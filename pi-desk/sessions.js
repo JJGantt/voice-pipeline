@@ -14,6 +14,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { awaitSession } from '../orchestrator/src/discover.js';
 import { typeable, transcriptSize, awaitSubmitted } from '../orchestrator/src/handoff.js';
+import { expectPrompt } from '../orchestrator/src/sessionWatch.js';
 
 const exec = promisify(execFile);
 
@@ -74,7 +75,7 @@ export async function liveSessions() {
  * the dialog and the Enter would answer it. The drain loop runs commands one at a time and this does not
  * return until the message is confirmed, which is what serialises two messages to one session.
  */
-export async function typeInto(target, text, { expect = null } = {}) {
+export async function typeInto(target, text, { expect = null, cmd = null } = {}) {
   const pane = (await liveSessions()).find((l) => l.name === target && l.alive);
   if (!pane?.pid) throw new Error(`${target} is not running`);
   // A session launched a moment ago may not have written its record yet; it does within a second.
@@ -83,6 +84,8 @@ export async function typeInto(target, text, { expect = null } = {}) {
   if (s.waiting) throw new Error(`${target} is waiting on a ${s.waiting} — not typing into it`);
 
   const from = transcriptSize(s.transcriptPath);
+  // The id the watcher stamps on the prompt these words become (sessionWatch.js `expectPrompt`).
+  if (cmd) expectPrompt(target, text, cmd);
   const { line, how } = typeable(text, target);
   const buf = `pd-${target}`;
   await exec('tmux', ['set-buffer', '-b', buf, '--', line], { timeout: 10000 });

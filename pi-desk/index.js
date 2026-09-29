@@ -737,7 +737,8 @@ async function run(cmd) {
     if (!/^hub-[A-Za-z0-9._-]+$/.test(target)) throw new Error(`unusable session name: ${target}`);
     const prompt = await withAttachments((cmd.payload || {}).prompt, cmd.payload);
     if (!prompt) throw new Error('no prompt to send');
-    return typeInto(target, prompt);
+    // The hub passes the sender's own message id as `msg` when it has one; the command id otherwise.
+    return typeInto(target, prompt, { cmd: (cmd.payload || {}).msg || cmd.id });
   }
 
   // Name the session itself, with the command Jared would type. Claude Code writes the `custom-title`
@@ -785,7 +786,7 @@ async function run(cmd) {
     const alreadyUp = (await liveSessions()).some((l) => l.name === id && l.alive);
     if (alreadyUp) {
       if (!prompt) return `${id} is already running`;
-      return `${id} was already running — ${await typeInto(id, prompt)}`;
+      return `${id} was already running — ${await typeInto(id, prompt, { cmd: (cmd.payload || {}).msg || cmd.id })}`;
     }
     if (!row.claude_session_id) throw new Error(`${id} has no recorded claude session id — cannot resume`);
     const report = (cmd.payload || {}).report === true;

@@ -7,7 +7,9 @@
 //
 // So this watches each live session's transcript and pushes what it sees:
 //
-//   a prompt    → the host writes `active_at` (and `working`) to the row: a turn has started
+//   a prompt    → the host writes `active_at` (and `working`) to the row: a turn has started, and
+//                 the hub's /api/session-activity gets it as `said` (or `queued` then `said`), with an
+//                 id and, when this machine typed it for a command, that command's id (`expectPrompt`)
 //   tool_use    → the hub's /api/session-activity, transient, straight out to the wall over SSE
 //   text        → the same, state 'text': what it says between tool calls (never the final reply)
 //   end_turn    → the same, carrying the reply, AND the host writes `last_reply` to the row
@@ -20,6 +22,7 @@
 // Shared by both hosts. The Mac's deskSessions.js and the Pi's pi-desk each call syncSessionWatch
 // with whatever they currently believe is running, and hand in their own way of writing the row.
 import fs from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { config } from './config.js';
 import { readTail, turnStart, resolvePrompt, gist, flatten, fromHim } from './transcripts.js';
@@ -29,6 +32,37 @@ import { readTail, turnStart, resolvePrompt, gist, flatten, fromHim } from './tr
 const DEBOUNCE_MS = 120;
 
 const watched = new Map();   // session id -> { id, path, offset, rest, watcher, timer, onTurnEnd }
+
+// EVERY PROMPT FRAME CARRIES AN IDENTITY, so nothing downstream has to recognise one by its text.
+//
+// `id` is minted here, once per message: a message queued behind a running turn is one event at two
+// moments (`queued` when Claude Code takes it, `said` when the model reads it), and both frames carry
+// the same id, so a view updates one entry instead of matching two texts. `cmd` names the hub command
+// whose words these are, when this machine typed them: the host registers what it is about to type
+// (`expectPrompt`), and the first prompt the transcript then shows with those words takes the id. That
+// is the one place text is compared — once, at the source, against the exact string this process just
+// typed — and it is what lets the device that sent the words replace its own placeholder by id.
+//
+// Registered against the session, not the watcher: a resume with words launches a new row that is not
+// watched until the next tick, and the words are typed before that.
+const expecting = new Map();   // session id -> [{ text, cmd, at }]
+const EXPECT_MS = 5 * 60 * 1000;
+export function expectPrompt(sessionId, text, cmd) {
+  const list = expecting.get(sessionId) || [];
+  list.push({ text: flatten(text), cmd: String(cmd), at: Date.now() });
+  expecting.set(sessionId, list);
+}
+function takeExpect(sessionId, prompt) {
+  const list = expecting.get(sessionId);
+  if (!list) return null;
+  const now = Date.now();
+  const flat = flatten(prompt);
+  const i = list.findIndex((e) => e.text === flat && now - e.at < EXPECT_MS);
+  const hit = i >= 0 ? list.splice(i, 1)[0].cmd : null;
+  const kept = list.filter((e) => now - e.at < EXPECT_MS);
+  if (kept.length) expecting.set(sessionId, kept); else expecting.delete(sessionId);
+  return hit;
+}
 
 async function push(body) {
   if (!config.HUB_URL || !config.HUB_TOKEN) return;
@@ -113,7 +147,20 @@ function drain(st) {
       if (!fromHim(d.content)) continue;
       const said = resolvePrompt(d.content);
       if (said.prompt && (d.operation === 'enqueue' || d.operation === 'remove')) {
-        send(st, { session: st.id, state: d.operation === 'enqueue' ? 'queued' : 'said', text: said.prompt });
+        // The same message at its two moments carries the same id: minted at `enqueue` and held on
+        // `st.queue` until its `remove` (matched by the exact text both records carry) takes it. A
+        // `remove` with nothing queued (the enqueue landed before this watcher attached) mints its own.
+        let ev;
+        if (d.operation === 'enqueue') {
+          ev = { id: randomUUID(), cmd: takeExpect(st.id, said.prompt) };
+          st.queue.push({ ...ev, text: flatten(said.prompt) });
+        } else {
+          const flat = flatten(said.prompt);
+          const i = st.queue.findIndex((q) => q.text === flat);
+          ev = i >= 0 ? st.queue.splice(i, 1)[0] : { id: randomUUID(), cmd: takeExpect(st.id, said.prompt) };
+        }
+        send(st, { session: st.id, state: d.operation === 'enqueue' ? 'queued' : 'said', text: said.prompt,
+                   id: ev.id, ...(ev.cmd ? { cmd: ev.cmd } : {}) });
         if (said.stashed) st.echo = gist(said.prompt);
       }
       continue;
@@ -135,7 +182,10 @@ function drain(st) {
       // summaries are not him speaking, and a message stashed to a file resolves to its real text.
       // A prompt that started its OWN turn: this record is its ingestion. One that was absorbed
       // mid-turn never reaches here — the `remove` above already reported it.
-      if (said && said.prompt) send(st, { session: st.id, state: 'said', text: said.prompt });
+      if (said && said.prompt) {
+        const cmd = takeExpect(st.id, said.prompt);
+        send(st, { session: st.id, state: 'said', text: said.prompt, id: randomUUID(), ...(cmd ? { cmd } : {}) });
+      }
       // A message too long for the tty is typed as a stub that ASKS the session to reply with the
       // words verbatim, so they are visible in the terminal. They are visible in the hub already —
       // `said` above carries them — so the echo is the same paragraph twice, and the whole point of
@@ -208,7 +258,11 @@ export function reportTurnEnd(id, tail) {
   // The notification does not ride on it: `summary_coming` tells the hub to hold it for the frame
   // below, which arrives seconds later carrying a sentence worth putting on a lock screen. A host that
   // does not send one (the Pi, today) simply omits the flag and the hub notifies from `done` as before.
+  // `text` is the 400-character line a wall draws; `reply` is the whole answer, and `prompt` what
+  // began the turn, so the hub's event log holds the finished turn in full without a second read.
   const p = push({ session: id, state: 'done', text: tail.lastReply.slice(0, 400),
+                   reply: tail.lastReply.slice(0, 4000),
+                   prompt: tail.lastPrompt ? tail.lastPrompt.slice(0, 4000) : null,
                    at: tail.replyAt || null, summary_coming: true });
   summarise(tail.lastReply).then((summary) => push({
     session: id, state: 'summary', text: tail.lastReply.slice(0, 400), at: tail.replyAt || null, summary,
@@ -303,7 +357,7 @@ export function syncSessionWatch(rows, onTurnEnd, onActivity = () => {}) {
     let offset = 0;
     try { offset = fs.statSync(r.transcript_path).size; } catch { continue; }
     const st = { id: r.id, path: r.transcript_path, offset, rest: '', watcher: null, timer: null, onTurnEnd, onActivity,
-                 said: null, chain: Promise.resolve() };
+                 said: null, queue: [], chain: Promise.resolve() };
     watched.set(r.id, st);
     attach(st);
   }

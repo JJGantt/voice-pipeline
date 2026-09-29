@@ -30,6 +30,7 @@ import { isKnownRepo } from './repos.js';
 import { ensureTrusted } from './trust.js';
 import { openFreshTab, sendToTty, closeTabForTty } from './applescript.js';
 import { withAttachments, transcriptSize, awaitSubmitted } from './handoff.js';
+import { expectPrompt } from './sessionWatch.js';
 import { mirrorUp, mirrorDown } from './mirror.js';
 
 // Appended only when a dispatch ASKED for a write-up (`report` on the command payload, set by the
@@ -79,15 +80,18 @@ function repoDir(name) {
  * "Sent" is reported only once the session's transcript holds the prompt (handoff.js): typing itself
  * reports nothing, and text can sit in the composer unsent while everything looks like it worked. A
  * session blocked on a permission prompt is refused rather than typed into, since the keys would answer
- * the dialog. `expect` is what the transcript will hold when that differs from the text typed.
+ * the dialog. `expect` is what the transcript will hold when that differs from the text typed. `cmd`
+ * is the id the watcher stamps on the prompt these words become (sessionWatch.js `expectPrompt`), so
+ * the device that sent them can recognise its own message coming back by id rather than by text.
  */
-async function deliver(row, text, { expect = null } = {}) {
+async function deliver(row, text, { expect = null, cmd = null } = {}) {
   if (!row) throw new Error('no such session');
   if (!row.tty) throw new Error(`no terminal recorded for ${row.id}`);
   const s = row.pid ? sessionOf(row.pid) : null;
   if (s?.waiting) throw new Error(`${row.id} is waiting on a ${s.waiting} — not typing into it`);
   const tpath = s?.transcriptPath || row.transcript_path || null;
   const from = tpath ? transcriptSize(tpath) : 0;
+  if (cmd) expectPrompt(row.id, text, cmd);
   const { line, how } = await sendToTty(row.tty, text);
   if (!tpath) return `sent ${text.length} chars to ${row.tty} (${how}, unconfirmed: no transcript bound yet)`;
   if (!(await awaitSubmitted(tpath, from, expect || line))) {
@@ -106,7 +110,8 @@ async function run(cmd) {
     // A session the reconciler has already found dead has no tab to type into. Fail here rather than
     // letting AppleScript hunt for a tty that a later tab may have been given.
     if (row && row.status !== 'resident') throw new Error(`${session} has ended`);
-    return deliver(row, prompt);
+    // The hub passes the sender's own message id as `msg` when it has one; the command id otherwise.
+    return deliver(row, prompt, { cmd: (cmd.payload || {}).msg || cmd.id });
   }
 
   // Name the session itself. `/rename` is the command Jared types, so this is the same act rather than
@@ -147,7 +152,7 @@ async function run(cmd) {
     const prompt = await withAttachments((cmd.payload || {}).prompt, cmd.payload) || null;
     if (row.status === 'resident') {
       if (!prompt) return `${id} was already running`;
-      return `${id} was already running — ${await deliver(row, prompt)}`;
+      return `${id} was already running — ${await deliver(row, prompt, { cmd: (cmd.payload || {}).msg || cmd.id })}`;
     }
     if (!row.claude_session_id) throw new Error(`${id} has no transcript recorded — cannot resume`);
     const dir = repoDir(row.repo);
