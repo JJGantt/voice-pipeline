@@ -170,13 +170,22 @@ Sonnet turn, then a CLI cold start, then a full Opus turn. That is why anything 
 belongs on the fast path, and why the fix for latency, if one is ever wanted, is to continue an
 escalated turn rather than restart it.
 
+## Every turn starts with `/clear`
+
+The warm process holds ONE conversation for its whole life unless it is cleared, and the SDK has no
+"new conversation" call. `_turn` sends `/clear` (about 0.2s) before every turn after the first, so each
+turn sees only the day's conversation the worker replays into its prompt (`recent_context`, everything
+since 4am or the last manual reset). Without it, each turn would ALSO carry every earlier turn and that
+turn's copy of the replay, which grows quadratically and ends in an auto-compaction that blocks one
+command for about 90s, and every command queued behind it.
+
 ## A refused turn wedges the warm client
 
 The `SdkRunner` holds ONE long-lived headless Claude Code process. When the model refuses a turn, the
 CLI answers `API Error: Sonnet 5 can't help with this. Start a new session to continue.` and then
 returns that same error for **every later turn regardless of content**, until the process is
-reconnected. Passing a fresh `session_id` to `query()` does not clear it, even though each turn
-already does exactly that.
+reconnected. Passing a fresh `session_id` to `query()` does not clear it: that argument is a label
+and starts no new conversation.
 
 The mic is always on, so the input that trips a refusal is usually room audio nobody addressed to the
 assistant — and the commands that die behind it are unrelated. On 2026-09-02 one false-triggered

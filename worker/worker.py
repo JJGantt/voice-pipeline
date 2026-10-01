@@ -1589,8 +1589,8 @@ class SdkRunner:
     """Warm Claude Agent SDK client — the PRIMARY fast path, billed to the subscription.
 
     One long-lived headless Claude Code process holds the four MCP servers, so the per-command spawn
-    spawn cost is paid once, not per turn. Each hub turn runs in a FRESH session (a new session_id on
-    the same warm process): the caller replays the hub conversation into the prompt. Pinned to Sonnet +
+    spawn cost is paid once, not per turn. Each hub turn runs in a FRESH conversation (`/clear` on the
+    same warm process, see _turn): the caller replays the day's hub conversation into the prompt. Pinned to Sonnet +
     SAFE_TOOLS at connect; escalation and full-agent turns keep their own `claude -p` spawns (full
     toolset). A failed turn is retried by `run_subscription` and then surfaced; errors never upgrade the
     model and never move a turn onto the paid API.
@@ -1600,6 +1600,7 @@ class SdkRunner:
         self._loop = None
         self._client = None
         self._ambient = True   # the turn in flight came from a room mic; set by run() before each turn
+        self._used = False     # the warm client has run a turn since it connected, so needs a /clear
 
     def _start_loop(self):
         if self._loop is None:
@@ -1662,6 +1663,7 @@ class SdkRunner:
         client = ClaudeSDKClient(options=opts)
         await client.connect()
         self._client = client
+        self._used = False
         log("sdk runner: warm client up (sonnet, safe toolset)")
 
     async def _teardown(self):
@@ -1675,6 +1677,15 @@ class SdkRunner:
     async def _turn(self, prompt, on_event):
         await self._ensure()
         from claude_agent_sdk import AssistantMessage, TextBlock, ToolUseBlock, ResultMessage
+        # `/clear` is what makes this turn a fresh conversation; the `session_id` passed to query() is
+        # only a label and starts nothing. Without it every turn appends to one conversation that also
+        # re-receives the whole day as `ctx`, so it grows quadratically: ~977k tokens after 112 turns,
+        # when auto-compaction stalled a turn for 90s and every command queued behind it. ~0.2s.
+        if self._used:
+            await self._client.query("/clear")
+            async for _ in self._client.receive_response():
+                pass
+        self._used = True
         await self._client.query(prompt, session_id=uuid.uuid4().hex)
         chunks, result_text, ok, raw_error = [], "", True, None
         used_tools = False
