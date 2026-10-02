@@ -32,10 +32,15 @@ it. `pi-desk/launch.sh` strips it separately (it sources the worker's `.env` its
 ## `server/` is a build context, not source
 
 `assemble.sh` does `rm -rf` on `server/data-layer`, `server/mcp-voice`, `server/govee-mcp` and
-`server/worker.py`, then recopies them from `~/repos/data-layer`, `mcp-voice/`, `~/repos/govee-mcp`
-and `worker/`. Editing a copy is lost work. Deploy with:
+`server/worker.py`, then recopies them from the data-layer and govee-mcp checkouts (`~/repos/...` on
+the Mac, `~/data-layer` and `~/mcp-govee` on the Pi), `mcp-voice/` and `worker/`. Editing a copy is
+lost work. Deploy with:
 
     cd server && ./assemble.sh && flyctl deploy --now -a jared-voice
+
+Over SSH the Mac's flyctl has no token (its login is not reachable from a non-interactive shell), so
+a deploy started from the Pi runs on the Pi, with `FLY_API_TOKEN=$(cat ~/.fly/token)` and
+`~/.fly/bin` on `PATH`.
 
 `server/server.py` is the one file there that is genuinely source.
 
