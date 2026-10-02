@@ -72,12 +72,6 @@ CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 # .env files, the Fly secret), so it is popped at import — a subprocess that inherited it would quietly
 # bill the API instead of the subscription.
 os.environ.pop("ANTHROPIC_API_KEY", None)
-# synth-on-Mac (hub setting `synth_on_mac`, default OFF): the Mac's PyTorch Kokoro synthesizes ~4x faster
-# than the Pi's CPU ONNX, so when on, the Mac worker turns the reply to PCM here and ships it to the Pi to
-# play — instead of writing voice_speech for the Pi to synthesize (slow). Falls back to voice_speech on
-# any failure, so the Pi-synth path stays the safety net.
-MAC_SYNTH_URL = os.environ.get("MAC_SYNTH_URL", "http://127.0.0.1:8731/synth")
-PI_PLAY_URL   = os.environ.get("PI_PLAY_URL", "http://raspberrypi.local:27187/play")
 # Most hub turns are tool use, but nutrition macro estimation leans on the model's internal
 # food knowledge — so default to Sonnet (strong priors, still fast). Override with HUB_MODEL
 # ('haiku' for max speed on trivial turns, 'opus' for the best macro/disambiguation quality).
@@ -343,18 +337,6 @@ AGENT_SESSION_FILE = STATE_DIR / "agent_session.json"   # full-agent mode: a SEP
 RESET_SENTINEL = "__RESET_CONTEXT__"
 _NOTHING_SAID = re.compile(r"^\W*thank\s+you\W*$", re.IGNORECASE)
 
-# Quick-add requests (source 'web-quick', from the hub's bottom-right mic FAB) show their reply in a
-# tiny status chip that holds only a few words before it fades. Append this directive to the turn so
-# the assistant still does the work but confirms it in one short phrase. Only the directive-free transcript
-# is shown as the user's bubble; this text is invisible to the conversation.
-QUICK_REPLY_DIRECTIVE = (
-    "\n\n[Reply format for THIS turn only: this came from the quick-add voice button, whose reply shows "
-    "in a tiny status chip for a couple seconds. Do the task, then confirm in ONE phrase of 3–7 words "
-    "naming what was done — e.g. \"Lunch bagel logged\", \"Weight logged: 178\", \"Lights set to blue\". "
-    "No greeting, no explanation, no follow-up question. If it failed, say so "
-    "in under 7 words.]"
-)
-
 # Power/precision directive (the Opus escalation path): maximum-precision for hard estimates — typically a
 # restaurant dish whose ingredients/macros are unknown. Routed to Opus, and this directive both asks
 # for careful decomposition AND contains the "ultrathink" keyword, which is how `claude -p` unlocks
@@ -598,8 +580,7 @@ ADDRESSING_DIRECTIVE = (
     "cats or to other people, others talking near him — so most of what reaches you was NOT said to you. "
     "It is almost never gibberish; it is real, grammatical speech that simply isn't addressed to the "
     "assistant. Act only on an utterance meant for you. When it is not, reply with EXACTLY "
-    f"'{IGNORE_SENTINEL}' and nothing else — never explain that it wasn't a command, because your reply "
-    "is read aloud."
+    f"'{IGNORE_SENTINEL}' and nothing else — never explain that it wasn't a command."
     "\n\nOne parsing note: when he dictates development work — 'send a command to the Mac agent…', 'in "
     "my status-hub repo I want you to…' — the machine he names is where to SEND the work, not someone "
     "else being addressed instead of you. Those are for you. Development talk that names no destination is him speaking to a session already open elsewhere, which has heard him already."
@@ -618,21 +599,6 @@ ROOM_SEND_DIRECTIVE = (
     "\n\n[This came from an always-on room mic, which cannot send texts or email. If it asks you to "
     "send, reply to or forward a text or an email, do not do it by any route — no session, no "
     f"'{ESCALATE_SENTINEL}' — and say it has to come from the button on his phone or watch.]"
-)
-
-# Voice (ESP/Mac) turns: the worker speaks the final WRITTEN reply itself — programmatically, via the Pi
-# audio service (warm Kokoro → the TV) — and pushes it to Jared's phone. No `say` tool, no separate spoken
-# phrase. So the reply must be one clean past-tense line. Appended to fly/mac turns (the quick-add FAB has
-# its own terser directive; typed web turns get neither). See voice-pipeline/ARCHITECTURE.md.
-VOICE_REPLY_DIRECTIVE = (
-    "\n\n[Voice command — your reply is spoken aloud and pushed to your phone. Full sentences are fine, but "
-    "answer ONLY what was asked and nothing more. A simple action → a quick confirmation ('Logged your weight "
-    "at 172.4 pounds.'). A question → just the answer ('About 1,800 calories.') — do NOT volunteer extra info, "
-    "progress, remaining amounts, goals, comparisons, or 'you're this far from X.' Never explain your "
-    "reasoning, restate the request, narrate what you noticed, or add caveats. NEVER say where the answer "
-    "came from or that it was already available — no 'it's in the conversation', 'from earlier', 'as I "
-    "mentioned', 'according to your log', 'I already told you.' State the fact on its own. Just the answer or "
-    "what you did. Plain spoken words only — never any markdown, tables, code, lists, bullets, or symbols. No preamble.]"
 )
 
 # Role framing for every hub turn. The base preset is claude_code (a coding agent), so without this
@@ -685,7 +651,6 @@ AGENT_SYSTEM = (
     "refusing or asking him to clarify; only ask when it's genuinely unclear WHAT he wants. "
     "Requests come from "
     "speech-to-text, so expect occasional mis-hearings; if a request is genuinely unintelligible, say so. "
-    "Keep spoken replies brief and to the point. "
     "Your last message is the whole answer: anything you write between tool calls is shown only as passing "
     "progress and is not kept, so restate in the final message whatever it depends on from earlier in the turn."
 )
@@ -1035,28 +1000,6 @@ def agent_settings() -> dict:
     return {"mode": _agent_cache["mode"], "cwd": _agent_cache["cwd"]}
 
 
-_synth_mac_cache = {"v": None, "t": 0.0}
-
-
-def synth_on_mac() -> bool:
-    """Whether to synthesize replies on the Mac and ship PCM to the Pi (fast) instead of writing voice_speech
-    for the Pi to synthesize (~4x slower). Hub setting `synth_on_mac`, cached ~30s. Default OFF."""
-    now = time.monotonic()
-    if _synth_mac_cache["v"] is None or now - _synth_mac_cache["t"] > 30:
-        v = False
-        try:
-            r = httpx.get(f"{SUPABASE_URL}/rest/v1/app_settings",
-                          params={"key": "eq.synth_on_mac", "select": "value"},
-                          headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=5)
-            rows = r.json()
-            if rows:
-                v = str(rows[0].get("value")).strip().lower() in ("1", "true", "on", "yes")
-        except Exception:  # noqa: BLE001
-            pass
-        _synth_mac_cache.update(v=v, t=now)
-    return _synth_mac_cache["v"]
-
-
 AO_IGNORE_STREAK_OFF = 3    # consecutive ignored turns that put the brakes on… (Jared's numbers)
 AO_IGNORE_WINDOW_S = 300    # …when they all land within this window — a rate, not a lifetime count
 
@@ -1161,21 +1104,6 @@ def maybe_auto_reenable_wakefree() -> None:
         log(f"always-on auto-re-enabled: quiet after {int(age)}s braked")
     except Exception as e:  # noqa: BLE001 — never take the heartbeat down
         log(f"wakefree auto-reenable check failed: {e}")
-
-
-def speak_via_mac(text: str) -> bool:
-    """Synthesize `text` on the Mac synth server and POST the PCM to the Pi to play. Returns True on success;
-    on ANY failure returns False so the caller falls back to the Pi-synth voice_speech path."""
-    try:
-        r = httpx.post(MAC_SYNTH_URL, content=text.encode("utf-8"), timeout=20)
-        if r.status_code != 200 or not r.content:
-            return False
-        p = httpx.post(PI_PLAY_URL, content=r.content,
-                       headers={"Content-Type": "application/octet-stream"}, timeout=15)
-        return p.status_code == 200
-    except Exception as e:  # noqa: BLE001
-        log(f"mac-synth path failed ({e}); falling back to Pi synth")
-        return False
 
 
 def publish_repo_dirs() -> None:
@@ -1709,8 +1637,8 @@ class SdkRunner:
                         chunks.append(b.text)
                     elif isinstance(b, ToolUseBlock):
                         # The reply is what the model says after its LAST tool call. Text before one
-                        # ("searching now") is narration, and on a voice turn it would be read aloud;
-                        # it goes to the activity stream as progress instead.
+                        # ("searching now") is narration; it goes to the activity stream as progress
+                        # instead.
                         said = "\n".join(chunks).strip()
                         chunks = []
                         used_tools = True   # gates the retry in run(); tracked even with no on_event
@@ -2175,12 +2103,9 @@ def process_request(db: Supabase, req: dict) -> None:
         text = (short + (" " + argstr if argstr else "")).strip()
         push_activity(text[:260], "tool")  # direct push → instant activity bar; full width like the rest
 
-    # Per-source prompt directives (ride only on the prompt handed to Claude, never shown in the thread):
-    #  · transcribed sources (ESP/Mac/quick-FAB) get the addressing gate so room-talk not aimed at the agent drops,
-    #  · the quick-add FAB additionally gets the terse fits-in-the-chip reply format.
+    # Prompt directives ride only on the prompt handed to Claude, never shown in the thread. None of them
+    # shapes how the reply is written: every surface renders the same markdown reply.
     source = (req.get("source") or "").strip()
-    quick = source == "web-quick"
-    audio = source in ("fly", "mac", "web-quick")   # transcribed (mishear-prone); typed text is excluded
     # AMBIENT is a different property from transcribed, and conflating them silently ate real messages.
     # The always-on mics hear the whole room, so most of what they send was not addressed to the
     # assistant and a turn may legitimately be dropped as noise. A press is meant, however
@@ -2238,10 +2163,6 @@ def process_request(db: Supabase, req: dict) -> None:
         prompt += ADDRESSING_DIRECTIVE + ROOM_SEND_DIRECTIVE
     else:
         prompt += DELIBERATE_DIRECTIVE
-    if quick:
-        prompt += QUICK_REPLY_DIRECTIVE
-    if source in ("fly", "mac"):
-        prompt += VOICE_REPLY_DIRECTIVE   # one past-tense line; spoken by the Pi audio service + phone push
 
     # ---- ONE dynamic route. Every hub command goes to Sonnet (safe tools + escalate); a request that needs
     # a gated WRITE tool escalates to a FRESH Opus (full tools). Photos skip straight to Opus (vision via the
@@ -2394,11 +2315,6 @@ def process_request(db: Supabase, req: dict) -> None:
         # would otherwise finish with no word to him until he looks again.
         if source in ("fly", "mac", "watch-cmd") and text:
             notify_phone(text)
-        if source in ("fly", "mac") and text:
-            # Speak it: Mac-synth→Pi when enabled (faster), else the Pi synthesizes from voice_speech. The
-            # Mac path returns False on any failure, so voice_speech (Pi synth) stays the safety net.
-            if not (WORKER_ID == "mac" and synth_on_mac() and speak_via_mac(text)):
-                db.post("voice_speech", {"text": text})  # Pi audio service synthesizes (warm Kokoro → TV)
         log(f"done request {rid}: {text[:120]!r}")
     else:
         err = result.get("raw_error") or "unknown error"

@@ -231,7 +231,7 @@ line; offered one, the model used it on clear speech.
 It carries only what the model cannot work out from the text itself:
 
 1. the audio is room-wide, so most of what arrives was not said to the assistant;
-2. the reply is read aloud, so an ignore must be the bare `__IGNORE__` sentinel and nothing else;
+2. an ignore must be the bare `__IGNORE__` sentinel and nothing else, since the exact sentinel is what drops the turn;
 3. a machine named in a dispatch ("the Mac agent", "the Pi") is a **destination**, not a third party.
 4. development talk naming no destination is him speaking to a session already open elsewhere —
    which has heard him already, through its own channel.

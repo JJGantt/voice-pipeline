@@ -119,15 +119,15 @@ Three signals, and only the first is local:
   `voice_presence.heard_jared_at`, and every surface renders that one row: the ESP light goes solid and
   the Mac HUD locks whether the Mac, the ESP, or both are the ones hearing him. This is the signal that
   answers "is anything listening to me", and it is deliberately not scoped to the capturing device.
-- **Processing + response — UNIVERSAL.** "working" (the brain is running), "done", and the spoken
-  reply reflect **one shared command lifecycle** that every surface subscribes to and renders the
-  same. An ESP-captured command still lights the Mac HUD and speaks on the Mac; a Mac-captured
-  command still blinks the ESP light. Drive these off the lifecycle in Supabase (`voice_requests`
-  status + the speech channel), **never** off "did I enqueue this row."
+- **Processing + response — UNIVERSAL.** "working" (the brain is running) and "done" reflect **one
+  shared command lifecycle** that every surface subscribes to and renders the same. An ESP-captured
+  command still lights the Mac HUD; a Mac-captured command still blinks the ESP light. Drive these off
+  the lifecycle in Supabase (`voice_requests` status), **never** off "did I enqueue this row."
 
-These are **two independent channels** — visual state and a single spoken line. Don't conflate them.
+Nothing in the pipeline speaks a reply. The reply is written markdown, the same on every surface, and
+the worker adds no directive about its form.
 
-**1. Visual state (HUD pop-ups + ESP light).** The state machine, driven by system state in Supabase
+**Visual state (HUD pop-ups + ESP light).** The state machine, driven by system state in Supabase
 (`voice_requests` status) — NOT by the model:
 
 ```
@@ -136,22 +136,14 @@ working   → UNIVERSAL (every screen / light, from capture-accept through the w
 done      → UNIVERSAL (every screen / light clears when the turn ends)
 ```
 
-**2. The spoken line (the `say` tool).** This is **not** a state transition and it does **not**
-narrate the lifecycle. It is the model saying **one** succinct thing about what it's doing — e.g.
-"changing the light to blue" — fired *alongside* the action tool so synthesis overlaps execution
-instead of stacking after it. Present tense, one short utterance per command (the `fly`/`mac` voice
-sources get a directive instructing exactly this). The model's final text is **not** spoken. The `say`
-tool lives in the `voice` MCP (`mcp-voice`) and inserts one row into the `voice_speech` table.
-
-So three distinct streams, none of which is the others: display thread = `voice_messages`; transient
-activity/state = the visual lifecycle above (+ `push_activity` tool events on the web activity bar);
-audio = the one `voice_speech` line. Only the last is played aloud.
+Two distinct streams: the display thread is `voice_messages`; transient activity/state is the visual
+lifecycle above (+ `push_activity` tool events on the web activity bar). `pi-audio/` and the
+`voice_speech` table are inert — nothing writes the table and the Pi unit is disabled.
 
 **Implemented (live, not aspirational):**
 - **Mac listener** holds one persistent realtime subscription (`RealtimeFeedback`): drives its on-screen
   HUD off `voice_requests` status (`claimed`→working / `done`→done) and off `voice_presence` ("Hearing
-  you", from ANY mic), and shows `listening` locally for its own mic. (`voice_speech` is played by the
-  Pi audio service, not here.)
+  you", from ANY mic), and shows `listening` locally for its own mic.
 - **Worker** drives the ESP light for every command — `/led-blink` on working, `/led-off` on done
   (jared-voice server's generic `/led-<state>` HTTP route).
 - Nothing is `request_id`-gated: the Mac speaks and lights up for an ESP- or phone-captured command the
@@ -271,7 +263,6 @@ bridges to the ESP over HTTP).
 | `voice_muted` | `0` | listener + ESP — global mute (set by the FAB / push-to-talk) |
 | `voice_inject_mode` | `0` | listener + ESP — Mac mic pastes into the focused window; the ESP goes deaf |
 | `agent_mode` / `agent_cwd` | `0` | worker — full-agent (coding) mode and its working directory |
-| `synth_on_mac` | `0` | worker — synthesize the reply on the Mac and ship PCM to the Pi to play |
 | `voiceid_threshold` | `0.30` | wakefree + ESP server — "it's Jared" cosine threshold for the live 2s-slice gate |
 | `voiceid_accept_threshold` | `0` | wakefree + ESP server — the confirmed-span bar at capture-accept; a capture under it is dropped before STT. `0` = off (measure only). No hub UI yet; set the row directly |
 | `wakefree_pause_s` | `2.0` | ESP server only — the energy endpoint it falls back to while wake-free is on but ECAPA/the voiceprint has not loaded (and during enrollment). The speaker-gated path ignores it |
