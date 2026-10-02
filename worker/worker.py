@@ -1656,6 +1656,10 @@ class SdkRunner:
 
         opts = ClaudeAgentOptions(
             model="sonnet",
+            # The SDK ships its own copy of Claude Code, which only moves when the package is upgraded, and
+            # the alias "sonnet" resolves to whatever model THAT copy knows. Running the installed CLI keeps
+            # this path on the same models as every other turn instead of drifting a release behind.
+            cli_path=shutil.which(CLAUDE_BIN),
             mcp_servers=write_mcp_config(),
             allowed_tools=list(SAFE_TOOLS),
             disallowed_tools=list(SESSION_TOOLS),   # browser-only: out of sight, so never a reason to escalate
