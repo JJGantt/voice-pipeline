@@ -39,7 +39,9 @@ and every ordinary stage bills the **subscription**:
 
 - **`SdkRunner`** — the warm Claude Agent SDK client: one long-lived headless Claude Code process
   holding the MCP servers (data, voice, lights, feeder and Gmail over stdio; iMessage over HTTP to the
-  Mac), pinned to Sonnet + `SAFE_TOOLS` at connect, which include WebSearch and WebFetch. Each hub turn is a
+  Mac), pinned to Sonnet + `SAFE_TOOLS` at connect, which include WebSearch and WebFetch. It runs the
+  installed `claude` (`cli_path`), not the SDK's bundled copy: the bundled one lags, and the `sonnet` alias
+  resolves to whatever model the running CLI knows. Each hub turn is a
   fresh `session_id` on that warm process, with the whole day's hub conversation (since 4 AM, each line timestamped) replayed into the prompt.
   This is the **fast path** on the Mac and the Pi: the spawn cost `claude -p` pays per command — CLI
   plus four MCP servers, 3.6s on the Pi, ~42% of a simple turn before the model sees a token — is
