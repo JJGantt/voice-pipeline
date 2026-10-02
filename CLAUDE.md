@@ -227,14 +227,13 @@ they confirm it is one contract, in `orchestrator/src/handoff.js`:
   Measured on 2.1.284: 790 characters arrive plain, 810 arrive wrapped; three lines plain, four
   wrapped; the same for bracketed paste and for plain keystrokes. A wrapped follow-up gets "your message
   was only the pasted block — you didn't ask me to follow it". So over `TYPE_MAX_CHARS` (700) or
-  `TYPE_MAX_LINES` (3) the text is stashed in `~/.claude-desk-prompts/` and the session is typed a
-  one-line stub telling it to read the file, **echo it back verbatim first**, then act. The echo keeps
-  the words visible in the session; `transcripts.js` also resolves the stub back to the words for every
-  surface, and the rest of the workaround is kept off them too: the session's `Read` of the stash file
-  is not streamed as a tool line, a text frame quoting the words is dropped, and an echo that lands in
-  the final reply is cut off its front (`dropEcho`) — otherwise the watch shows, and speaks, his message
-  a second time above the answer. That limit also keeps the Mac inside a tty's 1024-byte input buffer, which silently drops the
-  rest.
+  `TYPE_MAX_LINES` (3) `PASTE_LEAD` (`Jared's message:`) is TYPED in front of the paste, in the same
+  submit: the typed part is the message, and it makes the paste his. The terminal shows the whole text,
+  and `transcripts.js` strips the lead and the paste tags so every surface shows only his words. No
+  length limit applies: a running session's tty is raw (20,000 characters arrived intact on the Mac), and
+  tmux has none. Messages sent before this were stashed in `~/.claude-desk-prompts/` behind a read-this
+  stub; `unstash`, `readsStash` and `dropEcho` remain only to render those turns, and go inert as the
+  files are swept at thirty days.
 - **Whatever is typed goes inside bracketed-paste markers, and Enter follows as a keypress.** Without a
   boundary Claude Code can read the return as part of the text and leave the message in the composer.
   The Mac wraps the text in `ESC[200~ … ESC[201~` itself; the Pi uses `tmux paste-buffer -p -r`. The Pi
