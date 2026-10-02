@@ -265,6 +265,8 @@ export async function reopenDeskTab(cwd, id) {
 // session never starting. Measured exactly: a 2500-character prompt reached the terminal as 1024
 // characters. The command line now stays short whatever the prompt is, and the shell reads the text
 // itself, where no such limit applies. (This is the same reason pi-desk hands tmux a file path.)
+const DISPATCHED = fs.readFileSync(new URL('../dispatched-session.txt', import.meta.url), 'utf8').trim();
+
 export async function openFreshTab(cwd, name, prompt, sessionId = null, resumeId = null) {
   // The Remote Control name is an IDENTITY in the Claude app, so it has to be unique per SESSION,
   // not per repo. Named after the repo alone, two sessions on status-hub both register as
@@ -281,7 +283,12 @@ export async function openFreshTab(cwd, name, prompt, sessionId = null, resumeId
   // so a handed-over session is reachable and identifiable exactly like any other.
   const resume = resumeId ? ` --resume ${shQuote(resumeId)}` : '';
   const model = ` --model ${shQuote(config.DESK_MODEL)}`;
-  return runInNewTerminal(`cd ${shQuote(cwd)}; ${env}${shQuote(config.CLAUDE_BIN)}${model}${resume}${rc}${first}`);
+  // A fresh session with a prompt is a dispatch, and has to know it IS the session the request was
+  // for — otherwise "start a session in X and have it..." left in the words reads as an instruction to
+  // it, and it dispatches the same request a second time. A system prompt, not text in the prompt,
+  // so every surface still shows only his words. pi-desk/launch.sh reads the same file.
+  const sys = (pf && !resumeId) ? ` --append-system-prompt ${shQuote(DISPATCHED)}` : '';
+  return runInNewTerminal(`cd ${shQuote(cwd)}; ${env}${shQuote(config.CLAUDE_BIN)}${model}${resume}${rc}${sys}${first}`);
 }
 
 /**

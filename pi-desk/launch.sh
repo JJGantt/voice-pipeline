@@ -73,6 +73,11 @@ echo 800 > /proc/self/oom_score_adj 2>/dev/null || true
 if [ -n "$PROMPT_FILE" ] && [ -s "$PROMPT_FILE" ]; then
   PROMPT="$(cat "$PROMPT_FILE")"
   rm -f "$PROMPT_FILE"
-  exec claude --model "$MODEL" --chrome "${RESUME[@]}" --remote-control "$NAME" "$PROMPT"
+  # A fresh dispatch is told it IS the session the request was for, so words addressed to the
+  # dispatcher ("start a session in X and have it...") are not read as an order to dispatch again.
+  # A system prompt, so surfaces still show only his words. The Mac's orchestrator reads the same file.
+  SYS=()
+  [ -z "$RESUME_ID" ] && SYS=(--append-system-prompt "$(cat "$(dirname "$0")/../orchestrator/dispatched-session.txt")")
+  exec claude --model "$MODEL" --chrome "${RESUME[@]}" --remote-control "$NAME" "${SYS[@]}" "$PROMPT"
 fi
 exec claude --model "$MODEL" --chrome "${RESUME[@]}" --remote-control "$NAME"
