@@ -7,9 +7,16 @@
 //    the model wrapped in <pasted_content> tags — framed as material to look at, not as what he asked.
 //    Measured on 2.1.284, typing through tmux: 790 characters arrive as a plain message and 810 arrive
 //    wrapped; three lines arrive plain and four arrive wrapped. The same limits hold for bracketed paste
-//    and for plain keystrokes. A wrapped follow-up is answered with "your message was only the pasted
-//    block … you didn't ask me to follow it", so anything over either limit is parked in a file and the
-//    session is typed a one-line instruction to read it (`typeable`).
+//    and for plain keystrokes. A wrapped follow-up ALONE is answered with "your message was only the
+//    pasted block … you didn't ask me to follow it". So past either limit a short line is TYPED in front
+//    of the paste (`PASTE_LEAD`), in the same submit: the typed part is the message and it says the
+//    pasted part is his, which the model then acts on. The terminal shows the whole text, and the
+//    transcript records `<lead> <pasted_content>…</pasted_content>`, which transcripts.js unwraps.
+//
+//    There is no length cap on this path. A running Claude holds its tty in raw mode, and 20,000
+//    characters over 200 lines arrived intact through Terminal's `do script`. The Mac's 1024-byte limit
+//    is the CANONICAL-mode line limit, which only binds a line typed to a shell — the launch command,
+//    which is why a session's first prompt still travels in a file (applescript.js `openFreshTab`).
 //
 // 2. WHETHER IT WAS SUBMITTED. Typing reports nothing: text can land in the composer and sit there
 //    while the command that typed it reports success. The session's own transcript is the receipt — a
@@ -23,44 +30,27 @@ import os from 'node:os';
 import path from 'node:path';
 import { config } from './config.js';
 
-// Not /tmp: a busy session may not get to the message for a long time, and periodic cleaning there
-// would take the words with it. (They are never ONLY here — the payload is in desk_commands.)
-// transcripts.js reads stashed messages back from this directory by the stub's wording, so the path and
-// the stub text below are one contract with it.
+// Pictures are fetched here, and messages from before the paste lead were stashed here as files whose
+// stubs transcripts.js still resolves. Not /tmp: periodic cleaning there would take them early.
 export const PROMPT_DIR = path.join(os.homedir(), '.claude-desk-prompts');
 
-// Below the measured 800 / 4 with margin; see (1) above. The tty's own 1024-byte input limit on the Mac
-// is comfortably above this, so one limit covers both reasons a message cannot be typed.
+// Below the measured 800 / 4 with margin; see (1) above. Under both, the text is a plain message.
 export const TYPE_MAX_CHARS = 700;
 export const TYPE_MAX_LINES = 3;
 
-/** Park a message on disk for a session to read, and return its path. */
-function stashPrompt(text, tag) {
-  fs.mkdirSync(PROMPT_DIR, { recursive: true, mode: 0o700 });
-  const f = path.join(PROMPT_DIR, `${String(tag || 'msg').replace(/[^A-Za-z0-9._-]/g, '')}-${Date.now().toString(36)}.txt`);
-  fs.writeFileSync(f, String(text), { mode: 0o600 });
-  return f;
-}
+// Typed in front of a message that will arrive as a paste. Its wording is a contract with
+// transcripts.js, which strips it back off so every surface shows only his words.
+export const PASTE_LEAD = "Jared's message:";
 
-// The echo is the point. Without it the words exist only in a file nobody looks at, and the terminal
-// shows an instruction rather than the request. With it, the full message appears in the session's own
-// output within a second or two and the file stops mattering.
-//
-// The stub says WHY the words are in a file and whose they are. "Read this file and do what it asks",
-// bare, is the shape of an injected instruction, and a reply following it was stopped by a safety
-// classifier; context that it is his own message, moved only for length, is what makes it read as one.
-const handoff = (file) =>
-  `[Jared's message is in ${file}. He wrote it to you like anything he types here; it went into a file `
-  + 'only because it is too long to type into this terminal. Read it, quote it back in full so his words '
-  + 'show in this terminal, then answer it as his message. Leave the file in place; it is cleaned up '
-  + 'automatically.]';
-
-/** What to actually type for `text`: the text itself when it will arrive as a message, else a stub. */
-export function typeable(text, tag) {
+/**
+ * What to put into a session for `text`: `lead`, TYPED (empty for a message short enough to arrive
+ * plain), then `line`, PASTED with bracketed-paste markers, then one Enter.
+ */
+export function typeable(text) {
   const body = String(text).replace(/\x1b/g, '').trim();   // an escape could end a bracketed paste early
   const lines = body.split(/\r\n|\r|\n/).length;
-  if (body.length <= TYPE_MAX_CHARS && lines <= TYPE_MAX_LINES) return { line: body, how: 'typed' };
-  return { line: handoff(stashPrompt(body, tag)), how: 'handed over by file' };
+  if (body.length <= TYPE_MAX_CHARS && lines <= TYPE_MAX_LINES) return { lead: '', line: body, how: 'typed' };
+  return { lead: `${PASTE_LEAD} `, line: body, how: 'pasted with a lead' };
 }
 
 /**

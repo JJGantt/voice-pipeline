@@ -168,9 +168,9 @@ export async function closeTabForTty(tty) {
  * dictated follow-up landing in the wrong terminal is worse than one that fails.
  *
  * What gets typed is decided by `typeable` (handoff.js), shared with the Pi: a long or many-line message
- * is parked in a file and the session is typed a one-line stub, because Claude Code frames such input as
- * a paste rather than as his request. That also keeps the typed line far inside the tty's 1024-byte
- * input limit. Whether it then SUBMITTED is the caller's to confirm, from the transcript.
+ * gets a short typed lead in front of the paste, because Claude Code frames such input as a paste rather
+ * than as his request. A running session's tty is raw, so no length limit applies here. Whether it then
+ * SUBMITTED is the caller's to confirm, from the transcript.
  *
  * The alternatives for a long message all fail on this end. `do script` always appends a return, so
  * chunking submits each piece as a separate message. System Events can type without one, but needs
@@ -187,7 +187,7 @@ export async function closeTabForTty(tty) {
 const ESC = 'character id 27';
 
 export async function sendToTty(tty, text) {
-  const { line, how } = typeable(text, tty.replace('/dev/', ''));
+  const { lead, line, how } = typeable(text);
   // An AppleScript string literal cannot hold a raw line break, so each is written as `linefeed` joined
   // into the string; inside the bracketed paste it lands in the composer as a line break, not a submit.
   const escaped = line.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r\n|\r|\n/g, '" & linefeed & "');
@@ -196,7 +196,7 @@ export async function sendToTty(tty, text) {
       repeat with w in windows
         repeat with t in tabs of w
           if tty of t is "${tty}" then
-            do script (${ESC}) & "[200~${escaped}" & (${ESC}) & "[201~" in t
+            do script "${lead.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}" & (${ESC}) & "[200~${escaped}" & (${ESC}) & "[201~" in t
             set found to true
           end if
         end repeat

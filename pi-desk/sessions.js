@@ -61,8 +61,8 @@ export async function liveSessions() {
  * nothing submits early if the markers are ever not honoured.
  *
  * What is pasted is decided by `typeable` (handoff.js, shared with the Mac): a long or many-line message
- * goes by file, because Claude Code frames such input as a paste and the model treats it as material
- * rather than as his request.
+ * gets a short typed lead first, because Claude Code frames such input as a paste and the model treats a
+ * paste alone as material rather than as his request.
  *
  * The transcript is the receipt (`awaitSubmitted`). Typing reports nothing, and on 2026-09-28 three
  * follow-ups were logged here as "sent" while two sat in the composer and one vanished; nothing reached
@@ -86,8 +86,10 @@ export async function typeInto(target, text, { expect = null, cmd = null } = {})
   const from = transcriptSize(s.transcriptPath);
   // The id the watcher stamps on the prompt these words become (sessionWatch.js `expectPrompt`).
   if (cmd) expectPrompt(target, text, cmd);
-  const { line, how } = typeable(text, target);
+  const { lead, line, how } = typeable(text);
   const buf = `pd-${target}`;
+  // Typed, not pasted: the typed part is what tells the model the paste is his (handoff.js).
+  if (lead) await exec('tmux', ['send-keys', '-t', target, '-l', '--', lead], { timeout: 10000 });
   await exec('tmux', ['set-buffer', '-b', buf, '--', line], { timeout: 10000 });
   await exec('tmux', ['paste-buffer', '-p', '-r', '-d', '-b', buf, '-t', target], { timeout: 10000 });
   await new Promise((r) => setTimeout(r, 300));
