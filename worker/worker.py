@@ -573,6 +573,11 @@ ATTACH_DIRECTIVE = (
 # Sentinel the model emits to silently drop a turn (wake-word false positive). Matched loosely below.
 IGNORE_SENTINEL = "__IGNORE__"
 
+
+def is_ignore(text) -> bool:
+    t = (text or "").lower()
+    return "__ignore__" in t or re.sub(r"[^a-z]", "", t) == "ignore"
+
 # Appended to every command he meant (pressed, typed, sent from the watch or the phone). These turns are
 # never told the ignore sentinel exists — only ADDRESSING_DIRECTIVE teaches it, on room-mic turns — so
 # there is nothing to skip with. Nor is there a canned "didn't understand" reply: offered one, the model
@@ -1276,7 +1281,11 @@ def recent_context(db: Supabase) -> str:
         if r.get('ignored'):
             return f"[{when}] You (ignored as room noise, not acted on): {txt}"
         return f"[{when}] {who}: {txt}"
-    lines = [_line(r) for r in rows if (r.get('text') or '').strip()]
+    # A bare sentinel reply is dropped from the replay. It is never shown as a reply — but a deliberate
+    # turn that emitted one anyway was saved as `Raspy: __IGNORE__`, and replaying that line taught
+    # every later button press the sentinel by example, so they answered with it too.
+    lines = [_line(r) for r in rows
+             if (r.get('text') or '').strip() and not (r.get('role') == 'assistant' and is_ignore(r.get('text')))]
     if not lines:
         return ""
     now_local = now.astimezone(DAY_TZ).strftime("%-I:%M %p")
@@ -2329,6 +2338,16 @@ def process_request(db: Supabase, req: dict) -> None:
                             model="opus", allow_read=bool(att_paths), allowed_tools=turn_tools(ambient), deny_tools=room_deny)
         text = (result.get("text") or "").strip()
 
+    # The same net for __IGNORE__ on a turn he MEANT. Only room-mic turns are taught the sentinel, but a
+    # model can still pick it up (it did, from replayed history) — and on a deliberate turn there is no
+    # ignore branch to catch it, so it was saved and pushed to him as the reply. Re-run clean, with no
+    # context to mimic; the prompt already carries DELIBERATE_DIRECTIVE.
+    if not ambient and is_ignore(text) and not result.get("used_tools"):
+        log("deliberate turn answered __IGNORE__ → clean Opus re-run (no context)")
+        result = run_claude(prompt, None, on_event=_emit, system_append=sys_ctx,
+                            model="opus", allow_read=bool(att_paths), allowed_tools=turn_tools(ambient), deny_tools=room_deny)
+        text = (result.get("text") or "").strip()
+
     # Tag every row with the mode so the hub UI can show this mode's thread separately and switch live.
     # Defined up here because the ignore branch below writes a row too.
     msg_mode = "agent" if session_agent else "hub"
@@ -2339,7 +2358,7 @@ def process_request(db: Supabase, req: dict) -> None:
     # They used to be erased entirely, and that made a wrong judgement unrecoverable: Jared could not
     # say "do the one you ignored", and a following "answer my question" pointed at something that, as
     # far as the model could see, had never been said. Which is precisely what happened on 2026-08-28.
-    if ambient and ("__ignore__" in text.lower() or re.sub(r"[^a-z]", "", text.lower()) == "ignore"):
+    if ambient and is_ignore(text):
         push_activity("(ignored — likely noise)", "done")
         db.post("voice_messages",
                 {"request_id": rid, "focus": "hub", "mode": msg_mode, "role": "user",

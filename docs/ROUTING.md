@@ -209,12 +209,16 @@ line**; a new tool is invisible to the fast path until it appears here.
 
 ## The addressing directive
 
-Room-mic turns (sources `fly` and `mac`) get `ADDRESSING_DIRECTIVE` appended, because those mics are
-always on and hear the whole room. The phone's push-to-talk button (`web-quick`) and typed text never
-do: he pressed the button or typed it, so it was meant.
+Room-mic turns (sources `fly`, `mac`, and the watch's always-on `watch`) get `ADDRESSING_DIRECTIVE`
+appended, because those mics are always on and hear the whole room. The phone's push-to-talk button
+(`web-quick`), the watch's button (`watch-cmd`) and typed text never do: he pressed the button or
+typed it, so it was meant.
 
 Only a room-mic turn can be ignored: the `__IGNORE__` sentinel is taught in `ADDRESSING_DIRECTIVE`
-alone, so a deliberate turn never learns it exists. Deliberate turns get `DELIBERATE_DIRECTIVE`
+alone. That alone does not keep it from a deliberate turn, because every turn replays the day's thread
+and a model copies a reply it sees there — so a bare sentinel reply is never replayed (`is_ignore` in
+`_line`'s filter), and a deliberate turn that answers `__IGNORE__` anyway is re-run on a clean Opus
+with no context, the same net `__ESCALATE__` has. Deliberate turns get `DELIBERATE_DIRECTIVE`
 instead: work out the implied question when he describes something without asking one, and if he
 truly cannot be understood say so in the model's own words. There is no canned "didn't understand"
 line; offered one, the model used it on clear speech.
