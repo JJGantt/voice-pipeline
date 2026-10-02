@@ -110,7 +110,8 @@ export function unwrapPastes(text) {
 }
 
 const STASH_DIR = path.join(os.homedir(), '.claude-desk-prompts');
-const STASH_RE = /^\[A message from Jared, too long to type into this terminal\. It is in (\S+) /;
+// Both wordings the stub has had: stored turns keep the older one.
+const STASH_RE = /^\[(?:Jared's message is in (\S+?)\. |A message from Jared, too long to type into this terminal\. It is in (\S+) )/;
 const stashed = new Map();   // path -> text. The file is written once and never rewritten.
 
 /**
@@ -150,7 +151,7 @@ export function dropEcho(reply, prompt) {
 function unstash(text) {
   const m = STASH_RE.exec(String(text || ''));
   if (!m) return null;
-  const file = path.resolve(m[1]);
+  const file = path.resolve(m[1] || m[2]);
   if (path.dirname(file) !== STASH_DIR) return null;
   if (stashed.has(file)) return stashed.get(file);
   let body = null;
