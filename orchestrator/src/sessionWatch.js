@@ -25,7 +25,7 @@ import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { config } from './config.js';
-import { readTail, turnStart, resolvePrompt, gist, flatten, fromHim } from './transcripts.js';
+import { readTail, turnStart, turnStartBefore, resolvePrompt, gist, flatten, fromHim } from './transcripts.js';
 
 // fs.watch fires several times for one append, so coalesce. Long enough to batch a write, far short
 // of anything a person notices.
@@ -65,9 +65,9 @@ function takeExpect(sessionId, prompt) {
 }
 
 async function push(body) {
-  if (!config.HUB_URL || !config.HUB_TOKEN) return;
+  if (!config.HUB_URL || !config.HUB_TOKEN) return null;
   try {
-    await fetch(`${config.HUB_URL}/api/session-activity?token=${encodeURIComponent(config.HUB_TOKEN)}`, {
+    const r = await fetch(`${config.HUB_URL}/api/session-activity?token=${encodeURIComponent(config.HUB_TOKEN)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
@@ -75,13 +75,9 @@ async function push(body) {
       // would hold back every step and reply after it for as long as the process lived.
       signal: AbortSignal.timeout(10000),
     });
-  } catch { /* the wall's backstop poll covers a dropped push; never let it break the watcher */ }
-}
-
-// One session's pushes, one after another. Fired unawaited they can overtake each other in flight,
-// and a thought landing after the tool call it led to, or a step after the turn's `done`, reads wrong.
-function send(st, body) {
-  st.chain = st.chain.then(() => push(body));
+    // The hub answers an event with what it holds of that turn (`emit`); everything else is empty.
+    return r.status === 200 ? await r.json().catch(() => null) : null;
+  } catch { return null; /* the wall's backstop poll covers a dropped push; never let it break the watcher */ }
 }
 
 /**
@@ -104,6 +100,183 @@ function toolLine(block) {
   return `${short}${args ? ` ${args}` : ''}`.trim().slice(0, 260);
 }
 
+// ---- A TURN IS A NUMBERED LIST, AND THIS MACHINE HOLDS ALL OF IT ------------------------------
+//
+// The hub keeps a conversation's events in memory, so a hub restart (every deploy is one) loses the
+// turn in flight: its prompt, and every step so far. The transcript is the record, and it is here.
+// So each event of a turn carries the turn's `turn` key and its position `n` in it, and this keeps
+// the turn's whole list (`st.turn.events`). A hub that is sent n = 57 while holding nothing of that
+// turn answers `{ replay, have }`, and gets everything it is missing before the next frame goes out.
+// `done` carries the list too, which is what the hub stores as the finished turn.
+//
+// The key is the uuid of the record that opened the turn, so it is the same after this process
+// restarts and reads the turn's beginning back from the transcript (`loadPrefix`).
+const newTurn = (d) => ({ key: String((d && (d.uuid || d.timestamp)) || randomUUID()), at: (d && d.timestamp) || null, n: 0, events: [] });
+
+/** Number an event into its turn. Returns the event as sent. */
+function note(st, body) {
+  if (!st.turn) st.turn = newTurn();
+  const t = st.turn;
+  const ev = { ...body, turn: t.key, n: ++t.n };
+  t.events.push(ev);
+  return ev;
+}
+
+function emit(st, body) {
+  const ev = note(st, body), t = st.turn;
+  st.chain = st.chain.then(async () => {
+    const r = await push(ev);
+    if (r && r.replay) {
+      const have = Number(r.have) || 0;
+      await push({ session: st.id, state: 'replay', turn: t.key,
+                   events: t.events.filter((e) => e.n > have && e.n <= ev.n) });
+    }
+  });
+}
+
+/**
+ * One transcript record, as the events it means. `out` receives each one.
+ *
+ * Shared by the live read and by `loadPrefix`, which runs it over the part of a turn written before
+ * this process was watching: the same records have to number the same way both times, or a replay
+ * would not line up with what the hub already holds. `live` is false there, and the only things it
+ * turns off are the ones that act on the world (the row's activity stamp, claiming a typed command).
+ * Returns true when the record ends the turn.
+ */
+function step(st, d, out, live) {
+  // TYPED WHILE A TURN IS RUNNING. Claude Code QUEUES it and writes `queue-operation` records; there
+  // is no `user` record at all for one absorbed into a running turn. Two moments, and they are
+  // different facts:
+  //
+  //   enqueue — he has SENT it; the model has not seen it. `queued`, and a view holds it at the
+  //             bottom, because putting it among the steps would claim it was read there.
+  //   remove  — `absorbed_mid_turn`, and it carries the same content: THIS is when the model saw
+  //             it, so this is where it belongs in the stream.
+  //
+  // (`dequeue` is the other ending — it started a turn of its own — and carries no content, so the
+  // `user` record that follows is what reports it.)
+  if (d.type === 'queue-operation') {
+    if (!fromHim(d.content)) return false;
+    const said = resolvePrompt(d.content);
+    if (said.prompt && (d.operation === 'enqueue' || d.operation === 'remove')) {
+      // The same message at its two moments carries the same id: minted at `enqueue` and held on
+      // `st.queue` until its `remove` (matched by the exact text both records carry) takes it. A
+      // `remove` with nothing queued (the enqueue is beyond what this process has read) mints its own.
+      const fresh = () => ({ id: randomUUID(), cmd: live ? takeExpect(st.id, said.prompt) : null });
+      let ev;
+      if (d.operation === 'enqueue') {
+        ev = fresh();
+        st.queue.push({ ...ev, text: flatten(said.prompt) });
+      } else {
+        const flat = flatten(said.prompt);
+        const i = st.queue.findIndex((q) => q.text === flat);
+        ev = i >= 0 ? st.queue.splice(i, 1)[0] : fresh();
+      }
+      out({ session: st.id, state: d.operation === 'enqueue' ? 'queued' : 'said', text: said.prompt,
+            id: ev.id, ...(ev.cmd ? { cmd: ev.cmd } : {}) });
+      if (said.stashed) st.echo = gist(said.prompt);
+    }
+    return false;
+  }
+  if (d.type === 'user') {
+    // A prompt starts a turn. Tool results are recorded as user records too, and are the model's
+    // own work coming back — the same distinction readTail draws.
+    // turnStart is null for both, and for a terminal-local command and its output.
+    const said = turnStart(d);
+    if (said) st.said = null;
+    // Injected context starts nothing of its own, as in readTail: the turn before it stands.
+    if (said && !said.meta) st.turn = newTurn(d);
+    if (live && said && typeof d.timestamp === 'string') {
+      try { st.onActivity(st.id, d.timestamp); } catch { /* the tick writes it regardless */ }
+    }
+    // HIS WORDS, AT THE MOMENT THEY ARRIVE, as their own event in the list.
+    // `turnStart` is the same rule readTail uses: tool results, injected context and compact
+    // summaries are not him speaking, and a message stashed to a file resolves to its real text.
+    // A prompt that started its OWN turn: this record is its ingestion. One that was absorbed
+    // mid-turn never reaches here — the `remove` above already reported it.
+    // One that waited in the queue for the turn before to end is the same message it was when queued,
+    // so it keeps that id and a view moves the one entry instead of showing it twice.
+    if (said && said.prompt) {
+      const flat = flatten(said.prompt);
+      const i = st.queue.findIndex((q) => q.text === flat);
+      const ev = i >= 0 ? st.queue.splice(i, 1)[0] : { id: randomUUID(), cmd: live ? takeExpect(st.id, said.prompt) : null };
+      out({ session: st.id, state: 'said', text: said.prompt, id: ev.id, ...(ev.cmd ? { cmd: ev.cmd } : {}) });
+    }
+    // A message too long for the tty is typed as a stub that ASKS the session to quote the words
+    // back, so they are visible in the terminal. They are visible in the hub already — `said` above
+    // carries them — so the echo is the same paragraph twice, and the whole point of resolving the
+    // stub was that there be no trace of the workaround here. Held so the text frame that quotes it
+    // can be recognised and dropped.
+    if (said && said.stashed) st.echo = gist(said.prompt);
+    else if (said && said.prompt) st.echo = null;
+    return false;
+  }
+  if (d.type !== 'assistant') return false;
+  const msg = d.message || {};
+  // What it says between tool calls. Claude Code writes a message one block per record, in order, so
+  // a step's words arrive before its tool call; they are held until that call and sent just ahead of
+  // it: the text if Claude Code recorded it, else the summary of its thinking. From 2.1.268 Claude
+  // Code records a turn's opening text and its final reply but not text written after a tool result
+  // (measured across every transcript on the Mac: 1 in 540 records on 268-270, against hundreds per
+  // version on 267 and before), so for most steps the thinking summary is the only account written.
+  // The transcript format is internal and undocumented, so this is only as good as what it holds.
+  // A message that ends the turn is the reply, which arrives on `done`; what it held is dropped.
+  if (st.said?.id !== msg.id) st.said = { id: msg.id, text: [], thought: [] };
+  for (const b of Array.isArray(msg.content) ? msg.content : []) {
+    if (b?.type === 'text' && String(b.text || '').trim()) st.said.text.push(String(b.text).trim());
+    else if (b?.type === 'thinking' && String(b.thinking || '').trim()) st.said.thought.push(String(b.thinking).trim());
+    else if (b?.type === 'tool_use') {
+      const words = st.said.text.length ? st.said.text : st.said.thought;
+      const text = words.join('\n\n');
+      // Not the session reading his own stashed message back to him — see `st.echo` above.
+      if (words.length && !(st.echo && flatten(text).includes(st.echo))) {
+        out({ session: st.id, state: 'text', text });
+      }
+      st.said = { id: msg.id, text: [], thought: [] };
+      // Nor the session opening the stash file itself: a path into ~/.claude-desk-prompts on the wrist
+      // is the workaround showing through, and his words already arrived as `said`.
+      if (readsStash(b)) continue;
+      out({ session: st.id, state: 'tool', text: toolLine(b) });
+    }
+  }
+  // Claude Code writes one record per content block, each carrying the message's stop_reason, and
+  // a turn ends with `end_turn` — the same marker readTail keys off.
+  if (msg.stop_reason === 'end_turn') { st.said = null; return true; }
+  return false;
+}
+
+/**
+ * The part of the turn in flight that was written before this process started watching.
+ *
+ * The watcher attaches at the END of a transcript, so a turn already under way then is known only
+ * from there on — and its events would number from 1 again, against a hub holding the real count.
+ * Read once, on the first new record: from the record that opened the turn up to where the watcher
+ * attached, through the same `step` the live read uses.
+ */
+function loadPrefix(st) {
+  st.partial = false;
+  const start = turnStartBefore(st.path, st.attachOffset);
+  if (!start || typeof start.offset !== 'number' || start.offset >= st.attachOffset) return;
+  let text;
+  try {
+    const fd = fs.openSync(st.path, 'r');
+    try {
+      const buf = Buffer.allocUnsafe(st.attachOffset - start.offset);
+      fs.readSync(fd, buf, 0, buf.length, start.offset);
+      text = buf.toString('utf8');
+    } finally { fs.closeSync(fd); }
+  } catch { return; }
+  const was = { id: st.id, said: null, queue: [], echo: null, turn: null };
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue;
+    let d;
+    try { d = JSON.parse(line); } catch { continue; }
+    // A turn that had ended by the attach leaves nothing in flight.
+    if (step(was, d, (body) => note(was, body), false)) was.turn = null;
+  }
+  st.turn = was.turn; st.said = was.said; st.queue = was.queue; st.echo = was.echo;
+}
+
 // Read only what is NEW. These transcripts reach tens of megabytes, so the offset is the whole point
 // — and `rest` holds the trailing partial line, because an append can land mid-record.
 function drain(st) {
@@ -124,117 +297,28 @@ function drain(st) {
     } finally { fs.closeSync(fd); }
   } catch { return; }
   st.offset = size;
+  if (st.partial) loadPrefix(st);
 
   const lines = (st.rest + chunk).split('\n');
   st.rest = lines.pop();          // incomplete until the next append finishes it
-  let ended = false;
+  let ended = null;
   for (const line of lines) {
     if (!line.trim()) continue;
     let d;
     try { d = JSON.parse(line); } catch { continue; }
-    // TYPED WHILE A TURN IS RUNNING. Claude Code QUEUES it and writes `queue-operation` records; there
-    // is no `user` record at all for one absorbed into a running turn. Two moments, and they are
-    // different facts:
-    //
-    //   enqueue — he has SENT it; the model has not seen it. `queued`, and a view holds it at the
-    //             bottom, because putting it among the steps would claim it was read there.
-    //   remove  — `absorbed_mid_turn`, and it carries the same content: THIS is when the model saw
-    //             it, so this is where it belongs in the stream.
-    //
-    // (`dequeue` is the other ending — it started a turn of its own — and carries no content, so the
-    // `user` record that follows is what reports it.)
-    if (d.type === 'queue-operation') {
-      if (!fromHim(d.content)) continue;
-      const said = resolvePrompt(d.content);
-      if (said.prompt && (d.operation === 'enqueue' || d.operation === 'remove')) {
-        // The same message at its two moments carries the same id: minted at `enqueue` and held on
-        // `st.queue` until its `remove` (matched by the exact text both records carry) takes it. A
-        // `remove` with nothing queued (the enqueue landed before this watcher attached) mints its own.
-        let ev;
-        if (d.operation === 'enqueue') {
-          ev = { id: randomUUID(), cmd: takeExpect(st.id, said.prompt) };
-          st.queue.push({ ...ev, text: flatten(said.prompt) });
-        } else {
-          const flat = flatten(said.prompt);
-          const i = st.queue.findIndex((q) => q.text === flat);
-          ev = i >= 0 ? st.queue.splice(i, 1)[0] : { id: randomUUID(), cmd: takeExpect(st.id, said.prompt) };
-        }
-        send(st, { session: st.id, state: d.operation === 'enqueue' ? 'queued' : 'said', text: said.prompt,
-                   id: ev.id, ...(ev.cmd ? { cmd: ev.cmd } : {}) });
-        if (said.stashed) st.echo = gist(said.prompt);
-      }
-      continue;
-    }
-    if (d.type === 'user') {
-      // A prompt starts a turn. Tool results are recorded as user records too, and are the model's
-      // own work coming back — the same distinction readTail draws.
-      // turnStart is null for both, and for a terminal-local command and its output.
-      const said = turnStart(d);
-      if (said) st.said = null;
-      if (said && typeof d.timestamp === 'string') {
-        try { st.onActivity(st.id, d.timestamp); } catch { /* the tick writes it regardless */ }
-      }
-      // HIS WORDS, AT THE MOMENT THEY ARRIVE. A prompt sent while a turn is running used to send no
-      // frame at all, so a live view learned of it only when the turn ended — and then drew it at the
-      // TOP of that turn, above tool calls that had already happened before he typed it. Sent as its
-      // own entry, it lands in the stream where it actually happened.
-      // `turnStart` is the same rule readTail uses: tool results, injected context and compact
-      // summaries are not him speaking, and a message stashed to a file resolves to its real text.
-      // A prompt that started its OWN turn: this record is its ingestion. One that was absorbed
-      // mid-turn never reaches here — the `remove` above already reported it.
-      if (said && said.prompt) {
-        const cmd = takeExpect(st.id, said.prompt);
-        send(st, { session: st.id, state: 'said', text: said.prompt, id: randomUUID(), ...(cmd ? { cmd } : {}) });
-      }
-      // A message too long for the tty is typed as a stub that ASKS the session to reply with the
-      // words verbatim, so they are visible in the terminal. They are visible in the hub already —
-      // `said` above carries them — so the echo is the same paragraph twice, and the whole point of
-      // resolving the stub was that there be no trace of the workaround here. Held so the text frame
-      // that quotes it can be recognised and dropped.
-      if (said && said.stashed) st.echo = gist(said.prompt);
-      else if (said && said.prompt) st.echo = null;
-      continue;
-    }
-    if (d.type !== 'assistant') continue;
-    const msg = d.message || {};
-    // What it says between tool calls. Claude Code writes a message one block per record, in order, so
-    // a step's words arrive before its tool call; they are held until that call and sent just ahead of
-    // it: the text if Claude Code recorded it, else the summary of its thinking. From 2.1.268 Claude
-    // Code records a turn's opening text and its final reply but not text written after a tool result
-    // (measured across every transcript on the Mac: 1 in 540 records on 268-270, against hundreds per
-    // version on 267 and before), so for most steps the thinking summary is the only account written.
-    // The transcript format is internal and undocumented, so this is only as good as what it holds.
-    // A message that ends the turn is the reply, which arrives on `done`; what it held is dropped.
-    if (st.said?.id !== msg.id) st.said = { id: msg.id, text: [], thought: [] };
-    for (const b of Array.isArray(msg.content) ? msg.content : []) {
-      if (b?.type === 'text' && String(b.text || '').trim()) st.said.text.push(String(b.text).trim());
-      else if (b?.type === 'thinking' && String(b.thinking || '').trim()) st.said.thought.push(String(b.thinking).trim());
-      else if (b?.type === 'tool_use') {
-        const words = st.said.text.length ? st.said.text : st.said.thought;
-        const text = words.join('\n\n');
-        // Not the session reading his own stashed message back to him — see `st.echo` above.
-        if (words.length && !(st.echo && flatten(text).includes(st.echo))) {
-          send(st, { session: st.id, state: 'text', text });
-        }
-        st.said = { id: msg.id, text: [], thought: [] };
-        // Nor the session opening the stash file itself: a path into ~/.claude-desk-prompts on the wrist
-        // is the workaround showing through, and his words already arrived as `said`.
-        if (readsStash(b)) continue;
-        send(st, { session: st.id, state: 'tool', text: toolLine(b) });
-      }
-    }
-    // Claude Code writes one record per content block, each carrying the message's stop_reason, and
-    // a turn ends with `end_turn` — the same marker readTail keys off.
-    if (msg.stop_reason === 'end_turn') { ended = true; st.said = null; }
+    if (step(st, d, (body) => emit(st, body), true)) { ended = st.turn || newTurn(); st.turn = null; }
   }
-  if (ended) finish(st);
+  if (ended) finish(st, ended);
 }
 
 // The reply itself is NOT assembled here. A turn's text spans several records and readTail already
 // does that correctly, including the fallback for a transcript with no end_turn at all — this only
 // has to notice that the turn ended and ask.
-function finish(st) {
+function finish(st, turn) {
   const tail = readTail(st.path);
+  // The turn's list goes with the reply it led to. A turn that ended saying nothing reports the
+  // reply before it (readTail's `lastReply` is the last COMPLETED answer), which is not this turn's.
+  const mine = !turn.at || !tail.replyAt || tail.replyAt >= turn.at ? turn : null;
   // The row first, then the news, and both after the steps still in flight. A surface told `done`
   // fetches the reply at once (the watch's open session does), and one that asks before the host
   // has written the row gets the previous reply and keeps showing it.
@@ -243,7 +327,7 @@ function finish(st) {
   st.chain = st.chain
     .then(() => Promise.race([st.onTurnEnd(st.id, tail), new Promise((r) => setTimeout(r, 10000))]))
     .catch(() => { /* the tick will write it 30s from now regardless */ })
-    .then(() => reportTurnEnd(st.id, tail));
+    .then(() => reportTurnEnd(st.id, tail, mine));
 }
 
 /**
@@ -252,7 +336,7 @@ function finish(st) {
  * turn end fs.watch dropped. `at` identifies the turn and the hub pushes each one once, so both
  * calling it for the same turn is harmless.
  */
-export function reportTurnEnd(id, tail) {
+export function reportTurnEnd(id, tail, turn = null) {
   if (!tail?.lastReply) return Promise.resolve();
   // `done` goes out AT ONCE — it is what makes a live view stop showing the caret and fetch the reply.
   // The notification does not ride on it: `summary_coming` tells the hub to hold it for the frame
@@ -263,7 +347,11 @@ export function reportTurnEnd(id, tail) {
   const p = push({ session: id, state: 'done', text: tail.lastReply.slice(0, 400),
                    reply: tail.lastReply.slice(0, 4000),
                    prompt: tail.lastPrompt ? tail.lastPrompt.slice(0, 4000) : null,
-                   at: tail.replyAt || null, summary_coming: true });
+                   at: tail.replyAt || null, summary_coming: true,
+                   // The turn in order, as this machine read it: what the hub stores, and what fills
+                   // in a hub that restarted and heard none of it. Absent from the tick's report of a
+                   // turn end the watcher missed, which has no list.
+                   ...(turn ? { turn: turn.key, events: turn.events } : {}) });
   summarise(tail.lastReply).then((summary) => push({
     session: id, state: 'summary', text: tail.lastReply.slice(0, 400), at: tail.replyAt || null, summary,
   })).catch(() => {});
@@ -357,7 +445,8 @@ export function syncSessionWatch(rows, onTurnEnd, onActivity = () => {}) {
     let offset = 0;
     try { offset = fs.statSync(r.transcript_path).size; } catch { continue; }
     const st = { id: r.id, path: r.transcript_path, offset, rest: '', watcher: null, timer: null, onTurnEnd, onActivity,
-                 said: null, queue: [], chain: Promise.resolve() };
+                 said: null, queue: [], chain: Promise.resolve(),
+                 turn: null, partial: true, attachOffset: offset };
     watched.set(r.id, st);
     attach(st);
   }

@@ -172,7 +172,7 @@ function unstash(text) {
  * Bytes, not strings, until a line is chosen: a chunk boundary can fall inside a multi-byte character,
  * and a newline byte never does. Returns undefined when no turn start is within `maxBytes`.
  */
-function turnStartBefore(transcriptPath, end, { chunk = 1024 * 1024, maxBytes = 64 * 1024 * 1024 } = {}) {
+export function turnStartBefore(transcriptPath, end, { chunk = 1024 * 1024, maxBytes = 64 * 1024 * 1024 } = {}) {
   let fd;
   try { fd = fs.openSync(transcriptPath, 'r'); } catch { return undefined; }
   try {
@@ -200,7 +200,8 @@ function turnStartBefore(transcriptPath, end, { chunk = 1024 * 1024, maxBytes = 
         const start = d.type === 'user' ? turnStart(d) : null;
         // Injected context is passed over, as readTail passes over it going forwards: the prompt
         // before it is the one that stands.
-        if (start && !start.meta) return start;
+        // `offset` is where that record begins, and `key` names the turn it opens (sessionWatch).
+        if (start && !start.meta) return { ...start, offset: pos + lo, key: d.uuid || d.timestamp || null, at: d.timestamp || null };
       }
     }
   } catch { /* unreadable: the same as not found */ } finally { fs.closeSync(fd); }
