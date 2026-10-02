@@ -301,24 +301,32 @@ function drain(st) {
 
   const lines = (st.rest + chunk).split('\n');
   st.rest = lines.pop();          // incomplete until the next append finishes it
-  let ended = null;
+  let ended = false;
   for (const line of lines) {
     if (!line.trim()) continue;
     let d;
     try { d = JSON.parse(line); } catch { continue; }
-    if (step(st, d, (body) => emit(st, body), true)) { ended = st.turn || newTurn(); st.turn = null; }
+    if (step(st, d, (body) => emit(st, body), true)) {
+      // A message is one record per content block, so a turn's last message ends it once per block.
+      // The turn is set aside at the first and stays `st.last` for the rest: taking it again at the
+      // second would hand `finish` an empty list in place of the turn.
+      if (st.turn) { st.last = st.turn; st.turn = null; }
+      ended = true;
+    }
   }
-  if (ended) finish(st, ended);
+  if (ended) finish(st);
 }
 
 // The reply itself is NOT assembled here. A turn's text spans several records and readTail already
 // does that correctly, including the fallback for a transcript with no end_turn at all — this only
 // has to notice that the turn ended and ask.
-function finish(st, turn) {
+function finish(st) {
   const tail = readTail(st.path);
-  // The turn's list goes with the reply it led to. A turn that ended saying nothing reports the
-  // reply before it (readTail's `lastReply` is the last COMPLETED answer), which is not this turn's.
-  const mine = !turn.at || !tail.replyAt || tail.replyAt >= turn.at ? turn : null;
+  // The turn's list goes with the reply it led to. A turn that ended saying nothing, or whose reply
+  // is not written yet (the block before it also carries `end_turn`), reports the reply before it —
+  // readTail's `lastReply` is the last COMPLETED answer — which is not this turn's.
+  const turn = st.last;
+  const mine = turn && (!turn.at || !tail.replyAt || tail.replyAt >= turn.at) ? turn : null;
   // The row first, then the news, and both after the steps still in flight. A surface told `done`
   // fetches the reply at once (the watch's open session does), and one that asks before the host
   // has written the row gets the previous reply and keeps showing it.
@@ -446,7 +454,7 @@ export function syncSessionWatch(rows, onTurnEnd, onActivity = () => {}) {
     try { offset = fs.statSync(r.transcript_path).size; } catch { continue; }
     const st = { id: r.id, path: r.transcript_path, offset, rest: '', watcher: null, timer: null, onTurnEnd, onActivity,
                  said: null, queue: [], chain: Promise.resolve(),
-                 turn: null, partial: true, attachOffset: offset };
+                 turn: null, last: null, partial: true, attachOffset: offset };
     watched.set(r.id, st);
     attach(st);
   }
