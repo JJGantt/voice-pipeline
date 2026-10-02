@@ -60,8 +60,8 @@ The web (`WebSearch`, `WebFetch`) and reading Gmail and iMessage are on the fast
 rule. They are listed once, tool by tool, in `OPEN_TOOLS` and spread into both lists.
 
 **Sending a text or an email (`SEND_TOOLS`) is decided per turn, by which mic heard it.** A pushed
-command — typed, the phone's button, the watch's — may send; one from the always-on room mics (source
-`fly`/`mac`) may not, because those hear the whole room and a sentence meant for someone else would
+command — typed, the phone's button, the watch's — may send; one from an always-on mic (`voice_requests.always_on`)
+may not, because those hear the whole room and a sentence meant for someone else would
 reach a real person. The sends are on no allow list: the warm client's `_gate` callback allows them
 only when `SdkRunner.run(..., ambient=False)`, and every other runner gets `turn_tools(ambient)`
 (full-agent mode, which has no allow list, gets them as `--disallowedTools`).
@@ -209,10 +209,15 @@ line**; a new tool is invisible to the fast path until it appears here.
 
 ## The addressing directive
 
-Room-mic turns (sources `fly`, `mac`, and the watch's always-on `watch`) get `ADDRESSING_DIRECTIVE`
-appended, because those mics are always on and hear the whole room. The phone's push-to-talk button
-(`web-quick`), the watch's button (`watch-cmd`) and typed text never do: he pressed the button or
-typed it, so it was meant.
+Room-mic turns get `ADDRESSING_DIRECTIVE` appended, because those mics are always on and hear the
+whole room. A press (the phone's button, the watch's) and typed text never do: it was meant.
+
+Which is which is `voice_requests.always_on`, stamped by whoever captured the clip — the ESP server,
+the Mac's listener and wake-free capture, and the hub for an uploaded clip from a listener label
+(`GATED_SOURCES` in status-hub). The worker never decides it from `source`: one device can be both a
+listener and a button, and a second list of labels here is how the phone's listener ended up counted
+as a press. An unstamped row is a press, so a new capture path that forgets the flag gets answered,
+never silently dropped.
 
 Only a room-mic turn can be ignored: the `__IGNORE__` sentinel is taught in `ADDRESSING_DIRECTIVE`
 alone. That alone does not keep it from a deliberate turn, because every turn replays the day's thread

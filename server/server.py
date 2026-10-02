@@ -304,7 +304,7 @@ async def _open_request(cap_start: str | None = None, cap_end: str | None = None
                 headers={"apikey": SUPABASE_SERVICE_KEY,
                          "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
                          "Content-Type": "application/json", "Prefer": "return=representation"},
-                json={"status": "transcribing", "source": "fly", "focus": "hub",
+                json={"status": "transcribing", "source": "fly", "focus": "hub", "always_on": True,
                       **({"capture_start": cap_start} if cap_start else {}),
                       **({"capture_end": cap_end} if cap_end else {})},
             )
@@ -375,7 +375,7 @@ async def handle_transcript(text: str, duration_s: float, truncated: bool,
                         "Content-Type": "application/json",
                         "Prefer": "return=minimal",
                     },
-                    json={"transcript": text, "source": "fly",
+                    json={"transcript": text, "source": "fly", "always_on": True,
                           **({"capture_start": cap_start} if cap_start else {}),
                           **({"capture_end": cap_end} if cap_end else {})},
                 )

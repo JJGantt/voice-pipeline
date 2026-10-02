@@ -898,7 +898,7 @@ def open_request(cap_start: str, cap_end: str) -> str | None:
         r = httpx.post(f"{SUPABASE_URL}/rest/v1/voice_requests",
                        headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
                                 "Content-Type": "application/json", "Prefer": "return=representation"},
-                       json={"status": "transcribing", "source": "mac", "focus": "hub",
+                       json={"status": "transcribing", "source": "mac", "focus": "hub", "always_on": True,
                              "capture_start": cap_start, "capture_end": cap_end}, timeout=6)
         rows = r.json()
         return rows[0]["id"] if isinstance(rows, list) and rows else None
@@ -939,7 +939,7 @@ def enqueue(text: str, cap_start: str | None = None, cap_end: str | None = None)
     if not (SUPABASE_KEY and text):
         return None
     try:
-        payload: dict = {"transcript": text, "source": "mac", "focus": "hub"}
+        payload: dict = {"transcript": text, "source": "mac", "focus": "hub", "always_on": True}
         if cap_start:
             payload["capture_start"] = cap_start
         if cap_end:

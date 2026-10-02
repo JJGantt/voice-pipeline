@@ -122,7 +122,7 @@ MESSAGES_MCP_TOKEN = os.environ.get("MESSAGES_MCP_TOKEN", "")
 MESSAGES_HEADERS = {"Authorization": f"Bearer {MESSAGES_MCP_TOKEN}"}
 HAS_MESSAGES = bool(MESSAGES_MCP_URL and MESSAGES_MCP_TOKEN)
 
-# Low-latency activity push to the status-hub server: transient "what Jarvis is doing" events go
+# Low-latency activity push to the status-hub server: transient "what the assistant is doing" events go
 # straight to the SSE clients (bypassing Supabase realtime) so the on-screen activity bar tracks
 # tool calls in real time. Authenticated by the hub's kiosk token in the URL.
 HUB_PUSH_URL = os.environ.get(
@@ -345,7 +345,7 @@ _NOTHING_SAID = re.compile(r"^\W*thank\s+you\W*$", re.IGNORECASE)
 
 # Quick-add requests (source 'web-quick', from the hub's bottom-right mic FAB) show their reply in a
 # tiny status chip that holds only a few words before it fades. Append this directive to the turn so
-# Jarvis still does the work but confirms it in one short phrase. Only the directive-free transcript
+# the assistant still does the work but confirms it in one short phrase. Only the directive-free transcript
 # is shown as the user's bubble; this text is invisible to the conversation.
 QUICK_REPLY_DIRECTIVE = (
     "\n\n[Reply format for THIS turn only: this came from the quick-add voice button, whose reply shows "
@@ -1276,13 +1276,13 @@ def recent_context(db: Supabase) -> str:
     def _line(r):
         ts = _parse_ts(r.get("created_at") or "")
         when = ts.astimezone(DAY_TZ).strftime("%-I:%M %p") if ts else "?"
-        who = 'You' if r.get('role') == 'user' else 'Raspy'
+        who = 'You' if r.get('role') == 'user' else 'Assistant'
         txt = (r.get('text') or '').strip()
         if r.get('ignored'):
             return f"[{when}] You (ignored as room noise, not acted on): {txt}"
         return f"[{when}] {who}: {txt}"
     # A bare sentinel reply is dropped from the replay. It is never shown as a reply — but a deliberate
-    # turn that emitted one anyway was saved as `Raspy: __IGNORE__`, and replaying that line taught
+    # turn that emitted one anyway was saved as `Assistant: __IGNORE__`, and replaying that line taught
     # every later button press the sentinel by example, so they answered with it too.
     lines = [_line(r) for r in rows
              if (r.get('text') or '').strip() and not (r.get('role') == 'assistant' and is_ignore(r.get('text')))]
@@ -2179,12 +2179,11 @@ def process_request(db: Supabase, req: dict) -> None:
     audio = source in ("fly", "mac", "web-quick")   # transcribed (mishear-prone); typed text is excluded
     # AMBIENT is a different property from transcribed, and conflating them silently ate real messages.
     # The always-on mics hear the whole room, so most of what they send was not addressed to the
-    # assistant and a turn may legitimately be dropped as noise. The phone's quick button is
-    # PUSH-TO-TALK: he held it and spoke, so every utterance from it is meant, however conversational
-    # it sounds. Judging one of those "not for you" threw away "So I've never done better than 3 by 10."
-    # The room mics: the puck, the Mac's listener, and the watch's always-on listener (`watch`; a press on
-    # the watch is `watch-cmd`). What they pick up may be ignored silently.
-    ambient = source in ("fly", "mac", "watch")
+    # assistant and a turn may legitimately be dropped as noise. A press is meant, however
+    # conversational it sounds. Judging one "not for you" threw away "So I've never done better than 3 by 10."
+    # The capture stamps it (`always_on`), not the source label: one device can be a listener and a
+    # button, and a list of labels here drifted from the hub's — the phone's listener was in neither.
+    ambient = bool(req.get("always_on"))
     prompt = transcript
     # Give the model a clock so any relative date/time resolves correctly — without it the model defaults
     # to its training era (e.g. logging "yesterday" against 2024). Pure wall-clock, no timezone concept.
