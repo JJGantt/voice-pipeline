@@ -7,11 +7,9 @@
 //    the model wrapped in <pasted_content> tags — framed as material to look at, not as what he asked.
 //    Measured on 2.1.284, typing through tmux: 790 characters arrive as a plain message and 810 arrive
 //    wrapped; three lines arrive plain and four arrive wrapped. The same limits hold for bracketed paste
-//    and for plain keystrokes. A wrapped follow-up ALONE is answered with "your message was only the
-//    pasted block … you didn't ask me to follow it". So past either limit a short line is TYPED in front
-//    of the paste (`PASTE_LEAD`), in the same submit: the typed part is the message and it says the
-//    pasted part is his, which the model then acts on. The terminal shows the whole text, and the
-//    transcript records `<lead> <pasted_content>…</pasted_content>`, which transcripts.js unwraps.
+//    and for plain keystrokes. A wrapped message is still acted on as his: every long dictation he
+//    pastes at the keyboard arrives as a bare <pasted_content> block and is answered as a request. So a
+//    message of any length is simply pasted; transcripts.js unwraps the tags for every surface.
 //
 //    There is no length cap on this path. A running Claude holds its tty in raw mode, and 20,000
 //    characters over 200 lines arrived intact through Terminal's `do script`. The Mac's 1024-byte limit
@@ -30,27 +28,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { config } from './config.js';
 
-// Pictures are fetched here, and messages from before the paste lead were stashed here as files whose
+// Pictures are fetched here, and messages sent before they were pasted were stashed here as files whose
 // stubs transcripts.js still resolves. Not /tmp: periodic cleaning there would take them early.
 export const PROMPT_DIR = path.join(os.homedir(), '.claude-desk-prompts');
 
-// Below the measured 800 / 4 with margin; see (1) above. Under both, the text is a plain message.
-export const TYPE_MAX_CHARS = 700;
-export const TYPE_MAX_LINES = 3;
-
-// Typed in front of a message that will arrive as a paste. Its wording is a contract with
-// transcripts.js, which strips it back off so every surface shows only his words.
-export const PASTE_LEAD = "Jared's message:";
-
-/**
- * What to put into a session for `text`: `lead`, TYPED (empty for a message short enough to arrive
- * plain), then `line`, PASTED with bracketed-paste markers, then one Enter.
- */
+/** What to paste into a session for `text`, with bracketed-paste markers and then one Enter. */
 export function typeable(text) {
-  const body = String(text).replace(/\x1b/g, '').trim();   // an escape could end a bracketed paste early
-  const lines = body.split(/\r\n|\r|\n/).length;
-  if (body.length <= TYPE_MAX_CHARS && lines <= TYPE_MAX_LINES) return { lead: '', line: body, how: 'typed' };
-  return { lead: `${PASTE_LEAD} `, line: body, how: 'pasted with a lead' };
+  return String(text).replace(/\x1b/g, '').trim();   // an escape could end a bracketed paste early
 }
 
 /**

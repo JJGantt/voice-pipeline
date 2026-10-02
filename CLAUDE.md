@@ -222,18 +222,13 @@ Both machines put a follow-up into a live session by typing it — the Mac into 
 (`sendToTty`), the Pi into a tmux pane (`typeInto` in `pi-desk/sessions.js`). What they type and how
 they confirm it is one contract, in `orchestrator/src/handoff.js`:
 
-- **Only short text is typed as a message.** Claude Code decides by shape whether input is a paste,
-  and a paste reaches the model wrapped in `<pasted_content>` — framed as material, not as his request.
-  Measured on 2.1.284: 790 characters arrive plain, 810 arrive wrapped; three lines plain, four
-  wrapped; the same for bracketed paste and for plain keystrokes. A wrapped follow-up gets "your message
-  was only the pasted block — you didn't ask me to follow it". So over `TYPE_MAX_CHARS` (700) or
-  `TYPE_MAX_LINES` (3) `PASTE_LEAD` (`Jared's message:`) is TYPED in front of the paste, in the same
-  submit: the typed part is the message, and it makes the paste his. The terminal shows the whole text,
-  and `transcripts.js` strips the lead and the paste tags so every surface shows only his words. No
-  length limit applies: a running session's tty is raw (20,000 characters arrived intact on the Mac), and
-  tmux has none. Messages sent before this were stashed in `~/.claude-desk-prompts/` behind a read-this
-  stub; `unstash`, `readsStash` and `dropEcho` remain only to render those turns, and go inert as the
-  files are swept at thirty days.
+- **A message of any length is pasted as it is.** Past about 800 characters or 4 lines Claude Code wraps
+  input as `<pasted_content>`, and a session still answers it as his request — every long dictation he
+  pastes at the keyboard arrives that way. `transcripts.js` strips the tags so every surface shows only
+  his words. A running session's tty is raw, so nothing is cut (20,000 characters arrived intact on the
+  Mac), and tmux has no limit. Messages sent before this were stashed in `~/.claude-desk-prompts/` behind
+  a read-this stub; `unstash`, `readsStash` and `dropEcho` remain only to render those turns, and go
+  inert as the files are swept at thirty days.
 - **Whatever is typed goes inside bracketed-paste markers, and Enter follows as a keypress.** Without a
   boundary Claude Code can read the return as part of the text and leave the message in the composer.
   The Mac wraps the text in `ESC[200~ … ESC[201~` itself; the Pi uses `tmux paste-buffer -p -r`. The Pi

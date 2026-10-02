@@ -167,10 +167,8 @@ export async function closeTabForTty(tty) {
  * "front window" is whatever Jared last clicked — which is exactly the mistake to avoid, since a
  * dictated follow-up landing in the wrong terminal is worse than one that fails.
  *
- * What gets typed is decided by `typeable` (handoff.js), shared with the Pi: a long or many-line message
- * gets a short typed lead in front of the paste, because Claude Code frames such input as a paste rather
- * than as his request. A running session's tty is raw, so no length limit applies here. Whether it then
- * SUBMITTED is the caller's to confirm, from the transcript.
+ * What gets typed is `typeable` (handoff.js), shared with the Pi. A running session's tty is raw, so no
+ * length limit applies here. Whether it then SUBMITTED is the caller's to confirm, from the transcript.
  *
  * The alternatives for a long message all fail on this end. `do script` always appends a return, so
  * chunking submits each piece as a separate message. System Events can type without one, but needs
@@ -187,7 +185,7 @@ export async function closeTabForTty(tty) {
 const ESC = 'character id 27';
 
 export async function sendToTty(tty, text) {
-  const { lead, line, how } = typeable(text);
+  const line = typeable(text);
   // An AppleScript string literal cannot hold a raw line break, so each is written as `linefeed` joined
   // into the string; inside the bracketed paste it lands in the composer as a line break, not a submit.
   const escaped = line.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r\n|\r|\n/g, '" & linefeed & "');
@@ -196,7 +194,7 @@ export async function sendToTty(tty, text) {
       repeat with w in windows
         repeat with t in tabs of w
           if tty of t is "${tty}" then
-            do script "${lead.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}" & (${ESC}) & "[200~${escaped}" & (${ESC}) & "[201~" in t
+            do script (${ESC}) & "[200~${escaped}" & (${ESC}) & "[201~" in t
             set found to true
           end if
         end repeat
@@ -204,7 +202,7 @@ export async function sendToTty(tty, text) {
       if not found then error "no tab with tty ${tty}"
     end tell
     return "sent"`);
-  return { line, how };
+  return line;
 }
 
 // Run a shell command in a new Terminal tab, falling back to a new window.

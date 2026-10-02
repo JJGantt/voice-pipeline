@@ -92,12 +92,12 @@ async function deliver(row, text, { expect = null, cmd = null } = {}) {
   const tpath = s?.transcriptPath || row.transcript_path || null;
   const from = tpath ? transcriptSize(tpath) : 0;
   if (cmd) expectPrompt(row.id, text, cmd);
-  const { line, how } = await sendToTty(row.tty, text);
-  if (!tpath) return `sent ${text.length} chars to ${row.tty} (${how}, unconfirmed: no transcript bound yet)`;
+  const line = await sendToTty(row.tty, text);
+  if (!tpath) return `sent ${text.length} chars to ${row.tty} (unconfirmed: no transcript bound yet)`;
   if (!(await awaitSubmitted(tpath, from, expect || line))) {
     throw new Error(`typed into ${row.tty} but it never reached the transcript — likely sitting unsent in the composer`);
   }
-  return `sent ${text.length} chars to ${row.tty} (${how})`;
+  return `sent ${text.length} chars to ${row.tty}`;
 }
 
 async function run(cmd) {

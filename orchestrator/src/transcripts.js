@@ -8,7 +8,6 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { PASTE_LEAD } from './handoff.js';
 
 const PROJECTS = process.env.CLAUDE_PROJECTS_DIR || path.join(os.homedir(), '.claude', 'projects');
 
@@ -90,15 +89,7 @@ export function fromHim(text) {
 export function resolvePrompt(text) {
   const body = unstash(text);
   return body ? { prompt: unwrapPastes(body), stashed: true }
-              : { prompt: unwrapPastes(unlead(text)) || null };
-}
-
-// The line typed in front of a long message so the paste reads as his (handoff.js `PASTE_LEAD`). It is
-// how the words got in, not part of them. Only the lead directly followed by a paste is stripped: he can
-// say those words himself.
-const LEAD_RE = new RegExp(`^${PASTE_LEAD.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*(?=<pasted_content\\b)`);
-function unlead(text) {
-  return String(text || '').replace(LEAD_RE, '');
+              : { prompt: unwrapPastes(text) || null };
 }
 
 // A PASTE IS STILL HIS WORDS, NOT MARKUP.
@@ -157,7 +148,7 @@ export function dropEcho(reply, prompt) {
   const rest = reply.slice(end + last.length).replace(/^\s*(```|["\u201d])?\s*/, '');
   return rest || reply;
 }
-// Resolves the file stubs messages were sent as before the paste lead (handoff.js). Nothing writes one
+// Resolves the file stubs long messages were once sent as (handoff.js). Nothing writes one
 // now; this stays only so turns already recorded that way still show his words until their files are
 // swept at thirty days.
 function unstash(text) {

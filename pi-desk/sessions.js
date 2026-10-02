@@ -60,9 +60,7 @@ export async function liveSessions() {
  * ("Enter", "Up", "C-c") as that key. `-r` keeps line breaks as line breaks rather than returns, so
  * nothing submits early if the markers are ever not honoured.
  *
- * What is pasted is decided by `typeable` (handoff.js, shared with the Mac): a long or many-line message
- * gets a short typed lead first, because Claude Code frames such input as a paste and the model treats a
- * paste alone as material rather than as his request.
+ * What is pasted is `typeable` (handoff.js, shared with the Mac).
  *
  * The transcript is the receipt (`awaitSubmitted`). Typing reports nothing, and on 2026-09-28 three
  * follow-ups were logged here as "sent" while two sat in the composer and one vanished; nothing reached
@@ -86,20 +84,18 @@ export async function typeInto(target, text, { expect = null, cmd = null } = {})
   const from = transcriptSize(s.transcriptPath);
   // The id the watcher stamps on the prompt these words become (sessionWatch.js `expectPrompt`).
   if (cmd) expectPrompt(target, text, cmd);
-  const { lead, line, how } = typeable(text);
+  const line = typeable(text);
   const buf = `pd-${target}`;
-  // Typed, not pasted: the typed part is what tells the model the paste is his (handoff.js).
-  if (lead) await exec('tmux', ['send-keys', '-t', target, '-l', '--', lead], { timeout: 10000 });
   await exec('tmux', ['set-buffer', '-b', buf, '--', line], { timeout: 10000 });
   await exec('tmux', ['paste-buffer', '-p', '-r', '-d', '-b', buf, '-t', target], { timeout: 10000 });
   await new Promise((r) => setTimeout(r, 300));
   await exec('tmux', ['send-keys', '-t', target, 'Enter'], { timeout: 10000 });
   const want = expect || line;
-  if (await awaitSubmitted(s.transcriptPath, from, want)) return `sent ${text.length} chars to ${target} (${how})`;
+  if (await awaitSubmitted(s.transcriptPath, from, want)) return `sent ${text.length} chars to ${target}`;
 
   await exec('tmux', ['send-keys', '-t', target, 'Enter'], { timeout: 10000 });
   if (await awaitSubmitted(s.transcriptPath, from, want)) {
-    return `sent ${text.length} chars to ${target} (${how}, on a second Enter)`;
+    return `sent ${text.length} chars to ${target} (on a second Enter)`;
   }
   throw new Error(`typed into ${target} but it never reached the transcript — likely sitting unsent in the composer`);
 }
