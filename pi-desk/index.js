@@ -39,6 +39,7 @@ import { withAttachments, sweepStashedPrompts } from '../orchestrator/src/handof
 // Which conversation a process is in, from Claude Code's own record — shared with the Mac, which
 // reads the same files for the same reason.
 import { sessionOf } from '../orchestrator/src/discover.js';
+import { sweepScratch } from './scratch.js';
 import { syncSessionWatch, reportTurnEnd } from '../orchestrator/src/sessionWatch.js';
 import { relayFirstReply } from '../orchestrator/src/relay.js';
 // Shared with the Mac rather than reimplemented: both halves of a transfer must agree byte for
@@ -232,9 +233,15 @@ const laterOf = (a, b) => (!a ? b || null : !b ? a : (Date.parse(a) >= Date.pars
 
 // Publish what is running and reap what is not, then run the queue. tmux is the source of truth
 // rather than a list this process keeps, because this process restarts and tmux does not.
+// The running sessions as of the last tick: a change means one ended (or began), which is when a
+// finished conversation's scratch directory is cleared (scratch.js) — not on every tick.
+let lastLiveKey = null;
+
 async function reconcileSessions() {
   const live = await liveSessions();
   const residents = [];
+  const liveKey = live.filter((l) => l.alive).map((l) => `${l.name}:${l.pid}`).sort().join(',');
+  if (liveKey !== lastLiveKey) { lastLiveKey = liveKey; sweepScratch(); }
 
   for (const { name, alive, created, pid } of live) {
     if (!alive) {
@@ -995,6 +1002,9 @@ async function sweepRetention() {
     await sweepClips();
     // Messages handed to sessions by file, and the pictures fetched for them (handoff.js).
     sweepStashedPrompts();
+    // The net under the tick's sweep, for a conversation that ended inside a process that kept
+    // running (a `/clear`, or the voice worker's long-lived claude moving on to a new one).
+    sweepScratch();
   } catch (e) { console.error('[pi-desk] retention:', e.message); }
 }
 

@@ -186,6 +186,11 @@ it, and `claude --resume` still works. What goes is the row that OFFERS it in th
 mirrored copy in storage, cleared in the same step so the bucket cannot fill with transcripts of
 sessions nothing can name any more.
 
+Claude Code's per-conversation scratch directories (`/tmp/claude-<uid>/<project>/<id>/`) go the moment
+their conversation stops running (`pi-desk/scratch.js`): on the Pi `/tmp` is RAM, an idle tmpfs page
+lands in zram swap, and swap over `MAX_SWAP_PCT` holds every queued launch. A parked session resumes
+with an empty scratch directory.
+
 Dead letters are deliberately exempt: an unretried one holds words Jared may still want, and a
 retried or dismissed one is a decision worth keeping.
 
