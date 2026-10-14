@@ -16,13 +16,26 @@ routed once it gets here is `../docs/ROUTING.md`.
 1. **Heartbeat** — every `HEARTBEAT_INTERVAL_S` (30s), upsert `worker_presence`
    `{worker, last_seen, info:{}}`. A deferring worker drops to 60s, which stays
    inside `HEARTBEAT_FRESH_S` so it never looks dead to the workers below it.
+   A worker whose own Supabase calls hit a network error or 5xx in the last
+   `NET_DEGRADED_S` (180s) beats `info:{degraded:true}` instead. A flaky link lets
+   enough beats through to look alive while every claim and reply takes minutes,
+   so freshness alone cannot be the test.
 2. **Claim (serialized, never concurrent)** — woken by a Supabase realtime INSERT
    on `voice_requests`; the poll below is only a backstop.
    - **Priority gate:** if any worker ranked *higher* in `WORKER_PRIORITY` has a
-     `last_seen` within `HEARTBEAT_FRESH_S` (90s), skip and let them take it.
+     `last_seen` within `HEARTBEAT_FRESH_S` (90s) and is not degraded, skip and
+     let them take it.
    - **Affinity override:** a live hub context window stays pinned to the worker
-     that owns it, even against priority, until the window resets or the owner
-     goes silent past `OWNER_GRACE_S` — a needless switch loses the conversation.
+     that owns it, even against priority, until the window resets, the owner
+     goes silent past `OWNER_GRACE_S`, or the owner reports itself degraded.
+   - **Degraded stands down:** a degraded worker does not claim while any other
+     worker is healthy.
+   - **Failover deadline:** a request still pending `FAILOVER_S` (8s) after it was
+     created, with no worker busy on another request, is taken by whoever is
+     looking, deferral or not — a healthy worker claims in about a second, so an
+     idle one that has not is not going to. A standing-by worker sleeps to exactly
+     that deadline rather than its 120s backstop. While a worker IS busy the
+     follow-up waits for it on purpose: it queues behind the run it follows.
    - **Atomic claim:** `PATCH ...&status=eq.pending` → `claimed`. If the returned
      representation is empty, someone else won the race — skip.
 3. **Process** the claimed request:

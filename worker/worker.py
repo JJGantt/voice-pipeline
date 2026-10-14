@@ -315,6 +315,15 @@ STANDBY_POLL_S = 120.0       # deferring → idle-poll every 120s (realtime carr
 # silent past this grace — longer than HEARTBEAT_FRESH_S so a brief owner hiccup can't cause a context-losing
 # switch, short enough that a genuinely-offline owner hands off promptly (then the new owner starts fresh).
 OWNER_GRACE_S = 150.0
+# A worker whose own Supabase calls failed (network, not a 4xx) within this window is DEGRADED: it says so
+# in its heartbeat, stops claiming while a healthy worker exists, and the others stop deferring to it. A
+# flaky link lets just enough heartbeats through to look alive while every claim and reply takes minutes,
+# and liveness alone cannot see that.
+NET_DEGRADED_S = 180.0
+# How long a pending request may sit unclaimed while its preferred worker is IDLE before the next worker
+# takes it anyway. A healthy worker claims in about a second; an idle one that has not claimed in this long
+# is not going to. A preferred worker that is busy keeps its follow-ups, which queue behind its run.
+FAILOVER_S = 8.0
 DEDUP_WINDOW_S = 10.0         # fallback only: 2 mics' enqueue times for rows that predate capture-window stamping
 DEDUP_TOL_S = 0.75            # pad each recording window by this (Fly↔Mac clock skew + ESP→Fly stream latency)
 # A mic still hearing Jared means the utterance is NOT FINISHED, whoever else has already enqueued a
@@ -737,6 +746,22 @@ def headers() -> dict:
 # --------------------------------------------------------------------------- #
 
 
+_net_fail_at = 0.0   # monotonic time of this worker's last network-level Supabase failure
+
+
+def _note_failure(e: Exception) -> None:
+    """Record a failure that says the LINK is bad: transport errors and 5xx. A 4xx is a bad query, which
+    says nothing about the network, and must not take a healthy worker out of rotation."""
+    global _net_fail_at
+    if isinstance(e, httpx.HTTPStatusError) and e.response.status_code < 500:
+        return
+    _net_fail_at = time.monotonic()
+
+
+def degraded() -> bool:
+    return _net_fail_at > 0 and time.monotonic() - _net_fail_at < NET_DEGRADED_S
+
+
 class Supabase:
     def __init__(self, client: httpx.Client):
         self.c = client
@@ -751,6 +776,7 @@ class Supabase:
             r.raise_for_status()
             return r.json()
         except Exception as e:  # noqa: BLE001 — defensive on purpose
+            _note_failure(e)
             log(f"GET {table}?{query} failed: {e}")
             return []
 
@@ -769,6 +795,7 @@ class Supabase:
                     return None
             return None
         except Exception as e:  # noqa: BLE001
+            _note_failure(e)
             log(f"POST {table} failed: {e}")
             return None
 
@@ -786,6 +813,7 @@ class Supabase:
                     return None
             return None
         except Exception as e:  # noqa: BLE001
+            _note_failure(e)
             log(f"PATCH {table}?{query} failed: {e}")
             return None
 
@@ -799,6 +827,7 @@ class Supabase:
             r.raise_for_status()
             return True
         except Exception as e:  # noqa: BLE001
+            _note_failure(e)
             log(f"UPSERT {table} failed: {e}")
             return False
 
@@ -811,7 +840,7 @@ class Supabase:
 def heartbeat(db: Supabase) -> None:
     db.upsert(
         "worker_presence",
-        {"worker": WORKER_ID, "last_seen": now_iso(), "info": {}},
+        {"worker": WORKER_ID, "last_seen": now_iso(), "info": {"degraded": True} if degraded() else {}},
         on_conflict="worker",
     )
 
@@ -839,6 +868,10 @@ PRESENCE_CACHE_S = 30.0
 # attempt in claim_one; read by the heartbeat thread and the main loop to pick the slow standby cadence.
 # A plain bool is safe here: one writer (the main loop), and the GIL makes the read/write atomic.
 _standby = False
+# While standing by with something pending: the monotonic moment the preferred worker's chance to claim it
+# runs out. The main loop sleeps to exactly then instead of its slow standby backstop — a clock arrival,
+# not a poll — and claim_one stops deferring once it has passed.
+_failover_at = 0.0
 # Set while a claim is deliberately deferred because a mic is still hearing him. The main loop looks
 # again in a second rather than waiting out the idle backstop, so the hold costs ~1s, not ~15.
 _holding = False
@@ -847,9 +880,21 @@ _holding = False
 def presence_rows(db: Supabase) -> list:
     now = time.monotonic()
     if _presence_cache["rows"] is None or now - _presence_cache["at"] > PRESENCE_CACHE_S:
-        _presence_cache["rows"] = db.get("worker_presence", "select=worker,last_seen") or []
+        _presence_cache["rows"] = db.get("worker_presence", "select=worker,last_seen,info") or []
         _presence_cache["at"] = now
     return _presence_cache["rows"]
+
+
+def _healthy(row: dict, window_s: float = HEARTBEAT_FRESH_S) -> bool:
+    """A presence row that is fresh AND not reporting a degraded link."""
+    if (row.get("info") or {}).get("degraded"):
+        return False
+    ts = _parse_ts(row.get("last_seen", ""))
+    return bool(ts) and (datetime.now(timezone.utc) - ts).total_seconds() <= window_s
+
+
+def other_worker_healthy(db: Supabase) -> bool:
+    return any(r.get("worker") != WORKER_ID and _healthy(r) for r in presence_rows(db))
 
 
 def higher_priority_present(db: Supabase) -> bool:
@@ -862,14 +907,7 @@ def higher_priority_present(db: Supabase) -> bool:
     higher = set(WORKER_PRIORITY[:my_rank])
     if not higher:
         return False
-    rows = presence_rows(db)
-    now = datetime.now(timezone.utc)
-    for row in rows:
-        if row.get("worker") in higher:
-            ts = _parse_ts(row.get("last_seen", ""))
-            if ts and (now - ts).total_seconds() <= HEARTBEAT_FRESH_S:
-                return True
-    return False
+    return any(row.get("worker") in higher and _healthy(row) for row in presence_rows(db))
 
 
 def context_owner(db: Supabase) -> str | None:
@@ -895,6 +933,10 @@ def context_owner(db: Supabase) -> str | None:
     if age > session_reset_s():
         return None
     if claimed_at.astimezone().date() != now.astimezone().date():
+        return None
+    # An owner reporting a degraded link releases affinity at once: keeping the conversation on one
+    # machine is not worth minutes per command.
+    if any(r.get("worker") == owner and (r.get("info") or {}).get("degraded") for r in presence_rows(db)):
         return None
     # Liveness: a claim IS proof the owner was running. If it claimed within the grace window, treat the
     # owner as alive WITHOUT a presence read — this survives a briefly-unavailable presence query (e.g. the
@@ -1872,6 +1914,19 @@ def _same_utterance(rows: list, first: dict) -> list:
     return group
 
 
+def overdue_for_failover(db: Supabase, waited_s: float) -> bool:
+    """Whether a pending request has waited past FAILOVER_S with no worker busy on anything else — the
+    worker it was waiting for is up but not claiming, so the next one takes it. While some other worker
+    holds an in-flight request the wait is deliberate: a follow-up queues behind the run it follows."""
+    if waited_s < FAILOVER_S:
+        return False
+    busy = db.get("voice_requests", f"status=eq.claimed&claimed_by=neq.{WORKER_ID}&select=id&limit=1")
+    if busy:
+        return False
+    log(f"pending {waited_s:.0f}s with the preferred worker idle — taking it")
+    return True
+
+
 def claim_one(db: Supabase) -> dict | None:
     """Find one pending request and atomically claim it. Returns the row or None."""
     global _standby
@@ -1892,10 +1947,20 @@ def claim_one(db: Supabase) -> dict | None:
         refresh_standby(db)
         return reclaim_stale(db)
 
-    if should_defer(db):
-        _standby = True   # a higher-priority worker is handling things → stand down to the slow cadence
+    global _failover_at
+    oldest_at = _parse_ts(pending[0].get("created_at") or "")
+    waited_s = (datetime.now(timezone.utc) - oldest_at).total_seconds() if oldest_at else 0.0
+    if degraded() and other_worker_healthy(db):
+        # My own link is failing: a claim here could take minutes to answer while a healthy worker sits idle.
+        _standby, _failover_at = True, 0.0
         return None
-    _standby = False      # I'm eligible to claim → run the active cadence
+    if should_defer(db) and not overdue_for_failover(db, waited_s):
+        _standby = True   # a higher-priority worker is handling things → stand down to the slow cadence
+        # Only while the deadline is still ahead. Past it, the wait is behind a busy worker's run, which
+        # ends in that worker claiming the follow-up itself — nothing here needs to wake for it.
+        _failover_at = time.monotonic() + (FAILOVER_S - waited_s) + 0.5 if waited_s < FAILOVER_S else 0.0
+        return None
+    _standby, _failover_at = False, 0.0   # I'm eligible to claim → run the active cadence
 
     # HOLD WHILE HE IS STILL TALKING. One utterance reaches the queue as several rows — mics endpoint
     # at different pauses — and acting on the first one to arrive is how half a sentence becomes a
@@ -1906,7 +1971,6 @@ def claim_one(db: Supabase) -> dict | None:
     # Waiting for every mic to go quiet costs nothing on a short command: by the time "turn the light
     # blue" is enqueued, no mic has heard anything for seconds, so it claims immediately.
     heard = _mics_hearing(db)
-    oldest_at = _parse_ts(pending[0].get("created_at") or "")
     held_s = (datetime.now(timezone.utc) - oldest_at).total_seconds() if oldest_at else 0.0
     if heard and (datetime.now(timezone.utc) - heard).total_seconds() < MIC_QUIET_S and held_s < MAX_HOLD_S:
         if not _holding:
@@ -2577,7 +2641,8 @@ def main() -> int:
                     if _holding:
                         wait_s = HOLD_RETRY_S   # he is still talking; look again shortly
                     elif _standby:
-                        wait_s = STANDBY_POLL_S
+                        wait_s = (max(0.5, _failover_at - time.monotonic()) if _failover_at
+                                  else STANDBY_POLL_S)
                     elif not waker.healthy:
                         wait_s = IDLE_POLL_DEGRADED_S
                     else:
