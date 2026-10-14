@@ -250,11 +250,11 @@ async function reconcileSessions() {
       console.log(`[pi-desk] reaped finished session ${name}`);
       continue;
     }
-    let row = null;
-    try {
-      const rows = await sb(`desk_sessions?id=eq.${encodeURIComponent(name)}&select=*`);
-      row = rows?.[0] || null;
-    } catch {}
+    // A failed read ends the tick rather than reading as "no row". Treated as absent, the upsert below
+    // went on to write the session as though it were new — label null, conversation "rebound" — and on
+    // a flaky network the read fails while the write a moment later succeeds, which wiped dispatch labels.
+    const rows = await sb(`desk_sessions?id=eq.${encodeURIComponent(name)}&select=*`);
+    const row = rows?.[0] || null;
     // Which conversation the session is in, from its process's own record (orchestrator/src/
     // discover.js) — including after a `/clear`, which starts a new one inside the same process. Until
     // claude has written that record (its first second or so) the row keeps what it had.
@@ -316,9 +316,15 @@ async function reconcileSessions() {
           // A name Jared typed himself (`/rename`, which writes a `custom-title` record) outranks the
           // label the router wrote — the same rule the Mac applies. Without this the rename reached
           // the session and nothing ever read it back, so the pane kept showing the old label.
-          label: tail.customTitle ? tail.customTitle.slice(0, 60) : (row?.label || null),
-          // Separately, so a tab can show the repo unless Jared named the session himself.
-          custom_title: tail.customTitle ? tail.customTitle.slice(0, 60) : (row?.custom_title || null),
+          //
+          // With no row yet, neither is sent unless the transcript names the session: a tick that reads
+          // between launch() and startSession's own publish would otherwise land after it and blank the
+          // dispatch label that publish just wrote.
+          ...(tail.customTitle || row ? {
+            label: tail.customTitle ? tail.customTitle.slice(0, 60) : (row?.label || null),
+            // Separately, so a tab can show the repo unless Jared named the session himself.
+            custom_title: tail.customTitle ? tail.customTitle.slice(0, 60) : (row?.custom_title || null),
+          } : {}),
           last_reply: tail.lastReply ? tail.lastReply.slice(0, 4000) : (rebound ? null : row?.last_reply || null),
           // The prompt that reply answers, and carried by the same rule: it belongs to the reply, so it
           // is replaced only when the reply is.
