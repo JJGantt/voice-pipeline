@@ -1359,6 +1359,12 @@ def write_mcp_config() -> str:
         cfg["mcpServers"]["gmail"] = {"command": GMAIL_PY, "args": [GMAIL_MCP_PY]}
     if HAS_MESSAGES:
         cfg["mcpServers"]["messages"] = {"type": "http", "url": MESSAGES_MCP_URL, "headers": MESSAGES_HEADERS}
+    # alwaysLoad makes Claude Code connect a server BEFORE the first turn. Without it, `-p` connects
+    # --mcp-config servers in the background and the model's first request carries only whichever ones
+    # had finished starting: on Fly the voice server (~1.6s) made it and data (~2s) did not, so the
+    # assistant answered "I don't have a nutrition tool" with the tool seconds away.
+    for srv in cfg["mcpServers"].values():
+        srv["alwaysLoad"] = True
     fd, path = tempfile.mkstemp(prefix="voice-mcp-", suffix=".json")
     with os.fdopen(fd, "w") as f:
         json.dump(cfg, f)
