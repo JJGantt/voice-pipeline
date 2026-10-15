@@ -21,7 +21,8 @@ KillMode=process
 # 1.2GB and the kernel took the TV instead.
 #
 # Not a working limit — two sessions plus the supervisor run ~850MB, well under. It is the backstop
-# for when RESIDENT_MAX is somehow not enough. Combined with the oom_score_adj=800 that launch.sh
+# for when the free-memory admission (makeRoom in index.js) is somehow not enough, since a session keeps
+# growing after it is admitted. Combined with the oom_score_adj=800 that launch.sh
 # stamps on each session, a cgroup OOM here picks a session rather than the supervisor.
 MemoryHigh=1G
 MemoryMax=1300M

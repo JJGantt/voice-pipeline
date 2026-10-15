@@ -109,6 +109,7 @@ export async function typeInto(target, text, { expect = null, cmd = null } = {})
  * backstop for a process that ignores both.
  */
 export async function evict(name) {
+  const pid = (await liveSessions()).find((l) => l.name === name)?.pid;
   try {
     await exec('tmux', ['send-keys', '-t', name, 'C-c'], { timeout: 10000 });
     await new Promise((r) => setTimeout(r, 800));
@@ -116,6 +117,16 @@ export async function evict(name) {
     await new Promise((r) => setTimeout(r, 2500));
   } catch { /* fall through to the backstop */ }
   try { await exec('tmux', ['kill-session', '-t', name], { timeout: 10000 }); } catch {}
+  // Return only once claude has actually exited: the caller measures the memory this freed, or flushes
+  // the transcript it was writing, and neither is true while the process is still winding down.
+  if (pid) await exited(pid);
+}
+
+/** Resolves once `pid` is gone, or after `ms` regardless. */
+async function exited(pid, ms = 10000) {
+  for (const end = Date.now() + ms; Date.now() < end; await new Promise((r) => setTimeout(r, 100))) {
+    try { process.kill(pid, 0); } catch { return; }
+  }
 }
 
 /**

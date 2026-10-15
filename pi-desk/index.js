@@ -87,19 +87,17 @@ const COMMAND_TTL_S = Number(process.env.COMMAND_TTL_S || 120);
 // How long a session gets to commit, push and update docs before it is closed regardless. Generous
 // on purpose: this is real work, and cutting it short is the thing wrapping up exists to prevent.
 const WORKER = 'pi-desk';
-// A MEMORY bound: sessions cost ~334MB each whether or not they are doing anything.
-//
-// Two, not three, since 2026-09-02: pi-browser.service became a permanent tenant of this Pi that
-// day (~450MB of Chromium on :99, capped at 1.3G). Three sessions plus the wall display plus the
-// automation browser does not fit in 4GB, and the way it does not fit is the kernel killing the
-// wall — see the OOM ordering note on IDLE_MAX_S below.
-const RESIDENT_MAX = Number(process.env.RESIDENT_MAX || 2);
+// MEMORY is the only bound on how many sessions run here. A session holds ~250-420MB for as long as
+// it is open, whatever it is doing, and grows as its conversation does; its CPU use is negligible,
+// because a turn is almost entirely waiting on the API. So there is no session count and no cap on how
+// many may be mid-turn: a count only stands in for memory, and a "busy" cap held a request behind two
+// working sessions while the processor sat idle. Admission is makeRoom: launch when memoryPressure is
+// clear, park idle sessions until it is, and hand the work to the Mac when it still is not.
 
 // A TIME bound, and the one the other limits do not provide.
 //
-// RESIDENT_MAX, WORKING_MAX, MIN_FREE_MB and pickEviction all run in ONE place: runQueue, when
-// something new wants a slot. Nothing queued means nothing re-examines what is already resident, so
-// a session that finished its work simply stays. On 2026-09-04 two Amazon-cart sessions from Sep 3
+// makeRoom runs only when something new wants to start. Nothing starting means nothing re-examines
+// what is already resident, so a session that finished its work simply stays. On 2026-09-04 two Amazon-cart sessions from Sep 3
 // (one of which had already answered, one of which returned __ESCALATE__) sat idle for two days
 // holding ~516MB, and the kernel spent that afternoon killing the wall display's renderer instead —
 // 13 OOM kills in the final hour. Nothing was over any limit; there was no limit to be over.
@@ -112,7 +110,7 @@ const IDLE_MAX_S = Number(process.env.PI_DESK_IDLE_MAX_S || 3600);
 // that loses an out-of-memory fight — the kernel OOM-killed its renderer twice on 2026-08-26 while
 // sessions sat inside the residency cap, leaving the screen on 'Aw, Snap' with nothing technically
 // over its limit. A session costs ~350-420MB, so refusing to launch below this floor keeps enough
-// headroom that starting one cannot take the display down. Below it, work queues rather than fails.
+// headroom that starting one, and letting it grow, cannot take the display down.
 const MIN_FREE_MB = Number(process.env.PI_DESK_MIN_FREE_MB || 900);
 
 /** MemAvailable in MB — the kernel's own estimate of what is actually reclaimable, not `free`. */
@@ -159,8 +157,101 @@ function memoryPressure() {
   if (swap > MAX_SWAP_PCT) return `swap ${swap}% used, ceiling is ${MAX_SWAP_PCT}%`;
   return null;
 }
-// A CPU bound: four ARM cores, and two sessions both running a build contend badly.
-const WORKING_MAX = Number(process.env.WORKING_MAX || 2);
+
+/**
+ * Resident sessions as admission sees them: live in tmux, with whether a turn is in flight and when
+ * each was last active. The tick builds the same list from transcripts; this reads the row the tick
+ * and the session watcher keep current, because a launch should not wait on a full reconcile. A
+ * session with no row yet is treated as working — it was launched a moment ago, and parking it would
+ * kill a request before it answered.
+ */
+async function residentsNow() {
+  const live = (await liveSessions()).filter((l) => l.alive);
+  if (!live.length) return [];
+  const rows = await sb(`desk_sessions?worker=eq.${WORKER}&select=id,working,active_at`).catch(() => []);
+  const byId = new Map((rows || []).map((r) => [r.id, r]));
+  return live.map((l) => {
+    const row = byId.get(l.name);
+    return { ...l, working: row ? row.working === true : true,
+             lastActivity: (row?.active_at && Date.parse(row.active_at)) || l.created || 0 };
+  });
+}
+
+/** Close a session so it can be resumed later, and record that it was parked. */
+async function park(name) {
+  await evict(name);
+  queueDirty = true;   // memory just came free, so queued work gets another look on the next tick
+  await sb(`desk_sessions?id=eq.${encodeURIComponent(name)}`, {
+    method: 'PATCH', headers: { Prefer: 'return=minimal' },
+    body: JSON.stringify({ status: 'evicted', ended: new Date().toISOString() }),
+  }).catch(() => {});
+}
+
+/**
+ * Make room here for one more session. Returns null when it may start now, else why it cannot.
+ *
+ * Parks idle sessions, least recently active first (pickEviction), until memoryPressure clears. A
+ * session mid-turn is never parked. Memory is measured again after each one, because what a session
+ * frees varies with how long its conversation has grown, and the shortage may not be sessions at all.
+ */
+async function makeRoom(residents, forWhat) {
+  let left = residents.slice();
+  for (let why = memoryPressure(); why; why = memoryPressure()) {
+    const victim = pickEviction(left);
+    if (!victim) return why;
+    console.log(`[pi-desk] parking ${victim.name} to make room for ${forWhat} (${why})`);
+    await park(victim.name);
+    left = left.filter((r) => r !== victim);
+  }
+  return null;
+}
+
+/** Where the Mac keeps a project, from the list its orchestrator publishes; the Pi's layout differs. */
+async function macPath(name) {
+  if (name === 'root') return '~';
+  const rows = await sb(`repos?name=eq.${encodeURIComponent(name)}&select=path`).catch(() => null);
+  return rows?.[0]?.path || null;
+}
+
+/**
+ * Send a new session to the Mac because this Pi has no room. Returns the command id.
+ *
+ * A NEW command rather than re-targeting this one: the Mac wakes on inserts only. The id goes back in
+ * this command's detail (`handed to the Mac as <id>`), which is how start_session follows the work to
+ * where it actually launched and reports that, instead of reporting a hand-off as a start.
+ */
+async function handOpenToMac(payload) {
+  const id = randomUUID();
+  await sb('desk_commands', {
+    method: 'POST', headers: { Prefer: 'return=minimal' },
+    body: JSON.stringify({ id, kind: 'open_session', payload: { ...payload, target: 'mac' } }),
+  });
+  return id;
+}
+
+/**
+ * Resume a parked Pi session on the Mac because this Pi has no room — the transfer path for a session
+ * that is already closed. Its transcript is flushed to the mirror, the row is marked transferred so
+ * only one machine ever holds it, and the Mac resumes it from the mirror. Returns the command id.
+ */
+async function handResumeToMac(row, prompt) {
+  const at = await mirrorUp(row.claude_session_id, row.transcript_path, row.mirror_offset || 0);
+  const now = new Date().toISOString();
+  await sb(`desk_sessions?id=eq.${encodeURIComponent(row.id)}`, {
+    method: 'PATCH', headers: { Prefer: 'return=minimal' },
+    body: JSON.stringify({ status: 'transferred', ended: now, working: false,
+                           ...(at != null ? { mirror_offset: at, mirror_at: now } : {}) }),
+  });
+  const id = randomUUID();
+  await sb('desk_commands', {
+    method: 'POST', headers: { Prefer: 'return=minimal' },
+    body: JSON.stringify({ id, kind: 'resume_mirrored',
+                           payload: { target: 'mac', claude_session_id: row.claude_session_id, repo: row.repo,
+                                      label: row.label, origin: row.origin || 'dispatched', from: 'pi',
+                                      ...(prompt ? { prompt } : {}) } }),
+  });
+  return id;
+}
 
 if (!SUPABASE_KEY) {
   console.error('[pi-desk] SUPABASE_KEY is not set — refusing to start.');
@@ -210,7 +301,6 @@ function hostStats(residentCount) {
     if (swapTotal) stats.swap_pct = Math.round(((swapTotal - kb('SwapFree')) / swapTotal) * 100);
   } catch { /* a machine that cannot read /proc simply reports no numbers */ }
   if (Number.isFinite(residentCount)) stats.sessions = residentCount;
-  stats.session_max = RESIDENT_MAX;
   return stats;
 }
 
@@ -434,11 +524,7 @@ async function reapIdleSessions(residents) {
     if (r.working || !quiet || !old) { kept.push(r); continue; }
     const idleMin = Math.round((Date.now() - (r.lastActivity || r.created || 0)) / 60000);
     console.log(`[pi-desk] reaping ${r.name}: idle ${idleMin}m (limit ${Math.round(IDLE_MAX_S / 60)}m)`);
-    await evict(r.name);
-    await sb(`desk_sessions?id=eq.${encodeURIComponent(r.name)}`, {
-      method: 'PATCH', headers: { Prefer: 'return=minimal' },
-      body: JSON.stringify({ status: 'evicted', ended: new Date().toISOString() }),
-    }).catch(() => {});
+    await park(r.name);
   }
   return kept;
 }
@@ -460,27 +546,13 @@ async function runQueue(residents) {
   const next = queued?.[0];
   if (!next) return;
 
-  const working = residents.filter((r) => r.working).length;
-  if (working >= WORKING_MAX) return;          // CPU bound: let the busy ones finish first
-
-  // Under the memory floor with a free slot means the machine is short for some other reason — the
-  // display, a build, anything. Evicting a session would not help (the slot is not what is missing)
-  // and launching into it is how the wall display gets OOM-killed. Wait; the queue never expires.
-  const pressure = memoryPressure();
-  if (pressure && residents.length < RESIDENT_MAX) {
-    console.log(`[pi-desk] holding queue: ${pressure}`);
+  // No room here and the Mac awake: the queued work goes to the Mac rather than waiting on this Pi.
+  // The queue holds work only for as long as neither machine can take it.
+  const why = await makeRoom(residents, next.repo);
+  const toMac = why && await macIsAwake(false);
+  if (why && !toMac) {
+    console.log(`[pi-desk] holding queue: ${why}`);
     return;
-  }
-
-  if (residents.length >= RESIDENT_MAX) {      // memory bound: someone has to go
-    const victim = pickEviction(residents);
-    if (!victim) return;                       // everything resident is mid-turn — wait, don't kill
-    console.log(`[pi-desk] evicting ${victim.name} to make room for ${next.repo}`);
-    await evict(victim.name);
-    await sb(`desk_sessions?id=eq.${encodeURIComponent(victim.name)}`, {
-      method: 'PATCH', headers: { Prefer: 'return=minimal' },
-      body: JSON.stringify({ status: 'evicted', ended: new Date().toISOString() }),
-    }).catch(() => {});
   }
 
   // Claim before launching so two ticks cannot both take the same queued item.
@@ -495,27 +567,45 @@ async function runQueue(residents) {
   try {
     // A queued resume names its conversation; everything else about it comes from the parked row.
     let args = { name: next.repo, prompt: next.prompt, report: next.report === true, label: next.label || null };
+    const parked = next.resume_id
+      ? (await sb(`desk_sessions?claude_session_id=eq.${encodeURIComponent(next.resume_id)}` +
+          '&select=*&order=started.desc.nullslast&limit=1').catch(() => null))?.[0]
+      : null;
     if (next.resume_id) {
-      const parked = await sb(`desk_sessions?claude_session_id=eq.${encodeURIComponent(next.resume_id)}` +
-        '&select=*&order=started.desc.nullslast&limit=1').catch(() => null);
-      args = parked?.[0] ? resumeArgs(parked[0], { prompt: next.prompt, report: next.report === true })
-                         : { ...args, resumeId: next.resume_id };
+      args = parked ? resumeArgs(parked, { prompt: next.prompt, report: next.report === true })
+                    : { ...args, resumeId: next.resume_id };
     }
-    const detail = await startSession(args);
+    let detail;
+    if (toMac && next.resume_id) {
+      if (!parked) throw new Error(`no parked row for ${next.resume_id}`);
+      detail = `handed to the Mac as ${await handResumeToMac(parked, next.prompt)}`;
+    } else if (toMac) {
+      const p = await macPath(next.repo);
+      if (!p) throw new Error(`the Mac has no project ${next.repo}`);
+      detail = `handed to the Mac as ${await handOpenToMac({ name: next.repo, path: p, prompt: next.prompt || undefined,
+                                                              report: next.report === true || undefined,
+                                                              label: next.label || undefined })}`;
+    } else {
+      detail = await startSession(args);
+    }
     console.log(`[pi-desk] from queue -> ${detail}`);
   } catch (e) {
     console.error('[pi-desk] queued launch failed:', e.message);
+    // The queued row is deleted below either way, so its words are kept here, as for any command.
+    await deadLetter({ id: null, kind: next.resume_id ? 'resume_session' : 'open_session',
+                       payload: { name: next.repo, prompt: next.prompt, label: next.label, resume_id: next.resume_id } },
+                     `queued launch failed: ${e.message}`);
   }
   await sb(`desk_queue?id=eq.${encodeURIComponent(next.id)}`, { method: 'DELETE', headers: { Prefer: 'return=minimal' } }).catch(() => {});
 }
 
-async function macIsAwake() {
+async function macIsAwake(ifUnsure = true) {
   try {
     const rows = await sb('worker_presence?worker=eq.desk&select=last_seen');
     const seen = rows?.[0]?.last_seen;
     if (!seen) return false;
     return (Date.now() - new Date(seen).getTime()) / 1000 <= MAC_STALE_S;
-  } catch { return true; }   // can't tell → assume the Mac has it, rather than double-launching
+  } catch { return ifUnsure; }   // routing assumes the Mac has it rather than double-launch; a hand-off assumes not
 }
 
 // ---- the repo -------------------------------------------------------------
@@ -769,19 +859,14 @@ async function run(cmd) {
   if (cmd.kind === 'end_session') {
     const target = String((cmd.payload || {}).session || '').trim();
     if (!/^hub-[A-Za-z0-9._-]+$/.test(target)) throw new Error(`unusable session name: ${target}`);
-    // Closing is a REQUEST TO FINISH, not a kill. The session is told to commit, push and bring the
     // No wrap-up handshake before closing. Every session already works under a standing rule to
     // commit and push after each logical change, so a session is safe to close at any moment by
     // construction — asking it to wrap up first only delayed freeing the machine by up to ten
     // minutes, and made a capacity problem wait on a model finishing a sentence.
-    await evict(target);
     // PARKED, not deleted. Closing a session frees the machine; it does not throw the work away. The
     // row keeps the transcript id so it can be resumed with full context, and only an explicit
     // "forget" removes it.
-    await sb(`desk_sessions?id=eq.${encodeURIComponent(target)}`, {
-      method: 'PATCH', headers: { Prefer: 'return=minimal' },
-      body: JSON.stringify({ status: 'evicted', ended: new Date().toISOString() }),
-    }).catch(() => {});
+    await park(target);
     return `parked ${target} (resumable)`;
   }
   // Bring an evicted session back with its full context. `claude --resume <id>` replays the
@@ -803,20 +888,17 @@ async function run(cmd) {
     }
     if (!row.claude_session_id) throw new Error(`${id} has no recorded claude session id — cannot resume`);
     const report = (cmd.payload || {}).report === true;
-    // A resume takes a slot like any other session. On a full Pi it waits in the queue instead of
-    // becoming a third resident — two idle sessions have already been OOM-killed here (transcripts.js)
-    // — and runQueue resumes it when one frees, evicting the longest-idle as it does for new work.
-    const residents = (await liveSessions()).filter((l) => l.alive);
-    const pressure = memoryPressure();
-    if (residents.length >= RESIDENT_MAX || pressure) {
+    // A resume is admitted exactly like new work (makeRoom): here if memory allows, else on the Mac
+    // with its whole conversation, else queued until one of them can take it.
+    const why = await makeRoom(await residentsNow(), id);
+    if (why) {
+      if (await macIsAwake(false)) return `handed to the Mac as ${await handResumeToMac(row, prompt)} — ${why}`;
       await sb('desk_queue', {
         method: 'POST', headers: { Prefer: 'return=minimal' },
         body: JSON.stringify([{ id: randomUUID(), worker: WORKER, repo: row.repo, prompt, report,
                                 label: row.label || null, resume_id: row.claude_session_id }]),
       });
-      return residents.length >= RESIDENT_MAX
-        ? `queued resume of ${id} behind ${residents.length} resident session(s)`
-        : `queued resume of ${id} — ${pressure}`;
+      return `queued resume of ${id} — ${why}, and the Mac is asleep`;
     }
     return startSession(resumeArgs(row, { prompt, report, commandId: cmd.id }));
   }
@@ -876,15 +958,15 @@ async function run(cmd) {
   const name = safeName(payload.name);
   if (!name) throw new Error(`unusable project name: ${JSON.stringify(payload.name)}`);
 
-  // Capacity is checked HERE, not inside startSession, so a request that cannot run right now becomes
-  // a queued row rather than being dropped or forced onto a full machine. A resume checks the same
-  // limits in its own handler (resume_session, above); the queue runner calls startSession directly
-  // because it has just made the room.
+  // Capacity is checked HERE, not inside startSession, so a request that cannot run on this Pi goes to
+  // the Mac, or waits as a queued row when the Mac is asleep, rather than being dropped or forced onto a
+  // full machine. A resume does the same in its own handler; the queue runner calls startSession
+  // directly because it has just made the room.
   // Fetched now, before a possible wait in the queue: the prompt stored there is what gets launched.
   const spoken = await withAttachments(payload.prompt, payload);
-  const residents = (await liveSessions()).filter((l) => l.alive);
-  const pressure = memoryPressure();
-  if (residents.length >= RESIDENT_MAX || pressure) {
+  const why = await makeRoom(await residentsNow(), name);
+  if (why) {
+    if (await macIsAwake(false)) return `handed to the Mac as ${await handOpenToMac(payload)} — ${why}`;
     await sb('desk_queue', {
       method: 'POST', headers: { Prefer: 'return=minimal' },
       body: JSON.stringify([{ id: randomUUID(), worker: WORKER, repo: name,
@@ -892,9 +974,7 @@ async function run(cmd) {
                               report: payload.report === true,
                               label: payload.label || null }]),
     });
-    return residents.length >= RESIDENT_MAX
-      ? `queued behind ${residents.length} resident session(s)`
-      : `queued — ${pressure}`;
+    return `queued — ${why}, and the Mac is asleep`;
   }
   return startSession({ name, prompt: spoken, commandId: cmd.id, report: payload.report === true, label: payload.label || null });
 }

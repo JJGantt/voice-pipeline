@@ -216,7 +216,8 @@ async function run(cmd) {
     const sessionId = `mac-${cmd.id.slice(0, 8)}`;
     beginLaunch();   // until the row exists — see open_session below
     try {
-      const raw = await openFreshTab(dir, repo, null, sessionId, claudeId);
+      // A prompt rides along when the Pi hands over a resume it had no room for (pi-desk handResumeToMac).
+      const raw = await openFreshTab(dir, repo, (cmd.payload || {}).prompt || null, sessionId, claudeId);
       const [how, tty] = String(raw).split('\t');
       await upsertDeskSession({
         id: sessionId, worker: 'desk', repo, status: 'resident',

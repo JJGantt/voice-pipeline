@@ -279,7 +279,7 @@ name, same row, flipped back to `resident`. The Remote Control name is the sessi
 Claude app, and a fresh one made a reaped-and-resumed conversation show up there as a different
 session. The Mac still opens a resume as a new row with a new name.
 
-The Mac's `deskSessions.js` tick is still smaller than the Pi's: no residency cap and no eviction of
+The Mac's `deskSessions.js` tick is still smaller than the Pi's: no memory admission and no eviction of
 its own. Those exist because a headless 4GB machine must decide what to close; on the Mac Jared can
 see the tabs. What it does do each tick: bind each running row to its process (`pid`) and that
 process's current conversation, close a row whose process has exited, adopt any process no row owns,
