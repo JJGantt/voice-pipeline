@@ -22,6 +22,9 @@ KillMode=process
 # landed on, mid-turn, however small its own share. pi-desk's admission (shortfall in index.js) keeps
 # the sum of every session's budget inside what the Pi has free.
 Delegate=yes
+# systemd starts the daemon straight into supervisor/. Without it a restart fails: the unit's own cgroup
+# hands memory to its children, and the kernel allows no process in a cgroup that does that.
+DelegateSubgroup=supervisor
 # A session being OOM-killed must NOT take the unit down with it: the default (stop) would end the
 # supervisor and every other session over one casualty, turning a contained loss into a total one.
 OOMPolicy=continue
