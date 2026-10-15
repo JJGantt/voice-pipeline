@@ -40,6 +40,7 @@ import { withAttachments, sweepStashedPrompts } from '../orchestrator/src/handof
 // reads the same files for the same reason.
 import { sessionOf } from '../orchestrator/src/discover.js';
 import { sweepScratch } from './scratch.js';
+import { setupCgroups, limitSession, watchSession, liftBudget, sessionUsage, SESSION_BUDGET_MB } from './cgroups.js';
 import { syncSessionWatch, reportTurnEnd } from '../orchestrator/src/sessionWatch.js';
 import { relayFirstReply } from '../orchestrator/src/relay.js';
 // Shared with the Mac rather than reimplemented: both halves of a transfer must agree byte for
@@ -91,8 +92,12 @@ const WORKER = 'pi-desk';
 // it is open, whatever it is doing, and grows as its conversation does; its CPU use is negligible,
 // because a turn is almost entirely waiting on the API. So there is no session count and no cap on how
 // many may be mid-turn: a count only stands in for memory, and a "busy" cap held a request behind two
-// working sessions while the processor sat idle. Admission is makeRoom: launch when memoryPressure is
+// working sessions while the processor sat idle. Admission is makeRoom: launch when shortfall() is
 // clear, park idle sessions until it is, and hand the work to the Mac when it still is not.
+//
+// This Pi is not for memory-heavy work. Each session runs in a cgroup with a budget (cgroups.js), and
+// one that goes over it with memory it cannot give back is moved to the Mac (onHeavy) rather than
+// left to push the machine into the kernel's OOM killer, which takes whole sessions mid-turn.
 
 // A TIME bound, and the one the other limits do not provide.
 //
@@ -106,12 +111,10 @@ const WORKER = 'pi-desk';
 // it back with full context, so the cost of reaping early is tokens on resume, not lost work. That
 // asymmetry is why this can be aggressive where pickEviction is a last resort.
 const IDLE_MAX_S = Number(process.env.PI_DESK_IDLE_MAX_S || 3600);
-// Capacity is not only a count. This Pi also drives the wall display, and Chromium is the process
-// that loses an out-of-memory fight — the kernel OOM-killed its renderer twice on 2026-08-26 while
-// sessions sat inside the residency cap, leaving the screen on 'Aw, Snap' with nothing technically
-// over its limit. A session costs ~350-420MB, so refusing to launch below this floor keeps enough
-// headroom that starting one, and letting it grow, cannot take the display down.
-const MIN_FREE_MB = Number(process.env.PI_DESK_MIN_FREE_MB || 900);
+// Memory kept free beyond every session's budget, for what is not a session: the wall display, the
+// automation browser and the voice worker all move around, and Chromium is the process that loses an
+// out-of-memory fight on this machine.
+const RESERVE_MB = Number(process.env.PI_DESK_RESERVE_MB || 300);
 
 /** MemAvailable in MB — the kernel's own estimate of what is actually reclaimable, not `free`. */
 function memAvailableMb() {
@@ -120,7 +123,7 @@ function memAvailableMb() {
     return m ? Math.round(Number(m[1]) / 1024) : Infinity;   // unreadable → never block on it
   } catch { return Infinity; }
 }
-// The SECOND memory bound, and the one MIN_FREE_MB cannot express.
+// The SECOND memory bound, and the one MemAvailable cannot express.
 //
 // MemAvailable is the kernel's estimate of what could be handed to a new process without swapping.
 // It says nothing about how much swap has ALREADY been spent, so a machine whose swap is completely
@@ -144,15 +147,23 @@ function swapUsedPct() {
 }
 
 /**
- * Why starting a session right now would be unsafe, or null if it is safe.
+ * Why starting one more session right now would be unsafe, or null if it is safe.
  *
- * Both callers go through this rather than testing the numbers themselves: they are the same
- * question asked at two moments (a fresh dispatch, and the queue draining later), and when they were
- * two separate expressions only one of them learned about swap.
+ * Every session may grow to its budget, so room is counted against budgets rather than against what
+ * sessions hold this minute: the new one's whole budget, plus whatever each running session has left
+ * before it reaches its own, plus the reserve. Admitting against current usage alone is what let
+ * sessions that grew after launch run the Pi out of memory. A session's growth past its budget is not
+ * counted here because it does not stay — onHeavy moves it to the Mac.
  */
-function memoryPressure() {
+function shortfall(residents) {
+  const growth = residents.reduce((t, r) =>
+    t + Math.max(0, SESSION_BUDGET_MB - (sessionUsage(r.name)?.currentMb ?? 0)), 0);
+  const need = SESSION_BUDGET_MB + growth + RESERVE_MB;
   const freeMb = memAvailableMb();
-  if (freeMb < MIN_FREE_MB) return `only ${freeMb}MB free, need ${MIN_FREE_MB}MB`;
+  if (freeMb < need) {
+    return `${freeMb}MB free, need ${need}MB (${SESSION_BUDGET_MB} for it, ${growth} for ` +
+           `${residents.length} running to reach their budgets, ${RESERVE_MB} reserve)`;
+  }
   const swap = swapUsedPct();
   if (swap > MAX_SWAP_PCT) return `swap ${swap}% used, ceiling is ${MAX_SWAP_PCT}%`;
   return null;
@@ -190,13 +201,13 @@ async function park(name) {
 /**
  * Make room here for one more session. Returns null when it may start now, else why it cannot.
  *
- * Parks idle sessions, least recently active first (pickEviction), until memoryPressure clears. A
+ * Parks idle sessions, least recently active first (pickEviction), until shortfall clears. A
  * session mid-turn is never parked. Memory is measured again after each one, because what a session
  * frees varies with how long its conversation has grown, and the shortage may not be sessions at all.
  */
 async function makeRoom(residents, forWhat) {
   let left = residents.slice();
-  for (let why = memoryPressure(); why; why = memoryPressure()) {
+  for (let why = shortfall(left); why; why = shortfall(left)) {
     const victim = pickEviction(left);
     if (!victim) return why;
     console.log(`[pi-desk] parking ${victim.name} to make room for ${forWhat} (${why})`);
@@ -234,7 +245,7 @@ async function handOpenToMac(payload) {
  * that is already closed. Its transcript is flushed to the mirror, the row is marked transferred so
  * only one machine ever holds it, and the Mac resumes it from the mirror. Returns the command id.
  */
-async function handResumeToMac(row, prompt) {
+async function handResumeToMac(row, prompt, moved = null) {
   const at = await mirrorUp(row.claude_session_id, row.transcript_path, row.mirror_offset || 0);
   const now = new Date().toISOString();
   await sb(`desk_sessions?id=eq.${encodeURIComponent(row.id)}`, {
@@ -248,9 +259,47 @@ async function handResumeToMac(row, prompt) {
     body: JSON.stringify({ id, kind: 'resume_mirrored',
                            payload: { target: 'mac', claude_session_id: row.claude_session_id, repo: row.repo,
                                       label: row.label, origin: row.origin || 'dispatched', from: 'pi',
-                                      ...(prompt ? { prompt } : {}) } }),
+                                      ...(prompt ? { prompt } : {}), ...(moved ? { moved } : {}) } }),
   });
   return id;
+}
+
+/**
+ * A session went over its memory budget holding memory it cannot give back: heavy work, which this
+ * Pi is not for. It moves to the Mac now, mid-turn — closed here, everything it was running killed
+ * with its cgroup, and resumed on the Mac with its whole conversation and an instruction to redo
+ * what was cut off. Waiting for the turn to end is not an option, because the turn is the heavy work.
+ *
+ * With the Mac asleep there is nowhere to send it, so it stays and is no longer throttled at its
+ * budget; its hard ceiling still keeps the rest of the Pi safe, and tool.sh makes the command that
+ * crosses it the thing that dies, not the session.
+ */
+const moving = new Set();
+async function onHeavy(name, usage) {
+  if (moving.has(name)) return;
+  moving.add(name);
+  try {
+    const why = `holding ${usage.anonMb}MB, over its ${SESSION_BUDGET_MB}MB budget on the Pi`;
+    if (!(await macIsAwake(false))) {
+      console.log(`[pi-desk] ${name} is ${why}, and the Mac is asleep — it stays, unthrottled`);
+      liftBudget(name);
+      return;
+    }
+    const row = (await sb(`desk_sessions?id=eq.${encodeURIComponent(name)}&select=*`))?.[0];
+    if (!row?.claude_session_id) {
+      console.log(`[pi-desk] ${name} is ${why}, but has no transcript to move — it stays, unthrottled`);
+      liftBudget(name);
+      return;
+    }
+    console.log(`[pi-desk] ${name} is ${why} — moving it to the Mac`);
+    await evict(name);
+    const id = await handResumeToMac(row, 'Continue', why);
+    console.log(`[pi-desk] ${name} handed to the Mac as ${id}`);
+  } catch (e) {
+    console.error(`[pi-desk] moving ${name} to the Mac failed:`, e.message);
+  } finally {
+    moving.delete(name);
+  }
 }
 
 if (!SUPABASE_KEY) {
@@ -689,7 +738,11 @@ function launch(dir, name, prompt, resumeId = null, reuse = null) {
     fs.writeFileSync(promptFile, prompt, { mode: 0o600 });
   }
 
-  const args = ['new-session', '-d', '-s', session, '-c', dir, launcher, dir, rcName, promptFile, resumeId || '', session];
+  // The session's cgroup exists before it starts; launch.sh moves itself in before exec'ing claude, so
+  // nothing the session ever runs is charged anywhere else.
+  const cg = limitSession(session);
+  watchSession(session, onHeavy);
+  const args = ['new-session', '-d', '-s', session, '-c', dir, launcher, dir, rcName, promptFile, resumeId || '', session, cg];
   // The first of these spawns creates the tmux SERVER, and the server keeps this environment for
   // its whole life — every later session in it inherits the lot, including ones a person opens by
   // hand. run.sh loaded worker/.env into this process, so without scrubbing here the server carries
@@ -1116,6 +1169,11 @@ async function sweepAbandonedClaims() {
 }
 
 console.log(`[pi-desk] watching desk_commands (repos in ${REPO_ROOT}, owner ${GITHUB_OWNER})`);
+{
+  const live = await liveSessions();
+  await setupCgroups(live);
+  for (const l of live) if (l.alive) watchSession(l.name, onHeavy);
+}
 heartbeat();
 setInterval(heartbeat, PRESENCE_MS);
 // Realtime is the primary path: a command inserted anywhere reaches this within a moment, rather

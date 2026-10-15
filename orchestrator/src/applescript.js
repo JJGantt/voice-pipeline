@@ -265,7 +265,7 @@ export async function reopenDeskTab(cwd, id) {
 // itself, where no such limit applies. (This is the same reason pi-desk hands tmux a file path.)
 const DISPATCHED = fs.readFileSync(new URL('../dispatched-session.txt', import.meta.url), 'utf8').trim();
 
-export async function openFreshTab(cwd, name, prompt, sessionId = null, resumeId = null) {
+export async function openFreshTab(cwd, name, prompt, sessionId = null, resumeId = null, note = null) {
   // The Remote Control name is an IDENTITY in the Claude app, so it has to be unique per SESSION,
   // not per repo. Named after the repo alone, two sessions on status-hub both register as
   // "status-hub" and the app lists two entries claiming to be the same session. Bare
@@ -285,7 +285,10 @@ export async function openFreshTab(cwd, name, prompt, sessionId = null, resumeId
   // for — otherwise "start a session in X and have it..." left in the words reads as an instruction to
   // it, and it dispatches the same request a second time. A system prompt, not text in the prompt,
   // so every surface still shows only his words. pi-desk/launch.sh reads the same file.
-  const sys = (pf && !resumeId) ? ` --append-system-prompt ${shQuote(DISPATCHED)}` : '';
+  // `note` is anything else the session must know before its first turn — a session moved here from
+  // the Pi mid-turn is told why and what was cut off (commands.js resume_mirrored).
+  const sysText = [(pf && !resumeId) ? DISPATCHED : '', note || ''].filter(Boolean).join('\n\n');
+  const sys = sysText ? ` --append-system-prompt ${shQuote(sysText)}` : '';
   return runInNewTerminal(`cd ${shQuote(cwd)}; ${env}${shQuote(config.CLAUDE_BIN)}${model}${resume}${rc}${sys}${first}`);
 }
 

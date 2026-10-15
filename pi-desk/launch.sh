@@ -1,13 +1,21 @@
 #!/usr/bin/env bash
 # Start one Claude session. Run inside tmux by index.js; never called by hand.
 #
-#   launch.sh <repo-dir> <repo-name> <prompt-file>
+#   launch.sh <repo-dir> <repo-name> <prompt-file> [resume-id] [session-id] [cgroup-dir]
 #
 # The prompt arrives as a FILE, not an argument. It is dictated speech — arbitrary text with quotes,
 # apostrophes and newlines in it — and threading that through tmux's command string is a quoting
 # problem with no safe answer. Reading it here means it is never shell syntax at any point.
 set -uo pipefail
-DIR="$1"; NAME="$2"; PROMPT_FILE="${3:-}"; RESUME_ID="${4:-}"; SESSION_ID="${5:-}"
+DIR="$1"; NAME="$2"; PROMPT_FILE="${3:-}"; RESUME_ID="${4:-}"; SESSION_ID="${5:-}"; CGROUP="${6:-}"
+HERE="$(dirname "$0")"
+
+# Into the session's own memory cgroup (pi-desk/cgroups.js) BEFORE claude starts, so claude, its tool
+# servers and every command it runs are charged to this session's budget and killed with it on close.
+[ -n "$CGROUP" ] && { echo $$ > "$CGROUP/cgroup.procs"; } 2>/dev/null
+
+# Every command runs through tool.sh, which puts it ahead of claude in any out-of-memory kill.
+export CLAUDE_CODE_SHELL_PREFIX="$HERE/tool.sh"
 
 # The session's own id, so a report it publishes can say which session wrote it. The data MCP
 # runs as a child of this process and inherits the environment, which is the only channel there
@@ -70,14 +78,17 @@ export DISPLAY="${PI_DESK_DISPLAY:-:99}"
 # this half has to work without it, because launch.sh must never need root.
 echo 800 > /proc/self/oom_score_adj 2>/dev/null || true
 
+# Every session, fresh or resumed, is told what this machine is for. One --append-system-prompt,
+# carrying a dispatch's own text too when there is one.
+SYS_TEXT="$(cat "$HERE/pi-session.txt")"
+
 if [ -n "$PROMPT_FILE" ] && [ -s "$PROMPT_FILE" ]; then
   PROMPT="$(cat "$PROMPT_FILE")"
   rm -f "$PROMPT_FILE"
   # A fresh dispatch is told it IS the session the request was for, so words addressed to the
   # dispatcher ("start a session in X and have it...") are not read as an order to dispatch again.
   # A system prompt, so surfaces still show only his words. The Mac's orchestrator reads the same file.
-  SYS=()
-  [ -z "$RESUME_ID" ] && SYS=(--append-system-prompt "$(cat "$(dirname "$0")/../orchestrator/dispatched-session.txt")")
-  exec claude --model "$MODEL" --chrome "${RESUME[@]}" --remote-control "$NAME" "${SYS[@]}" "$PROMPT"
+  [ -z "$RESUME_ID" ] && SYS_TEXT="$(cat "$HERE/../orchestrator/dispatched-session.txt")"$'\n\n'"$SYS_TEXT"
+  exec claude --model "$MODEL" --chrome "${RESUME[@]}" --remote-control "$NAME" --append-system-prompt "$SYS_TEXT" "$PROMPT"
 fi
-exec claude --model "$MODEL" --chrome "${RESUME[@]}" --remote-control "$NAME"
+exec claude --model "$MODEL" --chrome "${RESUME[@]}" --remote-control "$NAME" --append-system-prompt "$SYS_TEXT"

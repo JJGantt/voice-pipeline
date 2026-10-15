@@ -27,6 +27,9 @@ import { awaitSessionOn, sessionOf } from './discover.js';
 import { beginLaunch, endLaunch } from './deskSessions.js';
 import { watchTable } from './realtime.js';
 import { isKnownRepo } from './repos.js';
+
+// What a session closed on the Pi mid-turn for doing heavy work is told when it resumes here.
+const MOVED_NOTE = fs.readFileSync(new URL('../moved-session.txt', import.meta.url), 'utf8').trim();
 import { ensureTrusted } from './trust.js';
 import { openFreshTab, sendToTty, closeTabForTty } from './applescript.js';
 import { withAttachments, transcriptSize, awaitSubmitted } from './handoff.js';
@@ -216,8 +219,11 @@ async function run(cmd) {
     const sessionId = `mac-${cmd.id.slice(0, 8)}`;
     beginLaunch();   // until the row exists — see open_session below
     try {
-      // A prompt rides along when the Pi hands over a resume it had no room for (pi-desk handResumeToMac).
-      const raw = await openFreshTab(dir, repo, (cmd.payload || {}).prompt || null, sessionId, claudeId);
+      // A prompt rides along when the Pi hands over a resume it had no room for (pi-desk handResumeToMac),
+      // and `moved` when it closed a session mid-turn for doing heavy work there (pi-desk onHeavy).
+      const moved = (cmd.payload || {}).moved;
+      const note = moved ? MOVED_NOTE.replace('{why}', String(moved)) : null;
+      const raw = await openFreshTab(dir, repo, (cmd.payload || {}).prompt || null, sessionId, claudeId, note);
       const [how, tty] = String(raw).split('\t');
       await upsertDeskSession({
         id: sessionId, worker: 'desk', repo, status: 'resident',

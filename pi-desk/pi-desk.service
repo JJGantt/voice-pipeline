@@ -15,17 +15,13 @@ RestartSec=5
 # being spawned detached. That meant restarting the daemon destroyed every session it was managing,
 # silently, on every deploy. Sessions must outlive their supervisor; that is the point of tmux.
 KillMode=process
-# A ceiling, so this unit cannot starve the wall display. The tmux server is inside this cgroup (see
-# KillMode above), so these bound the SESSIONS, not just the supervisor. pi-browser.service has
-# carried the same pair since it landed; pi-desk had MemoryMax=infinity, and on 2026-09-04 it grew to
-# 1.2GB and the kernel took the TV instead.
-#
-# Not a working limit — two sessions plus the supervisor run ~850MB, well under. It is the backstop
-# for when the free-memory admission (makeRoom in index.js) is somehow not enough, since a session keeps
-# growing after it is admitted. Combined with the oom_score_adj=800 that launch.sh
-# stamps on each session, a cgroup OOM here picks a session rather than the supervisor.
-MemoryHigh=1G
-MemoryMax=1300M
+# The unit's cgroup is handed to pi-desk to divide (cgroups.js): the supervisor and tmux server in
+# one child with its own ceiling, each session in another with its own budget and ceiling, so one
+# session's memory can be watched, capped and cleaned up on its own. No MemoryHigh/MemoryMax on the
+# unit as a whole: a single ceiling over every session throttled and then killed whichever session it
+# landed on, mid-turn, however small its own share. pi-desk's admission (shortfall in index.js) keeps
+# the sum of every session's budget inside what the Pi has free.
+Delegate=yes
 # A session being OOM-killed must NOT take the unit down with it: the default (stop) would end the
 # supervisor and every other session over one casualty, turning a contained loss into a total one.
 OOMPolicy=continue

@@ -15,6 +15,7 @@ import { promisify } from 'node:util';
 import { awaitSession } from '../orchestrator/src/discover.js';
 import { typeable, transcriptSize, awaitSubmitted } from '../orchestrator/src/handoff.js';
 import { expectPrompt } from '../orchestrator/src/sessionWatch.js';
+import { removeSessionCgroup } from './cgroups.js';
 
 const exec = promisify(execFile);
 
@@ -120,6 +121,9 @@ export async function evict(name) {
   // Return only once claude has actually exited: the caller measures the memory this freed, or flushes
   // the transcript it was writing, and neither is true while the process is still winding down.
   if (pid) await exited(pid);
+  // Whatever the session started and left running — a Python job, a dev server, a `flyctl agent` —
+  // goes with it. Without this they stayed resident for days after the session was gone.
+  await removeSessionCgroup(name);
 }
 
 /** Resolves once `pid` is gone, or after `ms` regardless. */
