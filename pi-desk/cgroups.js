@@ -38,6 +38,8 @@ export const cgroupsEnabled = () => enabled;
 export const sessionCgroup = (name) => path.join(SESSIONS, name);
 
 const write = (file, value) => fs.writeFileSync(file, String(value));
+// The session cgroups under s/, without the control files the kernel keeps beside them.
+const sessionDirs = () => fs.readdirSync(SESSIONS, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
 const procsOf = (dir) => {
   try { return fs.readFileSync(path.join(dir, 'cgroup.procs'), 'utf8').split('\n').filter(Boolean).map(Number); }
   catch { return []; }
@@ -83,7 +85,7 @@ export async function setupCgroups(live) {
   const ppid = parents();
   const sessions = live.filter((l) => l.alive && l.pid);
   const leftovers = [];
-  const strays = [UNIT, SUPERVISOR, ...fs.readdirSync(SESSIONS).map((n) => sessionCgroup(n))];
+  const strays = [UNIT, SUPERVISOR, ...sessionDirs().map((n) => sessionCgroup(n))];
   for (const dir of strays) {
     for (const pid of procsOf(dir)) {
       const owner = sessions.find((s) => descendsFrom(pid, s.pid, ppid));
@@ -107,7 +109,7 @@ export async function setupCgroups(live) {
     await killCgroup(reap);
   }
   // Session cgroups whose session is gone (and, after the kill above, hold nothing).
-  for (const n of fs.readdirSync(SESSIONS)) {
+  for (const n of sessionDirs()) {
     if (!sessions.some((s) => s.name === n)) await removeSessionCgroup(n);
   }
   try {
