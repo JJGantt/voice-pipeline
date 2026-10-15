@@ -173,7 +173,10 @@ export async function removeSessionCgroup(name) {
 }
 
 /**
- * Megabytes a session holds: `anonMb`, what its cgroup cannot simply drop, and `currentMb`, its total.
+ * Megabytes a session holds: `anonMb`, what its cgroup cannot simply drop — anon memory, resident or
+ * pushed into swap, since reclaim at memory.high moves anon into zram swap rather than freeing it, and
+ * resident anon alone then reads as under budget while the session keeps growing — and `currentMb`,
+ * its total.
  *
  * The total is the larger of the cgroup's count and the resident size of its processes. A process
  * moved into a cgroup leaves the memory it already had charged where it was, so a session that was
@@ -184,7 +187,9 @@ export function sessionUsage(name) {
   try {
     const cg = sessionCgroup(name);
     const stat = fs.readFileSync(path.join(cg, 'memory.stat'), 'utf8');
-    const anon = Number(stat.match(/^anon (\d+)$/m)?.[1] || 0);
+    let swap = 0;
+    try { swap = Number(fs.readFileSync(path.join(cg, 'memory.swap.current'), 'utf8')); } catch {}
+    const anon = Number(stat.match(/^anon (\d+)$/m)?.[1] || 0) + swap;
     const current = Number(fs.readFileSync(path.join(cg, 'memory.current'), 'utf8'));
     let rssKb = 0;
     for (const pid of procsOf(cg)) {
