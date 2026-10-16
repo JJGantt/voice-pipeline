@@ -38,6 +38,9 @@ routed once it gets here is `../docs/ROUTING.md`.
      follow-up waits for it on purpose: it queues behind the run it follows.
    - **Atomic claim:** `PATCH ...&status=eq.pending` → `claimed`. If the returned
      representation is empty, someone else won the race — skip.
+   - **Handed-off requests:** a request listing workers in `failed_on` is never
+     claimed by them again, and skips affinity: it defers only to a higher-ranked
+     worker that has not tried it (see *Handing a failed turn on*).
 3. **Process** the claimed request:
    - Read the `voice_focus` singleton. `focus == 'hub'` runs here; any other value
      names a live Mac session, and the transcript is injected into that session's
@@ -45,8 +48,9 @@ routed once it gets here is `../docs/ROUTING.md`.
    - Write the user turn to `voice_messages`.
    - Manage the hub session (resume vs. fresh — see the reset rule below).
    - Run the turn, parse `stream-json`, capture the `session_id` and the final text.
-   - Write the assistant turn to `voice_messages` and mark the request `done`
-     (or `error` on any failure).
+   - Write the assistant turn to `voice_messages` and mark the request `done`.
+     A failed turn that called no tool is handed to another worker; only when no
+     healthy worker is left untried is it marked `error`.
 4. Idle-poll every `IDLE_POLL_S` (60s), tightening to 2s only while realtime is
    down and 120s while deferring. An idle cycle costs ONE read: `pending` is read
    first, and the defer check and the orphan-claim sweep run on their own 60s
@@ -161,6 +165,25 @@ must never become `--disallowedTools`, is `../docs/ROUTING.md`.
 Full-agent mode is the opposite shape: `--dangerously-skip-permissions` in
 `agent_cwd`, every native tool live. It exists for dictated coding work and is
 gated behind the `agent_mode` setting.
+
+## Handing a failed turn on
+
+A failure on one machine is that machine's until every machine has tried the command. When a turn
+fails after its retries and **called no tool**, `hand_off` puts the request back to `pending`, adds
+this worker to `voice_requests.failed_on`, and the realtime wake brings the next healthy worker straight
+to it — no waiting out `FAILOVER_S`. Only when no healthy worker in `WORKER_PRIORITY` is left untried is
+the request closed as `error`. Nothing is written to the thread before the handoff, so the worker that
+succeeds writes the whole turn.
+
+A turn that called any tool is never handed on: it may already have logged a meal or sent a message,
+and running it again would do that twice. Those still end as `error` where they failed.
+
+`claude_unready()` checks, per turn, that `CLAUDE_BIN` resolves to something executable. A Claude Code
+self-update through npm can die half way and leave the link dangling, or `claude.exe` as a 500-byte
+non-executable placeholder; that host then hands every command on immediately instead of failing them.
+Repairing it means clearing npm's leftover `.claude-code-*` temp directory under
+`~/.npm-global/lib/node_modules/@anthropic-ai/` (npm refuses with `ENOTEMPTY` while it is there) and
+reinstalling `@anthropic-ai/claude-code`.
 
 ## Failure alerts
 

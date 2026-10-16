@@ -897,14 +897,15 @@ def other_worker_healthy(db: Supabase) -> bool:
     return any(r.get("worker") != WORKER_ID and _healthy(r) for r in presence_rows(db))
 
 
-def higher_priority_present(db: Supabase) -> bool:
-    """True if any worker ranked ABOVE me in WORKER_PRIORITY has a fresh heartbeat."""
+def higher_priority_present(db: Supabase, exclude: "set | frozenset" = frozenset()) -> bool:
+    """True if any worker ranked ABOVE me in WORKER_PRIORITY has a fresh heartbeat. `exclude` names
+    workers that do not count — the ones a handed-off request has already failed on."""
     try:
         my_rank = WORKER_PRIORITY.index(WORKER_ID)
     except ValueError:
         # I'm not in the priority list — assume lowest, defer to nobody specific.
         my_rank = len(WORKER_PRIORITY)
-    higher = set(WORKER_PRIORITY[:my_rank])
+    higher = set(WORKER_PRIORITY[:my_rank]) - set(exclude)
     if not higher:
         return False
     return any(row.get("worker") in higher and _healthy(row) for row in presence_rows(db))
@@ -963,6 +964,42 @@ def should_defer(db: Supabase) -> bool:
     if owner is not None:
         return owner != WORKER_ID
     return higher_priority_present(db)
+
+
+def claude_unready() -> str | None:
+    """Why this host cannot start a turn, or None when it can. A local check, made per turn: an npm
+    self-update of the CLI that dies half way leaves the link dangling or the binary a non-executable
+    placeholder, and every turn here then fails the same way until someone repairs the install."""
+    if shutil.which(CLAUDE_BIN) is None:
+        return f"claude CLI not runnable on {WORKER_ID}: {CLAUDE_BIN}"
+    return None
+
+
+def hand_off(db: Supabase, req: dict, err: str) -> bool:
+    """Put a request this worker failed back to 'pending' for a worker that has not tried it yet.
+
+    Only for a turn that called no tool, so running it again cannot repeat anything it did. The workers
+    tried so far ride in `failed_on`; none of them claims it again, and the rest skip affinity and
+    priority for it (`claim_one`), so the next healthy one takes it at once. False when no healthy
+    worker is left untried — the caller then closes it as an error, as before."""
+    tried = sorted(set(req.get("failed_on") or []) | {WORKER_ID})
+    left = [r.get("worker") for r in presence_rows(db)
+            if r.get("worker") in WORKER_PRIORITY and r.get("worker") not in tried and _healthy(r)]
+    if not left:
+        return False
+    got = db.patch(
+        "voice_requests",
+        f"id=eq.{req['id']}&status=eq.claimed&claimed_by=eq.{WORKER_ID}",
+        {"status": "pending", "claimed_by": None, "claimed_at": None, "failed_on": tried,
+         "updated_at": now_iso()},
+        extra_headers={"Prefer": "return=representation"},
+    )
+    if not got:
+        return False
+    log(f"handed off request {req['id']} after failing here ({err}); untried and up: {left}")
+    push_activity(f"Handing off from {WORKER_ID}", "tool")
+    alert_failure("request", err)
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -1945,8 +1982,8 @@ def claim_one(db: Supabase) -> dict | None:
     global _holding
     pending = db.get(
         "voice_requests",
-        "status=eq.pending&order=created_at.asc&limit=8"
-        "&select=id,transcript,source,created_at,capture_start,capture_end",
+        f"status=eq.pending&failed_on=not.cs.{{{WORKER_ID}}}&order=created_at.asc&limit=8"
+        "&select=id,transcript,source,created_at,capture_start,capture_end,failed_on",
     )
     if not pending:
         _holding = False
@@ -1960,7 +1997,11 @@ def claim_one(db: Supabase) -> dict | None:
         # My own link is failing: a claim here could take minutes to answer while a healthy worker sits idle.
         _standby, _failover_at = True, 0.0
         return None
-    if should_defer(db) and not overdue_for_failover(db, waited_s):
+    # A request another worker failed and handed on (`hand_off`) skips affinity — the context's owner is
+    # the worker that just failed it — and defers only to a higher-ranked worker that has not tried it.
+    tried = set(pending[0].get("failed_on") or [])
+    defer = higher_priority_present(db, exclude=tried) if tried else should_defer(db)
+    if defer and not overdue_for_failover(db, waited_s):
         _standby = True   # a higher-priority worker is handling things → stand down to the slow cadence
         # Only while the deadline is still ahead. Past it, the wait is behind a busy worker's run, which
         # ends in that worker claiming the follow-up itself — nothing here needs to wake for it.
@@ -2150,7 +2191,10 @@ def process_request(db: Supabase, req: dict) -> None:
         log(f"hub: fresh run + {len(ctx)} chars injected conversation" if ctx else "hub: fresh run (no prior context)")
 
     # Surface tool calls live by pushing them straight to the hub's activity bar (transient — not
-    # stored in voice_messages, so they never appear in the conversation thread).
+    # stored in voice_messages, so they never appear in the conversation thread). It also counts them:
+    # a failed turn that called no tool can run again elsewhere without repeating anything (`hand_off`).
+    tools_called = [0]
+
     def _emit(kind, payload):
         if kind == "text":
             # What the model says between tool calls. The runners report only text a tool call
@@ -2161,6 +2205,7 @@ def process_request(db: Supabase, req: dict) -> None:
             return
         if kind != "tool":
             return
+        tools_called[0] += 1
         name = str(payload.get("name") or "")
         short = name.rsplit("__", 1)[-1] if "__" in name else name
         try:
@@ -2273,10 +2318,14 @@ def process_request(db: Supabase, req: dict) -> None:
     # `ctx` (the replayed hub conversation) rides on the FRESH run; there is no --resume for hub turns, so
     # the two models never share a session. agent → the unrestricted coding agent (its own --resume
     # session). Photos → Opus (vision via Read). Otherwise: Sonnet (warm SDK client) with the safe toolset;
-    # a gated need → a FRESH Opus. Errors never upgrade the model.
+    # a gated need → a FRESH Opus. Errors never upgrade the model. A failure that called no tool is
+    # handed to another worker below rather than ended here.
     hub_prompt = ctx + prompt   # ctx is "" in agent mode (uses --resume) or when there's no live conversation
     room_deny = SEND_TOOLS if ambient else None   # the room mics never send a text or an email
-    if use_agent:
+    unready = claude_unready()
+    if unready:
+        result = {"session_id": None, "text": "", "result": "", "ok": False, "raw_error": unready}
+    elif use_agent:
         result = run_claude(prompt, resume_id, on_event=_emit, system_append=sys_ctx, model="opus",
                             agent=True, cwd=ag["cwd"], allow_read=bool(att_paths),
                             deny_tools=room_deny)
@@ -2341,6 +2390,11 @@ def process_request(db: Supabase, req: dict) -> None:
         result = run_claude(prompt, None, on_event=_emit, system_append=sys_ctx,
                             model="opus", allow_read=bool(att_paths), allowed_tools=turn_tools(ambient), deny_tools=room_deny)
         text = (result.get("text") or "").strip()
+
+    # A failure here is this machine's, not the command's, until every machine has tried it: hand it on.
+    # Nothing has been written to the thread yet, so the worker that takes it writes the whole turn.
+    if not result.get("ok") and not tools_called[0] and hand_off(db, req, result.get("raw_error") or "unknown error"):
+        return
 
     # Tag every row with the mode so the hub UI can show this mode's thread separately and switch live.
     # Defined up here because the ignore branch below writes a row too.

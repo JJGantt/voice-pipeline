@@ -67,6 +67,10 @@ whose `Read` tool is how a model views an image file.
   to the worker that owns it, so a conversation and its machine-local context aren't lost to a
   needless switch. Affinity releases when the window resets or the owner goes silent past
   `OWNER_GRACE_S`.
+- **A failure falls through.** A turn that fails on one worker without calling a tool goes back to
+  `pending` with that worker in `voice_requests.failed_on`, and the next healthy worker takes it
+  immediately; it ends as an error only once no healthy worker is left untried
+  (`worker/README.md` § Handing a failed turn on).
 - A deferring worker drops to a **slower heartbeat and poll** (still inside `HEARTBEAT_FRESH_S`, so it
   never looks dead to the workers below it) and ramps back up when the primary goes quiet.
 
