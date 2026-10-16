@@ -1552,9 +1552,12 @@ def write_mcp_config() -> str:
             "data": {"command": "node", "args": [DATA_MCP_JS], "env": data_env},
             "voice": {"command": "node", "args": [VOICE_MCP_JS], "env": env},
             "govee-lights": {"command": GOVEE_PY, "args": [GOVEE_MCP_PY], "env": env},
-            "petlibro-feeder": {"command": PETLIBRO_PY, "args": [PETLIBRO_MCP_PY], "env": env},
         }
     }
+    # Only where the feeder server is installed: it is LAN-only, and a registered server whose files are
+    # missing (Fly) fails to start on every turn.
+    if os.path.exists(PETLIBRO_MCP_PY):
+        cfg["mcpServers"]["petlibro-feeder"] = {"command": PETLIBRO_PY, "args": [PETLIBRO_MCP_PY], "env": env}
     if os.path.exists(GMAIL_MCP_PY):
         cfg["mcpServers"]["gmail"] = {"command": GMAIL_PY, "args": [GMAIL_MCP_PY]}
     if HAS_MESSAGES:

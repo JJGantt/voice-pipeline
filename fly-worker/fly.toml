@@ -1,0 +1,22 @@
+# The voice worker, on its own machine: it claims voice_requests from Supabase and answers them. No
+# inbound traffic, so no services; it runs as long as the machine does.
+app = "jared-voice-worker"
+primary_region = "iad"
+kill_timeout = "20s"   # time for the worker to announce it is stopping; a turn in flight is released by reclaim_stale
+
+[build]
+
+[env]
+  # Jared's wall clock, the same as the Pi's and the Mac's: the worker and its data MCP stamp "now" as
+  # naive local time, and on UTC they wrote entries four hours late.
+  TZ = "America/New_York"
+
+[mounts]
+  source = "worker_data"
+  destination = "/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  # 2GB: the warm Sonnet client and the warm Opus client each hold a Claude process and its MCP
+  # servers (~550MB measured for one), with room for a full-agent or photo spawn on top.
+  memory = "2gb"
