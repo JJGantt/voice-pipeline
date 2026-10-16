@@ -2888,14 +2888,14 @@ def _handle_signal(signum, frame):  # noqa: ARG001
     _running, _stopping = False, True
     log(f"received signal {signum}; shutting down after current iteration")
 
-    def _announce():
-        try:
-            with httpx.Client(timeout=5) as c:
-                heartbeat(Supabase(c))
-        except Exception:  # noqa: BLE001
-            pass
-
-    threading.Thread(target=_announce, daemon=True).start()
+    # Sent HERE, before returning: an idle worker exits within a moment of this handler, and a daemon
+    # thread sending it was killed with the process first — the Pi then waited out FAILOVER_S on a Fly
+    # worker that was already gone.
+    try:
+        with httpx.Client(timeout=3) as c:
+            heartbeat(Supabase(c))
+    except Exception:  # noqa: BLE001
+        pass
     if _waker is not None:
         _waker.event.set()
 
