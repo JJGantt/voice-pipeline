@@ -178,9 +178,13 @@ succeeds writes the whole turn.
 A turn that called any tool is never handed on: it may already have logged a meal or sent a message,
 and running it again would do that twice. Those still end as `error` where they failed.
 
-`claude_unready()` checks, per turn, that `CLAUDE_BIN` resolves to something executable. A Claude Code
+`claude_unready()` checks that `CLAUDE_BIN` resolves to something executable (about 13µs on the Pi).
+It runs BEFORE a claim: a host that fails it marks everything pending as tried with one write per row
+and claims nothing, and that write is the realtime wake for the next worker. Claiming first and handing
+off afterwards cost 1.17s on the Pi, all of it reads the turn does before reaching the check. It runs
+again at dispatch, which covers an orphan taken over by `reclaim_stale`. A Claude Code
 self-update through npm can die half way and leave the link dangling, or `claude.exe` as a 500-byte
-non-executable placeholder; that host then hands every command on immediately instead of failing them.
+non-executable placeholder.
 Repairing it means clearing npm's leftover `.claude-code-*` temp directory under
 `~/.npm-global/lib/node_modules/@anthropic-ai/` (npm refuses with `ENOTEMPTY` while it is there) and
 reinstalling `@anthropic-ai/claude-code`.

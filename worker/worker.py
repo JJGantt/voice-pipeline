@@ -975,6 +975,12 @@ def claude_unready() -> str | None:
     return None
 
 
+def untried_workers(db: Supabase, tried: set) -> list:
+    """Healthy workers in WORKER_PRIORITY that are not in `tried`."""
+    return [r.get("worker") for r in presence_rows(db)
+            if r.get("worker") in WORKER_PRIORITY and r.get("worker") not in tried and _healthy(r)]
+
+
 def hand_off(db: Supabase, req: dict, err: str) -> bool:
     """Put a request this worker failed back to 'pending' for a worker that has not tried it yet.
 
@@ -983,8 +989,7 @@ def hand_off(db: Supabase, req: dict, err: str) -> bool:
     priority for it (`claim_one`), so the next healthy one takes it at once. False when no healthy
     worker is left untried — the caller then closes it as an error, as before."""
     tried = sorted(set(req.get("failed_on") or []) | {WORKER_ID})
-    left = [r.get("worker") for r in presence_rows(db)
-            if r.get("worker") in WORKER_PRIORITY and r.get("worker") not in tried and _healthy(r)]
+    left = untried_workers(db, set(tried))
     if not left:
         return False
     got = db.patch(
@@ -1989,6 +1994,18 @@ def claim_one(db: Supabase) -> dict | None:
         _holding = False
         refresh_standby(db)
         return reclaim_stale(db)
+
+    # A host that cannot start a turn does not claim: it marks what is pending as tried here, one write
+    # each, and that UPDATE is the realtime wake that sends the next worker to it. Claiming first and
+    # handing off after cost 1.17s of reads on the Pi before the check was reached; the check is ~13µs.
+    unready = claude_unready()
+    if unready and untried_workers(db, {WORKER_ID}):
+        for r in pending:
+            db.patch("voice_requests", f"id=eq.{r['id']}&status=eq.pending",
+                     {"failed_on": sorted(set(r.get("failed_on") or []) | {WORKER_ID}), "updated_at": now_iso()})
+        log(f"passed {len(pending)} pending request(s) on unclaimed: {unready}")
+        alert_failure("request", unready)
+        return None
 
     global _failover_at
     oldest_at = _parse_ts(pending[0].get("created_at") or "")
