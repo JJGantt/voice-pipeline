@@ -260,7 +260,7 @@ def alert_failure(stage: str, err: str, detail: str = "") -> None:
 
 # The machines a desk session can run on, by the presence row each one's session host beats.
 DESK_PRESENCE = {"pi": "pi-desk", "mac": "desk"}
-HEALTH_REPO = {"path": "~/repos/health", "name": "health"}   # the Pi clones it on first dispatch
+HEALTH_REPO = "health"   # by name in `repos`, whose path is what the session hosts accept; the Pi clones it
 
 
 def investigate(stage: str, kind: str, err: str, detail: str) -> None:
@@ -289,9 +289,11 @@ def investigate(stage: str, kind: str, err: str, detail: str) -> None:
             "repo's CLAUDE.md: check function, not liveness, and give the failure a row in WATCHLIST.md. "
             "Your last message should say what broke, what you changed, and what is still open."
         )
+        repo = httpx.get(f"{SUPABASE_URL}/rest/v1/repos", params={"name": f"eq.{HEALTH_REPO}", "select": "path,name"},
+                         headers=hdr, timeout=5).json()[0]
         httpx.post(f"{SUPABASE_URL}/rest/v1/desk_commands", headers={**hdr, "Content-Type": "application/json"},
                    json={"id": str(uuid.uuid4()), "kind": "open_session",
-                         "payload": {**HEALTH_REPO, "target": target, "prompt": prompt,
+                         "payload": {"path": repo["path"], "name": repo["name"], "target": target, "prompt": prompt,
                                      "label": f"Voice worker failure on {WORKER_ID}"}},
                    timeout=5).raise_for_status()
         log(f"investigate: health session dispatched to {target}")
