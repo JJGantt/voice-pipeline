@@ -259,7 +259,8 @@ async function handResumeToMac(row, prompt, moved = null) {
     body: JSON.stringify({ id, kind: 'resume_mirrored',
                            payload: { target: 'mac', claude_session_id: row.claude_session_id, repo: row.repo,
                                       label: row.label, origin: row.origin || 'dispatched', from: 'pi',
-                                      ...(prompt ? { prompt } : {}), ...(moved ? { moved } : {}) } }),
+                                      ...(prompt ? { prompt } : {}),
+                                      ...(moved ? { moved, mid_turn: !!prompt } : {}) } }),
   });
   return id;
 }
@@ -274,6 +275,10 @@ async function handResumeToMac(row, prompt, moved = null) {
  * budget; its hard ceiling still keeps the rest of the Pi safe, and tool.sh makes the command that
  * crosses it the thing that dies, not the session.
  */
+// The message that restarts a moved session's turn on the Mac. It shows in the feeds as the prompt
+// that turn answers, so it is a bare label saying what sent it — never a word like "Continue", which a
+// session that had just proposed something would take as Jared approving it.
+const MOVED_MARKER = '[Moved from the Pi]';
 const moving = new Set();
 async function onHeavy(name, usage) {
   if (moving.has(name)) return;
@@ -291,9 +296,16 @@ async function onHeavy(name, usage) {
       liftBudget(name);
       return;
     }
-    console.log(`[pi-desk] ${name} is ${why} — moving it to the Mac`);
+    // Whether to restart a turn on the Mac is read from the live process BEFORE it is closed. Only a
+    // session mid-turn gets one: a background job can outgrow the budget after the turn has ended on a
+    // question for Jared, and any message that then restarted the session would read as his answer.
+    // A session that was waiting on him resumes idle, with the note, and waits for him there.
+    const pid = (await liveSessions()).find((l) => l.name === name)?.pid;
+    const rec = pid ? sessionOf(pid) : null;
+    const midTurn = rec?.busy === true && !rec.waiting;
+    console.log(`[pi-desk] ${name} is ${why} — moving it to the Mac (${midTurn ? 'mid-turn' : 'between turns'})`);
     await evict(name);
-    const id = await handResumeToMac(row, 'Continue', why);
+    const id = await handResumeToMac(row, midTurn ? MOVED_MARKER : null, why);
     console.log(`[pi-desk] ${name} handed to the Mac as ${id}`);
   } catch (e) {
     console.error(`[pi-desk] moving ${name} to the Mac failed:`, e.message);

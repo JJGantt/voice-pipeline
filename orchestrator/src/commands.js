@@ -28,8 +28,10 @@ import { beginLaunch, endLaunch } from './deskSessions.js';
 import { watchTable } from './realtime.js';
 import { isKnownRepo } from './repos.js';
 
-// What a session closed on the Pi mid-turn for doing heavy work is told when it resumes here.
-const MOVED_NOTE = fs.readFileSync(new URL('../moved-session.txt', import.meta.url), 'utf8').trim();
+// What a session the Pi closed for doing heavy work is told when it resumes here: what happened, then
+// one of two endings, for a session cut off mid-turn and for one that was waiting on Jared.
+const [MOVED_NOTE, MOVED_MID_TURN, MOVED_BETWEEN_TURNS] = fs.readFileSync(new URL('../moved-session.txt', import.meta.url), 'utf8')
+  .split(/^---$/m).map((s) => s.trim());
 import { ensureTrusted } from './trust.js';
 import { openFreshTab, sendToTty, closeTabForTty } from './applescript.js';
 import { withAttachments, transcriptSize, awaitSubmitted } from './handoff.js';
@@ -221,8 +223,9 @@ async function run(cmd) {
     try {
       // A prompt rides along when the Pi hands over a resume it had no room for (pi-desk handResumeToMac),
       // and `moved` when it closed a session mid-turn for doing heavy work there (pi-desk onHeavy).
-      const moved = (cmd.payload || {}).moved;
-      const note = moved ? MOVED_NOTE.replace('{why}', String(moved)) : null;
+      const { moved, mid_turn: midTurn } = cmd.payload || {};
+      const note = moved
+        ? `${MOVED_NOTE.replace('{why}', String(moved))}\n\n${midTurn ? MOVED_MID_TURN : MOVED_BETWEEN_TURNS}` : null;
       const raw = await openFreshTab(dir, repo, (cmd.payload || {}).prompt || null, sessionId, claudeId, note);
       const [how, tty] = String(raw).split('\t');
       await upsertDeskSession({
