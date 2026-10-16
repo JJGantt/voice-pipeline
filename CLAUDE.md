@@ -117,6 +117,16 @@ The other half is upstream: `data-layer`'s dispatch path checks the target machi
 it writes a command at all, because the queue itself has no way to fail — an unclaimed command simply
 expires while the caller has already been told a session started.
 
+## Status `fallback` belongs to the Pi alone
+
+A `voice_requests` row with status `fallback` came from the watch through Supabase's `voice-fallback`
+edge function (data-layer), because the hub on Fly did not answer. Only `FALLBACK_WORKER` (the Pi)
+claims it, in the same read as its `pending` rows, with no deferring or holding. Every other worker's
+claim filter must stay `status=eq.pending`: a Fly worker can be up while the hub is down, and a widened
+filter there would put the fallback back on Fly. The run is the unrestricted Opus agent with
+`fallback_directive`; `_hub_unreachable` skips the pushes to the hub for its duration, since each would
+only spend its timeout. Status-hub `docs/WATCH.md` § When the hub does not answer has the watch's half.
+
 ## Reading a session: two handles, two columns
 
 `desk_sessions.tty` reaches a Mac session (its Terminal tab); `transcript_path` reads what any session
