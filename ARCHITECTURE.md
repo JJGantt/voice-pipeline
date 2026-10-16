@@ -20,10 +20,10 @@ WORKER (worker/worker.py — the ONE brain):
 TOOLS (the only capabilities): data · voice · govee   (MCP, stdio)
 SOURCE OF TRUTH:  Supabase (felyggqjjhltwokdfhop)
 
-DEVICES (claim order pi → mac → fly):
-  Pi   — first claimer (systemd voice-worker.service). Also runs pi-desk, the desk-command consumer.
-  Mac  — fallback (launchd com.jaredgantt.voice-worker). Has the Claude subscription, like the Pi.
-  Fly  — last resort, bundled into the jared-voice server image (server/, WORKER_ID=fly).
+DEVICES (claim order fly → pi → mac):
+  Fly  — first claimer, its own app jared-voice-worker (fly-worker/, WORKER_ID=fly, WARM_OPUS=1).
+  Pi   — first fallback (systemd voice-worker.service). Also runs pi-desk, the desk-command consumer.
+  Mac  — second fallback (launchd com.jaredgantt.voice-worker).
 ```
 
 Inputs are thin by design: they capture and enqueue one row, and nothing about which device heard the
@@ -43,9 +43,11 @@ and every ordinary stage bills the **subscription**:
   installed `claude` (`cli_path`), not the SDK's bundled copy: the bundled one lags, and the `sonnet` alias
   resolves to whatever model the running CLI knows. Each hub turn is a
   fresh `session_id` on that warm process, with the whole day's hub conversation (since 4 AM, each line timestamped) replayed into the prompt.
-  This is the **fast path** on the Mac and the Pi: the spawn cost `claude -p` pays per command — CLI
+  This is the **fast path** on every worker: the spawn cost `claude -p` pays per command — CLI
   plus four MCP servers, 3.6s on the Pi, ~42% of a simple turn before the model sees a token — is
-  paid once at connect.
+  paid once at connect. Where `WARM_OPUS=1` (the Fly worker, 2GB) a second warm `SdkRunner` holds
+  Opus with the full toolset plus `Read`, and runs that worker's escalations and photo turns instead of
+  `run_claude`.
 - **`run_claude`** — headless `claude -p`, also on the subscription. It streams `stream-json`, so
   tool calls (and the text between them) surface live on the activity bar. This runs the **escalation** (Opus, full toolset —
   rare, and already slow enough that the CLI cold start is noise), photo turns (vision needs the
@@ -59,16 +61,20 @@ whose `Read` tool is how a model views an image file.
 
 Which host should run the agent, what each one can and cannot do, and measured speeds: `docs/WORKER-PLACEMENT.md`.
 
-- **Worker claim priority** is `WORKER_PRIORITY`, and `worker/run.sh` sets it to **`pi,mac,fly`** on
-  every machine that launches through it: the highest-priority worker with a fresh heartbeat claims
-  and the others defer, so the **Pi takes a command whenever it is up** and the Mac is the fallback.
-  That is deliberate — a session started by voice must outlive the laptop closing. `worker.py`'s own
-  in-file default (`mac,pi`) is only what applies if something starts it without `run.sh`. Claiming
-  is an atomic `PATCH ... status=eq.pending`, so it is safe even when two workers race.
-- **Worker affinity** overrides priority while a hub context window is live: the window stays pinned
-  to the worker that owns it, so a conversation and its machine-local context aren't lost to a
-  needless switch. Affinity releases when the window resets or the owner goes silent past
-  `OWNER_GRACE_S`.
+- **Worker claim priority** is `WORKER_PRIORITY`, **`fly,pi,mac`** everywhere: `worker/run.sh`'s
+  default, the Pi's `worker/.env`, and the `jared-voice-worker` image. The highest-priority worker with
+  a fresh heartbeat claims and the others defer, so **Fly takes a command whenever it is up**, then the
+  Pi, then the Mac. Fly is first because it answers the common Sonnet turn faster (2.8s median against
+  the Pi's 4.4s on identical commands) and is independent of the house; Opus turns cost about the same
+  everywhere. It has no route to iMessage, Gmail or the feeder, which are rare enough not to count
+  (`docs/WORKER-PLACEMENT.md`). The Mac is last so a session started by voice outlives the laptop
+  closing. Claiming is an atomic `PATCH ... status=eq.pending`, so it is safe even when two workers race.
+- **Worker affinity** overrides priority in **full-agent (coding) mode only**: while its window is
+  live, the conversation stays on the worker that claimed the last request, because a full-agent CLI
+  session lives on one machine. It releases when the window resets or the owner goes silent past
+  `OWNER_GRACE_S`. Hub turns follow `WORKER_PRIORITY` alone: each is a fresh run handed the day's
+  thread from the live state every worker holds, so pinning one bought nothing and kept commands on a
+  slower worker for up to `session_reset_s` (an hour).
 - **A failure falls through.** A turn that fails on one worker without calling a tool goes back to
   `pending` with that worker in `voice_requests.failed_on`, and the next healthy worker takes it
   immediately; it ends as an error only once no healthy worker is left untried
@@ -239,7 +245,7 @@ sleeping Mac cannot strand the ESP in the wrong mode — it restores itself from
 - The Mac listener still mirrors these to the ESP over HTTP (`/wakefree-on|off`, `/capture-off|on`,
   `/wakefree-route`) as a **redundant fast-path**, and still does the Mac-local work (mic handoff,
   start/stop `wakefree.py`). But that bridge is no longer load-bearing — if the Mac is off, Fly already
-  has the state. (The LED is likewise host-independent: the worker that drives it fails over Mac→Pi→Fly.)
+  has the state. (The LED is likewise host-independent: the worker that drives it fails over Fly→Pi→Mac.)
 
 ### Global mute — any explicit input deafens every always-on listener
 An explicit command — push-to-talk dictation, or the hub's voice FAB — silences every always-on

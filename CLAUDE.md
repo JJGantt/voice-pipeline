@@ -29,25 +29,30 @@ The CLI and the Agent SDK silently prefer the key over the subscription login an
 `worker.py` pops it from the environment at import and never reads it; nothing it spawns can inherit
 it. `pi-desk/launch.sh` strips it separately (it sources the worker's `.env` itself).
 
-## `server/` is a build context, not source
+## `server/` and `fly-worker/` are build contexts, not source
 
-`assemble.sh` does `rm -rf` on `server/data-layer`, `server/mcp-voice`, `server/govee-mcp` and
-`server/worker.py`, then recopies them from the data-layer and govee-mcp checkouts (`~/repos/...` on
-the Mac, `~/data-layer` and `~/mcp-govee` on the Pi), `mcp-voice/` and `worker/`. Editing a copy is
-lost work. Deploy with:
+Two Fly apps, each deployed from its own directory, and most of what they ship is copied in at deploy
+time. Editing a copy is lost work; edit the source.
 
-    cd server && ./assemble.sh && flyctl deploy --now -a jared-voice --build-arg CLAUDE_CODE_VERSION=$(npm view @anthropic-ai/claude-code version)
+- **`server/` → `jared-voice`**: the ESP wake-word/transcription server and the Govee inventory sync.
+  `assemble.sh` copies `sync_devices.py` in from the govee-mcp checkout. `server/server.py` is the one
+  file there that is genuinely source. Deploy with:
 
-Over SSH the Mac's flyctl has no token (its login is not reachable from a non-interactive shell), so
+      cd server && ./assemble.sh && flyctl deploy --now -a jared-voice
+
+- **`fly-worker/` → `jared-voice-worker`**: the voice worker. `deploy.sh` copies `worker/worker.py`,
+  `mcp-voice/`, the data-layer source and `govee_mcp.py` in (all gitignored), then deploys with the
+  newest Claude Code baked in. Deploy with:
+
+      fly-worker/deploy.sh
+
+  The worker is in an app of its own because, sharing `jared-voice`, a deploy of either restarted
+  both and the worker shared one CPU with transcription.
+
+Both scripts take the checkouts from `~/repos/...` on the Mac and `~/data-layer` / `~/mcp-govee` on the
+Pi. Over SSH the Mac's flyctl has no token (its login is not reachable from a non-interactive shell), so
 a deploy started from the Pi runs on the Pi, with `FLY_API_TOKEN=$(cat ~/.fly/token)` and
 `~/.fly/bin` on `PATH`.
-
-`server/server.py` is the one file there that is genuinely source.
-
-## `fly-worker/` is dead
-
-No `fly.toml`, no `Dockerfile`, nothing deploys it. The real Fly worker is `server/worker.py`,
-assembled from `worker/worker.py`. Do not read it for current behaviour and do not edit it.
 
 ## Both mics must endpoint identically
 

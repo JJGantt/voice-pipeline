@@ -18,9 +18,27 @@ ESP32 (I2S mic) ──wss://jared-voice.fly.dev/ws/audio──▶  Fly: jared-vo
   `WAKE_THRESHOLD`, `GROQ_MODEL`, `SUPABASE_URL` + `SUPABASE_ANON_KEY` (where
   transcripts enqueue), `VOICE_DEVICE_TOKEN` (optional ws auth — see below).
 - Deploy: `./assemble.sh && flyctl deploy --now -a jared-voice`, from `server/`. The assemble step
-  is not optional — most of that directory is copied in from elsewhere (`CLAUDE.md`). Set the key:
-  `fly secrets set GROQ_API_KEY=...`.
-- The same image also runs the **fallback worker** and the Govee inventory sync (`entrypoint.sh`).
+  is not optional — the Govee sync script is copied in from the govee-mcp checkout (`CLAUDE.md`). Set
+  the key: `fly secrets set GROQ_API_KEY=...`.
+- The same image also runs the Govee inventory sync (`entrypoint.sh`). The voice worker is not here;
+  it is its own app, below.
+
+## fly-worker/ (Fly app `jared-voice-worker`)
+- The voice worker (`worker/worker.py`, `WORKER_ID=fly`) alone on a `shared-cpu-1x` 2GB machine in
+  `iad`. It claims first (`WORKER_PRIORITY=fly,pi,mac`); the Pi, then the Mac, are fallbacks
+  (`docs/WORKER-PLACEMENT.md` has the measurements behind that order).
+- A 1GB volume `worker_data` at `/data` holds Claude's run transcripts (`CLAUDE_CONFIG_DIR=/data/claude`,
+  pruned after 30 days), the worker's state (`STATE_DIR=/data/voice-worker`) and `/data/worker.log`
+  (everything the machine prints, trimmed daily to 50,000 lines).
+- `WARM_OPUS=1` keeps a warm Opus client beside the warm Sonnet one, so escalated and photo turns do
+  not spawn `claude -p`.
+- `entrypoint.sh` restarts the worker whenever it exits, passes Fly's stop signal on to it, and
+  updates Claude Code daily.
+- Deploy: `fly-worker/deploy.sh`, which assembles the build context from the checkouts and bakes in
+  the newest Claude Code. Secrets: `SUPABASE_URL`, `SUPABASE_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`,
+  `GOVEE_API_KEY`, `LED_TOKEN`.
+- It is a separate app from `jared-voice` because, sharing one, a deploy of either restarted both and
+  the worker shared a CPU with transcription.
 
 ### The handoff seam
 `handle_transcript(text)` logs the transcript and, if `SUPABASE_URL` and

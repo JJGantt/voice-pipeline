@@ -7,8 +7,9 @@ on the **Claude subscription** — ordinary turns on a warm Agent SDK client
 back to Supabase (`voice_messages`) for a live display. The Console API key is
 only a fallback (see `../docs/ROUTING.md`).
 
-The same `worker.py` runs on the **Pi** (`WORKER_ID=pi`), the **Mac** (`WORKER_ID=mac`) and inside
-the `jared-voice` Fly image (`WORKER_ID=fly`); only `WORKER_ID` differs. How a claimed turn is
+The same `worker.py` runs on **Fly** as its own app, `jared-voice-worker` (`WORKER_ID=fly`, built from
+`../fly-worker/`), the **Pi** (`WORKER_ID=pi`) and the **Mac** (`WORKER_ID=mac`); only the environment
+differs. How a claimed turn is
 routed once it gets here is `../docs/ROUTING.md`.
 
 ## What it does (per loop iteration)
@@ -25,9 +26,13 @@ routed once it gets here is `../docs/ROUTING.md`.
    - **Priority gate:** if any worker ranked *higher* in `WORKER_PRIORITY` has a
      `last_seen` within `HEARTBEAT_FRESH_S` (90s) and is not degraded, skip and
      let them take it.
-   - **Affinity override:** a live hub context window stays pinned to the worker
-     that owns it, even against priority, until the window resets, the owner
-     goes silent past `OWNER_GRACE_S`, or the owner reports itself degraded.
+   - **Affinity override (full-agent mode only):** while `agent_mode` is on, a live
+     context window stays pinned to the worker that claimed the last request, even
+     against priority, until the window resets, the owner goes silent past
+     `OWNER_GRACE_S`, or the owner reports itself degraded — a full-agent CLI session
+     lives on one machine. A hub turn follows priority alone: it is a fresh run handed
+     the day's thread from the live state every worker holds, so pinning it bought
+     nothing and held commands on a slower worker for up to `session_reset_s`.
    - **Degraded stands down:** a degraded worker does not claim while any other
      worker is healthy.
    - **Failover deadline (`failover_wait`):** a request still pending `FAILOVER_S`
@@ -69,8 +74,9 @@ routed once it gets here is `../docs/ROUTING.md`.
 | `SUPABASE_URL` | `https://felyggqjjhltwokdfhop.supabase.co` | |
 | `SUPABASE_KEY` | *(required, no default)* | **Must be the service_role key** — it bypasses RLS and needs full read/write on `voice_requests`, `voice_messages`, `worker_presence`, `voice_focus`. The anon key will NOT work. |
 | `WORKER_ID` | `mac` | Also `pi`, `fly`. Identifies this worker in the queue + presence. |
-| `WORKER_PRIORITY` | `pi,mac,fly` (from `run.sh`) | Ordered, highest first. A worker only claims if no higher-priority worker has a fresh heartbeat. `worker.py`'s in-file default is `mac,pi`, which only applies if something starts it without `run.sh`. |
-| `STATE_DIR` | `~/.voice-worker` | Stores `hub_session.json` and `agent_session.json` (session id + last activity). |
+| `WORKER_PRIORITY` | `fly,pi,mac` | Ordered, highest first. A worker only claims if no higher-priority worker has a fresh heartbeat. The same value is `run.sh`'s default, `worker.py`'s, the Pi's `.env` and the Fly image's; change all four together. |
+| `STATE_DIR` | `~/.voice-worker` | Stores `hub_session.json` and `agent_session.json` (session id + last activity). `/data/voice-worker` on Fly, on the volume. |
+| `WARM_OPUS` | *(off)* | `1` keeps a warm Opus `SdkRunner` (full toolset plus `Read`) beside the Sonnet one, so escalated and photo turns skip the `claude -p` spawn. On only on Fly, which has the 2GB for two clients. |
 | `CLAUDE_BIN` | `claude` | Path to the Claude Code CLI. |
 | `DATA_MCP_JS` | `~/repos/data-layer/dist/mcp.js` | The **built** data MCP entrypoint — a source change there does nothing until `npm run build`. |
 | `VOICE_MCP_JS` | `~/repos/voice-pipeline/mcp-voice/src/index.js` | The voice MCP (`say`, `set_focus`, `list_sessions`). |
@@ -127,11 +133,16 @@ A root-only drop-in, `/etc/systemd/system/voice-worker.service.d/oauth.conf`, ad
 kills the Claude CLI mid-request and the worker pushes a false failure alert to the phone, and
 `pull-repos` restarts this unit on every voice-pipeline push.
 
-### Pi → Mac priority
+### Fly → Pi → Mac priority
 
-`run.sh` sets `WORKER_PRIORITY=pi,mac,fly`, so the **Pi claims whenever it is up**
-and the Mac is the fallback. That inversion is the point: work started by voice
-can be long-running, and closing the laptop must not kill it.
+`WORKER_PRIORITY` is `fly,pi,mac`, so **Fly claims whenever it is up**, the Pi is
+the first fallback and the Mac the second. Fly is first on speed: measured on
+identical commands it answers the common Sonnet turn in 2.8s median against the
+Pi's 4.4s, and Opus turns cost about the same on both, ~15s
+(`../docs/WORKER-PLACEMENT.md`). It is also independent of the house. It cannot
+reach iMessage, Gmail or the feeder; those are rare enough not to count against it.
+The Mac is last because work started by voice can be long-running, and closing the
+laptop must not kill it.
 
 Each worker checks `worker_presence` before claiming and defers to any
 higher-priority worker whose heartbeat is fresh. Failover needs no coordination
@@ -150,7 +161,7 @@ conversation replayed into its prompt (`recent_context()`): everything said
 since the day began at **4 AM Eastern** (`day_start`, `TZ_DISPLAY`, the hub's own
 "today"), or since the last manual "Reset context" (`voice_reset_at`) if that is
 later, oldest first, each line with its time, room chatter marked as ignored. An
-idle gap does not cut it, and the Fly worker's UTC clock does not move the
+idle gap does not cut it, and a host's own timezone does not move the
 boundary. A heavy day is about 12k tokens.
 
 **None of that is read per command.** The day's thread, the voice focus and the settings a turn consults
@@ -165,7 +176,7 @@ cost ~0.7s before a turn could start; from memory they are microseconds.
 **Only an always-on capture is checked for a duplicate.** Two room mics can hear one utterance; a
 press, a watch command or a typed message comes from one device on purpose, so it skips
 `_duplicate_of_recent` and the read of the last 12 requests it costs. `session_reset_s` still bounds which
-worker owns the conversation (affinity); it no longer bounds what the agent
+worker owns the conversation in full-agent mode (affinity); it no longer bounds what the agent
 remembers.
 
 The agent session resets only on a manual reset.
@@ -253,7 +264,7 @@ toggle, which is for command results.
 What the classes mean on the phone:
 
 - `auth` — the setup token is revoked or expired. Re-mint: `claude setup-token` → this `.env` on
-  every host + `fly secrets set CLAUDE_CODE_OAUTH_TOKEN=… -a jared-voice` → restart. A Google
+  every host + `fly secrets set CLAUDE_CODE_OAUTH_TOKEN=… -a jared-voice-worker` → restart. A Google
   password change revokes it (the claude.ai account signs in with Google).
 - `billing` — the subscription reports a billing problem.
 - `rate-limit` — transient and already retried; nothing to do unless it persists.

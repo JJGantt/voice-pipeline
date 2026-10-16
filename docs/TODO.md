@@ -93,7 +93,7 @@ this; it is specific to the ESP path.
 
 1. `fly scale vm performance-1x -a jared-voice` — a dedicated core, no burst mechanism. About $32/mo
    for 2 GB against about $11/mo for the current box (Fly pricing page, ams prices; iad is close).
-   Simplest, and the box also carries the Fly fallback worker.
+   Simplest.
 2. Cut the duty cycle: check every 1.4s instead of 0.7s while unconfirmed, and/or skip checks when
    the trailing window's energy profile matches the running TV floor. Cheaper, slower to confirm him,
    and the balance still drains on a long TV evening.

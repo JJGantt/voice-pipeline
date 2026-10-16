@@ -3,7 +3,7 @@
 ```
 mic → transcript → voice_requests (Supabase)
                         ↓
-              worker claims it (Pi primary, Mac fallback, Fly last)
+              worker claims it (Fly primary, Pi then Mac fallback)
                         ↓
           ┌─────────────┴──────────────┐
           │  Sonnet, the fast responder │   ← SAFE_TOOLS (allowed_tools on the warm SDK client)
@@ -149,8 +149,9 @@ The "ultrathink" in `POWER_DIRECTIVE` sets no budget; the CLI turns it into a no
 reasoning.
 
 **Everything runs on the subscription, and nothing else.** Sonnet runs on the warm `SdkRunner` (a
-long-lived headless Claude Code process holding the MCP servers); escalation runs Opus through
-`claude -p`. A failed run is retried on the subscription and then surfaced as an error — there is no
+long-lived headless Claude Code process holding the MCP servers); escalation runs Opus on a second
+warm `SdkRunner` where `WARM_OPUS=1` (the Fly worker, which has the memory for both) and through
+`claude -p` elsewhere. A failed run is retried on the subscription and then surfaced as an error — there is no
 paid path. An API-billed path is attractive twice over and fails both times: as the fast path it drains
 the Console balance at conversation volume, and as a fallback at the same tier it turns a passing
 "overloaded" on an Opus turn into a Console-billed Opus run. Errors also never upgrade the model: an
