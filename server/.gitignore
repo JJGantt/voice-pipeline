@@ -3,3 +3,4 @@ mcp-voice/
 worker.py
 entrypoint logs
 *.log
+govee-mcp/
