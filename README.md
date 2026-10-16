@@ -13,7 +13,7 @@ ESP32 (I2S mic) ──wss://jared-voice.fly.dev/ws/audio──▶  Fly: jared-vo
 ```
 
 ## server/ (Fly app `jared-voice`)
-- WebSocket server, openWakeWord, Groq STT. Always-on 1GB machine.
+- WebSocket server, openWakeWord, Groq STT. Always-on 2GB machine.
 - Config via env: `GROQ_API_KEY` (secret), `WAKE_MODEL` (default `hey_rhasspy`),
   `WAKE_THRESHOLD`, `GROQ_MODEL`, `SUPABASE_URL` + `SUPABASE_ANON_KEY` (where
   transcripts enqueue), `VOICE_DEVICE_TOKEN` (optional ws auth — see below).

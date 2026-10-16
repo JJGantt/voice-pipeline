@@ -4,8 +4,8 @@ Claims voice commands from the Supabase `voice_requests` queue and runs each one
 on the **Claude subscription** — ordinary turns on a warm Agent SDK client
 (Sonnet, safe toolset), escalations and full-agent turns through headless
 `claude -p` (Opus) — with the `data` MCP attached, then writes the conversation
-back to Supabase (`voice_messages`) for a live display. The Console API key is
-only a fallback (see `../docs/ROUTING.md`).
+back to Supabase (`voice_messages`) for a live display. Every turn runs on the Claude subscription;
+there is no API-billed path (see `../docs/ROUTING.md`).
 
 The same `worker.py` runs on **Fly** as its own app, `jared-voice-worker` (`WORKER_ID=fly`, built from
 `../fly-worker/`), the **Pi** (`WORKER_ID=pi`) and the **Mac** (`WORKER_ID=mac`); only the environment
