@@ -1780,6 +1780,9 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
 # --------------------------------------------------------------------------- #
 
 
+_SDK_LOOP_LOCK = threading.Lock()
+
+
 class SdkRunner:
     """Warm Claude Agent SDK client — the PRIMARY fast path, billed to the subscription.
 
@@ -1796,15 +1799,36 @@ class SdkRunner:
         self._client = None
         self._ambient = True   # the turn in flight came from a room mic; set by run() before each turn
         self._used = False     # the warm client has run a turn since it connected, so needs a /clear
+        self._lock = None      # serialises connects; created on the SDK loop
 
     def _start_loop(self):
-        if self._loop is None:
-            self._loop = asyncio.new_event_loop()
-            threading.Thread(target=self._loop.run_forever, name="sdk-loop", daemon=True).start()
+        with _SDK_LOOP_LOCK:   # warm() runs on its own thread, so two callers can race here
+            if self._loop is None:
+                self._loop = asyncio.new_event_loop()
+                threading.Thread(target=self._loop.run_forever, name="sdk-loop", daemon=True).start()
 
     async def _ensure(self):
         if self._client is not None:
             return
+        if self._lock is None:
+            self._lock = asyncio.Lock()   # warm() and a first turn can both get here; connect once
+        async with self._lock:
+            if self._client is None:
+                await self._connect()
+
+    def warm(self) -> None:
+        """Connect now rather than on the next turn. Measured cold, the first command after a restart
+        took 19.7s on Fly and 9.9s on the Pi where a warm one took 2.8s and 4.5s; every deploy, restart
+        and failed turn (`_recycle`) used to hand that cost to whatever he said next."""
+        if claude_unready():
+            return
+        self._start_loop()
+        try:
+            asyncio.run_coroutine_threadsafe(self._ensure(), self._loop).result(timeout=120)
+        except Exception as e:  # noqa: BLE001
+            log(f"sdk runner: warm-up failed ({e}); the next turn connects")
+
+    async def _connect(self):
         from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, HookMatcher, PermissionResultDeny
 
         gated = "This tool is gated on the fast path. If the request needs it, reply __ESCALATE__ (alone)."
@@ -1916,11 +1940,12 @@ class SdkRunner:
                 "result": result_text, "ok": ok, "raw_error": raw_error}
 
     def _recycle(self):
-        """Drop the warm client so the next turn reconnects cold."""
+        """Drop the warm client and connect a fresh one in the background, before the next turn needs it."""
         try:
             asyncio.run_coroutine_threadsafe(self._teardown(), self._loop).result(timeout=15)
         except Exception:  # noqa: BLE001
             pass
+        threading.Thread(target=self.warm, name="sdk-warm", daemon=True).start()
 
     def _attempt(self, transcript, on_event) -> dict:
         """One turn on the warm client. `used_tools` reports whether it acted before failing; a crash
@@ -2939,6 +2964,7 @@ def main() -> int:
         global _waker
         waker = _waker = RealtimeWaker()
         waker.start()   # event-driven claim; no-op fallback to polling if realtime is unavailable
+        threading.Thread(target=SDK.warm, name="sdk-warm", daemon=True).start()   # first turn starts warm
 
         # Heartbeat on its own thread so a long command (a multi-minute agent run) never lets this
         # worker's presence go stale — which would let a lower-priority worker poach the user's follow-up
