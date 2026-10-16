@@ -146,7 +146,20 @@ since the day began at **4 AM Eastern** (`day_start`, `TZ_DISPLAY`, the hub's ow
 "today"), or since the last manual "Reset context" (`voice_reset_at`) if that is
 later, oldest first, each line with its time, room chatter marked as ignored. An
 idle gap does not cut it, and the Fly worker's UTC clock does not move the
-boundary. A heavy day is about 12k tokens. `session_reset_s` still bounds which
+boundary. A heavy day is about 12k tokens.
+
+**None of that is read per command.** The day's thread, the voice focus and the settings a turn consults
+(`agent_mode`, `agent_cwd`, `session_reset_s`, `voice_reset_at`) are held in memory (`_live`): loaded
+when the realtime socket subscribes, and kept current by that socket's `voice_messages`, `voice_focus`
+and `app_settings` events. The socket is recycled every ~5 minutes and each subscribe reloads, which is
+the backstop for a channel that goes deaf while still reporting SUBSCRIBED. Read per command, these
+cost ~0.7s before a turn could start; from memory they are microseconds.
+
+**The lights are not listed in the prompt.** A turn that needs them calls govee's `list_lights`.
+
+**Only an always-on capture is checked for a duplicate.** Two room mics can hear one utterance; a
+press, a watch command or a typed message comes from one device on purpose, so it skips
+`_duplicate_of_recent` and the read of the last 12 requests it costs. `session_reset_s` still bounds which
 worker owns the conversation (affinity); it no longer bounds what the agent
 remembers.
 

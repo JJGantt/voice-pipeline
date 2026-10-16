@@ -685,39 +685,6 @@ SHARED_STATE_NOTE = (
 )
 
 
-# Govee lights the model can control — pulled from the auto-synced Supabase govee_devices table and
-# injected into the system prompt every turn, so the model acts on "the floor lamp" immediately
-# instead of burning a round-trip on a list tool. Cached in-process (30 min) to avoid a per-command DB hit.
-_govee_cache = {"at": -1e9, "lights": []}
-GOVEE_CACHE_TTL = 1800
-
-
-def _govee_lights() -> list:
-    """[(key, display), …] from Supabase govee_devices (hidden=false). key is the tool arg; display matches speech."""
-    now = time.monotonic()
-    if _govee_cache["lights"] and now - _govee_cache["at"] < GOVEE_CACHE_TTL:
-        return _govee_cache["lights"]
-    try:
-        r = httpx.get(f"{SUPABASE_URL}/rest/v1/govee_devices",
-                      params={"select": "key,display_name", "hidden": "eq.false", "order": "key"},
-                      headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=8)
-        out = [(row["key"], row["display_name"]) for row in r.json()]
-        _govee_cache["at"], _govee_cache["lights"] = now, out
-    except Exception:  # noqa: BLE001 — keep last-known list on a transient failure
-        out = _govee_cache["lights"]
-    return out
-
-
-def govee_context() -> str:
-    lights = _govee_lights()
-    if not lights:
-        return ""
-    listing = ", ".join(f"{k} ({d})" for k, d in lights)
-    return ("Govee lights you can control RIGHT NOW via the govee-lights tools — pass the KEY (the part "
-            "before the parentheses) as the `light` arg; do NOT call a list/lookup tool first. Available: "
-            + listing + ". If a request matches multiple lights by name (e.g. two 'Bedroom Ceiling'), "
-            "control ALL of them.")
-
 # --------------------------------------------------------------------------- #
 # Small helpers
 # --------------------------------------------------------------------------- #
@@ -1039,49 +1006,105 @@ def write_session(agent: bool, session_id: str) -> None:
         log(f"write {session_file(agent).name} failed: {e}")
 
 
-_reset_cache = {"v": None, "t": 0.0}
+# LIVE STATE: the settings a turn consults, the voice focus, and today's hub thread, held in memory.
+# Loaded once each time the realtime socket subscribes (it is recycled every ~5 minutes, which makes
+# that reload the backstop behind the events) and kept current by its app_settings / voice_focus /
+# voice_messages events, so a command reads none of them from the database. Reading them per command
+# cost ~0.7s of round trips before a turn could start.
+LIVE_SETTINGS = ("agent_mode", "agent_cwd", "session_reset_s", "voice_reset_at")
+_live = {"loaded": False, "settings": {}, "focus": "hub", "thread": {}}
+_live_lock = threading.Lock()
+_live_db: "Supabase | None" = None   # its own client: loads run on the realtime thread
+
+
+def _is_thread_row(r: dict) -> bool:
+    return r.get("focus") == "hub" and r.get("mode") == "hub" and r.get("role") in ("user", "assistant")
+
+
+def live_load() -> bool:
+    """(Re)load the live state from the database. False, leaving it unloaded, if any read failed."""
+    global _live_db
+    if _live_db is None:
+        _live_db = Supabase(httpx.Client(timeout=HTTP_TIMEOUT_S))
+
+    def get(table, query):
+        r = _live_db.c.get(_live_db._url(table, query), headers=headers())
+        r.raise_for_status()
+        return r.json()
+
+    try:
+        keys = ",".join(LIVE_SETTINGS)
+        settings = {r["key"]: r.get("value") for r in get("app_settings", f"key=in.({keys})&select=key,value")}
+        focus = (get("voice_focus", "id=eq.1&select=focus") or [{}])[0].get("focus") or "hub"
+        since = day_start(datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        rows: list = []
+        while True:
+            page = get("voice_messages",
+                       "focus=eq.hub&mode=eq.hub&role=in.(user,assistant)"
+                       f"&created_at=gte.{since}&order=created_at.asc&limit=1000&offset={len(rows)}"
+                       "&select=id,focus,mode,role,text,created_at,ignored,done")
+            rows += page
+            if len(page) < 1000:
+                break
+    except Exception as e:  # noqa: BLE001
+        _note_failure(e)
+        log(f"live state load failed: {e}")
+        with _live_lock:
+            _live["loaded"] = False
+        return False
+    with _live_lock:
+        _live.update(loaded=True, settings=settings, focus=focus, thread={r["id"]: r for r in rows})
+    log(f"live state loaded: {len(rows)} thread rows, focus={focus}")
+    return True
+
+
+def live_event(table: str, kind: str, rec: dict, old: dict) -> None:
+    """Apply one realtime change to the live state."""
+    with _live_lock:
+        if not _live["loaded"]:
+            return
+        if table == "app_settings":
+            key = (rec or old).get("key")
+            if key in LIVE_SETTINGS:
+                if kind == "DELETE":
+                    _live["settings"].pop(key, None)
+                else:
+                    _live["settings"][key] = rec.get("value")
+        elif table == "voice_focus" and kind != "DELETE":
+            _live["focus"] = rec.get("focus") or "hub"
+        elif table == "voice_messages":
+            if kind == "DELETE":
+                _live["thread"].pop(old.get("id"), None)
+            elif _is_thread_row(rec):
+                _live["thread"][rec["id"]] = rec
+            else:
+                _live["thread"].pop(rec.get("id"), None)
+
+
+def _live_view() -> dict:
+    """The live state, loading it first if no subscribe has done so yet (startup, or a failed load)."""
+    if not _live["loaded"]:
+        live_load()
+    with _live_lock:
+        return {"settings": dict(_live["settings"]), "focus": _live["focus"],
+                "thread": list(_live["thread"].values())}
 
 
 def session_reset_s() -> float:
-    """Idle budget before the hub conversation resets, from the hub setting `session_reset_s` (cached
-    ~30s so it's not a per-command DB hit). Falls back to SESSION_IDLE_RESET_S."""
-    now = time.monotonic()
-    if _reset_cache["v"] is None or now - _reset_cache["t"] > 30:
-        v = SESSION_IDLE_RESET_S
-        try:
-            r = httpx.get(f"{SUPABASE_URL}/rest/v1/app_settings",
-                          params={"key": "eq.session_reset_s", "select": "value"},
-                          headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=5)
-            rows = r.json()
-            if rows and rows[0].get("value"):
-                v = float(rows[0]["value"])
-        except Exception:  # noqa: BLE001
-            pass
-        _reset_cache.update(v=v, t=now)
-    return _reset_cache["v"]
-
-
-_agent_cache = {"mode": None, "cwd": None, "t": 0.0}
+    """Idle budget before the hub conversation resets, from the hub setting `session_reset_s`."""
+    try:
+        return float(_live_view()["settings"].get("session_reset_s") or SESSION_IDLE_RESET_S)
+    except (TypeError, ValueError):
+        return SESSION_IDLE_RESET_S
 
 
 def agent_settings() -> dict:
-    """Full-agent-mode knobs from app_settings (cached ~15s): `agent_mode` (bool — upgrade the subscription
-    path to the unrestricted Claude Code agent) and `agent_cwd` (where that agent runs; default $HOME)."""
-    now = time.monotonic()
-    if _agent_cache["mode"] is None or now - _agent_cache["t"] > 15:
-        mode, cwd = False, os.path.expanduser("~")
-        try:
-            r = httpx.get(f"{SUPABASE_URL}/rest/v1/app_settings",
-                          params={"key": "in.(agent_mode,agent_cwd)", "select": "key,value"},
-                          headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=5)
-            s = {row["key"]: row["value"] for row in r.json()}
-            mode = str(s.get("agent_mode", "")).strip().lower() in ("1", "true", "on", "yes")
-            if s.get("agent_cwd"):
-                cwd = os.path.expanduser(s["agent_cwd"].strip())
-        except Exception:  # noqa: BLE001
-            pass
-        _agent_cache.update(mode=mode, cwd=cwd, t=now)
-    return {"mode": _agent_cache["mode"], "cwd": _agent_cache["cwd"]}
+    """Full-agent-mode knobs from app_settings: `agent_mode` (bool — upgrade the subscription path to the
+    unrestricted Claude Code agent) and `agent_cwd` (where that agent runs; default $HOME)."""
+    s = _live_view()["settings"]
+    cwd = (s.get("agent_cwd") or "").strip()
+    return {"mode": str(s.get("agent_mode", "")).strip().lower() in ("1", "true", "on", "yes"),
+            "cwd": os.path.expanduser(cwd) if cwd else os.path.expanduser("~")}
 
 
 AO_IGNORE_STREAK_OFF = 3    # consecutive ignored turns that put the brakes on… (Jared's numbers)
@@ -1250,7 +1273,7 @@ def day_start(now: datetime) -> datetime:
     return start - timedelta(days=1) if local < start else start
 
 
-def recent_context(db: Supabase) -> str:
+def recent_context() -> str:
     """THE WHOLE DAY, replayed into a FRESH claude run instead of using --resume. We keep our own clean
     transcript in voice_messages (each turn's user prompt + final assistant reply), so a fresh process
     gets exactly the conversation and NONE of the CLI-session baggage — tool schemas, thinking blocks,
@@ -1263,25 +1286,13 @@ def recent_context(db: Supabase) -> str:
     deliberately omitted — a follow-up that needs live data just re-fetches with a tool."""
     now = datetime.now(timezone.utc)
     since = day_start(now)
-    try:
-        reset = db.get("app_settings", "key=eq.voice_reset_at&select=value")
-        at = _parse_ts((reset or [{}])[0].get("value") or "") if reset else None
-        if at and at > since:
-            since = at
-    except Exception:  # noqa: BLE001
-        pass
-    rows: list = []
-    try:
-        while True:
-            page = db.get("voice_messages",
-                          "focus=eq.hub&mode=eq.hub&role=in.(user,assistant)&done=eq.true"
-                          f"&created_at=gte.{since.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z')}"
-                          f"&order=created_at.asc&limit=1000&offset={len(rows)}&select=role,text,created_at,ignored")
-            rows += page or []
-            if not page or len(page) < 1000:
-                break
-    except Exception:  # noqa: BLE001
-        return ""
+    live = _live_view()
+    reset = _parse_ts(live["settings"].get("voice_reset_at") or "")
+    if reset and reset > since:
+        since = reset
+    rows = sorted((r for r in live["thread"]
+                   if r.get("done") and (_parse_ts(r.get("created_at") or "") or since) >= since),
+                  key=lambda r: r.get("created_at") or "")
     # An ignored turn is marked rather than hidden. Unmarked, room chatter would replay as things Jared
     # said TO the assistant; marked, he can point at one — "do the one you ignored" — and the model can
     # see both what was said and that nothing was done about it.
@@ -1682,7 +1693,7 @@ class SdkRunner:
             allowed_tools=list(SAFE_TOOLS),
             disallowed_tools=list(SESSION_TOOLS),   # browser-only: out of sight, so never a reason to escalate
             # The stable hub framing lives here so the prefix caches across turns; per-turn context
-            # (the govee device list, the replayed conversation) rides on the prompt instead.
+            # (the replayed conversation) rides on the prompt instead.
             system_prompt={"type": "preset", "preset": "claude_code",
                            "append": HUB_SYSTEM + "\n\n" + SHARED_STATE_NOTE,
                            "exclude_dynamic_sections": True},
@@ -1793,11 +1804,8 @@ class SdkRunner:
 SDK = SdkRunner()
 
 
-def get_focus(db: Supabase) -> str:
-    rows = db.get("voice_focus", "id=eq.1&select=focus")
-    if rows and isinstance(rows, list) and rows[0].get("focus"):
-        return rows[0]["focus"]
-    return "hub"  # safe default
+def get_focus() -> str:
+    return _live_view()["focus"]
 
 
 def inject_to_terminal(text: str) -> tuple[bool, str | None]:
@@ -2156,7 +2164,7 @@ def process_request(db: Supabase, req: dict) -> None:
         log(f"ignored {transcript!r}: nothing said")
         return
 
-    focus = get_focus(db)
+    focus = get_focus()
 
     # Focus is a specific Mac session → inject the transcript into that session's
     # wall terminal (the orchestrator owns the live `claude --resume` pty) instead
@@ -2174,11 +2182,10 @@ def process_request(db: Supabase, req: dict) -> None:
         return
 
     # Dedup: multiple always-on listeners (ESP + Mac) hear one utterance, so it lands as several requests
-    # a few seconds apart. If a near-simultaneous, near-identical transcript was already handled, drop this
-    # one so the command never runs twice. v1 keeps the earlier request; quality-ranked pick comes later.
-    # Typed input (source 'web') can't be double-heard — and it has no capture window, so the enqueue-time
-    # fallback would wrongly swallow two deliberate sends inside 10s. Mic sources only.
-    if (req.get("source") or "").strip() != "web" and _duplicate_of_recent(db, req):
+    # a few seconds apart. If an overlapping capture was already handled, drop this one so the command
+    # never runs twice. Only an always-on capture can be double-heard: a press, a watch command or a
+    # typed message comes from one device on purpose, so it skips the check and the read it costs.
+    if req.get("always_on") and _duplicate_of_recent(db, req):
         db.patch("voice_requests", f"id=eq.{rid}",
                  {"status": "done", "result": "(duplicate — dropped)", "updated_at": now_iso()})
         log(f"dropped duplicate request {rid}: {transcript[:60]!r}")
@@ -2204,7 +2211,7 @@ def process_request(db: Supabase, req: dict) -> None:
             log(f"agent session: resuming {resume_id}")
     else:
         resume_id = None
-        ctx = recent_context(db)
+        ctx = recent_context()
         log(f"hub: fresh run + {len(ctx)} chars injected conversation" if ctx else "hub: fresh run (no prior context)")
 
     # Surface tool calls live by pushing them straight to the hub's activity bar (transient — not
@@ -2311,12 +2318,9 @@ def process_request(db: Supabase, req: dict) -> None:
     ping_esp_led("blink")   # working — the ESP light blinks for EVERY command, not just ESP-sourced ones
     push_activity(transcript[:240], "working")   # bottom-strip: the prompt being worked
 
-    # Role framing first, then the live govee device list (when there are lights). Full-agent mode swaps the
-    # locked-down hub framing for the unrestricted all-purpose framing.
+    # Role framing. Full-agent mode swaps the locked-down hub framing for the unrestricted all-purpose
+    # framing. The lights are not listed here: a turn that needs them calls the govee `list_lights` tool.
     sys_ctx = (AGENT_SYSTEM if use_agent else HUB_SYSTEM) + "\n\n" + SHARED_STATE_NOTE
-    govee = govee_context()
-    if govee:
-        sys_ctx += "\n\n" + govee
     # Photo turns: pull the attachment objects local so Read can view them, and put the paths + the ONE-item
     # framing on the prompt. Photos go straight to Opus in the dispatch below.
     att_tmp, att_paths = None, []
@@ -2359,7 +2363,7 @@ def process_request(db: Supabase, req: dict) -> None:
         # model saw a token; the warm client pays it once.
         # Errors never upgrade the model: on 2026-08-30 an error-escalation turned every noise judgment
         # into a fresh Opus spawn — 291 in one evening.
-        fast_prompt = ((govee + "\n\n") if govee else "") + hub_prompt + ESCALATE_DIRECTIVE
+        fast_prompt = hub_prompt + ESCALATE_DIRECTIVE
         result = run_subscription(lambda: SDK.run(fast_prompt, on_event=_emit, ambient=ambient),
                                   "subscription fast path")
         st = (result.get("text") or "").strip().lower()
@@ -2534,6 +2538,8 @@ class RealtimeWaker:
                 # bindings on the same table (same note in mac-listener/listener.py).
                 ch.on_postgres_changes("*", callback=self._on_change,
                                        schema="public", table="voice_requests")
+                for t in ("app_settings", "voice_focus", "voice_messages"):   # the live state's feeds
+                    ch.on_postgres_changes("*", callback=self._on_live, schema="public", table=t)
                 await ch.subscribe(self._on_sub)
                 # Recycle the socket every ~5 min even while it still reports is_connected: a HALF-OPEN
                 # subscription stays "connected" but silently stops delivering INSERTs, stranding commands on
@@ -2574,8 +2580,18 @@ class RealtimeWaker:
         if str(rec.get("status") or "") == "pending":
             self.event.set()
 
+    def _on_live(self, payload) -> None:
+        try:
+            d = payload.get("data") or {}
+            live_event(str(d.get("table") or ""), str(d.get("type") or "").split(".")[-1].upper(),
+                       d.get("record") or {}, d.get("old_record") or {})
+        except Exception as e:  # noqa: BLE001 — a bad frame must not take the listener down
+            log(f"live event failed: {e}")
+
     def _on_sub(self, state, err=None) -> None:
         self.healthy = "SUBSCRIBED" in str(state).upper()   # any other state (TIMED_OUT/CLOSED/ERROR) → degraded poll
+        if self.healthy:   # a fresh subscription missed whatever happened while it was down: reload
+            threading.Thread(target=live_load, name="live-load", daemon=True).start()
         log(f"realtime subscription: {state}{(' err=' + str(err)) if err else ''}")
 
     def wait(self, timeout: float) -> bool:
