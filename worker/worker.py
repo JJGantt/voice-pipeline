@@ -2538,6 +2538,9 @@ def process_request(db: Supabase, req: dict) -> None:
     #     voice command it's the wrong anchor: it reads at claim/transcription time, ~25s after he
     #     started speaking on a HEALTHY run and much later when the Mac worker is down and the job falls
     #     through to the Pi or Fly, so every "in N minutes" would quietly lose that lag.
+    # To the SECOND, in both the readable clock and the literal occurred_at value: a set's stamp is the
+    # zero of the watch's m:ss rest clock, and a minute-precision stamp let the model pass HH:MM:00,
+    # which started that clock up to 59s before he had finished the set.
     # Rides on the prompt, NOT the cached system block, so it can't change the per-command system prefix
     # and break the prompt cache.
     _cap = _parse_ts((req.get("capture_start") or "").strip())
@@ -2545,21 +2548,21 @@ def process_request(db: Supabase, req: dict) -> None:
     _m = re.match(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})$", client_now)
     if _cap:
         _now = _cap.astimezone()   # UTC capture stamp → this machine's local wall clock
-        _now_str = _now.strftime("%A, %B %-d, %Y, %-I:%M %p %Z")
+        _now_str = _now.strftime("%A, %B %-d, %Y, %-I:%M:%S %p %Z")
     elif _m:
         _now = datetime(*(int(x) for x in _m.groups()))
-        _now_str = _now.strftime("%A, %B %-d, %Y, %-I:%M %p")
+        _now_str = _now.strftime("%A, %B %-d, %Y, %-I:%M:%S %p")
     else:
         _now = datetime.now().astimezone()
-        _now_str = _now.strftime("%A, %B %-d, %Y, %-I:%M %p %Z")
+        _now_str = _now.strftime("%A, %B %-d, %Y, %-I:%M:%S %p %Z")
     prompt += ("\n\n[This command was said/typed at " + _now_str + " ("
                + _now.strftime("%Y-%m-%d") + ") — treat THAT as 'now'. Anchor every relative date/time to "
                "it: both relative dates — 'today', 'yesterday', 'last night', 'this morning', 'last week' "
                "— and relative arithmetic — 'in 11 minutes', 'an hour from now'. Never your training data, "
                "and never your own guess at the current instant: the pipeline took some seconds to reach "
                "you and that lag is not part of what he asked for. When logging something for 'now' (no "
-               "different time named), pass this exact moment as occurred_at (YYYY-MM-DDTHH:MM:SS) to the "
-               "logging tool explicitly rather than omitting it — the tool's own clock may not be wherever "
+               "different time named), pass this exact moment as occurred_at — " + _now.strftime("%Y-%m-%dT%H:%M:%S")
+               + ", seconds included — to the logging tool explicitly rather than omitting it — the tool's own clock may not be wherever "
                "this was actually said/typed.]")
     # Where he was, when the device sent it (voice_requests.location). One line on the prompt, and the
     # same line for the data MCP to pass to any session this turn starts.
