@@ -177,6 +177,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("voice")
 
 groq = Groq(api_key=os.environ["GROQ_API_KEY"])
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")   # second transcription provider, after Groq
 oww = Model(wakeword_models=[WAKE_MODEL, WAKE_MODEL_POWER], inference_framework="onnx")
 
 
@@ -268,7 +269,19 @@ async def transcribe(pcm: bytes) -> str:
     except Exception as e:  # noqa: BLE001 — one retry for transient Groq/network blips
         log.warning("Groq transcription failed (%s) — retrying once", e)
         await asyncio.sleep(0.5)
-        result = await asyncio.to_thread(_call)   # a second failure propagates to the caller
+        try:
+            result = await asyncio.to_thread(_call)
+        except Exception as e2:  # noqa: BLE001 — Groq is down: OpenAI's Whisper is the second provider
+            if not OPENAI_API_KEY:
+                raise
+            log.warning("Groq failed again (%s) — trying OpenAI", e2)
+            async with httpx.AsyncClient(timeout=30) as c:
+                r = await c.post("https://api.openai.com/v1/audio/transcriptions",
+                                 headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                                 data={"model": "whisper-1", "response_format": "text", "language": "en"},
+                                 files={"file": ("utterance.wav", wav, "audio/wav")})
+                r.raise_for_status()   # a failure here propagates to the caller, as before
+                result = r.text
     return _heard((result if isinstance(result, str) else getattr(result, "text", "")).strip())
 
 

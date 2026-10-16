@@ -207,6 +207,15 @@ Repairing it means clearing npm's leftover `.claude-code-*` temp directory under
 `~/.npm-global/lib/node_modules/@anthropic-ai/` (npm refuses with `ENOTEMPTY` while it is there) and
 reinstalling `@anthropic-ai/claude-code`.
 
+## The last transcriber is the Mac
+
+Every capture path tries Groq, then OpenAI's Whisper (`OPENAI_API_KEY`). When both fail on a watch or
+phone command, the hub keeps the clip and queues the row `untranscribed` — only while the Mac worker is
+heartbeating, since it is the only host with a local Whisper. The Mac's worker takes it on the realtime
+event that attaches `audio` (and on each subscribe, for one it missed), runs `whisper-cli` with
+`ggml-small.en`, and turns it `pending`. Any worker closes an `untranscribed` row older than
+`UNTRANSCRIBED_MAX_S` (75s, under the 90s stuck-`transcribing` sweep) as an error and investigates.
+
 ## Orphans: a worker that dies mid-run
 
 A claim carries `claim_epoch`, a random id per worker PROCESS that its heartbeat also publishes. A worker
