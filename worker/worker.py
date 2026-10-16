@@ -2425,7 +2425,8 @@ def fallback_directive(db: Supabase, rid: str) -> str:
     """What a fallback command's run is told. The FIRST fallback command of an outage starts the
     troubleshooting session; later ones within FALLBACK_OUTAGE_S only say the fallback is in use, so a
     morning of commands during one outage is one investigation, not one per command."""
-    since = (datetime.now(timezone.utc) - timedelta(seconds=FALLBACK_OUTAGE_S)).isoformat()
+    # Z, not +00:00: a '+' in a query string reads as a space, and the filter then fails outright.
+    since = (datetime.now(timezone.utc) - timedelta(seconds=FALLBACK_OUTAGE_S)).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
         earlier = db.get("voice_requests", f"source=eq.watch-fallback&id=neq.{rid}&created_at=gte.{since}&select=id&limit=1")
     except Exception:  # noqa: BLE001 — unknown: investigate rather than stay quiet
