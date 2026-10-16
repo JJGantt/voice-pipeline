@@ -908,15 +908,26 @@ def open_request(cap_start: str, cap_end: str) -> str | None:
 
 
 def update_request_pending(rid: str, text: str) -> None:
-    """Fill the lifecycle row in with the transcript and hand it to the workers (status 'pending')."""
-    try:
-        httpx.patch(f"{SUPABASE_URL}/rest/v1/voice_requests?id=eq.{rid}",
-                    headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
-                             "Content-Type": "application/json", "Prefer": "return=minimal"},
-                    json={"transcript": text, "status": "pending",
-                          "updated_at": datetime.now(timezone.utc).isoformat()}, timeout=10)
-    except Exception as e:  # noqa: BLE001
-        log(f"enqueue (update) failed: {e}")
+    """Fill the lifecycle row in with the transcript and hand it to the workers (status 'pending').
+    Checked and retried, and guarded on 'transcribing' so a late write cannot revive a row the worker's
+    sweep already closed — unchecked, a failed write left the transcript stranded until that sweep."""
+    for pause in (0.5, 1.0, 2.0, None):
+        try:
+            r = httpx.patch(f"{SUPABASE_URL}/rest/v1/voice_requests?id=eq.{rid}&status=eq.transcribing",
+                            headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                                     "Content-Type": "application/json", "Prefer": "return=representation"},
+                            json={"transcript": text, "status": "pending",
+                                  "updated_at": datetime.now(timezone.utc).isoformat()}, timeout=10)
+            r.raise_for_status()
+            if not r.json():
+                log(f"enqueue: row {rid} is no longer transcribing; transcript dropped")
+                return
+            return
+        except Exception as e:  # noqa: BLE001
+            if pause is None:
+                log(f"enqueue (update) failed: {e}")
+                return
+            time.sleep(pause)
 
 
 def close_request_error(rid: str, err: str) -> None:

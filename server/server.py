@@ -355,16 +355,31 @@ async def handle_transcript(text: str, duration_s: float, truncated: bool,
         async with httpx.AsyncClient(timeout=10) as c:
             if rid and SUPABASE_SERVICE_KEY:
                 now = datetime.now(timezone.utc).isoformat()
-                await c.patch(
-                    f"{SUPABASE_URL}/rest/v1/voice_requests?id=eq.{rid}",
-                    headers={"apikey": SUPABASE_SERVICE_KEY,
-                             "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-                             "Content-Type": "application/json", "Prefer": "return=minimal"},
-                    # transcribed_at marks STT-done (transcribing→pending) so the created→claimed gap
-                    # splits into STT (created→transcribed_at) vs worker pickup (transcribed_at→claimed_at).
-                    json={"transcript": text, "status": "pending",
-                          "transcribed_at": now, "updated_at": now},
-                )
+                # Checked and retried: an unchecked PATCH that failed left the row 'transcribing' with
+                # the transcript in hand, until the worker's sweep closed it as a dead capturer. Guarded
+                # on 'transcribing' so a late write cannot revive a row the sweep already closed.
+                for pause in (0.5, 1.0, 2.0, None):
+                    try:
+                        r = await c.patch(
+                            f"{SUPABASE_URL}/rest/v1/voice_requests?id=eq.{rid}&status=eq.transcribing",
+                            headers={"apikey": SUPABASE_SERVICE_KEY,
+                                     "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                                     "Content-Type": "application/json", "Prefer": "return=representation"},
+                            # transcribed_at marks STT-done (transcribing→pending) so the created→claimed gap
+                            # splits into STT (created→transcribed_at) vs worker pickup (transcribed_at→claimed_at).
+                            json={"transcript": text, "status": "pending",
+                                  "transcribed_at": now, "updated_at": now},
+                        )
+                        r.raise_for_status()
+                        if not r.json():
+                            log.warning("lifecycle row %s is no longer transcribing; transcript dropped", rid)
+                            return False
+                        break
+                    except Exception as e:  # noqa: BLE001
+                        if pause is None:
+                            raise
+                        log.warning("enqueue patch failed (%s); retrying in %.1fs", e, pause)
+                        await asyncio.sleep(pause)
             else:
                 # Fallback (no lifecycle row): insert at enqueue, as before. The anon key is INSERT-only by RLS.
                 await c.post(

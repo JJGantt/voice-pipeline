@@ -30,12 +30,17 @@ routed once it gets here is `../docs/ROUTING.md`.
      goes silent past `OWNER_GRACE_S`, or the owner reports itself degraded.
    - **Degraded stands down:** a degraded worker does not claim while any other
      worker is healthy.
-   - **Failover deadline:** a request still pending `FAILOVER_S` (8s) after it was
-     created, with no worker busy on another request, is taken by whoever is
-     looking, deferral or not — a healthy worker claims in about a second, so an
-     idle one that has not is not going to. A standing-by worker sleeps to exactly
-     that deadline rather than its 120s backstop. While a worker IS busy the
-     follow-up waits for it on purpose: it queues behind the run it follows.
+   - **Failover deadline (`failover_wait`):** a request still pending `FAILOVER_S`
+     (8s) after it was created is taken by whoever is looking — a healthy worker
+     claims in about a second, so one that has not is not going to. The one
+     exception is the worker it is left to being mid-run itself: a follow-up queues
+     behind the run it follows, but for at most `BUSY_WAIT_S` (120s) of that run, so
+     a hung run cannot hold every command behind it. Another worker's run is no
+     reason to wait. A standing-by worker sleeps to exactly its deadline.
+   - **Desk hosts are not workers.** `desk` and `pi-desk` beat into the same
+     `worker_presence` table; every "is another worker up" question counts only
+     `WORKER_PRIORITY` members, and a presence with `info.stopping` or
+     `info.degraded` counts as down.
    - **Atomic claim:** `PATCH ...&status=eq.pending` → `claimed`. If the returned
      representation is empty, someone else won the race — skip.
    - **Handed-off requests:** a request listing workers in `failed_on` is never
@@ -201,6 +206,27 @@ non-executable placeholder.
 Repairing it means clearing npm's leftover `.claude-code-*` temp directory under
 `~/.npm-global/lib/node_modules/@anthropic-ai/` (npm refuses with `ENOTEMPTY` while it is there) and
 reinstalling `@anthropic-ai/claude-code`.
+
+## Orphans: a worker that dies mid-run
+
+A claim carries `claim_epoch`, a random id per worker PROCESS that its heartbeat also publishes. A worker
+restarted mid-run — a deploy, `pull-repos`, a SIGKILL at the unit's stop timeout — comes back under the
+same name with a fresh heartbeat, so only the epoch shows its old claim is dead. `reclaim_stale` (every
+`RECLAIM_SWEEP_S` and at startup, whatever is pending) releases an orphan: back to `pending` with the
+owner in `failed_on` when it had not acted, closed as an error and investigated when it had (it may be
+half-done) or when it is older than the conversation window.
+
+**Acted** means the turn called a tool that changes something: anything but `get_*`, `list_*`,
+`search_*`, `find_*`, web search/fetch and the feeder's status reads (`replay_safe`). The first such call
+stamps `acted_at`. A failure after reads only is still handed on; a crash in `process_request` is handed
+on the same way.
+
+A pending row whose `failed_on` already holds every healthy worker — the one it was handed to died
+before claiming — is **stranded**; the same sweep clears its `failed_on` so everyone may try again.
+
+On SIGTERM the worker heartbeats `info.stopping` at once and wakes its main loop, so others stop
+deferring to it and an idle worker exits in a moment rather than at the stop timeout. On Fly,
+`entrypoint.sh` restarts the worker whenever it exits.
 
 ## Failure alerts
 

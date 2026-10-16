@@ -211,6 +211,8 @@ SUBSCRIPTION_RETRY_S = (3, 8, 15)
 
 def transient_failure(err: str) -> bool:
     e = (err or "").lower()
+    if e.startswith("claude timed out"):
+        return False   # our own watchdog: a hung run hangs again, and each retry holds the claim 300s more
     if classify_failure(err) == "rate-limit":
         return True
     return any(t in e for t in ("529", "500", "502", "503", "504", "internal server error", "timed out",
@@ -369,6 +371,7 @@ NET_DEGRADED_S = 180.0
 # takes it anyway. A healthy worker claims in about a second; an idle one that has not claimed in this long
 # is not going to. A preferred worker that is busy keeps its follow-ups, which queue behind its run.
 FAILOVER_S = 8.0
+BUSY_WAIT_S = 120.0   # longest a request waits behind the run of the worker it is left to (failover_wait)
 DEDUP_WINDOW_S = 10.0         # fallback only: 2 mics' enqueue times for rows that predate capture-window stamping
 DEDUP_TOL_S = 0.75            # pad each recording window by this (Fly↔Mac clock skew + ESP→Fly stream latency)
 # A mic still hearing Jared means the utterance is NOT FINISHED, whoever else has already enqueued a
@@ -849,12 +852,22 @@ class Supabase:
 # --------------------------------------------------------------------------- #
 
 
+# This PROCESS, as opposed to this host. Claims carry it (`claim_epoch`) and the heartbeat publishes
+# it, so a claim left by a process that died and came back under the same WORKER_ID — a restart
+# mid-run, a deploy, a SIGKILL at the unit's stop timeout — is recognisable as orphaned even though
+# the host's heartbeat is fresh.
+WORKER_EPOCH = uuid.uuid4().hex[:12]
+_stopping = False   # set by the signal handler: others stop deferring to a worker on its way out
+
+
 def heartbeat(db: Supabase) -> None:
-    db.upsert(
-        "worker_presence",
-        {"worker": WORKER_ID, "last_seen": now_iso(), "info": {"degraded": True} if degraded() else {}},
-        on_conflict="worker",
-    )
+    info = {"epoch": WORKER_EPOCH}
+    if degraded():
+        info["degraded"] = True
+    if _stopping:
+        info["stopping"] = True
+    db.upsert("worker_presence", {"worker": WORKER_ID, "last_seen": now_iso(), "info": info},
+              on_conflict="worker")
 
 
 def _parse_ts(s: str):
@@ -898,29 +911,29 @@ def presence_rows(db: Supabase) -> list:
 
 
 def _healthy(row: dict, window_s: float = HEARTBEAT_FRESH_S) -> bool:
-    """A presence row that is fresh AND not reporting a degraded link."""
-    if (row.get("info") or {}).get("degraded"):
+    """A presence row that is fresh AND not reporting a degraded link or a shutdown."""
+    info = row.get("info") or {}
+    if info.get("degraded") or info.get("stopping"):
         return False
     ts = _parse_ts(row.get("last_seen", ""))
     return bool(ts) and (datetime.now(timezone.utc) - ts).total_seconds() <= window_s
 
 
-def other_worker_healthy(db: Supabase) -> bool:
-    return any(r.get("worker") != WORKER_ID and _healthy(r) for r in presence_rows(db))
+def other_worker_healthy(db: Supabase, exclude: "set | frozenset" = frozenset()) -> bool:
+    """Whether another VOICE worker (not a desk session host, which beats into the same table) is healthy
+    and not in `exclude` — the workers a request has already failed on."""
+    return bool(untried_workers(db, {WORKER_ID} | set(exclude)))
 
 
-def higher_priority_present(db: Supabase, exclude: "set | frozenset" = frozenset()) -> bool:
-    """True if any worker ranked ABOVE me in WORKER_PRIORITY has a fresh heartbeat. `exclude` names
-    workers that do not count — the ones a handed-off request has already failed on."""
+def higher_priority_target(db: Supabase, exclude: "set | frozenset" = frozenset()) -> str | None:
+    """The highest-ranked healthy worker ABOVE me in WORKER_PRIORITY, not in `exclude`, or None."""
     try:
         my_rank = WORKER_PRIORITY.index(WORKER_ID)
     except ValueError:
         # I'm not in the priority list — assume lowest, defer to nobody specific.
         my_rank = len(WORKER_PRIORITY)
-    higher = set(WORKER_PRIORITY[:my_rank]) - set(exclude)
-    if not higher:
-        return False
-    return any(row.get("worker") in higher and _healthy(row) for row in presence_rows(db))
+    healthy = {r.get("worker") for r in presence_rows(db) if _healthy(r)}
+    return next((w for w in WORKER_PRIORITY[:my_rank] if w not in exclude and w in healthy), None)
 
 
 def context_owner(db: Supabase) -> str | None:
@@ -967,15 +980,31 @@ def context_owner(db: Supabase) -> str | None:
     return None
 
 
-def should_defer(db: Supabase) -> bool:
-    """Whether THIS worker should NOT claim right now. Affinity first: if a live context window is owned by
-    a DIFFERENT worker that is still online, defer to it so the conversation stays on one worker and keeps
-    its context — this OVERRIDES normal priority. If I own the live window, claim (continue my own context).
-    Otherwise (no live window, or the owner went offline) fall back to priority ordering."""
+def defer_target(db: Supabase, tried: "set | frozenset" = frozenset()) -> str | None:
+    """The worker THIS one should leave a request to, or None to claim it. Affinity first: a live context
+    window owned by a DIFFERENT worker that is still online keeps the conversation there, over priority;
+    if I own it, I claim. Otherwise priority ordering. A request other workers have already failed on
+    (`tried`) skips affinity — the owner is likely the worker that just failed it — and goes to the
+    highest-ranked worker that has not tried it."""
+    if tried:
+        return higher_priority_target(db, tried)
     owner = context_owner(db)
     if owner is not None:
-        return owner != WORKER_ID
-    return higher_priority_present(db)
+        return None if owner == WORKER_ID else owner
+    return higher_priority_target(db)
+
+
+def should_defer(db: Supabase) -> bool:
+    return defer_target(db) is not None
+
+
+# Tools that only read. Running a turn again after any of these repeats nothing, so a failure after
+# them is still handed on; any other tool marks the turn as having acted.
+REPLAY_SAFE = {"WebSearch", "WebFetch", "Read", "feeder_status", "food_level"}
+
+
+def replay_safe(tool: str) -> bool:
+    return tool.startswith(("get_", "list_", "search_", "find_")) or tool in REPLAY_SAFE
 
 
 def claude_unready() -> str | None:
@@ -1470,6 +1499,18 @@ def write_mcp_config() -> str:
     return path
 
 
+def _kill_group(proc) -> None:
+    """Kill a run and everything it started. A grandchild holding stdout open would otherwise keep the
+    stream reader from ever reaching EOF, and the claim with it."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except Exception:  # noqa: BLE001
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def run_claude(transcript: str, resume_session_id: str | None, on_event=None, system_append: str = "",
                model: str = HUB_MODEL, agent: bool = False, cwd: str | None = None,
                allow_read: bool = False, allowed_tools: "list | None" = None,
@@ -1542,6 +1583,7 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1, env=sub_env, cwd=cwd,  # line-buffered; cwd is where a full agent operates
+            start_new_session=True,   # its own process group, so a kill reaches anything it spawned
         )
         # Watchdog: kill the run if it exceeds the timeout, which ends the streaming loop at EOF.
         done = threading.Event()
@@ -1549,10 +1591,7 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
         def _watchdog():
             if not done.wait(timeout_s):
                 timed_out["v"] = True
-                try:
-                    proc.kill()
-                except Exception:  # noqa: BLE001
-                    pass
+                _kill_group(proc)
 
         threading.Thread(target=_watchdog, daemon=True).start()
 
@@ -1619,7 +1658,10 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
                     raw_error = ev.get("result") or "claude reported is_error"
 
         done.set()
-        proc.wait(timeout=5)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:   # stdout closed but the process lingers: the reply is already in
+            _kill_group(proc)
         stderr = "".join(err_buf)
         t_end = time.monotonic()
         if t_spawn:                       # latency breakdown of this run (where the seconds actually go)
@@ -1646,10 +1688,7 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
         }
     except Exception as e:  # noqa: BLE001
         if proc is not None:
-            try:
-                proc.kill()
-            except Exception:  # noqa: BLE001
-                pass
+            _kill_group(proc)
         return {
             "session_id": session_id,
             "text": "",
@@ -1916,61 +1955,71 @@ def sweep_stuck_transcribing(db: Supabase) -> None:
         log(f"transcribing sweep failed: {e}")
 
 
-def reclaim_stale(db: Supabase) -> dict | None:
-    """Recover a request stuck in 'claimed' by a worker that died mid-run (OOM, sleep, power loss).
+def reclaim_stale(db: Supabase) -> None:
+    """Release requests no live process is working on, so a worker takes them.
 
-    Presence-gated, NOT a timer on the work itself: the claimer heartbeats every 10s from its own
-    thread even during a long command, so while its worker_presence.last_seen is fresh the claim is
-    never touched — however long the command runs. A stale heartbeat (+ a claim older than the same
-    freshness window, so a just-claimed row whose owner hasn't beaten yet isn't stolen) can only mean
-    the owner is gone; without this, such rows sat 'claimed' forever and were silently never answered.
+    An ORPHAN is a claimed row whose process is gone: its owner's heartbeat is stale, or the owner is up
+    under a different `claim_epoch` — a worker that died mid-run and came back under the same name, which
+    a heartbeat alone can never show. One that had not acted (`acted_at` empty) goes back to pending with
+    the owner in `failed_on`, and the realtime UPDATE sends the next worker to it. One that HAD acted may
+    be half-done, so it is not replayed: it ends as an error and is investigated. So does an orphan older
+    than the conversation window, which would be stale to run.
 
-    Fresh-enough orphans (within the hub's own session_reset_s staleness boundary) are re-claimed and
-    re-run; older ones are closed as errors — replaying a command from hours ago would be worse than
-    dropping it. The re-claim PATCH is guarded on (status, claimed_by) so two reclaimers can't both win."""
+    A STRANDED row is pending with every healthy worker already in `failed_on` — the one it was handed
+    to died before claiming it. Its `failed_on` is cleared so everyone may try again; each failure hands
+    on until none is left and the last one ends it, so this cannot loop.
+
+    The sweep is a backstop on its own clock (RECLAIM_SWEEP_S, and once at startup), run whether or not
+    anything is pending."""
     global _last_reclaim_sweep
     now_mono = time.monotonic()
-    if now_mono - _last_reclaim_sweep < RECLAIM_SWEEP_S:
-        return None
+    if _last_reclaim_sweep and now_mono - _last_reclaim_sweep < RECLAIM_SWEEP_S:
+        return
     _last_reclaim_sweep = now_mono
-    rows = db.get(
-        "voice_requests",
-        "status=eq.claimed&order=created_at.asc&limit=5"
-        "&select=id,transcript,source,claimed_by,claimed_at,created_at",
-    )
-    if not rows:
-        return None
-    presence = {r.get("worker"): _parse_ts(r.get("last_seen", ""))
-                for r in presence_rows(db)}   # ≤30s-stale is fine — the liveness window is 90s
     now = datetime.now(timezone.utc)
-    for req in rows:
+    presence = {r.get("worker"): r for r in presence_rows(db)}
+    for req in db.get("voice_requests", "status=eq.claimed&order=created_at.asc&limit=20"
+                      "&select=id,transcript,claimed_by,claim_epoch,claimed_at,created_at,acted_at,failed_on") or []:
         owner = req.get("claimed_by") or ""
         if owner == WORKER_ID:
-            continue                      # my own in-flight row
-        beat = presence.get(owner)
-        if beat and (now - beat).total_seconds() <= HEARTBEAT_FRESH_S:
-            continue                      # owner alive — just still working
-        claimed_at = _parse_ts(req.get("claimed_at") or "")
-        if claimed_at and (now - claimed_at).total_seconds() <= HEARTBEAT_FRESH_S:
-            continue                      # claim newer than the freshness window — give the owner time
-        created = _parse_ts(req.get("created_at") or "")
-        if created and (now - created).total_seconds() > session_reset_s():
-            db.patch("voice_requests", f"id=eq.{req['id']}&status=eq.claimed&claimed_by=eq.{owner}",
-                     {"status": "error", "error": f"orphaned: worker '{owner}' went silent mid-run",
-                      "updated_at": now_iso()})
-            log(f"closed orphaned request {req['id']} (claimed by silent '{owner}', too old to replay)")
+            alive = req.get("claim_epoch") == WORKER_EPOCH
+        else:
+            p = presence.get(owner) or {}
+            ts = _parse_ts(p.get("last_seen", ""))
+            fresh = bool(ts) and (now - ts).total_seconds() <= HEARTBEAT_FRESH_S
+            epoch = (p.get("info") or {}).get("epoch")
+            alive = fresh and (not req.get("claim_epoch") or not epoch or epoch == req.get("claim_epoch"))
+            claimed_at = _parse_ts(req.get("claimed_at") or "")
+            if not alive and fresh is False and claimed_at and (now - claimed_at).total_seconds() <= HEARTBEAT_FRESH_S:
+                continue   # stale heartbeat but a claim newer than the window: give the owner its chance
+        if alive:
             continue
-        got = db.patch(
-            "voice_requests",
-            f"id=eq.{req['id']}&status=eq.claimed&claimed_by=eq.{owner}",
-            {"status": "claimed", "claimed_by": WORKER_ID, "claimed_at": now_iso(),
-             "assigned_to": WORKER_ID, "updated_at": now_iso()},
-            extra_headers={"Prefer": "return=representation"},
-        )
-        if got:
-            log(f"reclaimed request {req['id']} from silent worker '{owner}'")
-            return got[0]
-    return None
+        guard = f"id=eq.{req['id']}&status=eq.claimed&claimed_by=eq.{owner}"
+        created = _parse_ts(req.get("created_at") or "")
+        what = f"Request {req['id']} ({(req.get('transcript') or '')[:200]!r}) was orphaned by '{owner}'"
+        if req.get("acted_at") or (created and (now - created).total_seconds() > session_reset_s()):
+            why = ("it had already acted, so it may be half-done and was not replayed" if req.get("acted_at")
+                   else "it is too old to run now")
+            if db.patch("voice_requests", guard,
+                        {"status": "error", "error": f"orphaned: '{owner}' died mid-run; {why}", "updated_at": now_iso()},
+                        extra_headers={"Prefer": "return=representation"}):
+                log(f"closed orphaned request {req['id']} from '{owner}': {why}")
+                alert_failure("orphan", f"'{owner}' died mid-run", f"{what}; {why}. It ended as an error.")
+            continue
+        if db.patch("voice_requests", guard,
+                    {"status": "pending", "claimed_by": None, "claimed_at": None, "claim_epoch": None,
+                     "failed_on": sorted(set(req.get("failed_on") or []) | {owner}), "updated_at": now_iso()},
+                    extra_headers={"Prefer": "return=representation"}):
+            log(f"released orphaned request {req['id']} from '{owner}' back to pending")
+            alert_failure("orphan", f"'{owner}' died mid-run",
+                          f"{what} before it acted, and was put back to pending for another worker.")
+    for req in db.get("voice_requests", "status=eq.pending&failed_on=neq.{}&select=id,failed_on,created_at") or []:
+        created = _parse_ts(req.get("created_at") or "")
+        if created and (now - created).total_seconds() > FAILOVER_S and \
+                not untried_workers(db, set(req.get("failed_on") or [])):
+            if db.patch("voice_requests", f"id=eq.{req['id']}&status=eq.pending",
+                        {"failed_on": [], "updated_at": now_iso()}, extra_headers={"Prefer": "return=representation"}):
+                log(f"request {req['id']} was stranded (every healthy worker in failed_on) — cleared for a retry")
 
 
 def _mics_hearing(db: Supabase):
@@ -2016,17 +2065,25 @@ def _same_utterance(rows: list, first: dict) -> list:
     return group
 
 
-def overdue_for_failover(db: Supabase, waited_s: float) -> bool:
-    """Whether a pending request has waited past FAILOVER_S with no worker busy on anything else — the
-    worker it was waiting for is up but not claiming, so the next one takes it. While some other worker
-    holds an in-flight request the wait is deliberate: a follow-up queues behind the run it follows."""
+def failover_wait(db: Supabase, waited_s: float, target: str) -> float:
+    """Seconds still to leave a pending request to `target` before taking it; 0 means take it now.
+
+    FAILOVER_S from its creation: a healthy target claims in about a second, so one that has not is not
+    going to. Past that, the only reason to keep waiting is that `target` ITSELF is mid-run — a follow-up
+    queues behind the run it follows — and only for BUSY_WAIT_S of that run, because a run that hangs
+    would otherwise hold every command behind it for as long as it hangs. Another worker's run is no
+    reason to wait at all."""
     if waited_s < FAILOVER_S:
-        return False
-    busy = db.get("voice_requests", f"status=eq.claimed&claimed_by=neq.{WORKER_ID}&select=id&limit=1")
-    if busy:
-        return False
-    log(f"pending {waited_s:.0f}s with the preferred worker idle — taking it")
-    return True
+        return FAILOVER_S - waited_s
+    busy = db.get("voice_requests",
+                  f"status=eq.claimed&claimed_by=eq.{target}&select=claimed_at&order=claimed_at.desc&limit=1")
+    at = _parse_ts((busy or [{}])[0].get("claimed_at") or "") if busy else None
+    if at:
+        left = BUSY_WAIT_S - (datetime.now(timezone.utc) - at).total_seconds()
+        if left > 0:
+            return left
+    log(f"pending {waited_s:.0f}s and {target} has not taken it — taking it")
+    return 0.0
 
 
 def claim_one(db: Supabase) -> dict | None:
@@ -2044,40 +2101,44 @@ def claim_one(db: Supabase) -> dict | None:
         f"status=eq.pending&failed_on=not.cs.{{{WORKER_ID}}}&order=created_at.asc&limit=8"
         "&select=id,transcript,source,created_at,capture_start,capture_end,failed_on",
     )
+    reclaim_stale(db)   # orphans and stranded rows, on its own clock, whether or not anything is pending
     if not pending:
         _holding = False
         refresh_standby(db)
-        return reclaim_stale(db)
+        return None
 
     # A host that cannot start a turn does not claim: it marks what is pending as tried here, one write
     # each, and that UPDATE is the realtime wake that sends the next worker to it. Claiming first and
     # handing off after cost 1.17s of reads on the Pi before the check was reached; the check is ~13µs.
+    # A row no other healthy worker is left to try is claimed instead, and ends as an error the normal way.
     unready = claude_unready()
-    if unready and untried_workers(db, {WORKER_ID}):
-        for r in pending:
+    if unready:
+        passed = [r for r in pending
+                  if untried_workers(db, set(r.get("failed_on") or []) | {WORKER_ID})]
+        for r in passed:
             db.patch("voice_requests", f"id=eq.{r['id']}&status=eq.pending",
                      {"failed_on": sorted(set(r.get("failed_on") or []) | {WORKER_ID}), "updated_at": now_iso()})
-        log(f"passed {len(pending)} pending request(s) on unclaimed: {unready}")
-        alert_failure("request", unready, f"This host cannot start a turn, so it passed {len(pending)} pending "
-                      f"request(s) to the other workers unclaimed: {[r['id'] for r in pending]}.")
-        return None
+        if passed:
+            log(f"passed {len(passed)} pending request(s) on unclaimed: {unready}")
+            alert_failure("request", unready, f"This host cannot start a turn, so it passed {len(passed)} "
+                          f"pending request(s) to the other workers unclaimed: {[r['id'] for r in passed]}.")
+        pending = [r for r in pending if r not in passed]
+        if not pending:
+            return None
 
     global _failover_at
     oldest_at = _parse_ts(pending[0].get("created_at") or "")
     waited_s = (datetime.now(timezone.utc) - oldest_at).total_seconds() if oldest_at else 0.0
-    if degraded() and other_worker_healthy(db):
+    tried = set(pending[0].get("failed_on") or [])
+    if degraded() and other_worker_healthy(db, tried):
         # My own link is failing: a claim here could take minutes to answer while a healthy worker sits idle.
         _standby, _failover_at = True, 0.0
         return None
-    # A request another worker failed and handed on (`hand_off`) skips affinity — the context's owner is
-    # the worker that just failed it — and defers only to a higher-ranked worker that has not tried it.
-    tried = set(pending[0].get("failed_on") or [])
-    defer = higher_priority_present(db, exclude=tried) if tried else should_defer(db)
-    if defer and not overdue_for_failover(db, waited_s):
-        _standby = True   # a higher-priority worker is handling things → stand down to the slow cadence
-        # Only while the deadline is still ahead. Past it, the wait is behind a busy worker's run, which
-        # ends in that worker claiming the follow-up itself — nothing here needs to wake for it.
-        _failover_at = time.monotonic() + (FAILOVER_S - waited_s) + 0.5 if waited_s < FAILOVER_S else 0.0
+    target = defer_target(db, tried)
+    left = failover_wait(db, waited_s, target) if target else 0.0
+    if left > 0:
+        _standby = True   # another worker should take it → stand down until its chance runs out
+        _failover_at = time.monotonic() + left + 0.5   # a clock arrival, not a poll
         return None
     _standby, _failover_at = False, 0.0   # I'm eligible to claim → run the active cadence
 
@@ -2119,6 +2180,7 @@ def claim_one(db: Supabase) -> dict | None:
         {
             "status": "claimed",
             "claimed_by": WORKER_ID,
+            "claim_epoch": WORKER_EPOCH,
             "claimed_at": now_iso(),
             "assigned_to": WORKER_ID,
             "updated_at": now_iso(),
@@ -2219,6 +2281,8 @@ def process_request(db: Supabase, req: dict) -> None:
     if focus != "hub":
         log(f"focus={focus!r}: injecting into wall terminal via orchestrator")
         ok, err = inject_to_terminal(transcript)
+        if not ok and hand_off(db, req, err or "inject failed"):
+            return   # only the Mac runs the orchestrator; another worker may reach it
         db.patch(
             "voice_requests",
             f"id=eq.{rid}",
@@ -2262,9 +2326,9 @@ def process_request(db: Supabase, req: dict) -> None:
         log(f"hub: fresh run + {len(ctx)} chars injected conversation" if ctx else "hub: fresh run (no prior context)")
 
     # Surface tool calls live by pushing them straight to the hub's activity bar (transient — not
-    # stored in voice_messages, so they never appear in the conversation thread). It also counts them:
-    # a failed turn that called no tool can run again elsewhere without repeating anything (`hand_off`).
-    tools_called = [0]
+    # stored in voice_messages, so they never appear in the conversation thread). The first one that
+    # CHANGES something marks the request acted (`req["_acted"]`, and `acted_at` on the row): until then
+    # a failed or orphaned turn can run again elsewhere without repeating anything.
 
     def _emit(kind, payload):
         if kind == "text":
@@ -2276,9 +2340,12 @@ def process_request(db: Supabase, req: dict) -> None:
             return
         if kind != "tool":
             return
-        tools_called[0] += 1
         name = str(payload.get("name") or "")
         short = name.rsplit("__", 1)[-1] if "__" in name else name
+        if not req.get("_acted") and not replay_safe(short):
+            req["_acted"] = True
+            threading.Thread(target=db.patch, daemon=True,
+                             args=("voice_requests", f"id=eq.{rid}", {"acted_at": now_iso()})).start()
         try:
             args = payload.get("input")
             argstr = json.dumps(args, ensure_ascii=False, separators=(",", ":")) if args else ""
@@ -2461,7 +2528,7 @@ def process_request(db: Supabase, req: dict) -> None:
 
     # A failure here is this machine's, not the command's, until every machine has tried it: hand it on.
     # Nothing has been written to the thread yet, so the worker that takes it writes the whole turn.
-    if not result.get("ok") and not tools_called[0] and hand_off(db, req, result.get("raw_error") or "unknown error"):
+    if not result.get("ok") and not req.get("_acted") and hand_off(db, req, result.get("raw_error") or "unknown error"):
         return
 
     # Tag every row with the mode so the hub UI can show this mode's thread separately and switch live.
@@ -2524,7 +2591,7 @@ def process_request(db: Supabase, req: dict) -> None:
         )
         log(f"ERROR request {rid}: {err}")
         alert_failure("request", err, f"Request {rid} ({transcript[:200]!r}) ENDED AS AN ERROR here: "
-                      + ("it had already called a tool, so it was not handed on." if tools_called[0] else
+                      + ("it had already acted, so it was not handed on." if req.get("_acted") else
                          f"no healthy worker was left untried (failed_on {req.get('failed_on') or []})."))
 
 
@@ -2657,10 +2724,27 @@ class RealtimeWaker:
 _running = True
 
 
+_waker = None   # the RealtimeWaker, so a signal can cut the main loop's wait short
+
+
 def _handle_signal(signum, frame):  # noqa: ARG001
-    global _running
-    _running = False
+    """Stop after the current iteration. Says so in the heartbeat at once, so no worker keeps deferring
+    to one on its way out, and wakes the main loop so an idle worker exits in a moment instead of
+    sleeping out its poll past the unit's stop timeout (which then SIGKILLs it)."""
+    global _running, _stopping
+    _running, _stopping = False, True
     log(f"received signal {signum}; shutting down after current iteration")
+
+    def _announce():
+        try:
+            with httpx.Client(timeout=5) as c:
+                heartbeat(Supabase(c))
+        except Exception:  # noqa: BLE001
+            pass
+
+    threading.Thread(target=_announce, daemon=True).start()
+    if _waker is not None:
+        _waker.event.set()
 
 
 def one_iteration(db: Supabase) -> bool:
@@ -2672,6 +2756,11 @@ def one_iteration(db: Supabase) -> bool:
         process_request(db, req)
     except Exception as e:  # noqa: BLE001 — a bug in processing must not kill the loop
         log(f"process_request crashed: {e}")
+        try:
+            if not req.get("_acted") and hand_off(db, req, f"process_request crashed: {e}"):
+                return True
+        except Exception:  # noqa: BLE001
+            pass
         try:
             db.patch(
                 "voice_requests",
@@ -2757,7 +2846,8 @@ def main() -> int:
             log(f"--once complete (processed={processed})")
             return 0
 
-        waker = RealtimeWaker()
+        global _waker
+        waker = _waker = RealtimeWaker()
         waker.start()   # event-driven claim; no-op fallback to polling if realtime is unavailable
 
         # Heartbeat on its own thread so a long command (a multi-minute agent run) never lets this
@@ -2771,7 +2861,11 @@ def main() -> int:
 
         try:
             while _running:
-                processed = one_iteration(db)
+                try:
+                    processed = one_iteration(db)
+                except Exception as e:  # noqa: BLE001 — a failed claim must not end the worker
+                    log(f"iteration failed: {e}")
+                    processed = False
                 # Loop quickly if we just worked (drain the queue); else wait for the next INSERT.
                 # waker.wait wakes instantly on a realtime INSERT; the timeout is only the missed-event
                 # backstop — slow while the subscription is healthy, tight when realtime is down.
