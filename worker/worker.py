@@ -981,14 +981,17 @@ def context_owner(db: Supabase) -> str | None:
 
 
 def defer_target(db: Supabase, tried: "set | frozenset" = frozenset()) -> str | None:
-    """The worker THIS one should leave a request to, or None to claim it. Affinity first: a live context
-    window owned by a DIFFERENT worker that is still online keeps the conversation there, over priority;
-    if I own it, I claim. Otherwise priority ordering. A request other workers have already failed on
+    """The worker THIS one should leave a request to, or None to claim it. In full-agent mode, affinity
+    first: a live context window owned by a DIFFERENT worker that is still online keeps the conversation
+    there, over priority; if I own it, I claim. Otherwise priority ordering. A request other workers have already failed on
     (`tried`) skips affinity — the owner is likely the worker that just failed it — and goes to the
     highest-ranked worker that has not tried it."""
     if tried:
         return higher_priority_target(db, tried)
-    owner = context_owner(db)
+    # Affinity only in full-agent mode, whose CLI session lives on one machine. A hub turn is a fresh run
+    # handed the day's thread from the live state, which every worker holds, so keeping it on the last
+    # claimer bought nothing — and kept commands on a slower worker for up to an hour.
+    owner = context_owner(db) if agent_settings()["mode"] else None
     if owner is not None:
         return None if owner == WORKER_ID else owner
     return higher_priority_target(db)
