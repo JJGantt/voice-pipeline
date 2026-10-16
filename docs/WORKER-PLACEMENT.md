@@ -1,0 +1,210 @@
+# Which machine runs the voice agent
+
+The same `worker/worker.py` runs on three hosts. Whichever one claims a `voice_requests` row runs the
+whole turn — the Sonnet fast path, any Opus escalation, and every MCP tool the turn calls. This page
+is the answer to "should the primary be somewhere else", with the measurements behind it. The
+measurements were taken on 2026-10-15/16 (UTC); re-run them before acting on the numbers.
+
+## Current placement
+
+**The Pi is primary, the Mac second, Fly last.** `worker/run.sh` exports `WORKER_PRIORITY=pi,mac,fly`
+and the Pi and Mac launch through it (the Pi's `.env` also sets the same value). Fly does not use
+`run.sh`: `server/Dockerfile` sets `WORKER_PRIORITY=mac,pi,fly`. Fly is last in both orders, so the
+difference changes nothing today, but it has to be edited too if the order ever changes.
+
+| | Pi | Mac | Fly (`jared-voice`) |
+|---|---|---|---|
+| launched by | systemd `voice-worker` → `run.sh` | launchd `com.jaredgantt.voice-worker` → `run.sh` | `server/entrypoint.sh`, in a restart loop beside `server.py` (wake word + transcription) and the Govee sync loop |
+| hardware | Raspberry Pi 5, 4 cores, 4GB + 2GB swap | M1, 8 cores | `shared-cpu-1x`, 2GB, no swap, region `iad` |
+| Claude Code version (2026-10-16) | 2.1.301 | 2.1.301 | **2.1.197** |
+| turns claimed, 2026-09-15 → 10-16 | 191 (188 done, 3 error) | 1 | 20 |
+
+Fly took its 20 turns in two incidents, never otherwise:
+
+- **2026-10-14 22:39Z → 10-15 01:28Z.** The Pi's worker was running but could not reach Supabase:
+  its journal shows `UPSERT worker_presence failed` with DNS failures (`Temporary failure in name
+  resolution`), TLS EOFs and read timeouts from 22:55Z on. Its heartbeat went stale and Fly claimed.
+- **2026-10-16 ~02:02Z → 02:51Z.** The Pi's CLI was gone: from 01:55Z every Opus escalation failed
+  with `No such file or directory: '/usr/local/bin/claude'` (the `~/.npm-global/bin/claude` link the
+  wrapper points at was re-created at 02:03:19Z, consistent with a self-update replacing it). Those
+  turns fell through to Fly. Part of this window was also failover testing by another session.
+
+## How Claude runs on each host
+
+The code is the same everywhere; only the environment differs.
+
+- **Fast path:** a warm `ClaudeSDKClient` (`SdkRunner`), Sonnet, `SAFE_TOOLS`, driving the INSTALLED
+  CLI (`cli_path=shutil.which("claude")`). It connects LAZILY, on the first turn after the worker
+  starts, and then stays up for the life of the process (each turn is a `/clear` on it). There is no
+  pre-warm at startup.
+- **Escalation:** gated tools (log_nutrition, stage_meal, edit_staged, save_recipe, …) and photo turns
+  spawn a fresh `claude -p --model opus` per turn (`run_claude`), which starts every MCP server again.
+- **Billing:** the Claude subscription (`CLAUDE_CODE_OAUTH_TOKEN`) on all three. Fly's environment
+  also carries `ANTHROPIC_API_KEY` (observed with `env` in the container); `worker.py` pops it at
+  import, before any client or subprocess starts, so no turn inherits it.
+- **Session transcripts:** on the Pi and Mac they land in `~/.claude/projects/` and persist. On Fly
+  `HOME=/root`, there is no volume on the machine and `CLAUDE_CONFIG_DIR` is unset, so anything the CLI
+  writes there is on the root filesystem, which a deploy or restart replaces. After a restart
+  `/root/.claude` does not exist at all. `STATE_DIR` (`~/.voice-worker`) is ephemeral there for the
+  same reason.
+- **Worker logs:** the Pi's are in `journalctl -u voice-worker` (retained back to 2026-10-02 when
+  measured); the Mac's in `worker/worker.out.log` (back to June). Fly's are only what
+  `fly logs -a jared-voice --no-tail` still holds — 100 lines, which a restart clears. **There is no
+  history of a Fly turn's `timing:` line once the machine has restarted**, which is why the Fly numbers
+  below come from `voice_requests` rather than worker logs.
+- **No session host on Fly.** The container's process list (read from `/proc`) is `server.py`,
+  `worker.py`, `sync_devices.py --loop`, `hallpass` and init — no orchestrator, no desk host, and
+  `worker_presence` has no Fly desk row. `investigate()` sends a Fly failure's health session to the
+  Pi or the Mac. `start_session` still works from Fly because it is a database write that the Pi's or
+  the Mac's desk host picks up.
+
+**The CLI on Fly is a release behind the others because the image never re-fetches it.**
+`npm install -g @anthropic-ai/claude-code` is unpinned and sits in a Docker layer that does not
+change, so the builder reuses the cached layer from whenever it was first built. The model aliases
+`sonnet` / `opus` are resolved by that CLI, so Fly can be running different models from the Pi and
+Mac under the same alias. (Not checked which models 2.1.197 maps them to.)
+
+## What each host can and cannot do
+
+MCP servers a turn gets come from `write_mcp_config()`. Measured by spawning each server's command
+with the worker's environment and timing `initialize` and `tools/list` over stdio (read-only; no tool
+called). Seconds are to `initialize`, one cold run then warm runs on Fly, one run elsewhere:
+
+| server | Pi | Mac | Fly |
+|---|---|---|---|
+| data (65 tools) | 0.86s | 0.20s | 2.20s cold, 0.52–0.59s warm |
+| voice (4) | 0.59s | 0.17s | 0.34–0.44s |
+| govee-lights (5) | 1.16s | 0.43s | 0.75–0.95s |
+| petlibro-feeder (4) | 3.70s | 0.48s | **fails to spawn** — config points at `/Users/jaredgantt/repos/petlibro-mcp/.venv/bin/python` |
+| gmail (8) | 2.10s | present | **absent** — no checkout in the image, so the `os.path.exists` guard drops it |
+| messages (HTTP) | via `http://Jareds-MacBook-Air.local:27187/mcp` | loopback | **absent** — `MESSAGES_MCP_URL` is empty |
+
+Everything else that differs, from the code (`grep -n WORKER_ID worker/worker.py`):
+
+- **iMessage:** only reachable while the Mac is awake, from any host. Fly cannot reach it at all
+  today: `.local` does not resolve in Fly, the Mac's port is not exposed to the internet, and the
+  container has no Tailscale.
+- **Feeder:** the PetLibro server is LAN-only (tinytuya), so even with the right path Fly could not
+  reach the feeder without a route into the home network.
+- **Lights:** `govee_mcp.py` tries a LAN multicast scan first (1.2s timeout) and falls back to the
+  Govee cloud API. On Fly the scan can never answer, so every light command is cloud-only and pays
+  the scan timeout first (from the code; not timed on Fly).
+- **Full-agent (coding) mode:** off on Fly by design — `session_agent = ag["mode"] and WORKER_ID != "fly"`.
+- **Inject into a terminal session:** goes to the orchestrator at `ORCH_URL` (default
+  `localhost:7682`), which only the Mac runs; any other worker hands the request off on failure.
+- **Mac-only housekeeping:** `publish_repo_dirs()` (the agent cwd picker) and the Mac mic's listener
+  supervisor.
+- **Photos:** work everywhere — attachments are fetched from Supabase storage into a temp dir.
+- **Clock:** Fly runs with `TZ=America/New_York` (`fly.toml`); without it, naive local timestamps
+  were written four hours late.
+
+## Speed
+
+Claim latency is `claimed_at − created_at`; run time is `updated_at − claimed_at` on rows that ended
+`done`, from `voice_requests` 2026-09-15 → 2026-10-16. Turn internals are the worker's `timing:` and
+`warm client up` log lines.
+
+| | Pi | Mac | Fly |
+|---|---|---|---|
+| claim latency, p50 | 1.2s (n=191, p90 2.7s) | 1.2s (n=1) | 0.5–1.4s on ordinary turns; three re-queued rows waited 86–157s behind the Pi's failures and are not a claim cost |
+| run, all done turns, p50 | 10.0s (n=188, p90 31.1s) | — | 24.8s (n=20, p90 53.4s) |
+| run, set-logging turns (fast path) | p50 9.2s (n=36) | — | p50 10.7s (n=8; 7.4–11.7s warm, 28.2s on the first turn after a deploy) |
+| run, nutrition turns (Opus escalation) | p50 23.9s (n=54) | — | 23.8, 37.8, 46.0, 53.4, 58.1s (n=5) |
+| warm SDK client connect | p50 2.5s (n=11, 1.5–8.2s) | p50 4.5s (n=6) | 5.2s (n=1) |
+| Opus spawn → MCP ready | p50 3.5s (n=106) | p50 3.7s (n=332, Aug) | no log retained |
+| Opus first token after ready | p50 3.2s | p50 2.9s | no log retained |
+| Opus spawn total | p50 17.0s | p50 9.9s (Aug; turns differed then) | no log retained |
+| new-connection GET to Supabase | 0.20–0.28s | 0.19–0.27s | 0.16–0.21s |
+| GET `api.anthropic.com` | 0.10–0.16s | 0.10–0.20s | 0.08s |
+
+What these say, and how far:
+
+- **On the fast path Fly is as fast as the Pi** once its client is warm. The warm client survives
+  between turns on every host (the Pi connected 11 times across 387 claims), but Fly loses it on every
+  deploy of `jared-voice`, and that app is deployed often (five releases in 40 minutes on 2026-10-16).
+- **Escalated turns look about twice as slow on Fly** (median 46s against 24s), but n=5, one of them
+  the failed turn, and the Fly turns were not the same commands. Not enough to call it measured.
+- **Region does not favour any host.** Supabase is `West US (North California)`; Fly is `iad`, the
+  home machines are in Florida, and all three pay about 0.2s per new connection to it.
+- **Fly's one vCPU is shared with transcription.** `server.py` holds ~225MB and runs Whisper / ECAPA
+  on the same core; at idle the load average was 0.2–0.3 and ~1.5GB of the 2GB was available. A turn
+  overlapping a transcription was not measured.
+
+## The missing tools on 2026-10-14/15
+
+Two turns claimed by Fly answered that a tool did not exist:
+
+- 23:49:55Z, "Make the light, the floor lamp white and 30% brightness" → "I checked my available tools
+  and I don't actually have a working lighting-control function…"
+- 00:44:35Z, "114 grams of Honey Nut Cheerios…" → "I don't have a working nutrition-logging tool…"
+
+They had two separate causes. Both are recorded in commit `3d881b2` (2026-10-15 01:15Z), the fix the
+investigation session made:
+
+1. **No lights:** the image installed the `mcp` Python package unpinned, the rebuild for release v112
+   (2026-10-14 22:37Z) pulled 2.x, and 2.x removed `mcp.server.fastmcp`, so `govee_mcp.py` died on
+   import. The fix pins `mcp<2` in the Dockerfile. Fly has `mcp 1.30.0` now, and govee starts there
+   (table above).
+2. **No nutrition tool:** Claude Code under `-p` connects `--mcp-config` servers in the background, so
+   the model's first request carried only the servers that had finished starting. log_nutrition is
+   gated, so the turn ran on a fresh Opus spawn, and on Fly the data server (2.2s cold, measured above)
+   lost that race while the set-logging turns earlier that evening, on the warm client, had it. The
+   fix sets `alwaysLoad: true` on every server in `write_mcp_config()`, which makes the CLI connect
+   them before the first turn. Fly's 2.1.197 binary contains `alwaysLoad`.
+
+Both shipped to Fly as releases v113/v114 (2026-10-15 01:17Z / 01:21Z), after both failures. Since
+then Fly has run stage_meal, edit_staged and log_nutrition on escalated spawns (2026-10-16 02:02Z →
+02:24Z) without a missing tool. That is the evidence it is fixed; it is a handful of turns.
+
+**Still latent, not fixed:**
+
+- `petlibro-feeder` is in every Fly turn's config with a path that does not exist there. With
+  `alwaysLoad` a server that fails to start fails alone, so it costs a failed spawn per turn and a
+  feeder request on Fly gets "no tool" rather than an explanation. Guarding it with `os.path.exists`
+  the way gmail is guarded removes it.
+- Nothing runs a tool check on Fly, so the next server that breaks there will again be found by Jared
+  asking for something. `worker/tool-check.py` calls one read-only tool on every server
+  `write_mcp_config()` registers, but it is not in the Fly image; shipping it and running it at worker
+  start, with an alert on a failure, would catch this class.
+- The CLI and `claude-agent-sdk` are unpinned and the CLI layer is cached, so Fly's CLI only moves
+  when that layer happens to rebuild.
+
+## Should Fly be primary?
+
+**Not as things stand.** What it would gain, and what it would cost:
+
+Gains:
+
+- Independence from the house. Both incidents in the last month were home-side: the Pi losing its
+  path to Supabase for ~1.5h, and the Pi's CLI disappearing mid-update. A datacenter VM has neither.
+- Nothing extra to pay: the machine is already always-on for the wake-word server, and every turn is
+  on the subscription wherever it runs.
+
+Losses, today:
+
+- iMessage, Gmail and the feeder (table above) — the first two are among the gated tools Jared uses
+  by voice; on Fly a request for them ends in "no tool".
+- Every deploy of `jared-voice` — the transcriber's own deploys included — restarts the worker,
+  dropping the warm client and any turn in flight. The Pi's worker restarts only for its own changes.
+- Post-mortems: no transcripts and no worker-log history survive a Fly restart.
+- A shared single vCPU that the transcriber also needs, with escalated turns that looked slower
+  (not established, n=5).
+
+What it would take:
+
+1. `WORKER_PRIORITY` with fly first in `run.sh`, the Pi's `.env` and `server/Dockerfile`.
+2. A route to the Mac's messages endpoint: Tailscale in the container (userspace networking, an auth
+   key as a Fly secret), `MESSAGES_MCP_URL` / `MESSAGES_MCP_TOKEN` set on Fly, and the Mac's tailnet
+   address in messages-mcp's `ALLOWED_HOSTS`. The default list there names `<tailnet-ip>`; the Mac's
+   Tailscale address on 2026-10-16 is `<mac-tailnet-ip>`. iMessage still needs the Mac awake.
+3. Gmail in the image: its code and refresh token as secrets (it is plain HTTPS, no machine dependency).
+4. A decision on the feeder: route into the home LAN (a Tailscale subnet router at home) or accept
+   that Fly hands feeder commands back.
+5. Persistence: a volume (or `CLAUDE_CONFIG_DIR` on one) for transcripts, and worker logs shipped
+   somewhere that survives a restart.
+6. Pin the CLI version in the Dockerfile so it moves deliberately and matches the Pi and Mac.
+7. Re-measure escalated turns on Fly before switching; a larger VM (`shared-cpu-2x` or a
+   performance CPU) is the lever if they are slower.
+
+The cheaper alternative, which keeps the Pi primary: make Fly a faithful fallback — the latent fixes
+above plus items 5 and 6 — so that when the house fails, the turns Fly takes behave the same way.

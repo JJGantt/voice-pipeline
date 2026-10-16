@@ -57,6 +57,8 @@ whose `Read` tool is how a model views an image file.
 
 ## Device fallback
 
+Which host should run the agent, what each one can and cannot do, and measured speeds: `docs/WORKER-PLACEMENT.md`.
+
 - **Worker claim priority** is `WORKER_PRIORITY`, and `worker/run.sh` sets it to **`pi,mac,fly`** on
   every machine that launches through it: the highest-priority worker with a fresh heartbeat claims
   and the others defer, so the **Pi takes a command whenever it is up** and the Mac is the fallback.
