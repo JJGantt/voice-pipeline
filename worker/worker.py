@@ -1794,7 +1794,13 @@ class SdkRunner:
     model and never move a turn onto the paid API.
     """
 
-    def __init__(self):
+    def __init__(self, model: str = "sonnet", tools: "list | None" = None):
+        """`model` and `tools` (the allow list; SAFE_TOOLS by default) fix what the warm client is. The
+        Opus runner (`OPUS`) gets the full toolset plus Read, which its fence allows only inside the
+        current turn's photo directory."""
+        self.model = model
+        self.tools = list(tools if tools is not None else SAFE_TOOLS)
+        self._read_dir = None  # this turn's attachment directory, the only place Read may look
         self._loop = None
         self._client = None
         self._ambient = True   # the turn in flight came from a room mic; set by run() before each turn
@@ -1831,9 +1837,10 @@ class SdkRunner:
     async def _connect(self):
         from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, HookMatcher, PermissionResultDeny
 
-        gated = "This tool is gated on the fast path. If the request needs it, reply __ESCALATE__ (alone)."
-        exact = set(SAFE_TOOLS)
-        servers = tuple(t + "__" for t in SAFE_TOOLS if t.startswith("mcp__") and t.count("__") == 1)
+        gated = ("This tool is gated on the fast path. If the request needs it, reply __ESCALATE__ (alone)."
+                 if self.model == "sonnet" else "That tool is not available to this assistant.")
+        exact = set(self.tools)
+        servers = tuple(t + "__" for t in self.tools if t.startswith("mcp__") and t.count("__") == 1)
 
         def _decide(decision, reason=None):
             out = {"hookEventName": "PreToolUse", "permissionDecision": decision}
@@ -1855,6 +1862,11 @@ class SdkRunner:
                     return _decide("deny", "Sending texts and email is off for the always-on room mics. "
                                            "He can send it with the button on his phone or watch, or by typing it.")
                 return _decide("allow")
+            if name == "Read":   # photo turns only: the CLI views an image by reading its file
+                path = os.path.realpath(str((input_data.get("tool_input") or {}).get("file_path") or ""))
+                if self._read_dir and path.startswith(os.path.realpath(self._read_dir) + os.sep):
+                    return _decide("allow")
+                return _decide("deny", "Read is only for the photos attached to this message.")
             if name in exact or name.startswith(servers):
                 return {}
             return _decide("deny", gated)
@@ -1865,13 +1877,13 @@ class SdkRunner:
             return PermissionResultDeny(message=gated)
 
         opts = ClaudeAgentOptions(
-            model="sonnet",
+            model=self.model,
             # The SDK ships its own copy of Claude Code, which only moves when the package is upgraded, and
             # the alias "sonnet" resolves to whatever model THAT copy knows. Running the installed CLI keeps
             # this path on the same models as every other turn instead of drifting a release behind.
             cli_path=shutil.which(CLAUDE_BIN),
             mcp_servers=write_mcp_config(),
-            allowed_tools=list(SAFE_TOOLS),
+            allowed_tools=list(self.tools),
             disallowed_tools=list(SESSION_TOOLS),   # browser-only: out of sight, so never a reason to escalate
             # The stable hub framing lives here so the prefix caches across turns; per-turn context
             # (the replayed conversation) rides on the prompt instead.
@@ -1887,7 +1899,7 @@ class SdkRunner:
         await client.connect()
         self._client = client
         self._used = False
-        log("sdk runner: warm client up (sonnet, safe toolset)")
+        log(f"sdk runner: warm client up ({self.model}, {'safe' if self.model == 'sonnet' else 'full'} toolset)")
 
     async def _teardown(self):
         if self._client is not None:
@@ -1957,11 +1969,12 @@ class SdkRunner:
             return {"session_id": None, "text": "", "result": "", "ok": False, "used_tools": True,
                     "raw_error": f"sdk run failed: {e}"}
 
-    def run(self, transcript, on_event=None, ambient=True) -> dict:
-        """`ambient` says the turn came from a room mic, which is what _gate reads for the sends.
-        Turns run one at a time, so a flag on the runner is exactly one turn's."""
+    def run(self, transcript, on_event=None, ambient=True, read_dir=None) -> dict:
+        """`ambient` says the turn came from a room mic, which is what _gate reads for the sends;
+        `read_dir` is where this turn's photos are. Turns run one at a time, so a flag on the runner is
+        exactly one turn's."""
         self._start_loop()
-        self._ambient = ambient
+        self._ambient, self._read_dir = ambient, read_dir
         result = self._attempt(transcript, on_event)
         if result.get("ok"):
             return result
@@ -1984,6 +1997,20 @@ class SdkRunner:
 
 
 SDK = SdkRunner()
+# Opus kept running too, where there is memory for it (WARM_OPUS=1: the Fly worker, 2GB). Its turns —
+# the gated tools, photos — then skip the ~3-4s CLI and MCP start a `claude -p` spawn pays every time.
+# Elsewhere escalation spawns, as before.
+WARM_OPUS = os.environ.get("WARM_OPUS", "").strip().lower() in ("1", "true", "yes", "on")
+OPUS = SdkRunner("opus", ALL_TOOLS + ["Read"]) if WARM_OPUS else None
+
+
+def run_opus(prompt: str, on_event, system_append: str, ambient: bool, att_dir, allowed_tools, deny_tools) -> dict:
+    """One Opus hub turn: on the warm client when there is one, else a fresh `claude -p`. The warm
+    client carries the hub framing in its system prompt already, so `system_append` is for the spawn."""
+    if OPUS is not None:
+        return OPUS.run(prompt, on_event=on_event, ambient=ambient, read_dir=att_dir)
+    return run_claude(prompt, None, on_event=on_event, system_append=system_append, model="opus",
+                      allow_read=bool(att_dir), allowed_tools=allowed_tools, deny_tools=deny_tools)
 
 
 def get_focus() -> str:
@@ -2578,9 +2605,8 @@ def process_request(db: Supabase, req: dict) -> None:
     elif attachments:
         # Photos → straight to Opus (vision needs the capable model + Read; Sonnet would only escalate).
         result = run_subscription(
-            lambda: run_claude(hub_prompt + POWER_DIRECTIVE, None, on_event=_emit, system_append=sys_ctx,
-                               model="opus", allow_read=bool(att_paths), allowed_tools=turn_tools(ambient),
-                               deny_tools=room_deny),
+            lambda: run_opus(hub_prompt + POWER_DIRECTIVE, _emit, sys_ctx, ambient, att_tmp if att_paths else None,
+                     turn_tools(ambient), room_deny),
             "subscription Opus (photo)")
     else:
         # FAST PATH — Sonnet on the WARM SDK client, safe toolset only. Not a per-command `claude -p`: that
@@ -2603,9 +2629,8 @@ def process_request(db: Supabase, req: dict) -> None:
             push_activity("Escalated to Opus", "escalate")
             # These turns are rare and already slow, so the CLI cold start is noise here.
             result = run_subscription(
-                lambda: run_claude(hub_prompt + POWER_DIRECTIVE, None, on_event=_emit, system_append=sys_ctx,
-                                   model="opus", allow_read=bool(att_paths), allowed_tools=turn_tools(ambient),
-                                   deny_tools=room_deny),
+                lambda: run_opus(hub_prompt + POWER_DIRECTIVE, _emit, sys_ctx, ambient, att_tmp if att_paths else None,
+                     turn_tools(ambient), room_deny),
                 "subscription Opus")
 
     if att_tmp:
@@ -2623,8 +2648,8 @@ def process_request(db: Supabase, req: dict) -> None:
     if ("__escalate__" in text.lower()) or (re.sub(r"[^a-z]", "", text.lower()) == "escalate"):
         log("result leaked __ESCALATE__ → clean Opus re-run (no context)")
         push_activity("Escalated to Opus", "escalate")
-        result = run_claude(prompt, None, on_event=_emit, system_append=sys_ctx,
-                            model="opus", allow_read=bool(att_paths), allowed_tools=turn_tools(ambient), deny_tools=room_deny)
+        result = run_opus(prompt, _emit, sys_ctx, ambient, att_tmp if att_paths else None,
+                     turn_tools(ambient), room_deny)
         text = (result.get("text") or "").strip()
 
     # The same net for __IGNORE__ on a turn he MEANT. Only room-mic turns are taught the sentinel, but a
@@ -2633,8 +2658,8 @@ def process_request(db: Supabase, req: dict) -> None:
     # context to mimic; the prompt already carries DELIBERATE_DIRECTIVE.
     if not ambient and is_ignore(text) and not result.get("used_tools"):
         log("deliberate turn answered __IGNORE__ → clean Opus re-run (no context)")
-        result = run_claude(prompt, None, on_event=_emit, system_append=sys_ctx,
-                            model="opus", allow_read=bool(att_paths), allowed_tools=turn_tools(ambient), deny_tools=room_deny)
+        result = run_opus(prompt, _emit, sys_ctx, ambient, att_tmp if att_paths else None,
+                     turn_tools(ambient), room_deny)
         text = (result.get("text") or "").strip()
 
     # A failure here is this machine's, not the command's, until every machine has tried it: hand it on.
@@ -2965,6 +2990,8 @@ def main() -> int:
         waker = _waker = RealtimeWaker()
         waker.start()   # event-driven claim; no-op fallback to polling if realtime is unavailable
         threading.Thread(target=SDK.warm, name="sdk-warm", daemon=True).start()   # first turn starts warm
+        if OPUS is not None:
+            threading.Thread(target=OPUS.warm, name="opus-warm", daemon=True).start()
 
         # Heartbeat on its own thread so a long command (a multi-minute agent run) never lets this
         # worker's presence go stale — which would let a lower-priority worker poach the user's follow-up
