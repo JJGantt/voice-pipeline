@@ -133,6 +133,10 @@ what regressed.
 
 ## What the split is for — and how it bills
 
+**Sonnet answers without thinking; Opus thinks at maximum.** The fast path's transcripts carry no
+thinking blocks, which is what keeps a quick question quick. Every Opus run passes `--effort max`; the
+"ultrathink" in `POWER_DIRECTIVE` is only a nudge now (the CLI turns it into a note, not a budget).
+
 **Everything runs on the subscription, and nothing else.** Sonnet runs on the warm `SdkRunner` (a
 long-lived headless Claude Code process holding the MCP servers); escalation runs Opus through
 `claude -p`. A failed run is retried on the subscription and then surfaced as an error — there is no

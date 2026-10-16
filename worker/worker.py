@@ -395,9 +395,9 @@ RESET_SENTINEL = "__RESET_CONTEXT__"
 _NOTHING_SAID = re.compile(r"^\W*thank\s+you\W*$", re.IGNORECASE)
 
 # Power/precision directive (the Opus escalation path): maximum-precision for hard estimates — typically a
-# restaurant dish whose ingredients/macros are unknown. Routed to Opus, and this directive both asks
-# for careful decomposition AND contains the "ultrathink" keyword, which is how `claude -p` unlocks
-# its largest extended-thinking budget (there is no CLI flag for it).
+# restaurant dish whose ingredients/macros are unknown. The thinking budget itself is `--effort max` on
+# every Opus run (`run_claude`). "ultrathink" in this text no longer sets a budget: the CLI (2.1.301)
+# turns it into a one-line note asking for deeper reasoning, so it stays only as that nudge.
 POWER_DIRECTIVE = (
     "\n\n[Precision mode — ultrathink. Take your time and reason carefully before acting. If this "
     "involves estimating nutrition for a dish whose exact contents aren't given, decompose it into its "
@@ -1606,6 +1606,7 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
         cmd += ["--resume", resume_session_id]
     cmd += [
         "--model", model,
+        *(["--effort", "max"] if model == "opus" else []),   # Opus turns are the slow, careful path: think fully
         "--mcp-config", mcp_path,
         "--strict-mcp-config",
         "--output-format", "stream-json",
