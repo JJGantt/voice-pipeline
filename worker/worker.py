@@ -2125,8 +2125,14 @@ def reclaim_stale(db: Supabase) -> None:
             ts = _parse_ts(p.get("last_seen", ""))
             fresh = bool(ts) and (now - ts).total_seconds() <= HEARTBEAT_FRESH_S
             epoch = (p.get("info") or {}).get("epoch")
-            alive = fresh and (not req.get("claim_epoch") or not epoch or epoch == req.get("claim_epoch"))
             claimed_at = _parse_ts(req.get("claimed_at") or "")
+            # A different epoch proves the claimer died only if the owner has heartbeated SINCE the claim.
+            # A presence row older than the claim (cached here up to PRESENCE_CACHE_S, or simply written
+            # before a just-restarted process's first beat) still carries the previous process's epoch,
+            # and would orphan a live claim the instant it was made.
+            epoch_after_claim = bool(ts) and bool(claimed_at) and ts > claimed_at
+            alive = fresh and (not req.get("claim_epoch") or not epoch or epoch == req.get("claim_epoch")
+                               or not epoch_after_claim)
             if not alive and fresh is False and claimed_at and (now - claimed_at).total_seconds() <= HEARTBEAT_FRESH_S:
                 continue   # stale heartbeat but a claim newer than the window: give the owner its chance
         if alive:

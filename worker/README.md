@@ -231,7 +231,10 @@ event that attaches `audio` (and on each subscribe, for one it missed), runs `wh
 
 A claim carries `claim_epoch`, a random id per worker PROCESS that its heartbeat also publishes. A worker
 restarted mid-run — a deploy, `pull-repos`, a SIGKILL at the unit's stop timeout — comes back under the
-same name with a fresh heartbeat, so only the epoch shows its old claim is dead. `reclaim_stale` (every
+same name with a fresh heartbeat, so only the epoch shows its old claim is dead. The epoch counts only
+when the owner's heartbeat is newer than the claim: a just-restarted worker claims before its first beat
+lands, and sweepers cache presence for 30s, so a row older than the claim still carries the previous
+process's epoch and would orphan a live claim the moment it is made. `reclaim_stale` (every
 `RECLAIM_SWEEP_S` and at startup, whatever is pending) releases an orphan: back to `pending` with the
 owner in `failed_on` when it had not acted, closed as an error and investigated when it had (it may be
 half-done) or when it is older than the conversation window.
