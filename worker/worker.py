@@ -229,13 +229,15 @@ def run_subscription(run, label: str) -> dict:
         time.sleep(pause)
         result = run()
     if not result.get("ok"):
+        # Reported by process_request, which knows whether the command was handed on or ended.
         log(f"{label} failed ({result.get('raw_error')}) — giving up, no paid fallback")
-        alert_failure("subscription", result.get("raw_error") or "")
     return result
 
 
-def alert_failure(stage: str, err: str) -> None:
-    """Push a worker failure to Jared's phone: `<host> · <stage> · <class> · <error>`. Best-effort, threaded."""
+def alert_failure(stage: str, err: str, detail: str = "") -> None:
+    """Push a worker failure to Jared's phone (`<host> · <stage> · <class> · <error>`) and start a session in
+    the health repo to investigate it (`investigate`). `detail` is what that session is told about the
+    request and what became of it. Best-effort, threaded, and both share the one cooldown."""
     kind = classify_failure(err)
     key = f"{stage}:{kind}"
     now = time.monotonic()
@@ -244,16 +246,57 @@ def alert_failure(stage: str, err: str) -> None:
     _alert_last[key] = now
     body = f"{WORKER_ID} · {stage} · {kind} · {(err or '')[:180]}"
     log(f"ALERT {body}")
-    if not HUB_NOTIFY_URL:
-        return
 
     def _send():
-        try:
-            httpx.post(HUB_NOTIFY_URL, json={"title": "Voice worker", "body": body[:300], "kind": "voice"}, timeout=5.0)
-        except Exception:  # noqa: BLE001
-            pass
+        if HUB_NOTIFY_URL:
+            try:
+                httpx.post(HUB_NOTIFY_URL, json={"title": "Voice worker", "body": body[:300], "kind": "voice"}, timeout=5.0)
+            except Exception:  # noqa: BLE001
+                pass
+        investigate(stage, kind, err, detail)
 
     threading.Thread(target=_send, daemon=True).start()
+
+
+# The machines a desk session can run on, by the presence row each one's session host beats.
+DESK_PRESENCE = {"pi": "pi-desk", "mac": "desk"}
+HEALTH_REPO = {"path": "~/repos/health", "name": "health"}   # the Pi clones it on first dispatch
+
+
+def investigate(stage: str, kind: str, err: str, detail: str) -> None:
+    """Dispatch a session in the health repo to find out why this worker failed. It runs on a machine
+    other than this one when that machine's session host is up — the failing host may be failing for
+    the same reason — and on this one otherwise. Fly has no session host, so a Fly failure goes to the
+    Pi or the Mac. Writes the `open_session` command directly: no focus change, so his next spoken
+    follow-up still goes where it was going."""
+    order = ["mac", "pi"] if WORKER_ID == "pi" else ["pi", "mac"]
+    try:
+        hdr = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+        rows = httpx.get(f"{SUPABASE_URL}/rest/v1/worker_presence",
+                         params={"worker": f"in.({','.join(DESK_PRESENCE.values())})", "select": "worker,last_seen"},
+                         headers=hdr, timeout=5).json()
+        up = {r["worker"] for r in rows if _healthy(r)}
+        target = next((m for m in order if DESK_PRESENCE[m] in up), None)
+        if target is None:
+            log("investigate: no session host is up; nothing dispatched")
+            return
+        prompt = (
+            f"The voice worker on `{WORKER_ID}` failed at {now_iso()} (stage `{stage}`, class `{kind}`).\n\n"
+            f"Error: {err}\n\n{detail}\n\n"
+            "Find the cause and fix it if you can, on whichever machine it lives. Logs: the Pi's is "
+            "`journalctl -u voice-worker`, the Mac's is `~/repos/voice-pipeline/worker/worker.out.log`, "
+            "Fly's is `fly logs -a jared-voice`. The request is in Supabase `voice_requests`. Follow this "
+            "repo's CLAUDE.md: check function, not liveness, and give the failure a row in WATCHLIST.md. "
+            "Your last message should say what broke, what you changed, and what is still open."
+        )
+        httpx.post(f"{SUPABASE_URL}/rest/v1/desk_commands", headers={**hdr, "Content-Type": "application/json"},
+                   json={"id": str(uuid.uuid4()), "kind": "open_session",
+                         "payload": {**HEALTH_REPO, "target": target, "prompt": prompt,
+                                     "label": f"Voice worker failure on {WORKER_ID}"}},
+                   timeout=5).raise_for_status()
+        log(f"investigate: health session dispatched to {target}")
+    except Exception as e:  # noqa: BLE001 — the alert already went; never take the worker down
+        log(f"investigate: dispatch failed: {e}")
 
 
 # Drive the ESP light to reflect EVERY command's lifecycle (universal indicator, not just ESP-sourced):
@@ -970,7 +1013,8 @@ def hand_off(db: Supabase, req: dict, err: str) -> bool:
         return False
     log(f"handed off request {req['id']} after failing here ({err}); untried and up: {left}")
     push_activity(f"Handing off from {WORKER_ID}", "tool")
-    alert_failure("request", err)
+    alert_failure("request", err, f"Request {req['id']} ({(req.get('transcript') or '')[:200]!r}) failed "
+                  f"here before calling any tool and was handed to another worker (untried and up: {left}).")
     return True
 
 
@@ -2012,7 +2056,8 @@ def claim_one(db: Supabase) -> dict | None:
             db.patch("voice_requests", f"id=eq.{r['id']}&status=eq.pending",
                      {"failed_on": sorted(set(r.get("failed_on") or []) | {WORKER_ID}), "updated_at": now_iso()})
         log(f"passed {len(pending)} pending request(s) on unclaimed: {unready}")
-        alert_failure("request", unready)
+        alert_failure("request", unready, f"This host cannot start a turn, so it passed {len(pending)} pending "
+                      f"request(s) to the other workers unclaimed: {[r['id'] for r in pending]}.")
         return None
 
     global _failover_at
@@ -2476,7 +2521,9 @@ def process_request(db: Supabase, req: dict) -> None:
             {"status": "error", "error": err, "updated_at": now_iso()},
         )
         log(f"ERROR request {rid}: {err}")
-        alert_failure("request", err)
+        alert_failure("request", err, f"Request {rid} ({transcript[:200]!r}) ENDED AS AN ERROR here: "
+                      + ("it had already called a tool, so it was not handed on." if tools_called[0] else
+                         f"no healthy worker was left untried (failed_on {req.get('failed_on') or []})."))
 
 
 # --------------------------------------------------------------------------- #

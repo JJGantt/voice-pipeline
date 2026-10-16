@@ -204,11 +204,16 @@ reinstalling `@anthropic-ai/claude-code`.
 
 ## Failure alerts
 
-The worker pushes to Jared's phone (hub `/api/notify`, title `Voice worker`) when a subscription run
-still fails after its retries (overloaded, 5xx, rate limit and network errors are retried a few times
-first; auth and billing are not). Body: `<host> · <stage> · <class> · <error>`, stage ∈ `subscription`/`request`, class ∈
-`auth`/`billing`/`rate-limit`/`error`. One push per host per (stage, class) per `ALERT_COOLDOWN_S`
-(default 3600). Not gated by the hub's push toggle; that toggle is for command results.
+When a command fails on a worker — handed on, passed on unclaimed, or ended as an error — the worker
+pushes to Jared's phone (hub `/api/notify`, title `Voice worker`, body `<host> · request · <class> ·
+<error>`, class ∈ `auth`/`billing`/`rate-limit`/`error`) AND dispatches a session in the `health` repo
+to investigate (`investigate`). That session runs on a machine other than the failing one when its
+session host (`desk` / `pi-desk` presence) is up, gets the error, the request and what became of it,
+and is told to fix what it can and give the failure a WATCHLIST row. It is an `open_session` written
+straight to `desk_commands`, so it does not move the voice focus. Overloaded, 5xx, rate-limit and
+network errors are retried a few times before any of this; auth and billing are not. One alert and one
+investigation per host per class per `ALERT_COOLDOWN_S` (default 3600), not gated by the hub's push
+toggle, which is for command results.
 
 What the classes mean on the phone:
 
