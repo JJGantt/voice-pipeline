@@ -17,7 +17,7 @@ cd "$(dirname "$0")"
 
 export SUPABASE_URL="${SUPABASE_URL:-https://felyggqjjhltwokdfhop.supabase.co}"
 export WORKER_ID="${WORKER_ID:-mac}"
-export WORKER_PRIORITY="${WORKER_PRIORITY:-pi,mac,fly}"
+export WORKER_PRIORITY="${WORKER_PRIORITY:-fly,pi,mac}"
 export STATE_DIR="${STATE_DIR:-$HOME/.voice-worker}"
 export CLAUDE_BIN="${CLAUDE_BIN:-claude}"
 export DATA_MCP_JS="${DATA_MCP_JS:-/Users/jaredgantt/repos/data-layer/dist/mcp.js}"

@@ -61,7 +61,7 @@ WORKER_ID = os.environ.get("WORKER_ID", "mac")
 # Ordered highest-priority first. A worker only claims if no HIGHER-priority
 # worker has a fresh heartbeat.
 WORKER_PRIORITY = [
-    w.strip() for w in os.environ.get("WORKER_PRIORITY", "mac,pi").split(",") if w.strip()
+    w.strip() for w in os.environ.get("WORKER_PRIORITY", "fly,pi,mac").split(",") if w.strip()
 ]
 
 STATE_DIR = Path(os.path.expanduser(os.environ.get("STATE_DIR", "~/.voice-worker")))
