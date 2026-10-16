@@ -18,4 +18,4 @@ cp -R $VP/mcp-voice/src mcp-voice/src
 mkdir -p govee-mcp
 cp $GV/govee_mcp.py $GV/sync_devices.py govee-mcp/
 cp $VP/worker/worker.py worker.py
-echo "assembled — now: flyctl deploy --now -a jared-voice"
+echo "assembled — now: flyctl deploy --now -a jared-voice --build-arg CLAUDE_CODE_VERSION=$(npm view @anthropic-ai/claude-code version)"

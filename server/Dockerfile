@@ -10,7 +10,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-pip libgomp1 ca-certificates && rm -rf /var/lib/apt/lists/*
 
 # Claude CLI (the Agent SDK drives it for the fallback path) + python deps for both processes
-RUN npm install -g @anthropic-ai/claude-code
+# CLAUDE_CODE_VERSION is set by assemble.sh to the newest release, so this layer rebuilds whenever one
+# ships and a fresh machine boots current. Unparameterised, the builder reused a cached layer and Fly
+# booted months behind the Pi and the Mac. entrypoint.sh still updates a long-running machine daily.
+ARG CLAUDE_CODE_VERSION=latest
+RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 COPY requirements.txt .
 # `mcp<2`: govee_mcp.py imports mcp.server.fastmcp, which 2.x renamed — an unpinned rebuild leaves the
 # fallback with no lights tool and no error anywhere but the MCP server's stderr.
