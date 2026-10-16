@@ -64,6 +64,13 @@ WORKER_PRIORITY = [
     w.strip() for w in os.environ.get("WORKER_PRIORITY", "fly,pi,mac").split(",") if w.strip()
 ]
 
+# The one worker that claims status `fallback`: commands the watch sent through Supabase's
+# `voice-fallback` edge function (data-layer) because the hub on Fly did not answer. The Pi, because it is
+# the worker that does not run on Fly and does not sleep.
+FALLBACK_WORKER = os.environ.get("FALLBACK_WORKER", "pi")
+# Within this long of an earlier fallback command, it is the same outage: no second troubleshooting session.
+FALLBACK_OUTAGE_S = 30 * 60
+
 STATE_DIR = Path(os.path.expanduser(os.environ.get("STATE_DIR", "~/.voice-worker")))
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 
@@ -125,9 +132,14 @@ HUB_PUSH_URL = os.environ.get(
 )
 
 
+# Set for the duration of a FALLBACK command (`process_request`): the hub is the thing that did not answer,
+# so every push to it would only spend its timeout, once per tool call. One request runs at a time.
+_hub_unreachable = False
+
+
 def push_activity(text: str, state: str = "tool") -> None:
     """Fire a transient activity event to the hub (best-effort; never raises)."""
-    if not HUB_PUSH_URL:
+    if not HUB_PUSH_URL or _hub_unreachable:
         return
     try:
         httpx.post(HUB_PUSH_URL, json={"text": text, "state": state, "focus": "hub"}, timeout=2.0)
@@ -169,7 +181,7 @@ def push_enabled() -> bool:
 def notify_phone(body: str, title: str = "Hub") -> None:
     """Send a voice command's final result to Jared's phone as a push notification. Threaded + best-
     effort so it never delays closing out the request and never raises. Skipped if push is toggled off."""
-    if not (HUB_NOTIFY_URL and body) or not push_enabled():
+    if not (HUB_NOTIFY_URL and body) or _hub_unreachable or not push_enabled():
         return
 
     def _send():
@@ -2249,11 +2261,24 @@ def claim_one(db: Supabase) -> dict | None:
     # the standby flag is refreshed on its own slow clock, which is all its consumer (the poll cadence)
     # needs; the instant there IS something pending, it is decided fresh, before any claim.
     global _holding
+    # The fallback worker reads `fallback` rows in the SAME query, so the watch's way in costs no extra
+    # read per cycle. Every other worker's filter stays `pending`, which is what keeps them off it.
+    statuses = "in.(pending,fallback)" if WORKER_ID == FALLBACK_WORKER else "eq.pending"
     pending = db.get(
         "voice_requests",
-        f"status=eq.pending&failed_on=not.cs.{{{WORKER_ID}}}&order=created_at.asc&limit=8"
-        "&select=id,transcript,source,created_at,updated_at,capture_start,capture_end,failed_on",
+        f"status={statuses}&failed_on=not.cs.{{{WORKER_ID}}}&order=created_at.asc&limit=8"
+        "&select=id,transcript,source,status,created_at,updated_at,capture_start,capture_end,failed_on",
     )
+    fb = next((r for r in pending or [] if r.get("status") == "fallback"), None)
+    if fb:
+        # No deferring, holding or grouping: it came from one watch because the hub did not answer, and
+        # nobody else will take it.
+        got = db.patch("voice_requests", f"id=eq.{fb['id']}&status=eq.fallback",
+                       {"status": "claimed", "claimed_by": WORKER_ID, "claim_epoch": WORKER_EPOCH,
+                        "claimed_at": now_iso(), "assigned_to": WORKER_ID, "updated_at": now_iso()},
+                       extra_headers={"Prefer": "return=representation"})
+        return got[0] if got else None
+    pending = [r for r in pending or [] if r.get("status") == "pending"]
     reclaim_stale(db)   # orphans and stranded rows, on its own clock, whether or not anything is pending
     if not pending:
         _holding = False
@@ -2396,6 +2421,31 @@ def _duplicate_of_recent(db: Supabase, req: dict) -> bool:
     return False
 
 
+def fallback_directive(db: Supabase, rid: str) -> str:
+    """What a fallback command's run is told. The FIRST fallback command of an outage starts the
+    troubleshooting session; later ones within FALLBACK_OUTAGE_S only say the fallback is in use, so a
+    morning of commands during one outage is one investigation, not one per command."""
+    since = (datetime.now(timezone.utc) - timedelta(seconds=FALLBACK_OUTAGE_S)).isoformat()
+    try:
+        earlier = db.get("voice_requests", f"source=eq.watch-fallback&id=neq.{rid}&created_at=gte.{since}&select=id&limit=1")
+    except Exception:  # noqa: BLE001 — unknown: investigate rather than stay quiet
+        earlier = []
+    note = ("\n\n[FALLBACK: this command reached you through the watch's FALLBACK path — the watch could not "
+            "get an answer from the hub (Fly app jared-status-hub), so it sent the clip through a Supabase edge "
+            "function and you are running on the Pi. Open your reply with one short sentence saying it came "
+            "through the fallback because the hub did not answer, then handle the command itself exactly as you "
+            "normally would. Your reply reaches the watch directly; the hub's own surfaces may be down.")
+    if earlier:
+        return note + (" An earlier command in this outage already started a troubleshooting session, so do "
+                       "not start another.]")
+    return note + (" This is the first fallback command of this outage: AFTER handling the command, start ONE "
+                   "session with the data tool start_session (machine 'pi', repo 'status-hub', label 'Hub "
+                   "unreachable: troubleshoot') whose prompt asks it to find out why the watch could not reach "
+                   "jared-status-hub at " + now_iso() + " — check https://jared-status-hub.fly.dev/healthz, "
+                   "`fly status -a jared-status-hub`, its logs and Fly's status page — and to report what it "
+                   "finds. Say in your reply that you started it.]")
+
+
 def process_request(db: Supabase, req: dict) -> None:
     rid = req["id"]
     transcript = req.get("transcript") or ""
@@ -2430,7 +2480,14 @@ def process_request(db: Supabase, req: dict) -> None:
         log(f"ignored {transcript!r}: nothing said")
         return
 
-    focus = get_focus()
+    # THE HUB DID NOT ANSWER. The watch sent this through the voice-fallback edge function; it is run
+    # here on Opus with every tool, says so, and the first one of an outage starts a session to find out
+    # why. See fallback_directive.
+    fallback = (req.get("source") or "") == "watch-fallback"
+    global _hub_unreachable
+    _hub_unreachable = fallback
+
+    focus = "hub" if fallback else get_focus()
 
     # Focus is a specific Mac session → inject the transcript into that session's
     # wall terminal (the orchestrator owns the live `claude --resume` pty) instead
@@ -2588,7 +2645,7 @@ def process_request(db: Supabase, req: dict) -> None:
         except Exception:  # noqa: BLE001
             attachments = []
     use_agent = session_agent   # full-agent (coding) mode → the unrestricted agent, on its own session
-    log(f"route={'agent' if use_agent else ('photo→opus' if attachments else 'dynamic sonnet→opus')} src={source}")
+    log(f"route={'fallback→opus agent' if fallback else 'agent' if use_agent else ('photo→opus' if attachments else 'dynamic sonnet→opus')} src={source}")
     ping_esp_led("blink")   # working — the ESP light blinks for EVERY command, not just ESP-sourced ones
     push_activity(transcript[:240], "working")   # bottom-strip: the prompt being worked
 
@@ -2620,6 +2677,14 @@ def process_request(db: Supabase, req: dict) -> None:
     unready = claude_unready()
     if unready:
         result = {"session_id": None, "text": "", "result": "", "ok": False, "raw_error": unready}
+    elif fallback:
+        # Opus, the unrestricted agent, a FRESH run with the day's conversation replayed — whatever broke,
+        # it can handle the command and see enough to say what is wrong. Never the --resume agent session.
+        fb_prompt = (ctx or recent_context()) + prompt + fallback_directive(db, rid)
+        result = run_subscription(
+            lambda: run_claude(fb_prompt, None, on_event=_emit, system_append=AGENT_SYSTEM + "\n\n" + SHARED_STATE_NOTE,
+                               model="opus", agent=True, cwd=os.path.expanduser("~")),
+            "subscription Opus (fallback)")
     elif use_agent:
         result = run_claude(prompt, resume_id, on_event=_emit, system_append=sys_ctx, model="opus",
                             agent=True, cwd=ag["cwd"], allow_read=bool(att_paths),
@@ -2686,7 +2751,7 @@ def process_request(db: Supabase, req: dict) -> None:
 
     # A failure here is this machine's, not the command's, until every machine has tried it: hand it on.
     # Nothing has been written to the thread yet, so the worker that takes it writes the whole turn.
-    if not result.get("ok") and not req.get("_acted") and hand_off(db, req, result.get("raw_error") or "unknown error"):
+    if not result.get("ok") and not fallback and not req.get("_acted") and hand_off(db, req, result.get("raw_error") or "unknown error"):
         return
 
     # Tag every row with the mode so the hub UI can show this mode's thread separately and switch live.
@@ -2852,7 +2917,7 @@ class RealtimeWaker:
         except AttributeError:
             return
         status = str(rec.get("status") or "")
-        if status == "pending":
+        if status == "pending" or (status == "fallback" and WORKER_ID == FALLBACK_WORKER):
             self.event.set()
         elif status == "untranscribed" and rec.get("audio") and local_whisper_ready():
             threading.Thread(target=transcribe_local, args=(rec,), daemon=True).start()
