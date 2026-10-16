@@ -932,8 +932,15 @@ def higher_priority_target(db: Supabase, exclude: "set | frozenset" = frozenset(
     except ValueError:
         # I'm not in the priority list — assume lowest, defer to nobody specific.
         my_rank = len(WORKER_PRIORITY)
+    above = [w for w in WORKER_PRIORITY[:my_rank] if w not in exclude]
+    if not above:
+        return None   # nobody to defer to: the primary decides without reading presence at all
+    # Fresh, not the 30s cache: this runs only while a request is waiting on a worker below the top, and
+    # a stale view is exactly what keeps it waiting on a primary that has just announced it is stopping
+    # (measured: 9.1s to fail over from a stopped Fly worker, all of it the cache and FAILOVER_S).
+    _presence_cache["rows"] = None
     healthy = {r.get("worker") for r in presence_rows(db) if _healthy(r)}
-    return next((w for w in WORKER_PRIORITY[:my_rank] if w not in exclude and w in healthy), None)
+    return next((w for w in above if w in healthy), None)
 
 
 def context_owner(db: Supabase) -> str | None:
