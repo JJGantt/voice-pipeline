@@ -34,9 +34,8 @@ Fly took its 20 turns in two incidents, never otherwise:
 The code is the same everywhere; only the environment differs.
 
 - **Fast path:** a warm `ClaudeSDKClient` (`SdkRunner`), Sonnet, `SAFE_TOOLS`, driving the INSTALLED
-  CLI (`cli_path=shutil.which("claude")`). It connects LAZILY, on the first turn after the worker
-  starts, and then stays up for the life of the process (each turn is a `/clear` on it). There is no
-  pre-warm at startup.
+  CLI (`cli_path=shutil.which("claude")`). It connects at worker start (`SDK.warm`) and again right
+  after any recycle, then stays up for the life of the process (each turn is a `/clear` on it).
 - **Escalation:** gated tools (log_nutrition, stage_meal, edit_staged, save_recipe, …) and photo turns
   spawn a fresh `claude -p --model opus` per turn (`run_claude`), which starts every MCP server again.
 - **Billing:** the Claude subscription (`CLAUDE_CODE_OAUTH_TOKEN`) on all three. Fly's environment
@@ -58,11 +57,13 @@ The code is the same everywhere; only the environment differs.
   Pi or the Mac. `start_session` still works from Fly because it is a database write that the Pi's or
   the Mac's desk host picks up.
 
-**The CLI on Fly is a release behind the others because the image never re-fetches it.**
-`npm install -g @anthropic-ai/claude-code` is unpinned and sits in a Docker layer that does not
-change, so the builder reuses the cached layer from whenever it was first built. The model aliases
-`sonnet` / `opus` are resolved by that CLI, so Fly can be running different models from the Pi and
-Mac under the same alias. (Not checked which models 2.1.197 maps them to.)
+**Every host keeps Claude Code current.** The Mac and the Pi run the native install
+(`~/.local/bin/claude` → `~/.local/share/claude/versions/<v>`, `/usr/local/bin/claude` linked to it),
+which updates itself version by version. Fly's image copy sits in a cached Docker layer and so never
+moves on its own (it was still 2.1.197 while the others ran 2.1.301), so `server/entrypoint.sh` installs
+the latest at boot and daily into its own prefix and moves the `claude` link only once the new one
+runs. The model aliases `sonnet` / `opus` are resolved by the CLI, so a stale CLI is also a different
+model under the same name.
 
 ## What each host can and cannot do
 
@@ -117,13 +118,29 @@ Claim latency is `claimed_at − created_at`; run time is `updated_at − claime
 | new-connection GET to Supabase | 0.20–0.28s | 0.19–0.27s | 0.16–0.21s |
 | GET `api.anthropic.com` | 0.10–0.16s | 0.10–0.20s | 0.08s |
 
+**Controlled comparison, 2026-10-16** — the same command sent to one host at a time (routed by
+pre-filling `failed_on` with the others), both hosts on CLI 2.1.301 with the client connected at
+startup. Run time as above:
+
+| | Pi | Fly |
+|---|---|---|
+| "how many items are on my todo list" (Sonnet fast path, one read tool), 5 runs each, alternating | 6.1 4.2 4.3 4.7 4.4 → **p50 4.4s** | 2.8 2.8 2.6 3.4 2.7 → **p50 2.8s** |
+| "stage a banana" (Opus escalation), clean runs only | 14.9, 15.1, 15.6s | 14.3, 15.7, 16.5, 17.1s |
+| first fast-path turn after a restart | 9.9s (client connecting on the turn) | 19.7s connecting on the turn; 15.0s connected at startup but straight after a CLI update |
+
+Three Opus runs in a later batch are excluded: the earlier test turns were in the replayed
+conversation, and only three of six staged anything, so some answered from context without
+escalating. The 15.0s first turn on Fly came straight after its CLI moved from 2.1.197 to 2.1.301; a
+new CLI version changes the system prompt, so nothing was cached for it yet (inferred, not isolated).
+
 What these say, and how far:
 
-- **On the fast path Fly is as fast as the Pi** once its client is warm. The warm client survives
-  between turns on every host (the Pi connected 11 times across 387 claims), but Fly loses it on every
-  deploy of `jared-voice`, and that app is deployed often (five releases in 40 minutes on 2026-10-16).
-- **Escalated turns look about twice as slow on Fly** (median 46s against 24s), but n=5, one of them
-  the failed turn, and the Fly turns were not the same commands. Not enough to call it measured.
+- **On the fast path Fly is faster than the Pi**: 2.8s against 4.4s for the same command, five runs
+  each. The historical gap (24.8s against 10.0s) was cold clients after deploys, and turns that
+  waited behind the Pi's failures — not the machine.
+- **Escalated (Opus) turns cost the same on both**, about 15s. The CLI's own start to ready-for-tools
+  was 3.9–4.0s on Fly against 2.9–6.8s on the Pi; what varies most is Anthropic's time to first
+  token (2.0s and 10.5s on two otherwise identical Fly runs).
 - **Region does not favour any host.** Supabase is `West US (North California)`; Fly is `iad`, the
   home machines are in Florida, and all three pay about 0.2s per new connection to it.
 - **Fly's one vCPU is shared with transcription.** `server.py` holds ~225MB and runs Whisper / ECAPA
@@ -166,45 +183,28 @@ then Fly has run stage_meal, edit_staged and log_nutrition on escalated spawns (
   asking for something. `worker/tool-check.py` calls one read-only tool on every server
   `write_mcp_config()` registers, but it is not in the Fly image; shipping it and running it at worker
   start, with an alert on a failure, would catch this class.
-- The CLI and `claude-agent-sdk` are unpinned and the CLI layer is cached, so Fly's CLI only moves
-  when that layer happens to rebuild.
+- `claude-agent-sdk` (the Python package) is still whatever the image's cached pip layer holds.
 
 ## Should Fly be primary?
 
-**Not as things stand.** What it would gain, and what it would cost:
+Jared's weighting (2026-10-16): iMessage, Gmail and the feeder are rare enough that they do not count
+in this decision. Everything below leaves them out.
 
-Gains:
+**On the measurements, yes.** Fly answers the common turn faster (2.8s against 4.4s), costs the same on
+Opus turns, and is independent of the house — both incidents in the last month were home-side: the Pi
+losing its path to Supabase for ~1.5h, and the Pi's CLI disappearing mid-update. It costs nothing
+extra: every turn is on the subscription wherever it runs, and the machine is already always on.
 
-- Independence from the house. Both incidents in the last month were home-side: the Pi losing its
-  path to Supabase for ~1.5h, and the Pi's CLI disappearing mid-update. A datacenter VM has neither.
-- Nothing extra to pay: the machine is already always-on for the wake-word server, and every turn is
-  on the subscription wherever it runs.
+What still argues against it, and what fixes each:
 
-Losses, today:
+- **The worker restarts with every deploy of the transcriber**, because both live in `jared-voice`
+  (five releases in 40 minutes on 2026-10-16). A restart no longer costs the next turn its warm client
+  (it connects at startup) or strands a turn in flight (orphans are released), but a turn in flight at
+  a deploy is still run again from the start elsewhere. Moving the worker into its own Fly app ends
+  that coupling and gives it its own CPU instead of one shared with Whisper and ECAPA.
+- **No history survives a Fly restart**: no transcripts and only `fly logs`' last 100 lines. Before
+  Fly is primary, its worker logs and transcripts need to land somewhere that persists.
 
-- iMessage, Gmail and the feeder (table above) — the first two are among the gated tools Jared uses
-  by voice; on Fly a request for them ends in "no tool".
-- Every deploy of `jared-voice` — the transcriber's own deploys included — restarts the worker,
-  dropping the warm client and any turn in flight. The Pi's worker restarts only for its own changes.
-- Post-mortems: no transcripts and no worker-log history survive a Fly restart.
-- A shared single vCPU that the transcriber also needs, with escalated turns that looked slower
-  (not established, n=5).
-
-What it would take:
-
-1. `WORKER_PRIORITY` with fly first in `run.sh`, the Pi's `.env` and `server/Dockerfile`.
-2. A route to the Mac's messages endpoint: Tailscale in the container (userspace networking, an auth
-   key as a Fly secret), `MESSAGES_MCP_URL` / `MESSAGES_MCP_TOKEN` set on Fly, and the Mac's tailnet
-   address in messages-mcp's `ALLOWED_HOSTS`. The default list there names `<tailnet-ip>`; the Mac's
-   Tailscale address on 2026-10-16 is `<mac-tailnet-ip>`. iMessage still needs the Mac awake.
-3. Gmail in the image: its code and refresh token as secrets (it is plain HTTPS, no machine dependency).
-4. A decision on the feeder: route into the home LAN (a Tailscale subnet router at home) or accept
-   that Fly hands feeder commands back.
-5. Persistence: a volume (or `CLAUDE_CONFIG_DIR` on one) for transcripts, and worker logs shipped
-   somewhere that survives a restart.
-6. Pin the CLI version in the Dockerfile so it moves deliberately and matches the Pi and Mac.
-7. Re-measure escalated turns on Fly before switching; a larger VM (`shared-cpu-2x` or a
-   performance CPU) is the lever if they are slower.
-
-The cheaper alternative, which keeps the Pi primary: make Fly a faithful fallback — the latent fixes
-above plus items 5 and 6 — so that when the house fails, the turns Fly takes behave the same way.
+What switching takes: `WORKER_PRIORITY` with `fly` first in `run.sh`, the Pi's `.env` and
+`server/Dockerfile` (they differ today: Fly's image has `mac,pi,fly`, harmless while Fly is last), plus
+the two fixes above.
