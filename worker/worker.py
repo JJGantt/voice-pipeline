@@ -2099,7 +2099,7 @@ def claim_one(db: Supabase) -> dict | None:
     pending = db.get(
         "voice_requests",
         f"status=eq.pending&failed_on=not.cs.{{{WORKER_ID}}}&order=created_at.asc&limit=8"
-        "&select=id,transcript,source,created_at,capture_start,capture_end,failed_on",
+        "&select=id,transcript,source,created_at,updated_at,capture_start,capture_end,failed_on",
     )
     reclaim_stale(db)   # orphans and stranded rows, on its own clock, whether or not anything is pending
     if not pending:
@@ -2128,7 +2128,11 @@ def claim_one(db: Supabase) -> dict | None:
 
     global _failover_at
     oldest_at = _parse_ts(pending[0].get("created_at") or "")
-    waited_s = (datetime.now(timezone.utc) - oldest_at).total_seconds() if oldest_at else 0.0
+    # A row handed on or released waits from when it became claimable again, not from its creation —
+    # otherwise its preferred untried worker gets no head start and the lowest-ranked one races it.
+    back_at = _parse_ts(pending[0].get("updated_at") or "") if pending[0].get("failed_on") else None
+    since = max(t for t in (oldest_at, back_at) if t) if (oldest_at or back_at) else None
+    waited_s = (datetime.now(timezone.utc) - since).total_seconds() if since else 0.0
     tried = set(pending[0].get("failed_on") or [])
     if degraded() and other_worker_healthy(db, tried):
         # My own link is failing: a claim here could take minutes to answer while a healthy worker sits idle.
