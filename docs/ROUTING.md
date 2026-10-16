@@ -133,9 +133,20 @@ what regressed.
 
 ## What the split is for — and how it bills
 
-**Sonnet answers without thinking; Opus thinks at maximum.** The fast path's transcripts carry no
-thinking blocks, which is what keeps a quick question quick. Every Opus run passes `--effort max`; the
-"ultrathink" in `POWER_DIRECTIVE` is only a nudge now (the CLI turns it into a note, not a budget).
+**Sonnet answers without thinking; Opus thinks at its default effort.** The fast path's transcripts
+carry no thinking blocks, which is what keeps a quick question quick. Opus is not raised to `--effort
+max`, because it buys nothing here. Measured 2026-10-16 on four meals (a Chipotle burrito, cereal with
+milk and a banana, two thirds of a restaurant pad thai, tofu with oil and cornstarch), asking Opus for
+calories and macros at each level:
+
+| effort | seconds per answer | macros |
+|---|---|---|
+| low | 7–10 | the pad thai came out 730 cal against ~800 at the higher levels |
+| default | 7–11 | — |
+| max | 17–29 | the same as default (burrito identical; within 10 cal on cereal and pad thai; tofu 330 against 370, both plausible) |
+
+The "ultrathink" in `POWER_DIRECTIVE` sets no budget; the CLI turns it into a note asking for deeper
+reasoning.
 
 **Everything runs on the subscription, and nothing else.** Sonnet runs on the warm `SdkRunner` (a
 long-lived headless Claude Code process holding the MCP servers); escalation runs Opus through
