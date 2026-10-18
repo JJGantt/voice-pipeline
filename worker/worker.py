@@ -147,57 +147,21 @@ def push_activity(text: str, state: str = "tool") -> None:
         pass
 
 
-# Native push to Jared's phone: the past-tense result of a completed voice command lands as a phone
-# notification (APNs via the hub's /api/notify — the same proven sender + device tokens as the weight
-# reminder). The hub token rides the URL (same as the activity push above).
+# Native push to Jared's phone (APNs via the hub's /api/notify). Used only for the failure alerts
+# below: an orchestrator reply is never pushed, because it lands on the screen he asked from and a
+# notification arriving over it just covers the answer. Session replies are pushed by the hub itself.
+# The hub token rides the URL (same as the activity push above).
 HUB_NOTIFY_URL = os.environ.get(
     "HUB_NOTIFY_URL",
     "https://jared-status-hub.fly.dev/api/notify?token=REDACTED",
 )
 
 
-_push_cache = {"v": None, "t": 0.0}
-
-
-def push_enabled() -> bool:
-    """Whether to push command results to Jared's phone. Hub setting `push_enabled` (Settings → Push
-    notifications), cached ~30s. Default ON."""
-    now = time.monotonic()
-    if _push_cache["v"] is None or now - _push_cache["t"] > 30:
-        v = True
-        try:
-            r = httpx.get(f"{SUPABASE_URL}/rest/v1/app_settings",
-                          params={"key": "eq.push_enabled", "select": "value"},
-                          headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=5)
-            rows = r.json()
-            if rows:
-                v = str(rows[0].get("value")).strip().lower() not in ("0", "false", "off", "no", "")
-        except Exception:  # noqa: BLE001
-            pass
-        _push_cache.update(v=v, t=now)
-    return _push_cache["v"]
-
-
-def notify_phone(body: str, title: str = "Hub") -> None:
-    """Send a voice command's final result to Jared's phone as a push notification. Threaded + best-
-    effort so it never delays closing out the request and never raises. Skipped if push is toggled off."""
-    if not (HUB_NOTIFY_URL and body) or _hub_unreachable or not push_enabled():
-        return
-
-    def _send():
-        try:
-            httpx.post(HUB_NOTIFY_URL, json={"title": title, "body": body[:300], "kind": "voice"}, timeout=5.0)
-        except Exception:  # noqa: BLE001
-            pass
-
-    threading.Thread(target=_send, daemon=True).start()
-
-
 # Failure alerts. A request is not allowed to fail silently: a subscription run that still fails after
 # its retries (`run_subscription`) is pushed with its error, because a revoked or expired token is a
 # standing condition that every later request pays for. One push per host per (stage, class) per ALERT_COOLDOWN_S, so a burst of
-# the same fault does not flood the phone. Deliberately bypasses push_enabled — that toggle is for
-# command results, not outages.
+# the same fault does not flood the phone. Deliberately ignores the hub's push_enabled toggle —
+# that is for session replies, not outages.
 ALERT_COOLDOWN_S = float(os.environ.get("ALERT_COOLDOWN_S", "3600"))
 _alert_last: dict = {}
 
@@ -2793,11 +2757,6 @@ def process_request(db: Supabase, req: dict) -> None:
             f"id=eq.{rid}",
             {"status": "done", "result": text, "updated_at": now_iso()},
         )
-        # Pushed to the phone (and from there the watch) when nothing else will tell him: a room mic has
-        # no screen, and the watch app is suspended the moment the wrist drops, so a command sent from it
-        # would otherwise finish with no word to him until he looks again.
-        if source in ("fly", "mac", "watch-cmd") and text:
-            notify_phone(text)
         log(f"done request {rid}: {text[:120]!r}")
     else:
         err = result.get("raw_error") or "unknown error"
