@@ -2243,6 +2243,11 @@ def claim_one(db: Supabase) -> dict | None:
                        extra_headers={"Prefer": "return=representation"})
         return got[0] if got else None
     pending = [r for r in pending or [] if r.get("status") == "pending"]
+    # SPOKEN ORDER, not arrival order. A watch that loses the hub holds its clips and sends them together
+    # when it gets back, and the uploads land in whatever order they finish: a correction ("I said 11")
+    # then runs before the command it corrects and guesses at it. A row with no capture window (typed)
+    # sorts by when it arrived. Both are Postgres UTC timestamps, so they compare as strings.
+    pending.sort(key=lambda r: r.get("capture_start") or r.get("created_at") or "")
     reclaim_stale(db)   # orphans and stranded rows, on its own clock, whether or not anything is pending
     if not pending:
         _holding = False
@@ -2269,7 +2274,7 @@ def claim_one(db: Supabase) -> dict | None:
             return None
 
     global _failover_at
-    oldest_at = _parse_ts(pending[0].get("created_at") or "")
+    oldest_at = _parse_ts(min(r.get("created_at") or "" for r in pending))
     # A row handed on or released waits from when it became claimable again, not from its creation —
     # otherwise its preferred untried worker gets no head start and the lowest-ranked one races it.
     back_at = _parse_ts(pending[0].get("updated_at") or "") if pending[0].get("failed_on") else None
