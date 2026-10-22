@@ -44,7 +44,11 @@ const watched = new Map();   // session id -> { id, path, offset, rest, watcher,
 // typed — and it is what lets the device that sent the words replace its own placeholder by id.
 //
 // Registered against the session, not the watcher: a resume with words launches a new row that is not
-// watched until the next tick, and the words are typed before that.
+// watched until the next tick, and the words are typed before that. For the same reason the claim is
+// made on the PREFIX read too (`loadPrefix`): a resumed session writes its first prompt before the
+// watcher attaches, so that prompt is only ever read as prefix, and a claim made only on the live read
+// leaves its sender's placeholder on screen under the whole turn. Claiming there is safe because an
+// expectation exists only for words this process typed in the last few minutes.
 const expecting = new Map();   // session id -> [{ text, cmd, at }]
 const EXPECT_MS = 5 * 60 * 1000;
 export function expectPrompt(sessionId, text, cmd) {
@@ -139,11 +143,12 @@ function emit(st, body) {
  *
  * Shared by the live read and by `loadPrefix`, which runs it over the part of a turn written before
  * this process was watching: the same records have to number the same way both times, or a replay
- * would not line up with what the hub already holds. `live` is false there, and the only things it
- * turns off are the ones that act on the world (the row's activity stamp, claiming a typed command).
+ * would not line up with what the hub already holds. `live` is false there, and the only thing it
+ * turns off is the one that acts on the world: the row's activity stamp. A typed command's id IS
+ * claimed there (`takeExpect`, see `expectPrompt`).
  * Returns true when the record ends the turn.
  */
-function step(st, d, out, live) {
+export function step(st, d, out, live) {
   // TYPED WHILE A TURN IS RUNNING. Claude Code QUEUES it and writes `queue-operation` records; there
   // is no `user` record at all for one absorbed into a running turn. Two moments, and they are
   // different facts:
@@ -162,7 +167,7 @@ function step(st, d, out, live) {
       // The same message at its two moments carries the same id: minted at `enqueue` and held on
       // `st.queue` until its `remove` (matched by the exact text both records carry) takes it. A
       // `remove` with nothing queued (the enqueue is beyond what this process has read) mints its own.
-      const fresh = () => ({ id: randomUUID(), cmd: live ? takeExpect(st.id, said.prompt) : null });
+      const fresh = () => ({ id: randomUUID(), cmd: takeExpect(st.id, said.prompt) });
       let ev;
       if (d.operation === 'enqueue') {
         ev = fresh();
@@ -199,7 +204,7 @@ function step(st, d, out, live) {
     if (said && said.prompt) {
       const flat = flatten(said.prompt);
       const i = st.queue.findIndex((q) => q.text === flat);
-      const ev = i >= 0 ? st.queue.splice(i, 1)[0] : { id: randomUUID(), cmd: live ? takeExpect(st.id, said.prompt) : null };
+      const ev = i >= 0 ? st.queue.splice(i, 1)[0] : { id: randomUUID(), cmd: takeExpect(st.id, said.prompt) };
       out({ session: st.id, state: 'said', text: said.prompt, id: ev.id, ...(ev.cmd ? { cmd: ev.cmd } : {}) });
     }
     // A message too long for the tty is typed as a stub that ASKS the session to quote the words

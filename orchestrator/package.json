@@ -11,6 +11,7 @@
   "scripts": {
     "postinstall": "chmod +x node_modules/node-pty/prebuilds/*/spawn-helper 2>/dev/null || true",
     "start": "node src/server.js",
+    "test": "node --test test/*.test.js",
     "check": "node --check src/server.js && node --check src/config.js && node --check src/sessions.js && node --check src/focus.js && node --check src/applescript.js && node --check src/supabase.js && node --check src/pty.js"
   },
   "dependencies": {

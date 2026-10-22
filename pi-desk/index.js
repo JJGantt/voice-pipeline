@@ -41,7 +41,7 @@ import { withAttachments, sweepStashedPrompts } from '../orchestrator/src/handof
 import { sessionOf } from '../orchestrator/src/discover.js';
 import { sweepScratch } from './scratch.js';
 import { setupCgroups, limitSession, watchSession, liftBudget, sessionUsage, SESSION_BUDGET_MB } from './cgroups.js';
-import { syncSessionWatch, reportTurnEnd } from '../orchestrator/src/sessionWatch.js';
+import { syncSessionWatch, reportTurnEnd, expectPrompt } from '../orchestrator/src/sessionWatch.js';
 import { relayFirstReply } from '../orchestrator/src/relay.js';
 // Shared with the Mac rather than reimplemented: both halves of a transfer must agree byte for
 // byte on what a mirrored transcript is.
@@ -834,8 +834,8 @@ async function bindWhenUp(session, { attempts = 90, delayMs = 1000 } = {}) {
 // `claude --resume` keeps it — and so is the transcript it appends to, so the row is published with
 // both at launch instead of a tick later. That is what lets the hub see the conversation running again
 // at once and never resume it a second time, which would put two processes on one transcript.
-function resumeArgs(row, { prompt = null, report = false, commandId = null } = {}) {
-  return { name: row.repo, prompt: prompt || '', resumeId: row.claude_session_id, commandId, report,
+function resumeArgs(row, { prompt = null, report = false, commandId = null, msg = null } = {}) {
+  return { name: row.repo, prompt: prompt || '', resumeId: row.claude_session_id, commandId, report, msg,
            // Only one of this machine's own names can come back as itself; a Mac row's id is not a tmux name.
            reuse: row.worker === WORKER && /^hub-[A-Za-z0-9._-]+$/.test(row.id) ? row.id : null,
            label: row.label || null, origin: row.origin || null,
@@ -845,7 +845,7 @@ function resumeArgs(row, { prompt = null, report = false, commandId = null } = {
 
 async function startSession({ name, prompt, resumeId = null, commandId = null, report = false, label = null,
                               knownClaudeId = null, transcriptPath = null, mirrorOffset = null, origin = null,
-                              reuse = null }) {
+                              reuse = null, msg = null }) {
   if (reuse) {
     const same = (await liveSessions()).find((l) => l.name === reuse);
     // Running already: a second process on one transcript forks the conversation (see resume_session).
@@ -863,6 +863,10 @@ async function startSession({ name, prompt, resumeId = null, commandId = null, r
   // when Jared actually asks. A bare session with no prompt has nothing to report on either way.
   const full = [warning, spoken, (report && spoken) ? REPORT_DIRECTIVE : null].filter(Boolean).join('\n\n');
   const session = launch(dir, name, full, resumeId, reuse);
+  // The sender's message id, stamped on the prompt these words become, exactly as a follow-up typed
+  // into a running session is (`typeInto`). Without it the device that sent the words never sees its
+  // own id come back, and its placeholder stays under the whole turn.
+  if (msg && full) expectPrompt(session, full, msg);
 
   // Published immediately so the indicator lights up when work starts, not a poll later.
   await sb('desk_sessions?on_conflict=id', {
@@ -965,7 +969,7 @@ async function run(cmd) {
       });
       return `queued resume of ${id} — ${why}, and the Mac is asleep`;
     }
-    return startSession(resumeArgs(row, { prompt, report, commandId: cmd.id }));
+    return startSession(resumeArgs(row, { prompt, report, commandId: cmd.id, msg: (cmd.payload || {}).msg || cmd.id }));
   }
 
   // SOURCE half of a handover: this machine owns the session and is giving it up.

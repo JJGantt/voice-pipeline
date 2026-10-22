@@ -164,6 +164,9 @@ async function run(cmd) {
     ensureTrusted(dir);
     if (row.repo !== 'root') await pull(dir);
     const sessionId = `mac-${cmd.id.slice(0, 8)}`;
+    // The sender's message id, stamped on the prompt these words become, as `deliver` does for a
+    // running session — without it the sender's placeholder stays under the whole turn.
+    if (prompt) expectPrompt(sessionId, prompt, (cmd.payload || {}).msg || cmd.id);
     beginLaunch();   // until the row exists — see open_session below
     try {
       const raw = await openFreshTab(dir, row.repo, prompt, sessionId, row.claude_session_id);
