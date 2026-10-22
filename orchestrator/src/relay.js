@@ -35,7 +35,7 @@ export async function relayFirstReply(sessionId, tail) {
     : [];
   if (!c?.payload?.relay) { settled.add(sessionId); return; }
   const label = s.custom_title || s.label || c.payload.label || null;
-  const text = tail.lastReply.slice(0, 4000);
+  const text = tail.lastReply.slice(0, 20000);
   const rows = await rest('voice_messages?on_conflict=session_id', {
     method: 'POST',
     headers: { Prefer: 'resolution=ignore-duplicates,return=representation' },
