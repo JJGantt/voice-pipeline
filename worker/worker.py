@@ -1871,6 +1871,11 @@ class SdkRunner:
             can_use_tool=_deny,
             hooks={"PreToolUse": [HookMatcher(matcher=None, hooks=[_fence])]},
             cwd=os.path.expanduser("~"),
+            # The SDK reads the CLI's stdout one JSON line at a time and dies on any line over 1MB (its
+            # default). A photo turn's Read result carries the image base64 in one line, so a phone photo
+            # kills the whole turn ("JSON message exceeded maximum buffer size"). The buffer only grows
+            # to the size of the line actually read, so a high ceiling costs nothing on ordinary turns.
+            max_buffer_size=64 * 1024 * 1024,
         )
         client = ClaudeSDKClient(options=opts)
         await client.connect()
