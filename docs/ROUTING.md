@@ -166,7 +166,8 @@ error path that did turned every noise judgment into an Opus run (the dispatch c
 So the reasons the split exists, in the order they hold:
 
 1. **What the fast path can REACH.** The allow list is a correctness gate — a tool that would have to
-   invent a number is simply not in the schema Sonnet is handed, so it cannot quietly write one.
+   invent a number is not on Sonnet's allow list, so a call to it is refused and it cannot quietly
+   write one. It stays in the schema on purpose; that is what makes Sonnet escalate (§ above).
    Nothing to do with models or money.
 2. **Capacity, on the common case.** Every ordinary turn draws from the shared subscription window,
    so the cheap fast model runs it and Opus only runs the rare gated turn.
