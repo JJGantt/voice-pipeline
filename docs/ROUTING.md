@@ -56,14 +56,20 @@ and their dated and note items, `create_list`, the whole session group (`start_s
 Every argument those take is either a number the user spoke or an id from a read — there is nothing in
 them a bigger model knows better.
 
-The web (`WebSearch`, `WebFetch`) and reading Gmail and iMessage are on the fast path too, by the same
-rule. They are listed once, tool by tool, in `OPEN_TOOLS` and spread into both lists.
+The web (`WebSearch`, `WebFetch`) is on the fast path too, by the same rule (`WEB_TOOLS`, spread into
+both lists).
+
+**Gmail and iMessage are Opus's, reads included** (`MAIL_TOOLS`, on `ALL_TOOLS` only). Jared's call:
+anything touching his email or texts goes to the capable model. They are visible-but-denied on the fast
+path like the nutrition writes, and `ESCALATE_DIRECTIVE` names them, so a mail or text request from
+Sonnet comes back as `__ESCALATE__`.
 
 **Sending a text or an email (`SEND_TOOLS`) is decided per turn, by which mic heard it.** A pushed
 command — typed, the phone's button, the watch's — may send; one from an always-on mic (`voice_requests.always_on`)
 may not, because those hear the whole room and a sentence meant for someone else would
-reach a real person. The sends are on no allow list: the warm client's `_gate` callback allows them
-only when `SdkRunner.run(..., ambient=False)`, and every other runner gets `turn_tools(ambient)`
+reach a real person. The sends are on no allow list: the warm client's `_fence` hook allows them
+only on a runner whose tools include them (the warm Opus, never Sonnet) and only when
+`SdkRunner.run(..., ambient=False)`, and every other runner gets `turn_tools(ambient)`
 (full-agent mode, which has no allow list, gets them as `--disallowedTools`).
 
 The fast path's list is enforced by a **PreToolUse hook** (`SdkRunner._fence`), not by `allowed_tools`

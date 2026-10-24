@@ -10,6 +10,9 @@ kill_timeout = "20s"   # time for the worker to announce it is stopping; a turn 
   # Jared's wall clock, the same as the Pi's and the Mac's: the worker and its data MCP stamp "now" as
   # naive local time, and on UTC they wrote entries four hours late.
   TZ = "America/New_York"
+  # The Mac's iMessage server at its tailnet address. entrypoint.sh exports it as MESSAGES_MCP_URL only
+  # once Tailscale is up, so a machine without the tailnet registers no iMessage server at all.
+  MESSAGES_TAILNET_URL = "http://<mac-tailnet-ip>:27187/mcp"
 
 [mounts]
   source = "worker_data"

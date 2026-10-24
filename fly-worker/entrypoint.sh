@@ -32,6 +32,21 @@ update_claude() {
     find /data/claude/projects -type f -mtime +30 -delete 2>/dev/null
   done ) &
 
+# TAILSCALE: the route to the Mac's iMessage server, which listens only on the home network and the
+# tailnet. State lives on the volume so a restart rejoins as the same node instead of minting a new one.
+# Nothing here retries: a tailnet that will not come up costs the iMessage tools until the next restart,
+# and every other tool is unaffected.
+if [ -n "${TAILSCALE_AUTHKEY:-}" ]; then
+  mkdir -p /data/tailscale /var/run/tailscale
+  tailscaled --state=/data/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock >/dev/null 2>&1 &
+  if tailscale up --auth-key="$TAILSCALE_AUTHKEY" --hostname=jared-voice-worker --accept-dns=false --timeout=30s; then
+    export MESSAGES_MCP_URL="$MESSAGES_TAILNET_URL"
+    echo "tailscale up; iMessage at $MESSAGES_MCP_URL"
+  else
+    echo "tailscale did not come up; no iMessage tools this run" >&2
+  fi
+fi
+
 # The worker is restarted whenever it exits — a crash or an OOM-kill — and the machine's whole job is
 # this process, so the loop is the foreground. Fly's stop signal reaches this script, not the worker,
 # so it is passed on: the worker announces it is stopping and others stop deferring to it.

@@ -113,7 +113,9 @@ GMAIL_MCP_PY = os.environ.get("GMAIL_MCP_PY", "/Users/jaredgantt/repos/gmail-mcp
 # iMessage MCP, always over HTTP. It reads chat.db, which needs Full Disk Access, and only the Mac's
 # messages-http launchd job holds that — a stdio copy spawned by this worker would start fine and fail
 # every read. So the Mac talks to its own job on loopback and the Pi sets the Mac's address in .env.
-# Empty (Fly, or a Pi without the setting) means no iMessage tools rather than a server that can't connect.
+# Fly reaches it over Tailscale: entrypoint.sh sets the URL only once the tailnet is up.
+# Empty (Fly without Tailscale, or a Pi without the setting) means no iMessage tools rather than a server
+# that can't connect.
 MESSAGES_MCP_URL = os.environ.get(
     "MESSAGES_MCP_URL", "http://127.0.0.1:27187/mcp" if WORKER_ID == "mac" else ""
 )
@@ -393,21 +395,22 @@ POWER_DIRECTIVE = (
 # gated. A tool whose every argument is already in front of the model — a number the user spoke, an id
 # from a read it just did — is on the fast path however destructive it is, because there is nothing there
 # for a bigger model to know better.
-# The web and reading his email and texts are on BOTH lists. Nothing in them is a value the model
-# invents: a search takes his question, a read takes what he asked for. Named tool by tool rather than
-# by server so the two sends can be held apart; a tool either server adds later is visible but denied
-# until it is listed here.
-OPEN_TOOLS = [
+# The web is on BOTH lists: a search takes his question, so there is no value in it the model invents.
+WEB_TOOLS = ["WebSearch", "WebFetch"]
+# His email and texts are Opus's alone, reading as well as sending, because he decided so: anything that
+# touches another person's messages goes to the capable model. They are left OFF Sonnet's allow list
+# rather than removed, so Sonnet still sees them and escalates — the same visible-but-denied rule as the
+# nutrition writes. Named tool by tool so the two sends can be held apart below.
+MAIL_TOOLS = [
     "mcp__gmail__search_email", "mcp__gmail__get_email", "mcp__gmail__get_email_thread",
     "mcp__gmail__list_labels", "mcp__gmail__find_email_contact", "mcp__gmail__create_draft",
     "mcp__gmail__modify_email",
     "mcp__messages__list_chats", "mcp__messages__get_thread", "mcp__messages__search_messages",
     "mcp__messages__list_contacts",
-    "WebSearch", "WebFetch",
 ]
 # Sending a text or an email reaches another person, so it is decided per TURN, not per list: allowed
 # when he pushed a button or typed, never from the always-on room mics, which hear the whole room and
-# would send a sentence that was never meant for the assistant. See turn_tools() and SdkRunner._gate.
+# would send a sentence that was never meant for the assistant. See turn_tools() and SdkRunner._fence.
 SEND_TOOLS = ["mcp__messages__send_message", "mcp__gmail__send_email"]
 # Tools that only mean something next to his signed-in browser, which this worker does not have: a cart
 # URL has to be opened there, a cart recording is what its /cart page showed, and an item id is read off
@@ -416,7 +419,7 @@ SEND_TOOLS = ["mcp__messages__send_message", "mcp__gmail__send_email"]
 # request has to become a start_session, never an Opus turn with no browser.
 SESSION_TOOLS = ["mcp__data__build_walmart_cart_url", "mcp__data__record_walmart_cart",
                  "mcp__data__save_shopping_item"]
-ALL_TOOLS = ["mcp__data", "mcp__voice", "mcp__govee-lights", "mcp__petlibro-feeder", *OPEN_TOOLS, *SEND_TOOLS]  # full toolset (Opus)
+ALL_TOOLS = ["mcp__data", "mcp__voice", "mcp__govee-lights", "mcp__petlibro-feeder", *WEB_TOOLS, *MAIL_TOOLS, *SEND_TOOLS]  # full toolset (Opus)
 
 
 def turn_tools(ambient: bool, base: "list | None" = None) -> list:
@@ -491,7 +494,7 @@ SAFE_TOOLS = [
     "mcp__data__follow_up", "mcp__data__rename_session", "mcp__data__focus_session",
     "mcp__data__unfocus_session",
     "mcp__data__set_wall",
-    *OPEN_TOOLS,
+    *WEB_TOOLS,
 ]
 
 def validate_safe_tools(mcp_js: str) -> None:
@@ -536,8 +539,10 @@ ESCALATE_DIRECTIVE = (
     "not have yet. Everything whose arguments are already in front of you is YOURS, and you should just "
     "do it: read anything (get_*/list_*); manage lists, notes and dated items; log a weight or height he "
     "stated as a number; commit, remove or delete an entry by its id; log, edit or remove a SET; set or "
-    "clear the rep watcher; drive the lights, feeder, TV and voice settings; and read and send his "
-    "email (gmail tools) and his texts (messages tools). "
+    "clear the rep watcher; and drive the lights, feeder, TV and voice settings. "
+    "His EMAIL and his TEXTS are the capable model's, not yours — reading, searching, drafting, "
+    "replying or sending, a single message or a whole thread: any request that needs his Gmail or his "
+    "iMessages is an escalation, even when it only asks what someone said. "
     "When he explicitly names a RECIPE — 'my oatmeal recipe', 'the gochujang tofu recipe' — log or stage "
     "it with log_recipe, which is yours, because its macros were estimated once when it was saved and you "
     "are only naming it. A meal he describes by a past log ('same as yesterday', 'what I had Monday') is "
@@ -1522,8 +1527,13 @@ def write_mcp_config() -> str:
     # missing (Fly) fails to start on every turn.
     if os.path.exists(PETLIBRO_MCP_PY):
         cfg["mcpServers"]["petlibro-feeder"] = {"command": PETLIBRO_PY, "args": [PETLIBRO_MCP_PY], "env": env}
-    if os.path.exists(GMAIL_MCP_PY):
-        cfg["mcpServers"]["gmail"] = {"command": GMAIL_PY, "args": [GMAIL_MCP_PY]}
+    # The Mac and the Pi keep the Gmail credential in gmail-mcp/.env; Fly has no such file and holds it
+    # as secrets, passed through here — only what is set, since an empty value would shadow the .env.
+    # Registered only where one of the two exists: without it every Gmail call fails at the token.
+    g_env = {k: os.environ[k] for k in ("GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "GOOGLE_REFRESH_TOKEN")
+             if os.environ.get(k)}
+    if os.path.exists(GMAIL_MCP_PY) and (len(g_env) == 3 or os.path.exists(pathlib.Path(GMAIL_MCP_PY).parent / ".env")):
+        cfg["mcpServers"]["gmail"] = {"command": GMAIL_PY, "args": [GMAIL_MCP_PY], "env": g_env}
     if HAS_MESSAGES:
         cfg["mcpServers"]["messages"] = {"type": "http", "url": MESSAGES_MCP_URL, "headers": MESSAGES_HEADERS}
     # alwaysLoad makes Claude Code connect a server BEFORE the first turn. Without it, `-p` connects
@@ -1822,7 +1832,7 @@ class SdkRunner:
             # could call the gated nutrition tools directly, and a room-mic turn sent an email in the
             # first test of the send rule. A hook's deny outranks any allow rule, so the list holds here.
             name = input_data.get("tool_name") or ""
-            if name in SEND_TOOLS:
+            if name in SEND_TOOLS and name in exact:
                 # The one per-turn decision: the client is warm across turns, so only the flag run()
                 # sets can say which mic this turn came from.
                 if self._ambient:

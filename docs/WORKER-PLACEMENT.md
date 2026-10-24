@@ -78,14 +78,16 @@ called). Seconds are to `initialize`, one cold run then warm runs on Fly, one ru
 | voice (4) | 0.59s | 0.17s | 0.34–0.44s |
 | govee-lights (5) | 1.16s | 0.43s | 0.75–0.95s |
 | petlibro-feeder (4) | 3.70s | 0.48s | **absent** — registered only where its files exist |
-| gmail (8) | 2.10s | present | **absent** — no checkout in the image, so the `os.path.exists` guard drops it |
-| messages (HTTP) | via `http://Jareds-MacBook-Air.local:27187/mcp` | loopback | **absent** — `MESSAGES_MCP_URL` is empty |
+| gmail (8) | 2.10s | present | in the image (own venv, mcp 2.x); registered only while the three `GOOGLE_*` secrets are set |
+| messages (HTTP) | via `http://Jareds-MacBook-Air.local:27187/mcp` | loopback | over Tailscale to the Mac's `<mac-tailnet-ip>`, only while `TAILSCALE_AUTHKEY` is set and the tailnet came up at boot |
 
 Everything else that differs, from the code (`grep -n WORKER_ID worker/worker.py`):
 
-- **iMessage:** only reachable while the Mac is awake, from any host. Fly cannot reach it at all
-  today: `.local` does not resolve in Fly, the Mac's port is not exposed to the internet, and the
-  container has no Tailscale.
+- **iMessage:** only reachable while the Mac is awake, from any host. `.local` does not resolve in
+  Fly and the Mac's port is not on the internet, so Fly joins the tailnet (`entrypoint.sh`, node
+  `jared-voice-worker`, state on the volume) and talks to the Mac's tailnet address. Without the
+  `TAILSCALE_AUTHKEY` secret, or if `tailscale up` fails at boot, the server is simply not registered
+  until the next restart.
 - **Feeder:** the PetLibro server is LAN-only (tinytuya), so even with the right path Fly could not
   reach the feeder without a route into the home network.
 - **Lights:** `govee_mcp.py` tries a LAN multicast scan first (1.2s timeout) and falls back to the
@@ -196,5 +198,5 @@ in this decision, so Fly lacking them does not count against it.
 
 The Pi and then the Mac are the fallbacks: a Fly worker that stops heartbeating, reports itself
 degraded or fails a turn without acting hands the command to the next healthy worker
-(`worker/README.md` § Handing a failed turn on). A command that needs iMessage, Gmail or the feeder is
-answered on Fly without those tools.
+(`worker/README.md` § Handing a failed turn on). A command that needs the feeder is answered on Fly without it;
+Gmail and iMessage reach Fly's Opus as described above.
