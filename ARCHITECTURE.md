@@ -6,11 +6,19 @@ know before editing anything here.
 
 ## The pieces (modular boundaries)
 
+**The Mac's always-on listener is switched off** (since 2026-10-24): the watch is the everyday way in, and
+the ESP keeps listening for wake words. The code and the launchd plist stay; the job is
+`launchctl disable`d and booted out, so neither the worker's `_listener_supervisor` (which kicks only a
+LOADED job with no PID) nor Hammerspoon's wake kick (`voicelistener.lua`) can bring it back. To turn it on
+again: `launchctl enable gui/$(id -u)/com.jaredgantt.voice-mac-listener && launchctl bootstrap
+gui/$(id -u) ~/Library/LaunchAgents/com.jaredgantt.voice-mac-listener.plist`. The ESP does not need it:
+Fly reads its own mode from `app_settings`.
+
 ```
 INPUTS (capture + enqueue only — no model logic):
   status-hub web UI: the voice FAB + typed box     ─┐
   ESP mic (jared-voice server): wake word           ─┤→ Supabase voice_requests {transcript, source}
-  Mac mic (mac-listener / wakefree.py)              ─┘
+  Mac mic (mac-listener / wakefree.py) — DISABLED  ─┘
                                                         │
 WORKER (worker/worker.py — the ONE brain):
   claims a request, runs it, writes the reply to voice_messages
