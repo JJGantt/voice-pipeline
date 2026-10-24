@@ -28,9 +28,9 @@ DEVICES (claim order fly → pi → mac):
 
 Inputs are thin by design: they capture and enqueue one row, and nothing about which device heard the
 command survives into how it is processed. The one thing a device adds is where it was
-(`voice_requests.location`, sent by the watch and the browser): the worker puts it on the prompt as a
-single line of context and writes it to `STATE_DIR/cmd_loc`, which the data MCP appends to any
-session the turn starts.
+(`voice_requests.location`, sent by the watch and the browser). It is not put on the prompt: a trigger
+keeps the last fix per device in `locations` (data-layer 00129), and a model that needs it calls the
+data MCP's `get_location`.
 
 ## Worker execution strategies
 
