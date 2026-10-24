@@ -12,6 +12,7 @@ on screen via the Hammerspoon overlay HUD (see hud()).
 """
 
 import asyncio
+import json
 import os
 import re
 import resource
@@ -129,6 +130,29 @@ def _lid_closed() -> bool:
     return '"AppleClamshellState" = Yes' in out
 
 
+def _builtin_mic():
+    """The sounddevice index of the Mac's own microphone, or None to fall back to the default input.
+
+    Never the default: connected AirPods become it, and holding their mic — which this listener does
+    all day — keeps the whole Bluetooth link in the hands-free profile, so his music and calls are
+    call-quality for as long as they are in, and wake words are heard through a narrowband codec.
+    PortAudio does not report a transport, so CoreAudio's own (via system_profiler) names the device."""
+    try:
+        out = subprocess.run(["system_profiler", "SPAudioDataType", "-json"],
+                             capture_output=True, text=True, timeout=20).stdout
+        items = json.loads(out)["SPAudioDataType"][0]["_items"]
+        name = next(x["_name"] for x in items
+                    if x.get("coreaudio_device_transport") == "coreaudio_device_type_builtin"
+                    and x.get("coreaudio_device_input"))
+        for i, d in enumerate(sd.query_devices()):
+            if d["name"] == name and d["max_input_channels"] > 0:
+                return i
+        log(f"built-in mic {name!r} not in PortAudio's list — using the default input")
+    except Exception as exc:
+        log(f"no built-in mic found ({exc!r}) — using the default input")
+    return None
+
+
 def _open_input_stream():
     """Open the capture stream, waiting out a closed lid instead of dying into a respawn loop.
 
@@ -139,7 +163,8 @@ def _open_input_stream():
     real fault and still propagates."""
     waited = False
     while True:
-        stream = sd.RawInputStream(samplerate=SAMPLE_RATE, blocksize=FRAME, dtype="int16", channels=1)
+        stream = sd.RawInputStream(samplerate=SAMPLE_RATE, blocksize=FRAME, dtype="int16", channels=1,
+                                   device=_builtin_mic())
         try:
             stream.start()      # where a powered-down HAL actually fails; a second start() in `with` is a no-op
         except sd.PortAudioError as exc:
