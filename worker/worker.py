@@ -388,8 +388,8 @@ POWER_DIRECTIVE = (
     "the meal's totals by summing the ingredients, so keep each component's macros accurate.]"
 )
 
-# ---- Dynamic route. Sonnet is the fast first responder, given ONLY the SAFE tools below in its
-# --allowedTools; the gated tools are absent, so in `-p` mode Sonnet is DENIED them and physically cannot
+# ---- Dynamic route. the fast path (HUB_MODEL at HUB_EFFORT) is the first responder, given ONLY the SAFE tools below in its
+# --allowedTools; the gated tools are absent, so in `-p` mode the fast path is DENIED them and physically cannot
 # corrupt that data. It still SEES them in the schema and, per the escalate directive, hands the whole
 # turn to a fresh Opus rather than claiming it can't.
 #
@@ -401,8 +401,8 @@ POWER_DIRECTIVE = (
 # The web is on BOTH lists: a search takes his question, so there is no value in it the model invents.
 WEB_TOOLS = ["WebSearch", "WebFetch"]
 # His email and texts are Opus's alone, reading as well as sending, because he decided so: anything that
-# touches another person's messages goes to the capable model. They are left OFF Sonnet's allow list
-# rather than removed, so Sonnet still sees them and escalates — the same visible-but-denied rule as the
+# touches another person's messages goes to the capable model. They are left OFF the fast path's allow list
+# rather than removed, so the fast path still sees them and escalates — the same visible-but-denied rule as the
 # nutrition writes. Named tool by tool so the two sends can be held apart below.
 MAIL_TOOLS = [
     "mcp__gmail__search_email", "mcp__gmail__get_email", "mcp__gmail__get_email_thread",
@@ -418,7 +418,7 @@ SEND_TOOLS = ["mcp__messages__send_message", "mcp__gmail__send_email"]
 # Tools that only mean something next to his signed-in browser, which this worker does not have: a cart
 # URL has to be opened there, a cart recording is what its /cart page showed, and an item id is read off
 # the retailer's site. Here they could only be called with made-up values. They are REMOVED from every
-# runner's schema rather than gated, because a gated tool is what makes Sonnet escalate — and a cart
+# runner's schema rather than gated, because a gated tool is what makes the fast path escalate — and a cart
 # request has to become a start_session, never an Opus turn with no browser.
 SESSION_TOOLS = ["mcp__data__build_walmart_cart_url", "mcp__data__record_walmart_cart",
                  "mcp__data__save_shopping_item"]
@@ -431,12 +431,12 @@ def turn_tools(ambient: bool, base: "list | None" = None) -> list:
     tools = [t for t in (base or ALL_TOOLS) if t not in SEND_TOOLS]
     return tools if ambient else tools + SEND_TOOLS
 
-# Sonnet's allow list.  ⚠️  See docs/ROUTING.md before changing this.
+# the fast path's allow list.  ⚠️  See docs/ROUTING.md before changing this.
 #
 # It MUST be an allow list, not a deny list, and the difference is load-bearing:
 # a tool omitted from --allowedTools stays VISIBLE in the schema and is refused only when called, so
-# Sonnet sees log_nutrition, recognises it needs it, and escalates. --disallowedTools instead removes
-# the tool from the schema outright — Sonnet cannot see it, has nothing to escalate about, and
+# the fast path sees log_nutrition, recognises it needs it, and escalates. --disallowedTools instead removes
+# the tool from the schema outright — the fast path cannot see it, has nothing to escalate about, and
 # truthfully reports that nutrition logging "isn't available". That regression shipped and broke
 # logging until it was caught, so: do not "simplify" this into a deny list.
 #
@@ -531,7 +531,7 @@ def validate_safe_tools(mcp_js: str) -> None:
         log(f"[tools] not on the fast path (gated or forgotten): {', '.join(ungated)}")
 
 
-# Escalation: Sonnet emits this (mirrors IGNORE_SENTINEL) when a request needs a gated write tool; the
+# Escalation: the fast path emits this (mirrors IGNORE_SENTINEL) when a request needs a gated write tool; the
 # dispatch then re-runs the whole turn on Opus + max thinking. Appended to every standard-route turn.
 ESCALATE_SENTINEL = "__ESCALATE__"
 ESCALATE_DIRECTIVE = (
@@ -1845,7 +1845,7 @@ class SdkRunner:
         async def _fence(input_data, tool_use_id, context):  # noqa: ARG001
             # The fast path's allow list, enforced BEFORE any permission rule. This client is Claude
             # Code, which also applies the host user's own settings — and the Mac's pre-approve every
-            # data, gmail and messages tool in auto mode. With allowed_tools alone, Sonnet on the Mac
+            # data, gmail and messages tool in auto mode. With allowed_tools alone, the fast path on the Mac
             # could call the gated nutrition tools directly, and a room-mic turn sent an email in the
             # first test of the send rule. A hook's deny outranks any allow rule, so the list holds here.
             name = input_data.get("tool_name") or ""
@@ -2610,9 +2610,9 @@ def process_request(db: Supabase, req: dict) -> None:
     if alt:
         prompt += ALT_TRANSCRIPT_DIRECTIVE.format(alt=alt)
 
-    # ---- ONE dynamic route. Every hub command goes to Sonnet (safe tools + escalate); a request that needs
+    # ---- ONE dynamic route. Every hub command goes to the fast path (safe tools + escalate); a request that needs
     # a gated WRITE tool escalates to a FRESH Opus (full tools). Photos skip straight to Opus (vision via the
-    # CLI Read tool; Sonnet would just escalate anyway). Full-agent mode is the unrestricted coding agent on
+    # CLI Read tool; the fast path would just escalate anyway). Full-agent mode is the unrestricted coding agent on
     # its own --resume session. No user-facing model/route choice anymore — the model is chosen per turn.
     attachments = req.get("attachments") or []
     if isinstance(attachments, str):
@@ -2645,7 +2645,7 @@ def process_request(db: Supabase, req: dict) -> None:
     # fails transiently is retried (`run_subscription`), and one that still fails surfaces as an error.
     # `ctx` (the replayed hub conversation) rides on the FRESH run; there is no --resume for hub turns, so
     # the two models never share a session. agent → the unrestricted coding agent (its own --resume
-    # session). Photos → Opus (vision via Read). Otherwise: Sonnet (warm SDK client) with the safe toolset;
+    # session). Photos → Opus (vision via Read). Otherwise: the fast path (warm SDK client) with the safe toolset;
     # a gated need → a FRESH Opus. Errors never upgrade the model. A failure that called no tool is
     # handed to another worker below rather than ended here.
     hub_prompt = ctx + prompt   # ctx is "" in agent mode (uses --resume) or when there's no live conversation
@@ -2666,13 +2666,13 @@ def process_request(db: Supabase, req: dict) -> None:
                             agent=True, cwd=ag["cwd"], allow_read=bool(att_paths),
                             deny_tools=room_deny)
     elif attachments:
-        # Photos → straight to Opus (vision needs the capable model + Read; Sonnet would only escalate).
+        # Photos → straight to Opus (vision needs the capable model + Read; the fast path would only escalate).
         result = run_subscription(
             lambda: run_opus(hub_prompt + POWER_DIRECTIVE, _emit, sys_ctx, ambient, att_tmp if att_paths else None,
                      turn_tools(ambient), room_deny),
             "subscription Opus (photo)")
     else:
-        # FAST PATH — Sonnet on the WARM SDK client, safe toolset only. Not a per-command `claude -p`: that
+        # FAST PATH — HUB_MODEL on the WARM SDK client, safe toolset only. Not a per-command `claude -p`: that
         # spawn (CLI + four stdio MCP servers) measured 3.6s on the Pi (~42% of a simple turn) before the
         # model saw a token; the warm client pays it once.
         # Errors never upgrade the model: on 2026-08-30 an error-escalation turned every noise judgment
