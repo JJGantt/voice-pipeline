@@ -22,6 +22,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { config } from './config.js';
 import { upsertRepos, pruneRepos, heartbeatDesk } from './supabase.js';
+import { loginExpiresAt } from './login.js';
 
 const execFileP = promisify(execFile);
 
@@ -127,7 +128,7 @@ let failingSince = null;
 
 async function beat() {
   try {
-    await heartbeatDesk('desk', { host: os.hostname() });
+    await heartbeatDesk('desk', { host: os.hostname(), login_expires_at: loginExpiresAt() });
     failingSince = null;
   } catch (e) {
     const cause = e.cause ? ` (${e.cause.code || e.cause.message || e.cause})` : '';

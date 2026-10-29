@@ -36,6 +36,7 @@ import { ensureTrusted } from '../orchestrator/src/trust.js';
 import { readTail, liveSessions, evict, pickEviction, typeInto } from './sessions.js';
 // Pictures attached in the hub, fetched to this machine for the session to read — shared with the Mac.
 import { withAttachments, sweepStashedPrompts } from '../orchestrator/src/handoff.js';
+import { loginExpiresAt } from '../orchestrator/src/login.js';
 // Which conversation a process is in, from Claude Code's own record — shared with the Mac, which
 // reads the same files for the same reason.
 import { sessionOf } from '../orchestrator/src/discover.js';
@@ -373,7 +374,7 @@ async function heartbeat() {
       method: 'POST',
       headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
       body: JSON.stringify([{ worker: WORKER, last_seen: new Date().toISOString(),
-                              info: hostStats(lastResidentCount) }]),
+                              info: { ...hostStats(lastResidentCount), login_expires_at: loginExpiresAt() } }]),
     });
   } catch (e) { console.error('[pi-desk] heartbeat:', e.message); }
 }
@@ -660,11 +661,15 @@ async function runQueue(residents) {
   await sb(`desk_queue?id=eq.${encodeURIComponent(next.id)}`, { method: 'DELETE', headers: { Prefer: 'return=minimal' } }).catch(() => {});
 }
 
+// Awake AND signed in: a Mac whose /login has expired launches a session that does nothing, which is
+// worse than keeping the work here. A beat without the field (an older orchestrator) counts as signed in.
 async function macIsAwake(ifUnsure = true) {
   try {
-    const rows = await sb('worker_presence?worker=eq.desk&select=last_seen');
+    const rows = await sb('worker_presence?worker=eq.desk&select=last_seen,info');
     const seen = rows?.[0]?.last_seen;
     if (!seen) return false;
+    const exp = rows[0].info?.login_expires_at;
+    if (exp !== undefined && !(exp && Date.parse(exp) > Date.now())) return false;
     return (Date.now() - new Date(seen).getTime()) / 1000 <= MAC_STALE_S;
   } catch { return ifUnsure; }   // routing assumes the Mac has it rather than double-launch; a hand-off assumes not
 }
