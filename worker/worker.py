@@ -2253,7 +2253,7 @@ def claim_one(db: Supabase) -> dict | None:
         "&select=id,transcript,source,status,created_at,updated_at,capture_start,capture_end,failed_on",
     )
     fb = next((r for r in pending or [] if r.get("status") == "fallback"), None)
-    if fb:
+    if fb and _running:
         # No deferring, holding or grouping: it came from one watch because the hub did not answer, and
         # nobody else will take it.
         got = db.patch("voice_requests", f"id=eq.{fb['id']}&status=eq.fallback",
@@ -2344,6 +2344,11 @@ def claim_one(db: Supabase) -> dict | None:
             f"{[(r.get('source'), len(r.get('transcript') or '')) for r in group if r is not req]}")
     rid = req["id"]
 
+    # A stop signal can land anywhere in the reads above, and the handler only clears _running: without
+    # this check the worker claims a command it has seconds to live for, and the next worker gets it only
+    # after reclaim_stale declares this one dead.
+    if not _running:
+        return None
     claimed = db.patch(
         "voice_requests",
         f"id=eq.{rid}&status=eq.pending",
