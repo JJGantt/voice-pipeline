@@ -38,7 +38,7 @@ import tempfile
 import threading
 import time
 import uuid
-from datetime import datetime, timezone, date, timedelta
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
 
@@ -79,13 +79,12 @@ CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 # .env files, the Fly secret), so it is popped at import — a subprocess that inherited it would quietly
 # bill the API instead of the subscription.
 os.environ.pop("ANTHROPIC_API_KEY", None)
-# The fast path's model, run at LOW effort (minimal thinking). Opus rather than Sonnet for judgment: a
-# Sonnet turn saved a misheard "pair putt" as a to-do and then told him no haircut item existed while
-# naming "pair putt" at the same hour. At low effort Opus measured about a second slower than Sonnet on a
-# simple command and level with it on tool turns (docs/ROUTING.md). Gated tools still escalate to Opus at
-# its default effort, which macro estimates need. Override with HUB_MODEL / HUB_EFFORT.
+# Every hub turn runs on ONE model with the full toolset: Opus at its default effort, which is adaptive —
+# it thinks as hard as the turn needs. Quality over speed, by Jared's call (2026-10-29): there is no fast
+# first responder and no escalation. Low effort was measurably worse on macro estimates and `max` bought
+# nothing over the default (docs/ROUTING.md). Override with HUB_MODEL / HUB_EFFORT (empty = the default).
 HUB_MODEL = os.environ.get("HUB_MODEL", "opus")
-HUB_EFFORT = os.environ.get("HUB_EFFORT", "low")
+HUB_EFFORT = os.environ.get("HUB_EFFORT", "").strip() or None
 
 # Path to the built data MCP server (node entrypoint).
 DATA_MCP_JS = os.environ.get(
@@ -375,43 +374,25 @@ AGENT_SESSION_FILE = STATE_DIR / "agent_session.json"   # full-agent mode: a SEP
 RESET_SENTINEL = "__RESET_CONTEXT__"
 _NOTHING_SAID = re.compile(r"^\W*thank\s+you\W*$", re.IGNORECASE)
 
-# Power/precision directive (the Opus escalation path): maximum-precision for hard estimates — typically a
-# restaurant dish whose ingredients/macros are unknown. Opus runs at its DEFAULT effort: measured on four
-# meals, `--effort max` returned the same macros 7–19s slower per turn (docs/ROUTING.md). "ultrathink"
-# here sets no budget — the CLI (2.1.301) turns it into a one-line note asking for deeper reasoning.
-# The web-lookup rule: from memory Opus was off 20–40% on less-common branded/restaurant items (Jinya
-# vegan ramen 960 vs ~790, La Colombe draft latte 130–150 vs ~110) and searching fixed them, while famous
-# chains and generic foods came out exact without it — so search only where memory is weak (docs/ROUTING.md).
-POWER_DIRECTIVE = (
-    "\n\n[Precision mode — ultrathink. Take your time and reason carefully before acting. If this "
-    "involves estimating nutrition for a dish whose exact contents aren't given, decompose it into its "
-    "likely ingredients with realistic restaurant portions, estimate each component's macros, and sum "
-    "them — don't lowball. ALWAYS use the structured per-ingredient breakdown the log tool supports: "
-    "give each component its OWN protein/carbs/fat (and calories when you know them); the server computes "
-    "the meal's totals by summing the ingredients, so keep each component's macros accurate. When the "
-    "food is a specific restaurant menu item or a branded/packaged product and you can't quote its exact "
-    "published nutrition with certainty, search the web for it before logging — prefer the restaurant's "
-    "or brand's own nutrition page over third-party trackers. Don't search for generic foods (eggs, rice, "
-    "an apple), saved recipes, or repeats of something already in the log; use your own knowledge or the "
-    "stored numbers for those.]"
+# Estimating nutrition, appended to every hub turn. The web-lookup rule: from memory Opus was off 20–40%
+# on less-common branded/restaurant items (Jinya vegan ramen 960 vs ~790, La Colombe draft latte 130–150
+# vs ~110) and searching fixed them, while famous chains and generic foods came out exact without it — so
+# search only where memory is weak (docs/ROUTING.md).
+NUTRITION_DIRECTIVE = (
+    "\n\n[If this involves estimating nutrition for a dish whose exact contents aren't given, decompose "
+    "it into its likely ingredients with realistic restaurant portions, estimate each component's macros, "
+    "and sum them — don't lowball. ALWAYS use the structured per-ingredient breakdown the log tool "
+    "supports: give each component its OWN protein/carbs/fat (and calories when you know them); the server "
+    "computes the meal's totals by summing the ingredients, so keep each component's macros accurate. "
+    "When the food is a specific restaurant menu item or a branded/packaged product and you can't quote "
+    "its exact published nutrition with certainty, search the web for it before logging — prefer the "
+    "restaurant's or brand's own nutrition page over third-party trackers. Don't search for generic foods "
+    "(eggs, rice, an apple), saved recipes, or repeats of something already in the log; use your own "
+    "knowledge or the stored numbers for those.]"
 )
 
-# ---- Dynamic route. the fast path (HUB_MODEL at HUB_EFFORT) is the first responder, given ONLY the SAFE tools below in its
-# --allowedTools; the gated tools are absent, so in `-p` mode the fast path is DENIED them and physically cannot
-# corrupt that data. It still SEES them in the schema and, per the escalate directive, hands the whole
-# turn to a fresh Opus rather than claiming it can't.
-#
-# What decides the split is NOT read vs write. It is whether the model has to supply a value out of its
-# OWN knowledge: a food's macros, or the muscle map for a movement the catalog has never seen. Those are
-# gated. A tool whose every argument is already in front of the model — a number the user spoke, an id
-# from a read it just did — is on the fast path however destructive it is, because there is nothing there
-# for a bigger model to know better.
-# The web is on BOTH lists: a search takes his question, so there is no value in it the model invents.
 WEB_TOOLS = ["WebSearch", "WebFetch"]
-# His email and texts are Opus's alone, reading as well as sending, because he decided so: anything that
-# touches another person's messages goes to the capable model. They are left OFF the fast path's allow list
-# rather than removed, so the fast path still sees them and escalates — the same visible-but-denied rule as the
-# nutrition writes. Named tool by tool so the two sends can be held apart below.
+# His email and texts, named tool by tool so the two sends can be held apart below.
 MAIL_TOOLS = [
     "mcp__gmail__search_email", "mcp__gmail__get_email", "mcp__gmail__get_email_thread",
     "mcp__gmail__list_labels", "mcp__gmail__find_email_contact", "mcp__gmail__create_draft",
@@ -421,164 +402,33 @@ MAIL_TOOLS = [
 ]
 # Sending a text or an email reaches another person, so it is decided per TURN, not per list: allowed
 # when he pushed a button or typed, never from the always-on room mics, which hear the whole room and
-# would send a sentence that was never meant for the assistant. See turn_tools() and SdkRunner._fence.
+# would send a sentence that was never meant for the assistant. See SdkRunner._fence.
 SEND_TOOLS = ["mcp__messages__send_message", "mcp__gmail__send_email"]
 # Tools that only mean something next to his signed-in browser, which this worker does not have: a cart
 # URL has to be opened there, a cart recording is what its /cart page showed, and an item id is read off
-# the retailer's site. Here they could only be called with made-up values. They are REMOVED from every
-# runner's schema rather than gated, because a gated tool is what makes the fast path escalate — and a cart
-# request has to become a start_session, never an Opus turn with no browser.
+# the retailer's site. Here they could only be called with made-up values, so they are REMOVED from every
+# runner's schema: a cart request has to become a start_session, never a turn with no browser.
 SESSION_TOOLS = ["mcp__data__build_walmart_cart_url", "mcp__data__record_walmart_cart",
                  "mcp__data__save_shopping_item"]
-ALL_TOOLS = ["mcp__data", "mcp__voice", "mcp__govee-lights", "mcp__petlibro-feeder", *WEB_TOOLS, *MAIL_TOOLS, *SEND_TOOLS]  # full toolset (Opus)
+ALL_TOOLS = ["mcp__data", "mcp__voice", "mcp__govee-lights", "mcp__petlibro-feeder", *WEB_TOOLS, *MAIL_TOOLS, *SEND_TOOLS]
 
 
-def turn_tools(ambient: bool, base: "list | None" = None) -> list:
-    """A turn's allow list: `base` (the full toolset by default) with the sends added for a pushed
-    command and removed for one from a room mic."""
-    tools = [t for t in (base or ALL_TOOLS) if t not in SEND_TOOLS]
-    return tools if ambient else tools + SEND_TOOLS
-
-# the fast path's allow list.  ⚠️  See docs/ROUTING.md before changing this.
-#
-# It MUST be an allow list, not a deny list, and the difference is load-bearing:
-# a tool omitted from --allowedTools stays VISIBLE in the schema and is refused only when called, so
-# the fast path sees log_nutrition, recognises it needs it, and escalates. --disallowedTools instead removes
-# the tool from the schema outright — the fast path cannot see it, has nothing to escalate about, and
-# truthfully reports that nutrition logging "isn't available". That regression shipped and broke
-# logging until it was caught, so: do not "simplify" this into a deny list.
-#
-# The cost is that this list has to be maintained by hand and can rot. validate_safe_tools() below
-# makes that loud instead of silent.
-SAFE_TOOLS = [
-    "mcp__voice", "mcp__govee-lights", "mcp__petlibro-feeder",              # actuators + voice settings
-    "mcp__data__get_nutrition", "mcp__data__get_nutrition_targets", "mcp__data__get_workout",
-    "mcp__data__get_workout_catalog", "mcp__data__get_exercise_history", "mcp__data__get_weekly_volume",
-    "mcp__data__get_health_profile", "mcp__data__get_rep_watcher", "mcp__data__list_workouts",
-    "mcp__data__get_surf", "mcp__data__get_location",
-    # The saved shopping catalogue and the recorded Walmart cart: reads, so "what's in my cart" is
-    # answered here instead of costing an Opus escalation.
-    "mcp__data__get_shopping_items", "mcp__data__get_walmart_cart",
-    "mcp__data__list_staged", "mcp__data__reload_wall",                     # reads + the wall reload
-    # lists / notes / dated items: low-stakes writes needing no domain knowledge → fast path.
-    # Neither reminders nor notes have tools of their own any more — a reminder is a list item with a
-    # due date (00056), a note is an undated one whose body is its `text` (00092). Both are covered
-    # by get_lists / add_to_list / remove_from_list.
-    # create_list IS on the fast path even though it makes something new: it invents nothing, taking
-    # only a name Jared said. It is separate from add_to_list precisely so that adding cannot create
-    # a list by accident (00094) — gating it here would just move that accident to a bigger model.
-    "mcp__data__get_due", "mcp__data__set_due", "mcp__data__set_priority", "mcp__data__set_list_priority", "mcp__data__set_list_emoji",
-    "mcp__data__get_lists", "mcp__data__add_to_list", "mcp__data__complete_item", "mcp__data__remove_from_list", "mcp__data__delete_list",
-    "mcp__data__create_list",
-    # Recipes. Reading them invents nothing, and log_recipe cannot: it takes a saved recipe's NAME and
-    # a serving count, and every macro it writes was estimated once, when the recipe was saved. That is
-    # the whole reason it exists as a separate tool from log_nutrition — there is no field on it through
-    # which a macro could be guessed, so the fast path is safe by construction rather than by care.
-    # save_recipe IS gated: writing a recipe means estimating each ingredient's macros from its portion.
-    "mcp__data__list_recipes", "mcp__data__get_recipe", "mcp__data__log_recipe", "mcp__data__delete_recipe",
-    # Body figures the user says out loud. log_weight refuses anything it was not explicitly given;
-    # set_height is inches. Nothing to estimate, so nothing the capable model would do better.
-    # update_weight and remove_weight take the entry ID from get_health_profile, so neither can pick a
-    # weigh-in by date and neither writes a number he did not say.
-    "mcp__data__log_weight", "mcp__data__set_height", "mcp__data__update_weight", "mcp__data__remove_weight",
-    # Sets. An exercise is named by its CATALOG ID (migration 00075), so none of these can invent a
-    # movement or land on the wrong one: an id from get_workout_catalog either exists or the call
-    # fails. Registering a genuinely new movement means inventing a muscle map, which is real
-    # knowledge — that is upsert_catalog_exercise, deliberately absent from this list, so the case
-    # escalates rather than being guessed at down here. remove_set takes a set id; all three accept a
-    # stated occurred_at, a wall-clock string he said out loud that needs no more knowledge than the
-    # reps do.
-    "mcp__data__log_set", "mcp__data__update_set", "mcp__data__remove_set",
-    # Rep watcher: an exercise the catalog already has, plus a weight. setWatcher() cannot create a
-    # catalog entry — it errors on an unknown name — and clear takes no arguments at all.
-    "mcp__data__set_rep_watcher", "mcp__data__clear_rep_watcher",
-    # Moving or deleting an entry by ITS ID. The macros were estimated when it was staged; committing
-    # it changes no number, and a delete invents nothing. Destructive, but destructiveness is not a
-    # question a bigger model answers better.
-    "mcp__data__commit_staged", "mcp__data__remove_staged", "mcp__data__delete_nutrition_entry",
-    # Dispatching work to a machine and managing what is running there. None of it changes data, and
-    # none of it needs domain knowledge — routing a prompt to a session, closing one, moving one. The
-    # whole group belongs on the fast path or none of it does, and follow_up sat outside it only by
-    # oversight, which cost every dictated follow-up a full Opus re-run before it could be typed.
-    "mcp__data__list_repos", "mcp__data__start_session", "mcp__data__get_sessions",
-    "mcp__data__resume_session", "mcp__data__end_session", "mcp__data__transfer_session",
-    "mcp__data__follow_up", "mcp__data__rename_session", "mcp__data__focus_session",
-    "mcp__data__unfocus_session",
-    "mcp__data__set_wall",
-    *WEB_TOOLS,
-]
-
-def validate_safe_tools(mcp_js: str) -> None:
-    """Warn about SAFE_TOOLS entries that no longer exist in the data MCP.
-
-    The allow list is maintained by hand — it has to be, because omitting a tool is what makes it
-    visible-but-denied and therefore escalatable. The danger is that it drifts: data-layer renames or
-    removes a tool and nothing here notices. It was still naming create_reminder and
-    complete_list_item months after those were deleted, and it silently gated out every tool added
-    since, which is why dispatching work by voice could not work at all.
-
-    This does not fix the list, only make its rot audible. A name that no longer exists is dead
-    weight; a data tool that exists but is listed nowhere is either deliberately gated or forgotten,
-    and only the log can tell you which.
-    """
-    try:
-        src = pathlib.Path(mcp_js).read_text(errors="ignore")
-    except OSError:
-        return  # the MCP build is not readable from here; not worth failing startup over
-    # Tool definitions only. A looser pattern also matches the server name in the mcpServers
-    # block ("data"), which is not a tool and shows up as a phantom every startup.
-    real = {n for n in re.findall(r"\{\s*name:\s*'([a-z_]+)'\s*,\s*description:", src)}
-    if not real:
-        return
-    listed = {t.split("__")[-1] for t in SAFE_TOOLS if t.startswith("mcp__data__")}
-    dead = sorted(listed - real)
-    if dead:
-        log(f"[tools] SAFE_TOOLS names {len(dead)} tool(s) that no longer exist: {', '.join(dead)}")
-    ungated = sorted(real - listed - {t.split("__")[-1] for t in SESSION_TOOLS})
-    if ungated:
-        log(f"[tools] not on the fast path (gated or forgotten): {', '.join(ungated)}")
-
-
-# Escalation: the fast path emits this (mirrors IGNORE_SENTINEL) when a request needs a gated write tool; the
-# dispatch then re-runs the whole turn on Opus + max thinking. Appended to every standard-route turn.
-ESCALATE_SENTINEL = "__ESCALATE__"
-ESCALATE_DIRECTIVE = (
-    "\n\n[You are the fast first responder. You can see the full toolset, but the tools that need a "
-    "value supplied out of the model's OWN knowledge are handled by a more capable model, not you: "
-    "estimating a food's macros (logging, staging or editing nutrition, subtracting leftovers, or SAVING "
-    "a recipe), setting nutrition targets, and giving categories/muscles to an exercise the catalog does "
-    "not have yet. Everything whose arguments are already in front of you is YOURS, and you should just "
-    "do it: read anything (get_*/list_*); manage lists, notes and dated items; log a weight or height he "
-    "stated as a number; commit, remove or delete an entry by its id; log, edit or remove a SET; set or "
-    "clear the rep watcher; and drive the lights, feeder, TV and voice settings. "
-    "His EMAIL and his TEXTS are the capable model's, not yours — reading, searching, drafting, "
-    "replying or sending, a single message or a whole thread: any request that needs his Gmail or his "
-    "iMessages is an escalation, even when it only asks what someone said. "
-    "When he explicitly names a RECIPE — 'my oatmeal recipe', 'the gochujang tofu recipe' — log or stage "
-    "it with log_recipe, which is yours, because its macros were estimated once when it was saved and you "
-    "are only naming it. A meal he describes by a past log ('same as yesterday', 'what I had Monday') is "
-    "NEVER a recipe, even when a recipe shares its name: it is a copy of that logged entry. "
+# Appended to every hub turn: how to pick between tools that look interchangeable.
+TOOLS_DIRECTIVE = (
+    "\n\n[When he explicitly names a RECIPE — 'my oatmeal recipe', 'the gochujang tofu recipe' — log or "
+    "stage it with log_recipe. A meal he describes by a past log ('same as yesterday', 'what I had "
+    "Monday') is NEVER a recipe, even when a recipe shares its name: it is a copy of that logged entry. "
     "For sets, call get_workout_catalog first and pass the matching exercise's ID — however he said it, "
-    "plural or singular. If the movement is NOT in the catalog at all it needs a muscle map you would "
-    "have to invent — escalate instead. "
-    "LOOKING SOMETHING UP is yours, done right here with WebSearch and WebFetch: a fact, a score, a "
-    "listing, opening hours, a place, anything current. Search, read the pages you need, and answer in "
-    "your reply. A session is only for what needs his SIGNED-IN browser: ACTING on a site (his Amazon "
-    "or Walmart cart, an order, a ride, a booking, a form) or reading something behind his logins (an "
+    "plural or singular; only a movement genuinely absent from the catalog gets upsert_catalog_exercise. "
+    "LOOKING SOMETHING UP is done right here with WebSearch and WebFetch: a fact, a score, a listing, "
+    "opening hours, a place, anything current. Search, read the pages you need, and answer in your "
+    "reply. A session is only for what needs his SIGNED-IN browser: ACTING on a site (his Amazon or "
+    "Walmart cart, an order, a ride, a booking, a form) or reading something behind his logins (an "
     "order's status, what is in a cart). That is a start_session on the Pi with his request passed "
-    "through, and it is YOURS too: start_session is on your toolset, it is not an escalation. The "
-    "session's first reply is posted back into this conversation on its own, so say only that it has "
-    "started; never offer to check on it later, because nothing will run you again to do it. Never "
-    "answer a question about the current world out of your own memory, and never tell him you cannot "
-    "browse. "
-    "Decide this from the CURRENT instruction ALONE. The recent conversation above is background: that "
-    "it was about food, weight or workouts does not make THIS turn one, and a request to add something "
-    "to a list is a list request no matter what was being discussed a minute ago. "
-    "If the current instruction genuinely needs a gated tool, do NOT attempt it and do NOT say you "
-    f"can't — reply with EXACTLY '{ESCALATE_SENTINEL}' and nothing else, and it is handed to the "
-    "capable model. The same when he asks for that model himself — 'escalate to Opus', 'use Opus', "
-    f"'have Opus do it': reply '{ESCALATE_SENTINEL}' alone, whatever the rest of the request is, and "
-    "his words go to Opus unchanged. Handle everything else yourself.]"
+    "through. The session's first reply is posted back into this conversation on its own, so say only "
+    "that it has started; never offer to check on it later, because nothing will run you again to do "
+    "it. Never answer a question about the current world out of your own memory, and never tell him you "
+    "cannot browse.]"
 )
 
 # Photo turns (attachments on the request): the photos are downloaded locally, their paths ride the
@@ -653,12 +503,12 @@ ADDRESSING_DIRECTIVE = (
 )
 
 # The room mics can never send a text or an email. The send tools are denied on those turns by every
-# runner (SdkRunner._fence, turn_tools, --disallowedTools); this closes the ways around that the model
-# could still reach for — escalating, or starting a session whose own tools would send it.
+# runner (SdkRunner._fence, --disallowedTools); this closes the way around that the model could still
+# reach for — starting a session whose own tools would send it.
 ROOM_SEND_DIRECTIVE = (
     "\n\n[This came from an always-on room mic, which cannot send texts or email. If it asks you to "
-    "send, reply to or forward a text or an email, do not do it by any route — no session, no "
-    f"'{ESCALATE_SENTINEL}' — and say it has to come from the button on his phone or watch.]"
+    "send, reply to or forward a text or an email, do not do it by any route — no session — and say it "
+    "has to come from the button on his phone or watch.]"
 )
 
 # Role framing for every hub turn. The base preset is claude_code (a coding agent), so without this
@@ -718,7 +568,7 @@ AGENT_SYSTEM = (
 
 # Jared changes this same data OUT OF BAND while you work — via the hub's own UI (an "add set" button,
 # inline edit/delete controls) and via other voice turns a DIFFERENT worker may handle with its own separate
-# memory (continuity is machine-local; the fast path has none at all). So the conversation you remember is
+# memory (continuity is machine-local; a hub turn has none at all). So the conversation you remember is
 # not a reliable mirror of the live data. Appended to BOTH framings so every path treats the data — what the
 # tools return — as ground truth, never memory.
 SHARED_STATE_NOTE = (
@@ -1437,7 +1287,7 @@ def recent_context() -> str:
     """THE WHOLE DAY, replayed into a FRESH claude run instead of using --resume. We keep our own clean
     transcript in voice_messages (each turn's user prompt + final assistant reply), so a fresh process
     gets exactly the conversation and NONE of the CLI-session baggage — tool schemas, thinking blocks,
-    the __ESCALATE__ sentinel — that let the two models cross-contaminate one shared session.
+    that makes a resumed session drift from what was actually said.
 
     Everything since the day began (4 AM, `day_start`), or since a manual reset from the hub if that is
     later, oldest first, each line with its time — so he can refer back to anything said earlier today,
@@ -1515,7 +1365,7 @@ def fetch_attachments(paths: list) -> tuple[str | None, list[str]]:
 # command. The data MCP's now() reads it so a voice-logged SET lands at when Jared actually spoke — his
 # rest-clock reference — not ~30s later when the command finishes the pipeline.
 #
-# It is a FILE and not an env value, and that distinction is the whole point. The warm fast path
+# It is a FILE and not an env value, and that distinction is the whole point. The warm hub client
 # (SdkRunner) starts its MCP servers ONCE per worker lifetime as warm stdio sessions, so anything placed in the
 # subprocess environment is fixed for as long as the worker runs: passing the timestamp that way froze
 # it at one moment and stamped 29 hours of writes with it (Aug 31, found 2026-09-01). The path is
@@ -1622,8 +1472,7 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
         # which widens the list above. The worker runs from its own directory, so "project" loads none.
         cmd += ["--setting-sources", "project"]
     # Out of the schema, not just refused: the browser-only tools on every run, and the sends on a
-    # room-mic turn. A deny beats any allow rule, and neither is something a turn should escalate for,
-    # so taking them out of sight loses nothing.
+    # room-mic turn. A deny beats any allow rule, and taking them out of sight loses nothing.
     cmd += ["--disallowedTools", *SESSION_TOOLS, *(deny_tools or [])]
     if system_append:
         cmd += ["--append-system-prompt", system_append]
@@ -1783,25 +1632,21 @@ _SDK_LOOP_LOCK = threading.Lock()
 
 
 class SdkRunner:
-    """Warm Claude Agent SDK client — the PRIMARY fast path, billed to the subscription.
+    """Warm Claude Agent SDK client — every hub turn runs here, billed to the subscription.
 
     One long-lived headless Claude Code process holds the four MCP servers, so the per-command spawn
     spawn cost is paid once, not per turn. Each hub turn runs in a FRESH conversation (`/clear` on the
     same warm process, see _turn): the caller replays the day's hub conversation into the prompt. Pinned to HUB_MODEL
-    at HUB_EFFORT + SAFE_TOOLS at connect; escalation and full-agent turns keep their own `claude -p` spawns (full
-    toolset). A failed turn is retried by `run_subscription` and then surfaced; errors never upgrade the
-    model and never move a turn onto the paid API.
+    at HUB_EFFORT with the full toolset at connect; full-agent and fallback turns keep their own `claude -p`
+    spawns. A failed turn is retried by `run_subscription` and then surfaced, never moved onto the paid API.
     """
 
-    def __init__(self, model: str = HUB_MODEL, tools: "list | None" = None, effort: "str | None" = None):
-        """`model`, `effort` and `tools` (the allow list; SAFE_TOOLS by default, which makes it the fast
-        path) fix what the warm client is. The escalation runner (`OPUS`) gets the full toolset plus Read,
-        which its fence allows only inside the current turn's photo directory, and its model's default
-        effort."""
+    def __init__(self, model: str = HUB_MODEL, effort: "str | None" = HUB_EFFORT):
+        """The full toolset plus Read, which the fence allows only inside the current turn's photo
+        directory."""
         self.model = model
         self.effort = effort
-        self.fast = tools is None   # the safe-toolset runner: a gated tool there means escalate
-        self.tools = list(tools if tools is not None else SAFE_TOOLS)
+        self.tools = ALL_TOOLS + ["Read"]
         self._read_dir = None  # this turn's attachment directory, the only place Read may look
         self._loop = None
         self._client = None
@@ -1839,8 +1684,7 @@ class SdkRunner:
     async def _connect(self):
         from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, HookMatcher, PermissionResultDeny
 
-        gated = ("This tool is gated on the fast path. If the request needs it, reply __ESCALATE__ (alone)."
-                 if self.fast else "That tool is not available to this assistant.")
+        gated = "That tool is not available to this assistant."
         exact = set(self.tools)
         servers = tuple(t + "__" for t in self.tools if t.startswith("mcp__") and t.count("__") == 1)
 
@@ -1851,10 +1695,9 @@ class SdkRunner:
             return {"hookSpecificOutput": out}
 
         async def _fence(input_data, tool_use_id, context):  # noqa: ARG001
-            # The fast path's allow list, enforced BEFORE any permission rule. This client is Claude
-            # Code, which also applies the host user's own settings — and the Mac's pre-approve every
-            # data, gmail and messages tool in auto mode. With allowed_tools alone, the fast path on the Mac
-            # could call the gated nutrition tools directly, and a room-mic turn sent an email in the
+            # The allow list, enforced BEFORE any permission rule. This client is Claude Code, which also
+            # applies the host user's own settings — and the Mac's pre-approve every data, gmail and
+            # messages tool in auto mode; with allowed_tools alone a room-mic turn sent an email in the
             # first test of the send rule. A hook's deny outranks any allow rule, so the list holds here.
             name = input_data.get("tool_name") or ""
             if name in SEND_TOOLS and name in exact:
@@ -1887,7 +1730,7 @@ class SdkRunner:
             cli_path=shutil.which(CLAUDE_BIN),
             mcp_servers=write_mcp_config(),
             allowed_tools=list(self.tools),
-            disallowed_tools=list(SESSION_TOOLS),   # browser-only: out of sight, so never a reason to escalate
+            disallowed_tools=list(SESSION_TOOLS),   # browser-only: out of sight entirely
             # The stable hub framing lives here so the prefix caches across turns; per-turn context
             # (the replayed conversation) rides on the prompt instead.
             system_prompt={"type": "preset", "preset": "claude_code",
@@ -1907,7 +1750,7 @@ class SdkRunner:
         await client.connect()
         self._client = client
         self._used = False
-        log(f"sdk runner: warm client up ({self.model}{' @' + self.effort if self.effort else ''}, {'safe' if self.fast else 'full'} toolset)")
+        log(f"sdk runner: warm client up ({self.model}{' @' + self.effort if self.effort else ''})")
 
     async def _teardown(self):
         if self._client is not None:
@@ -2004,21 +1847,7 @@ class SdkRunner:
         return retry
 
 
-SDK = SdkRunner(effort=HUB_EFFORT)
-# Opus kept running too, where there is memory for it (WARM_OPUS=1: the Fly worker, 2GB). Its turns —
-# the gated tools, photos — then skip the ~3-4s CLI and MCP start a `claude -p` spawn pays every time.
-# Elsewhere escalation spawns, as before.
-WARM_OPUS = os.environ.get("WARM_OPUS", "").strip().lower() in ("1", "true", "yes", "on")
-OPUS = SdkRunner("opus", ALL_TOOLS + ["Read"]) if WARM_OPUS else None
-
-
-def run_opus(prompt: str, on_event, system_append: str, ambient: bool, att_dir, allowed_tools, deny_tools) -> dict:
-    """One Opus hub turn: on the warm client when there is one, else a fresh `claude -p`. The warm
-    client carries the hub framing in its system prompt already, so `system_append` is for the spawn."""
-    if OPUS is not None:
-        return OPUS.run(prompt, on_event=on_event, ambient=ambient, read_dir=att_dir)
-    return run_claude(prompt, None, on_event=on_event, system_append=system_append, model="opus",
-                      allow_read=bool(att_dir), allowed_tools=allowed_tools, deny_tools=deny_tools)
+SDK = SdkRunner()
 
 
 def get_focus() -> str:
@@ -2623,10 +2452,8 @@ def process_request(db: Supabase, req: dict) -> None:
     if alt:
         prompt += ALT_TRANSCRIPT_DIRECTIVE.format(alt=alt)
 
-    # ---- ONE dynamic route. Every hub command goes to the fast path (safe tools + escalate); a request that needs
-    # a gated WRITE tool escalates to a FRESH Opus (full tools). Photos skip straight to Opus (vision via the
-    # CLI Read tool; the fast path would just escalate anyway). Full-agent mode is the unrestricted coding agent on
-    # its own --resume session. No user-facing model/route choice anymore — the model is chosen per turn.
+    # ---- ONE route. Every hub command, photos included, runs on the warm SDK client (HUB_MODEL, full
+    # toolset). Full-agent mode is the unrestricted coding agent on its own --resume session.
     attachments = req.get("attachments") or []
     if isinstance(attachments, str):
         try:
@@ -2634,15 +2461,13 @@ def process_request(db: Supabase, req: dict) -> None:
         except Exception:  # noqa: BLE001
             attachments = []
     use_agent = session_agent   # full-agent (coding) mode → the unrestricted agent, on its own session
-    log(f"route={'fallback→opus agent' if fallback else 'agent' if use_agent else ('photo→opus' if attachments else f'dynamic {HUB_MODEL}@{HUB_EFFORT}→opus')} src={source}")
+    hub_route = f"hub {HUB_MODEL}@{HUB_EFFORT or 'default'}" + (" +photo" if attachments else "")
+    log(f"route={'fallback→opus agent' if fallback else 'agent' if use_agent else hub_route} src={source}")
     ping_esp_led("blink")   # working — the ESP light blinks for EVERY command, not just ESP-sourced ones
     push_activity(transcript[:240], "working")   # bottom-strip: the prompt being worked
 
-    # Role framing. Full-agent mode swaps the locked-down hub framing for the unrestricted all-purpose
-    # framing. The lights are not listed here: a turn that needs them calls the govee `list_lights` tool.
-    sys_ctx = (AGENT_SYSTEM if use_agent else HUB_SYSTEM) + "\n\n" + SHARED_STATE_NOTE
     # Photo turns: pull the attachment objects local so Read can view them, and put the paths + the ONE-item
-    # framing on the prompt. Photos go straight to Opus in the dispatch below.
+    # framing on the prompt.
     att_tmp, att_paths = None, []
     if attachments:
         att_tmp, att_paths = fetch_attachments(attachments)
@@ -2653,14 +2478,13 @@ def process_request(db: Supabase, req: dict) -> None:
             prompt += ("\n\n[The user attached photo(s), but they could not be retrieved — tell them "
                        "that briefly instead of guessing at the contents.]")
 
-    # Dispatch — one dynamic route, the same on every worker (Pi, Mac, and Fly, which holds its own
-    # subscription token). Everything runs on the Claude SUBSCRIPTION; there is no paid path. A run that
-    # fails transiently is retried (`run_subscription`), and one that still fails surfaces as an error.
-    # `ctx` (the replayed hub conversation) rides on the FRESH run; there is no --resume for hub turns, so
-    # the two models never share a session. agent → the unrestricted coding agent (its own --resume
-    # session). Photos → Opus (vision via Read). Otherwise: the fast path (warm SDK client) with the safe toolset;
-    # a gated need → a FRESH Opus. Errors never upgrade the model. A failure that called no tool is
-    # handed to another worker below rather than ended here.
+    # Dispatch — one route, the same on every worker (Pi, Mac, and Fly, which holds its own subscription
+    # token). Everything runs on the Claude SUBSCRIPTION; there is no paid path. A run that fails
+    # transiently is retried (`run_subscription`), and one that still fails surfaces as an error. `ctx`
+    # (the replayed hub conversation) rides on a FRESH conversation; there is no --resume for hub turns.
+    # agent → the unrestricted coding agent (its own --resume session). Everything else, photos included,
+    # → the warm SDK client. A failure that called no tool is handed to another worker below rather than
+    # ended here.
     hub_prompt = ctx + prompt   # ctx is "" in agent mode (uses --resume) or when there's no live conversation
     room_deny = SEND_TOOLS if ambient else None   # the room mics never send a text or an email
     unready = claude_unready()
@@ -2675,39 +2499,16 @@ def process_request(db: Supabase, req: dict) -> None:
                                model="opus", agent=True, cwd=os.path.expanduser("~")),
             "subscription Opus (fallback)")
     elif use_agent:
-        result = run_claude(prompt, resume_id, on_event=_emit, system_append=sys_ctx, model="opus",
+        result = run_claude(prompt, resume_id, on_event=_emit, system_append=AGENT_SYSTEM + "\n\n" + SHARED_STATE_NOTE, model="opus",
                             agent=True, cwd=ag["cwd"], allow_read=bool(att_paths),
                             deny_tools=room_deny)
-    elif attachments:
-        # Photos → straight to Opus (vision needs the capable model + Read; the fast path would only escalate).
-        result = run_subscription(
-            lambda: run_opus(hub_prompt + POWER_DIRECTIVE, _emit, sys_ctx, ambient, att_tmp if att_paths else None,
-                     turn_tools(ambient), room_deny),
-            "subscription Opus (photo)")
     else:
-        # FAST PATH — HUB_MODEL on the WARM SDK client, safe toolset only. Not a per-command `claude -p`: that
-        # spawn (CLI + four stdio MCP servers) measured 3.6s on the Pi (~42% of a simple turn) before the
-        # model saw a token; the warm client pays it once.
-        # Errors never upgrade the model: on 2026-08-30 an error-escalation turned every noise judgment
-        # into a fresh Opus spawn — 291 in one evening.
-        fast_prompt = hub_prompt + ESCALATE_DIRECTIVE
-        result = run_subscription(lambda: SDK.run(fast_prompt, on_event=_emit, ambient=ambient),
-                                  "subscription fast path")
-        st = (result.get("text") or "").strip().lower()
-        escalate = ("__escalate__" in st) or (re.sub(r"[^a-z]", "", st) == "escalate")
-        # Escalate ONLY on the sentinel — a gated need. A failed fast path surfaces as an error below; it
-        # does not buy an Opus run.
-        if escalate:
-            log("dynamic → Opus (full toolset): __ESCALATE__")
-            # Surface the hop itself: the bottom activity bar shows "escalated to Opus" and keeps an OPUS
-            # chip up for the rest of the run, so a turn that quietly changed models is visible on the wall
-            # instead of looking like an unexplained pause between the prompt and the first Opus tool call.
-            push_activity("Escalated to Opus", "escalate")
-            # These turns are rare and already slow, so the CLI cold start is noise here.
-            result = run_subscription(
-                lambda: run_opus(hub_prompt + POWER_DIRECTIVE, _emit, sys_ctx, ambient, att_tmp if att_paths else None,
-                     turn_tools(ambient), room_deny),
-                "subscription Opus")
+        # The warm SDK client, not a per-command `claude -p`: that spawn (CLI + four stdio MCP servers)
+        # measured 3.6s on the Pi before the model saw a token; the warm client pays it once.
+        result = run_subscription(
+            lambda: SDK.run(hub_prompt + NUTRITION_DIRECTIVE + TOOLS_DIRECTIVE, on_event=_emit,
+                            ambient=ambient, read_dir=att_tmp if att_paths else None),
+            "subscription hub")
 
     if att_tmp:
         shutil.rmtree(att_tmp, ignore_errors=True)   # staged photos served their turn
@@ -2718,24 +2519,13 @@ def process_request(db: Supabase, req: dict) -> None:
 
     text = (result.get("text") or "").strip()
 
-    # Safety net: __ESCALATE__ is an INTERNAL signal and must NEVER reach the user. Fresh hub runs + a clean
-    # replayed transcript make it nearly impossible now (the two models no longer share a session), but as a
-    # backstop, re-run on a fresh Opus with NO context at all — nothing to mimic.
-    if ("__escalate__" in text.lower()) or (re.sub(r"[^a-z]", "", text.lower()) == "escalate"):
-        log("result leaked __ESCALATE__ → clean Opus re-run (no context)")
-        push_activity("Escalated to Opus", "escalate")
-        result = run_opus(prompt, _emit, sys_ctx, ambient, att_tmp if att_paths else None,
-                     turn_tools(ambient), room_deny)
-        text = (result.get("text") or "").strip()
-
     # The same net for __IGNORE__ on a turn he MEANT. Only room-mic turns are taught the sentinel, but a
     # model can still pick it up (it did, from replayed history) — and on a deliberate turn there is no
     # ignore branch to catch it, so it was saved and pushed to him as the reply. Re-run clean, with no
     # context to mimic; the prompt already carries DELIBERATE_DIRECTIVE.
     if not ambient and is_ignore(text) and not result.get("used_tools"):
-        log("deliberate turn answered __IGNORE__ → clean Opus re-run (no context)")
-        result = run_opus(prompt, _emit, sys_ctx, ambient, att_tmp if att_paths else None,
-                     turn_tools(ambient), room_deny)
+        log("deliberate turn answered __IGNORE__ → clean re-run (no context)")
+        result = SDK.run(prompt + NUTRITION_DIRECTIVE + TOOLS_DIRECTIVE, on_event=_emit, ambient=ambient)
         text = (result.get("text") or "").strip()
 
     # A failure here is this machine's, not the command's, until every machine has tried it: hand it on.
@@ -3045,7 +2835,6 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _handle_signal)
 
     log(f"starting (priority={WORKER_PRIORITY}, state_dir={STATE_DIR}, once={once})")
-    validate_safe_tools(DATA_MCP_JS)
 
     with httpx.Client(timeout=HTTP_TIMEOUT_S) as client:
         db = Supabase(client)
@@ -3061,8 +2850,6 @@ def main() -> int:
         waker = _waker = RealtimeWaker()
         waker.start()   # event-driven claim; no-op fallback to polling if realtime is unavailable
         threading.Thread(target=SDK.warm, name="sdk-warm", daemon=True).start()   # first turn starts warm
-        if OPUS is not None:
-            threading.Thread(target=OPUS.warm, name="opus-warm", daemon=True).start()
 
         # Heartbeat on its own thread so a long command (a multi-minute agent run) never lets this
         # worker's presence go stale — which would let a lower-priority worker poach the user's follow-up

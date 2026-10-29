@@ -30,8 +30,6 @@ ESP32 (I2S mic) ──wss://jared-voice.fly.dev/ws/audio──▶  Fly: jared-vo
 - A 1GB volume `worker_data` at `/data` holds Claude's run transcripts (`CLAUDE_CONFIG_DIR=/data/claude`,
   pruned after 30 days), the worker's state (`STATE_DIR=/data/voice-worker`) and `/data/worker.log`
   (everything the machine prints, trimmed daily to 50,000 lines).
-- `WARM_OPUS=1` keeps a warm Opus client beside the warm Sonnet one, so escalated and photo turns do
-  not spawn `claude -p`.
 - `entrypoint.sh` restarts the worker whenever it exits, passes Fly's stop signal on to it, and
   updates Claude Code daily.
 - Deploy: `fly-worker/deploy.sh`, which assembles the build context from the checkouts and bakes in
@@ -62,8 +60,8 @@ accepted, so existing firmware keeps working until it's updated to send the toke
 
 - `CLAUDE.md` — what to know before editing: the build context under `server/`, the API-key trap,
   what is dead.
-- `docs/ROUTING.md` — the path from a transcript to an action, which tools the fast Sonnet path may
-  use, and why `SAFE_TOOLS` must stay an allow list rather than a deny list.
+- `docs/ROUTING.md` — the path from a transcript to an action: the one Opus route, what every turn
+  is told, and how sends are fenced per mic.
 - `ARCHITECTURE.md` — the always-on machinery: workers and failover, wake-free capture, speaker ID,
   the feedback channels, and the `app_settings` catalog.
 - Per-directory READMEs in `worker/`, `orchestrator/`, `mcp-voice/`, `voice-id/`.

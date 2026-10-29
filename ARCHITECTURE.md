@@ -22,14 +22,14 @@ INPUTS (capture + enqueue only — no model logic):
                                                         │
 WORKER (worker/worker.py — the ONE brain):
   claims a request, runs it, writes the reply to voice_messages
-    hub turn      → Opus @ low effort on SAFE_TOOLS, escalating to a fresh Opus run (docs/ROUTING.md)
+    hub turn      → Opus at default effort, full toolset, on the warm SDK client (docs/ROUTING.md)
     full-agent    → the unrestricted Claude Code agent in `agent_cwd`, its own persistent session
                                                         │
 TOOLS (the only capabilities): data · voice · govee   (MCP, stdio)
 SOURCE OF TRUTH:  Supabase (felyggqjjhltwokdfhop)
 
 DEVICES (claim order fly → pi → mac):
-  Fly  — first claimer, its own app jared-voice-worker (fly-worker/, WORKER_ID=fly, WARM_OPUS=1).
+  Fly  — first claimer, its own app jared-voice-worker (fly-worker/, WORKER_ID=fly).
   Pi   — first fallback (systemd voice-worker.service). Also runs pi-desk, the desk-command consumer.
   Mac  — second fallback (launchd com.jaredgantt.voice-worker).
 ```
@@ -47,23 +47,19 @@ and every ordinary stage bills the **subscription**:
 
 - **`SdkRunner`** — the warm Claude Agent SDK client: one long-lived headless Claude Code process
   holding the MCP servers (data, voice, lights, feeder and Gmail over stdio; iMessage over HTTP to the
-  Mac), pinned to `HUB_MODEL` at `HUB_EFFORT` (Opus, low) + `SAFE_TOOLS` at connect, which include WebSearch and WebFetch. It runs the
+  Mac), pinned to `HUB_MODEL` at `HUB_EFFORT` (Opus, default effort) + the full toolset at connect. It runs the
   installed `claude` (`cli_path`), not the SDK's bundled copy: the bundled one lags, and the `opus` alias
   resolves to whatever model the running CLI knows. Each hub turn is a
   fresh `session_id` on that warm process, with the whole day's hub conversation (since 4 AM, each line timestamped) replayed into the prompt.
-  This is the **fast path** on every worker: the spawn cost `claude -p` pays per command — CLI
-  plus four MCP servers, 3.6s on the Pi, ~42% of a simple turn before the model sees a token — is
-  paid once at connect. Where `WARM_OPUS=1` (the Fly worker, 2GB) a second warm `SdkRunner` holds
-  Opus with the full toolset plus `Read`, and runs that worker's escalations and photo turns instead of
-  `run_claude`.
+  Every hub turn runs here, photos included (`Read` is fenced to the turn's photo directory): the spawn
+  cost `claude -p` pays per command — CLI plus four MCP servers, 3.6s on the Pi, ~42% of a simple turn
+  before the model sees a token — is paid once at connect.
 - **`run_claude`** — headless `claude -p`, also on the subscription. It streams `stream-json`, so
-  tool calls (and the text between them) surface live on the activity bar. This runs the **escalation** (Opus, full toolset —
-  rare, and already slow enough that the CLI cold start is noise), photo turns (vision needs the
-  CLI's `Read`), and full-agent turns.
+  tool calls (and the text between them) surface live on the activity bar. This runs full-agent
+  turns and the fallback run on a command every other worker failed.
 There is no API-billed runner. Both runners bill the subscription on every worker, Fly included (it
 holds its own `CLAUDE_CODE_OAUTH_TOKEN`). A run that fails transiently is retried on the subscription
-(`run_subscription`) and otherwise surfaces as an error. Photo turns go to Opus through `run_claude`,
-whose `Read` tool is how a model views an image file.
+(`run_subscription`) and otherwise surfaces as an error.
 
 ## Device fallback
 
@@ -72,8 +68,8 @@ Which host should run the agent, what each one can and cannot do, and measured s
 - **Worker claim priority** is `WORKER_PRIORITY`, **`fly,pi,mac`** everywhere: `worker/run.sh`'s
   default, the Pi's `worker/.env`, and the `jared-voice-worker` image. The highest-priority worker with
   a fresh heartbeat claims and the others defer, so **Fly takes a command whenever it is up**, then the
-  Pi, then the Mac. Fly is first because it answers the common fast-path turn faster (2.8s median against
-  the Pi's 4.4s on identical commands) and is independent of the house; Opus turns cost about the same
+  Pi, then the Mac. Fly is first because it answers the common turn faster (2.8s median against
+  the Pi's 4.4s on identical commands, measured on the warm client) and is independent of the house; Opus turns cost about the same
   everywhere. It has no route to iMessage, Gmail or the feeder, which are rare enough not to count
   (`docs/WORKER-PLACEMENT.md`). The Mac is last so a session started by voice outlives the laptop
   closing. Claiming is an atomic `PATCH ... status=eq.pending`, so it is safe even when two workers race.

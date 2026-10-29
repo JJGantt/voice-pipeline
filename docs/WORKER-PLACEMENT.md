@@ -1,10 +1,10 @@
 # Which machine runs the voice agent
 
 The same `worker/worker.py` runs on three hosts. Whichever one claims a `voice_requests` row runs the
-whole turn — the fast path (Opus at low effort), any Opus escalation, and every MCP tool the turn calls. This page
-is why Fly is the primary, with the measurements behind it. The measurements were taken on
-2026-10-15/16 (UTC), while the Fly worker still ran inside `jared-voice` beside the transcriber; re-run
-them before acting on the numbers.
+whole turn — Opus on the warm client, and every MCP tool the turn calls. This page is why Fly is the
+primary, with the measurements behind it. The measurements were taken on 2026-10-15/16 (UTC), while the
+Fly worker still ran inside `jared-voice` beside the transcriber and hub turns were split between a fast
+Sonnet first responder and an Opus escalation; re-run them before acting on the numbers.
 
 ## Placement
 
@@ -36,13 +36,10 @@ Fly 20. Fly took its 20 turns in two incidents, never otherwise:
 
 The code is the same everywhere; only the environment differs.
 
-- **Fast path:** a warm `ClaudeSDKClient` (`SdkRunner`), Opus at low effort, `SAFE_TOOLS`, driving the INSTALLED
-  CLI (`cli_path=shutil.which("claude")`). It connects at worker start (`SDK.warm`) and again right
-  after any recycle, then stays up for the life of the process (each turn is a `/clear` on it).
-- **Escalation:** gated tools (log_nutrition, stage_meal, edit_staged, save_recipe, …) and photo turns
-  run on Opus. On Fly (`WARM_OPUS=1`) that is a second warm `SdkRunner`, connected at start beside the
-  fast-path one; on the Pi and the Mac it is a fresh `claude -p --model opus` per turn (`run_claude`),
-  which starts every MCP server again.
+- **Hub turns:** one warm `ClaudeSDKClient` (`SdkRunner`), Opus at its default effort with the full
+  toolset, driving the INSTALLED CLI (`cli_path=shutil.which("claude")`). It connects at worker start
+  (`SDK.warm`) and again right after any recycle, then stays up for the life of the process (each turn
+  is a `/clear` on it). Full-agent turns are a fresh `claude -p --model opus` (`run_claude`).
 - **Billing:** the Claude subscription (`CLAUDE_CODE_OAUTH_TOKEN`) on all three. `worker.py` pops any
   `ANTHROPIC_API_KEY` at import, before any client or subprocess starts, so no turn inherits one.
 - **Session transcripts:** on the Pi and Mac they land in `~/.claude/projects/` and persist. On Fly

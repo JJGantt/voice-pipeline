@@ -1,21 +1,16 @@
 # Working in voice-pipeline
 
-## There is one route, and it is dynamic
+## There is one route
 
-Every hub turn starts on **Opus at low effort** (`HUB_MODEL` / `HUB_EFFORT`) with `SAFE_TOOLS` in `--allowedTools`, and escalates to a fresh
-**Opus** run with `ALL_TOOLS` when the turn emits `__ESCALATE__` or is denied a gated tool. Read
-`docs/ROUTING.md` before touching `worker.py`'s routing — it covers what is gated and why, and the
-two things that break silently:
-
-- **`SAFE_TOOLS` must stay an allow list.** Converting it to `--disallowedTools` removes the gated
-  tools from the schema instead of denying them on call, so the fast path can no longer see that it needs
-  one — escalation stops happening and every gated write starts answering "I can't do that".
-- **A new data-layer tool is invisible to voice until it is named there.** `validate_safe_tools()`
-  logs the drift in both directions at startup; read that line after adding a tool.
+Every hub turn, photos included, runs on **Opus at its default effort** (`HUB_MODEL` / `HUB_EFFORT`)
+with the full toolset, on the warm SDK client. There is no fast first responder and no escalation —
+Jared's call for quality over speed. Read `docs/ROUTING.md` before touching `worker.py`'s routing: it
+covers what every turn is told, how sends are fenced per mic, and what to get right if a faster split
+is ever rebuilt (gate by omission from an allow list, never `--disallowedTools`).
 
 `voice_requests.tier` is a dead column: nothing writes or reads it (historical rows only). The two
-wake words ("Hey Rhasspy" / "Hey Jarvis") are equivalent triggers — routing is the worker's dynamic
-dispatch, and `app_settings.wakefree_route` is likewise an inert leftover row.
+wake words ("Hey Rhasspy" / "Hey Jarvis") are equivalent triggers — routing is the worker's one
+route, and `app_settings.wakefree_route` is likewise an inert leftover row.
 
 ## The worker never bills the API — `ANTHROPIC_API_KEY` is discarded
 

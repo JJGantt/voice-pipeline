@@ -15,7 +15,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'get_routing',
       description:
-        "Report how the conversational voice agent is routed and its live voice modes. The route is now DYNAMIC: a fast model (Sonnet) handles simple turns and automatically escalates to the most capable model (Opus, max thinking) for anything needing careful data writes — there is no manual model/thinking/runner choice anymore. Also reports whether ALWAYS-ON voice is on (the hands-free, no-wake-word mode — also called 'always on', 'AO', or 'wake-free'; all the same thing) and whether voice-inject mode is on. Use this when Jared asks what model/routing is in effect or whether always-on is enabled.",
+        "Report how the conversational voice agent is routed and its live voice modes. Every turn runs on Opus at its default (adaptive) effort with the full toolset — there is no escalation and no manual model/thinking/runner choice. Also reports whether ALWAYS-ON voice is on (the hands-free, no-wake-word mode — also called 'always on', 'AO', or 'wake-free'; all the same thing) and whether voice-inject mode is on. Use this when Jared asks what model/routing is in effect or whether always-on is enabled.",
       inputSchema: { type: 'object', properties: {} },
     },
     {

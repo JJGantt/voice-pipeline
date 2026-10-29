@@ -1,6 +1,5 @@
-// Voice route/mode tools backed by Supabase app_settings. The conversational route is now DYNAMIC
-// (Sonnet handles simple turns and escalates to Opus for careful data writes — there are no more
-// model/thinking/runner knobs), so this just reports that route and toggles the two live voice modes
+// Voice route/mode tools backed by Supabase app_settings. Every conversational turn runs on Opus with the
+// full toolset (there are no model/thinking/runner knobs), so this just reports that and toggles the two live voice modes
 // (always-on / wake-free and voice-inject) plus JaredBot. The single FAB button drives the one dynamic route.
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -38,8 +37,8 @@ function truthy(v) {
 export async function getRouting() {
   const s = await readSettings(['wakefree_enabled', 'voice_inject_mode']);
   return {
-    route: 'dynamic',
-    route_label: 'Dynamic — Sonnet handles simple turns and escalates to Opus (max thinking) for anything needing careful data writes.',
+    route: 'opus',
+    route_label: 'Every turn runs on Opus at its default (adaptive) effort with the full toolset; no escalation.',
     always_on: truthy(s.wakefree_enabled ?? '0'),   // hands-free, no-wake-word voice (aka 'AO' / 'wake-free')
     inject_mode: truthy(s.voice_inject_mode ?? '0'),   // voice-inject mode (transcripts injected into the conversation)
   };

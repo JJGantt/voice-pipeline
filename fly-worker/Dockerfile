@@ -58,7 +58,6 @@ ENV DATA_MCP_JS=/app/data-layer/dist/mcp.js \
     CLAUDE_CONFIG_DIR=/data/claude \
     STATE_DIR=/data/voice-worker \
     WORKER_ID=fly \
-    WORKER_PRIORITY=fly,pi,mac \
-    WARM_OPUS=1
+    WORKER_PRIORITY=fly,pi,mac
 
 CMD ["./entrypoint.sh"]

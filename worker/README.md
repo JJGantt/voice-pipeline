@@ -1,8 +1,8 @@
 # Voice-command worker daemon
 
 Claims voice commands from the Supabase `voice_requests` queue and runs each one
-on the **Claude subscription** — ordinary turns on a warm Agent SDK client
-(Opus at low effort, safe toolset), escalations and full-agent turns through headless
+on the **Claude subscription** — hub turns on a warm Agent SDK client
+(Opus at its default effort, full toolset), full-agent turns through headless
 `claude -p` (Opus) — with the `data` MCP attached, then writes the conversation
 back to Supabase (`voice_messages`) for a live display. Every turn runs on the Claude subscription;
 there is no API-billed path (see `../docs/ROUTING.md`).
@@ -76,8 +76,7 @@ routed once it gets here is `../docs/ROUTING.md`.
 | `WORKER_ID` | `mac` | Also `pi`, `fly`. Identifies this worker in the queue + presence. |
 | `WORKER_PRIORITY` | `fly,pi,mac` | Ordered, highest first. A worker only claims if no higher-priority worker has a fresh heartbeat. The same value is `run.sh`'s default, `worker.py`'s, the Pi's `.env` and the Fly image's; change all four together. |
 | `STATE_DIR` | `~/.voice-worker` | Stores `hub_session.json` and `agent_session.json` (session id + last activity). `/data/voice-worker` on Fly, on the volume. |
-| `HUB_MODEL` / `HUB_EFFORT` | `opus` / `low` | The fast path's model and effort (`docs/ROUTING.md`). Escalations are Opus at its default effort regardless. |
-| `WARM_OPUS` | *(off)* | `1` keeps a warm Opus `SdkRunner` (full toolset plus `Read`) beside the fast-path one, so escalated and photo turns skip the `claude -p` spawn. On only on Fly, which has the 2GB for two clients. |
+| `HUB_MODEL` / `HUB_EFFORT` | `opus` / *(unset)* | The hub turn's model and effort; unset is the model's default (`docs/ROUTING.md`). |
 | `CLAUDE_BIN` | `claude` | Path to the Claude Code CLI. |
 | `DATA_MCP_JS` | `~/repos/data-layer/dist/mcp.js` | The **built** data MCP entrypoint — a source change there does nothing until `npm run build`. |
 | `VOICE_MCP_JS` | `~/repos/voice-pipeline/mcp-voice/src/index.js` | The voice MCP (`say`, `set_focus`, `list_sessions`). |
@@ -138,7 +137,7 @@ kills the Claude CLI mid-request and the worker pushes a false failure alert to 
 
 `WORKER_PRIORITY` is `fly,pi,mac`, so **Fly claims whenever it is up**, the Pi is
 the first fallback and the Mac the second. Fly is first on speed: measured on
-identical commands it answers the common fast-path turn in 2.8s median against the
+identical commands it answers the common turn in 2.8s median against the
 Pi's 4.4s, and Opus turns cost about the same on both, ~15s
 (`../docs/WORKER-PLACEMENT.md`). It is also independent of the house. It cannot
 reach iMessage, Gmail or the feeder; those are rare enough not to count against it.
@@ -184,13 +183,11 @@ The agent session resets only on a manual reset.
 
 ## allowedTools (blast-radius note)
 
-A hub turn runs `claude -p` with an **explicit list** of MCP tool names in
-`--allowedTools`, plus `--strict-mcp-config --mcp-config <tmpfile>` — never
-`Bash`, `Edit` or `Write`. `Read` is added only for photo turns, which is how the
-CLI views an image file. In headless `-p` mode a tool not in the list is
-**denied, not prompted**, so a run never hangs on a permission dialog — and that
-denial is what escalation is built on. Which names go in which list, and why it
-must never become `--disallowedTools`, is `../docs/ROUTING.md`.
+A hub turn runs with an **explicit list** of tools (`ALL_TOOLS`: the MCP servers, the web, mail
+and messages) — never `Bash`, `Edit` or `Write`. `Read` is allowed only inside the current
+turn's photo directory, which is how the model views an image file. The warm client enforces the
+list with a PreToolUse hook (`_fence`), because Claude Code also applies the host's own permission
+settings; `../docs/ROUTING.md` has why.
 
 Full-agent mode is the opposite shape: `--dangerously-skip-permissions` in
 `agent_cwd`, every native tool live. It exists for dictated coding work and is
