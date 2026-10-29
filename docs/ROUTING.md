@@ -169,6 +169,16 @@ calories and macros at each level:
 The "ultrathink" in `POWER_DIRECTIVE` sets no budget; the CLI turns it into a note asking for deeper
 reasoning.
 
+`POWER_DIRECTIVE` also tells escalated Opus to web-search a specific restaurant item or branded product
+whose published nutrition it can't quote with certainty, and NOT to search generic foods, saved recipes or
+repeats of logged meals. Measured 2026-10-29, Opus at default effort, two runs each with and without web:
+famous chains (Big Mac, Chick-fil-A sandwich, grande latte, Chipotle burrito, Crunchwrap) came out at the
+published figures from memory, and searching only added 5–25s. Less-common items were off 20–40% from
+memory and searching fixed most of them: Jinya Spicy Creamy Vegan Ramen 960 → 790 (published ~790), La
+Colombe Vanilla Draft Latte 130–150 → 110 (label ~110). Searching costs 15–30s on the turns that do it, and
+can land on a stale third-party listing (a Panera melt came back 990 against ~890), which is why the
+directive points at the brand's own page. The fast path never sees this text; it only escalates.
+
 **Everything runs on the subscription, and nothing else.** The fast path runs on the warm `SdkRunner` (a
 long-lived headless Claude Code process holding the MCP servers); escalation runs Opus on a second
 warm `SdkRunner` where `WARM_OPUS=1` (the Fly worker, which has the memory for both) and through

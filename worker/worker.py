@@ -379,13 +379,21 @@ _NOTHING_SAID = re.compile(r"^\W*thank\s+you\W*$", re.IGNORECASE)
 # restaurant dish whose ingredients/macros are unknown. Opus runs at its DEFAULT effort: measured on four
 # meals, `--effort max` returned the same macros 7–19s slower per turn (docs/ROUTING.md). "ultrathink"
 # here sets no budget — the CLI (2.1.301) turns it into a one-line note asking for deeper reasoning.
+# The web-lookup rule: from memory Opus was off 20–40% on less-common branded/restaurant items (Jinya
+# vegan ramen 960 vs ~790, La Colombe draft latte 130–150 vs ~110) and searching fixed them, while famous
+# chains and generic foods came out exact without it — so search only where memory is weak (docs/ROUTING.md).
 POWER_DIRECTIVE = (
     "\n\n[Precision mode — ultrathink. Take your time and reason carefully before acting. If this "
     "involves estimating nutrition for a dish whose exact contents aren't given, decompose it into its "
     "likely ingredients with realistic restaurant portions, estimate each component's macros, and sum "
     "them — don't lowball. ALWAYS use the structured per-ingredient breakdown the log tool supports: "
     "give each component its OWN protein/carbs/fat (and calories when you know them); the server computes "
-    "the meal's totals by summing the ingredients, so keep each component's macros accurate.]"
+    "the meal's totals by summing the ingredients, so keep each component's macros accurate. When the "
+    "food is a specific restaurant menu item or a branded/packaged product and you can't quote its exact "
+    "published nutrition with certainty, search the web for it before logging — prefer the restaurant's "
+    "or brand's own nutrition page over third-party trackers. Don't search for generic foods (eggs, rice, "
+    "an apple), saved recipes, or repeats of something already in the log; use your own knowledge or the "
+    "stored numbers for those.]"
 )
 
 # ---- Dynamic route. the fast path (HUB_MODEL at HUB_EFFORT) is the first responder, given ONLY the SAFE tools below in its
