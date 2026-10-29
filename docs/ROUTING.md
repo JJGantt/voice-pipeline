@@ -153,10 +153,12 @@ fails twice, quickly, and surfaces as an error.
 ## The addressing directive
 
 Room-mic turns get `ADDRESSING_DIRECTIVE` appended, because those mics are always on and hear the
-whole room. A press (the phone's button, the watch's) and typed text never do: it was meant.
+whole room. A press (the phone's button, the watch's), typed text, and a command the ESP heard after
+its wake word never do: it was meant.
 
-Which is which is `voice_requests.always_on`, stamped by whoever captured the clip — the ESP server,
-the Mac's listener and wake-free capture, and the hub for an uploaded clip from a listener label
+Which is which is `voice_requests.always_on`, stamped by whoever captured the clip — the ESP server
+(only for a wake-free capture, started on speech energy; a wake-word capture is a press), the Mac's
+listener and wake-free capture, and the hub for an uploaded clip from a listener label
 (`GATED_SOURCES` in status-hub). The worker never decides it from `source`: one device can be both a
 listener and a button, and a second list of labels here is how the phone's listener ended up counted
 as a press. An unstamped row is a press, so a new capture path that forgets the flag gets answered,
@@ -165,11 +167,19 @@ never silently dropped.
 Only a room-mic turn can be ignored: the `__IGNORE__` sentinel is taught in `ADDRESSING_DIRECTIVE`
 alone. That alone does not keep it from a deliberate turn, because every turn replays the day's thread
 and a model copies a reply it sees there — so a bare sentinel reply is never replayed (`is_ignore` in
-`_line`'s filter), and a deliberate turn that answers `__IGNORE__` anyway is re-run on a clean Opus
-with no context, the same net `__ESCALATE__` has. Deliberate turns get `DELIBERATE_DIRECTIVE`
-instead: work out the implied question when he describes something without asking one, and if he
-truly cannot be understood say so in the model's own words. There is no canned "didn't understand"
-line; offered one, the model used it on clear speech.
+`_line`'s filter), and a deliberate turn that answers `__IGNORE__` anyway is re-run clean, with no
+context. Deliberate turns get `DELIBERATE_DIRECTIVE` instead: work out the implied question when he
+describes something without asking one, and if he truly cannot be understood say so in the model's own
+words. There is no canned "didn't understand" line; offered one, the model used it on clear speech.
+
+`DELIBERATE_DIRECTIVE` also makes the model his **orchestrator**: work he describes that needs a real
+machine (code, debugging, deploys, a project, his signed-in browser) becomes a `start_session` whether
+or not he says "session", and a reply from him that plainly answers a session's message in the thread
+goes back to that session through `follow_up`. For that, `_line` names a session's reply in the
+replayed thread as `Session "<label>" (<id>)` (from `voice_messages.session_id` / `session_label`)
+rather than `Assistant`, so the model can tell which session said what and pass its id. On room-mic
+turns none of this applies: talk naming no destination is assumed to be for a session already open,
+and `follow_up` there needs a handoff phrase (below).
 
 Every turn also gets `READ_DIRECTIVE`: a reply that tells him something he wanted to know ends with
 the `[[read]]` marker, and one that only confirms an action does not. `take_read_marker` strips it
@@ -188,9 +198,11 @@ It carries only what the model cannot work out from the text itself:
    which has heard him already, through its own channel.
 
 Point 4 is the one that cost something, and the rule is STRUCTURAL — it is not about what the words
-mean. Any sentence can be a dispatch or not, depending only on whether Jared handed it over, so
-`follow_up` requires an explicit handoff phrase ("send a follow-up", "tell it to") and judges nothing
-by subject matter. Listing example sentences that are "not for you" is the wrong shape of instruction
+mean. Any sentence can be a dispatch or not, depending only on whether Jared handed it over, so on a
+room-mic turn a follow-up needs an explicit handoff phrase ("send a follow-up", "tell it to") and is
+judged by nothing about subject matter. (On a deliberate turn, a plain reply to a session's posted
+message is itself a handoff; the `follow_up` tool description allows it and the room directive's
+"anything later needs him to hand it over" overrides it on room-mic turns.) Listing example sentences that are "not for you" is the wrong shape of instruction
 and was removed: it teaches that certain CONTENT is never a dispatch, when the same words forwarded
 deliberately are exactly that.
 

@@ -467,6 +467,17 @@ DELIBERATE_DIRECTIVE = (
     "\n\n[He said this to you on purpose. When he describes something without asking outright, answer "
     "what he evidently wants to know. Only if you genuinely cannot tell what he means, say so in your "
     "own words and ask him.]"
+    "\n\n[You are his orchestrator: the one assistant he talks to for everything. When he describes work "
+    "that needs a real machine — writing or changing code, debugging, building or deploying, digging "
+    "through one of his projects, anything that needs his signed-in browser — start a session for it "
+    "with start_session, whether or not he says the word 'session'. Use list_repos to pick the project "
+    "the work belongs to, and omit repo when it is unclear. Handle it yourself only when your own tools "
+    "cover it: his data, lists, lights, a web lookup, a question you can answer. "
+    "Sessions post their replies into this conversation, shown as 'Session \"<name>\" (<id>)'. When what "
+    "he says is plainly his answer to one of them — answering its question, approving or correcting its "
+    "plan, telling it to go ahead — send his words to that session with follow_up, passing its id, "
+    "instead of answering it yourself or starting a new session. If you cannot tell whether he is "
+    "replying to a running session or describing new work, ask.]"
 )
 
 # Appended to every hub turn. The watch keeps a flagged reply reachable until it has actually been on
@@ -1074,7 +1085,7 @@ def live_load() -> bool:
             page = get("voice_messages",
                        "focus=eq.hub&mode=eq.hub&role=in.(user,assistant)"
                        f"&created_at=gte.{since}&order=created_at.asc&limit=1000&offset={len(rows)}"
-                       "&select=id,focus,mode,role,text,created_at,ignored,done,needs_read")
+                       "&select=id,focus,mode,role,text,created_at,ignored,done,needs_read,session_id,session_label")
             rows += page
             if len(page) < 1000:
                 break
@@ -1332,6 +1343,10 @@ def recent_context() -> str:
         ts = _parse_ts(r.get("created_at") or "")
         when = ts.astimezone(DAY_TZ).strftime("%-I:%M %p") if ts else "?"
         who = 'You' if r.get('role') == 'user' else 'Assistant'
+        if r.get('role') == 'assistant' and r.get('session_id'):
+            # A session's reply posted into the hub thread. Named, so a reply from him that follows it can
+            # be sent back to that session with follow_up rather than answered as if the hub had said it.
+            who = f"Session \"{r.get('session_label') or r['session_id']}\" ({r['session_id']})"
         txt = (r.get('text') or '').strip()
         if r.get('ignored'):
             return f"[{when}] You (ignored as room noise, not acted on): {txt}"

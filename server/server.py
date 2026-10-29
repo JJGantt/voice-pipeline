@@ -319,7 +319,8 @@ async def _notify_transcribe_failure() -> None:
         pass
 
 
-async def _open_request(cap_start: str | None = None, cap_end: str | None = None) -> str | None:
+async def _open_request(cap_start: str | None = None, cap_end: str | None = None,
+                        always_on: bool = True) -> str | None:
     """Open the command's lifecycle row at CAPTURE-ACCEPT — status 'transcribing', no transcript yet.
     This is the moment the working indicators turn on (ESP blink here, floor lamp via pi-audio's
     realtime sub on this insert): the earliest instant the system has committed to processing the
@@ -334,7 +335,7 @@ async def _open_request(cap_start: str | None = None, cap_end: str | None = None
                 headers={"apikey": SUPABASE_SERVICE_KEY,
                          "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
                          "Content-Type": "application/json", "Prefer": "return=representation"},
-                json={"status": "transcribing", "source": "fly", "focus": "hub", "always_on": True,
+                json={"status": "transcribing", "source": "fly", "focus": "hub", "always_on": always_on,
                       **({"capture_start": cap_start} if cap_start else {}),
                       **({"capture_end": cap_end} if cap_end else {})},
             )
@@ -366,7 +367,7 @@ async def _close_request_error(rid: str, err: str) -> None:
 
 async def handle_transcript(text: str, duration_s: float, truncated: bool,
                             cap_start: str | None = None, cap_end: str | None = None,
-                            rid: str | None = None, alt: str | None = None) -> bool:
+                            rid: str | None = None, alt: str | None = None, always_on: bool = True) -> bool:
     """HANDOFF SEAM — the rest of the system hooks in here.
 
     `duration_s` is the captured length; `truncated` is True if the capture ended
@@ -425,7 +426,7 @@ async def handle_transcript(text: str, duration_s: float, truncated: bool,
                         "Content-Type": "application/json",
                         "Prefer": "return=minimal",
                     },
-                    json={"transcript": text, "source": "fly", "always_on": True, **alt_field,
+                    json={"transcript": text, "source": "fly", "always_on": always_on, **alt_field,
                           **({"capture_start": cap_start} if cap_start else {}),
                           **({"capture_end": cap_end} if cap_end else {})},
                 )
@@ -495,6 +496,7 @@ async def connection(ws):
     capturing = False
     utterance = bytearray()
     woke = False                    # capture trigger fired (either wake word, or speech energy in wake-free)
+    by_wake = False                 # the capture in progress was started by a wake word (see `if woke:`)
     threshold = 0.0                 # adaptive speech/silence level, set at wake
     capture_floor = 0.0             # noise floor measured at capture start (for endpoint diagnostics)
     last_voice = 0.0
@@ -610,6 +612,10 @@ async def connection(ws):
                     elif sense_buf:
                         sense_buf.clear()
                 if woke:
+                    # A wake word is him addressing the assistant on purpose, so that command is NOT
+                    # ambient (voice_requests.always_on): the worker treats it like a button press. Only a
+                    # wake-free capture, started on speech energy alone, is room audio.
+                    by_wake = not _wakefree
                     threshold = speech_level
                     capture_floor = floor     # remember the room floor that set this threshold (diagnostics)
                     capturing = True          # wake-free: LED stays as-is until ECAPA confirms it's Jared
@@ -813,7 +819,7 @@ async def connection(ws):
                         continue
                     log.info("wake-free: confirmed span sim=%.2f (span %.1fs of %.1fs, windows %s)",
                              whole, len(span) / SAMPLE_RATE, dur, windows)
-                rid = await _open_request(started_wall.isoformat(), end_wall.isoformat())
+                rid = await _open_request(started_wall.isoformat(), end_wall.isoformat(), always_on=not by_wake)
                 _led_capturing = False
                 _led_working = True
                 await _render_led(ws, "capture accepted")
@@ -824,7 +830,7 @@ async def connection(ws):
                     text = await transcribe(bytes(utterance))
                     enqueued = await handle_transcript(text, dur, truncated,
                                                        started_wall.isoformat(), end_wall.isoformat(), rid=rid,
-                                                       alt=await second)
+                                                       alt=await second, always_on=not by_wake)
                 except Exception as e:
                     log.exception("transcription failed: %s", e)
                     asyncio.create_task(_notify_transcribe_failure())
