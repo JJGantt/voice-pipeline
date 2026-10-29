@@ -469,6 +469,28 @@ DELIBERATE_DIRECTIVE = (
     "own words and ask him.]"
 )
 
+# Appended to every hub turn. The watch keeps a flagged reply reachable until it has actually been on
+# screen (status-hub docs/WATCH.md, "Unread answers"), so a later command cannot bury it; most replies
+# are confirmations he never needs to read, and those must NOT be flagged or they would queue up
+# unread forever. The marker is stripped before the reply is stored (`take_read_marker`), and the
+# replayed day puts it back on flagged replies (`recent_context`), so the history the model reads
+# shows the convention being followed rather than a run of untagged answers to copy.
+READ_MARKER = "[[read]]"
+READ_DIRECTIVE = (
+    "\n\n[If your reply gives him something he wanted to KNOW (an answer to a question, a lookup, a "
+    "summary, a recommendation, information he asked for), end it with " + READ_MARKER + " as the very "
+    "last thing. If it only confirms that something was done (a set logged, a light changed, an item "
+    "added, a session started), leave the marker off. The marker is removed before he sees the reply.]"
+)
+
+
+def take_read_marker(text: str) -> tuple[str, bool]:
+    """The reply without the read marker, and whether it carried one."""
+    if READ_MARKER not in (text or ""):
+        return text, False
+    return text.replace(READ_MARKER, "").strip(), True
+
+
 # A second speech-to-text reading from a different Whisper model, present only when its words differ
 # from the transcript (status-hub /api/voice-command, voice_requests.alt_transcript). The two mishear
 # different words, so the model is told to reconcile them rather than trust either: large-v3 wrote
@@ -1052,7 +1074,7 @@ def live_load() -> bool:
             page = get("voice_messages",
                        "focus=eq.hub&mode=eq.hub&role=in.(user,assistant)"
                        f"&created_at=gte.{since}&order=created_at.asc&limit=1000&offset={len(rows)}"
-                       "&select=id,focus,mode,role,text,created_at,ignored,done")
+                       "&select=id,focus,mode,role,text,created_at,ignored,done,needs_read")
             rows += page
             if len(page) < 1000:
                 break
@@ -1313,6 +1335,8 @@ def recent_context() -> str:
         txt = (r.get('text') or '').strip()
         if r.get('ignored'):
             return f"[{when}] You (ignored as room noise, not acted on): {txt}"
+        if r.get('needs_read') and r.get('role') == 'assistant':
+            txt = f"{txt} {READ_MARKER}"
         return f"[{when}] {who}: {txt}"
     # A bare sentinel reply is dropped from the replay. It is never shown as a reply — but a deliberate
     # turn that emitted one anyway was saved as `Assistant: __IGNORE__`, and replaying that line taught
@@ -2448,6 +2472,7 @@ def process_request(db: Supabase, req: dict) -> None:
         prompt += ADDRESSING_DIRECTIVE + ROOM_SEND_DIRECTIVE
     else:
         prompt += DELIBERATE_DIRECTIVE
+    prompt += READ_DIRECTIVE
     alt = (req.get("alt_transcript") or "").strip()
     if alt:
         prompt += ALT_TRANSCRIPT_DIRECTIVE.format(alt=alt)
@@ -2528,6 +2553,8 @@ def process_request(db: Supabase, req: dict) -> None:
         result = SDK.run(prompt + NUTRITION_DIRECTIVE + TOOLS_DIRECTIVE, on_event=_emit, ambient=ambient)
         text = (result.get("text") or "").strip()
 
+    text, needs_read = take_read_marker(text)
+
     # A failure here is this machine's, not the command's, until every machine has tried it: hand it on.
     # Nothing has been written to the thread yet, so the worker that takes it writes the whole turn.
     if not result.get("ok") and not fallback and not req.get("_acted") and hand_off(db, req, result.get("raw_error") or "unknown error"):
@@ -2564,7 +2591,7 @@ def process_request(db: Supabase, req: dict) -> None:
         db.post(
             "voice_messages",
             {"request_id": rid, "focus": "hub", "mode": msg_mode, "role": "assistant",
-             "text": text, "done": True, "worker": WORKER_ID},
+             "text": text, "done": True, "worker": WORKER_ID, "needs_read": needs_read},
         )
         db.patch(
             "voice_requests",
@@ -2579,7 +2606,7 @@ def process_request(db: Supabase, req: dict) -> None:
             db.post(
                 "voice_messages",
                 {"request_id": rid, "focus": "hub", "mode": msg_mode, "role": "assistant",
-                 "text": result["text"], "done": True, "worker": WORKER_ID},
+                 "text": take_read_marker(result["text"])[0], "done": True, "worker": WORKER_ID},
             )
         db.patch(
             "voice_requests",

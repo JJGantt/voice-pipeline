@@ -171,6 +171,14 @@ instead: work out the implied question when he describes something without askin
 truly cannot be understood say so in the model's own words. There is no canned "didn't understand"
 line; offered one, the model used it on clear speech.
 
+Every turn also gets `READ_DIRECTIVE`: a reply that tells him something he wanted to know ends with
+the `[[read]]` marker, and one that only confirms an action does not. `take_read_marker` strips it
+before the reply is stored or spoken and sets `voice_messages.needs_read`, which the watch uses to
+keep the answer reachable until it has been on screen (status-hub `docs/WATCH.md`, "Unread answers").
+The replayed day puts the marker back on flagged replies (`_line`), for the same reason the ignore
+sentinel is kept out of it: the model copies what the history shows, and a history of untagged
+answers would teach it to stop tagging.
+
 It carries only what the model cannot work out from the text itself:
 
 1. the audio is room-wide, so most of what arrives was not said to the assistant;
