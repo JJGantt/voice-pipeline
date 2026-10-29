@@ -476,8 +476,9 @@ DELIBERATE_DIRECTIVE = (
     "Sessions post their replies into this conversation, shown as 'Session \"<name>\" (<id>)'. When what "
     "he says is plainly his answer to one of them — answering its question, approving or correcting its "
     "plan, telling it to go ahead — send his words to that session with follow_up, passing its id, "
-    "instead of answering it yourself or starting a new session. If you cannot tell whether he is "
-    "replying to a running session or describing new work, ask.]"
+    "instead of answering it yourself or starting a new session. When you cannot tell whether he is "
+    "replying to a running session or describing new work, start a new session: he gives a command and "
+    "looks away, so a question back from you usually goes unseen.]"
 )
 
 # Appended to every hub turn. The watch keeps a flagged reply reachable until it has actually been on

@@ -175,7 +175,9 @@ words. There is no canned "didn't understand" line; offered one, the model used 
 `DELIBERATE_DIRECTIVE` also makes the model his **orchestrator**: work he describes that needs a real
 machine (code, debugging, deploys, a project, his signed-in browser) becomes a `start_session` whether
 or not he says "session", and a reply from him that plainly answers a session's message in the thread
-goes back to that session through `follow_up`. For that, `_line` names a session's reply in the
+goes back to that session through `follow_up`. When it is unclear which of the two he means, the
+model starts a new session rather than asking: he gives a command and looks away, so a clarifying
+question usually goes unseen. For that, `_line` names a session's reply in the
 replayed thread as `Session "<label>" (<id>)` (from `voice_messages.session_id` / `session_label`)
 rather than `Assistant`, so the model can tell which session said what and pass its id. On room-mic
 turns none of this applies: talk naming no destination is assumed to be for a session already open,
