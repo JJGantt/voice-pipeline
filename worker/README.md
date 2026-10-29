@@ -2,7 +2,7 @@
 
 Claims voice commands from the Supabase `voice_requests` queue and runs each one
 on the **Claude subscription** — ordinary turns on a warm Agent SDK client
-(Sonnet, safe toolset), escalations and full-agent turns through headless
+(Opus at low effort, safe toolset), escalations and full-agent turns through headless
 `claude -p` (Opus) — with the `data` MCP attached, then writes the conversation
 back to Supabase (`voice_messages`) for a live display. Every turn runs on the Claude subscription;
 there is no API-billed path (see `../docs/ROUTING.md`).
@@ -76,7 +76,8 @@ routed once it gets here is `../docs/ROUTING.md`.
 | `WORKER_ID` | `mac` | Also `pi`, `fly`. Identifies this worker in the queue + presence. |
 | `WORKER_PRIORITY` | `fly,pi,mac` | Ordered, highest first. A worker only claims if no higher-priority worker has a fresh heartbeat. The same value is `run.sh`'s default, `worker.py`'s, the Pi's `.env` and the Fly image's; change all four together. |
 | `STATE_DIR` | `~/.voice-worker` | Stores `hub_session.json` and `agent_session.json` (session id + last activity). `/data/voice-worker` on Fly, on the volume. |
-| `WARM_OPUS` | *(off)* | `1` keeps a warm Opus `SdkRunner` (full toolset plus `Read`) beside the Sonnet one, so escalated and photo turns skip the `claude -p` spawn. On only on Fly, which has the 2GB for two clients. |
+| `HUB_MODEL` / `HUB_EFFORT` | `opus` / `low` | The fast path's model and effort (`docs/ROUTING.md`). Escalations are Opus at its default effort regardless. |
+| `WARM_OPUS` | *(off)* | `1` keeps a warm Opus `SdkRunner` (full toolset plus `Read`) beside the fast-path one, so escalated and photo turns skip the `claude -p` spawn. On only on Fly, which has the 2GB for two clients. |
 | `CLAUDE_BIN` | `claude` | Path to the Claude Code CLI. |
 | `DATA_MCP_JS` | `~/repos/data-layer/dist/mcp.js` | The **built** data MCP entrypoint — a source change there does nothing until `npm run build`. |
 | `VOICE_MCP_JS` | `~/repos/voice-pipeline/mcp-voice/src/index.js` | The voice MCP (`say`, `set_focus`, `list_sessions`). |
@@ -137,7 +138,7 @@ kills the Claude CLI mid-request and the worker pushes a false failure alert to 
 
 `WORKER_PRIORITY` is `fly,pi,mac`, so **Fly claims whenever it is up**, the Pi is
 the first fallback and the Mac the second. Fly is first on speed: measured on
-identical commands it answers the common Sonnet turn in 2.8s median against the
+identical commands it answers the common fast-path turn in 2.8s median against the
 Pi's 4.4s, and Opus turns cost about the same on both, ~15s
 (`../docs/WORKER-PLACEMENT.md`). It is also independent of the house. It cannot
 reach iMessage, Gmail or the feeder; those are rare enough not to count against it.

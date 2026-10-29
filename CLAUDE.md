@@ -2,13 +2,13 @@
 
 ## There is one route, and it is dynamic
 
-Every hub turn starts on **Sonnet** with `SAFE_TOOLS` in `--allowedTools`, and escalates to a fresh
+Every hub turn starts on **Opus at low effort** (`HUB_MODEL` / `HUB_EFFORT`) with `SAFE_TOOLS` in `--allowedTools`, and escalates to a fresh
 **Opus** run with `ALL_TOOLS` when the turn emits `__ESCALATE__` or is denied a gated tool. Read
 `docs/ROUTING.md` before touching `worker.py`'s routing — it covers what is gated and why, and the
 two things that break silently:
 
 - **`SAFE_TOOLS` must stay an allow list.** Converting it to `--disallowedTools` removes the gated
-  tools from the schema instead of denying them on call, so Sonnet can no longer see that it needs
+  tools from the schema instead of denying them on call, so the fast path can no longer see that it needs
   one — escalation stops happening and every gated write starts answering "I can't do that".
 - **A new data-layer tool is invisible to voice until it is named there.** `validate_safe_tools()`
   logs the drift in both directions at startup; read that line after adding a tool.

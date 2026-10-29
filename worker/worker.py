@@ -79,10 +79,13 @@ CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 # .env files, the Fly secret), so it is popped at import — a subprocess that inherited it would quietly
 # bill the API instead of the subscription.
 os.environ.pop("ANTHROPIC_API_KEY", None)
-# Most hub turns are tool use, but nutrition macro estimation leans on the model's internal
-# food knowledge — so default to Sonnet (strong priors, still fast). Override with HUB_MODEL
-# ('haiku' for max speed on trivial turns, 'opus' for the best macro/disambiguation quality).
-HUB_MODEL = os.environ.get("HUB_MODEL", "sonnet")
+# The fast path's model, run at LOW effort (minimal thinking). Opus rather than Sonnet for judgment: a
+# Sonnet turn saved a misheard "pair putt" as a to-do and then told him no haircut item existed while
+# naming "pair putt" at the same hour. At low effort Opus measured about a second slower than Sonnet on a
+# simple command and level with it on tool turns (docs/ROUTING.md). Gated tools still escalate to Opus at
+# its default effort, which macro estimates need. Override with HUB_MODEL / HUB_EFFORT.
+HUB_MODEL = os.environ.get("HUB_MODEL", "opus")
+HUB_EFFORT = os.environ.get("HUB_EFFORT", "low")
 
 # Path to the built data MCP server (node entrypoint).
 DATA_MCP_JS = os.environ.get(
@@ -606,6 +609,17 @@ DELIBERATE_DIRECTIVE = (
     "\n\n[He said this to you on purpose. When he describes something without asking outright, answer "
     "what he evidently wants to know. Only if you genuinely cannot tell what he means, say so in your "
     "own words and ask him.]"
+)
+
+# A second speech-to-text reading from a different Whisper model, present only when its words differ
+# from the transcript (status-hub /api/voice-command, voice_requests.alt_transcript). The two mishear
+# different words, so the model is told to reconcile them rather than trust either: large-v3 wrote
+# "pair putt" where turbo heard "haircut", and turbo wrote "to view" where large heard "a to-do".
+ALT_TRANSCRIPT_DIRECTIVE = (
+    "\n\n[Speech-to-text ran twice on this recording, with two different models, and they disagree. The "
+    "other reading was: \"{alt}\". Where they differ, one of them misheard him. Act on the reading that "
+    "makes sense, word by word, and never save a name or a value that appears in only one reading and "
+    "makes no sense, as though he said it. If you cannot tell which he said, ask him.]"
 )
 
 # Always-on mics hear the WHOLE room — the TV, Jared talking to his cats, other people talking to or
@@ -1765,17 +1779,20 @@ class SdkRunner:
 
     One long-lived headless Claude Code process holds the four MCP servers, so the per-command spawn
     spawn cost is paid once, not per turn. Each hub turn runs in a FRESH conversation (`/clear` on the
-    same warm process, see _turn): the caller replays the day's hub conversation into the prompt. Pinned to Sonnet +
-    SAFE_TOOLS at connect; escalation and full-agent turns keep their own `claude -p` spawns (full
+    same warm process, see _turn): the caller replays the day's hub conversation into the prompt. Pinned to HUB_MODEL
+    at HUB_EFFORT + SAFE_TOOLS at connect; escalation and full-agent turns keep their own `claude -p` spawns (full
     toolset). A failed turn is retried by `run_subscription` and then surfaced; errors never upgrade the
     model and never move a turn onto the paid API.
     """
 
-    def __init__(self, model: str = "sonnet", tools: "list | None" = None):
-        """`model` and `tools` (the allow list; SAFE_TOOLS by default) fix what the warm client is. The
-        Opus runner (`OPUS`) gets the full toolset plus Read, which its fence allows only inside the
-        current turn's photo directory."""
+    def __init__(self, model: str = HUB_MODEL, tools: "list | None" = None, effort: "str | None" = None):
+        """`model`, `effort` and `tools` (the allow list; SAFE_TOOLS by default, which makes it the fast
+        path) fix what the warm client is. The escalation runner (`OPUS`) gets the full toolset plus Read,
+        which its fence allows only inside the current turn's photo directory, and its model's default
+        effort."""
         self.model = model
+        self.effort = effort
+        self.fast = tools is None   # the safe-toolset runner: a gated tool there means escalate
         self.tools = list(tools if tools is not None else SAFE_TOOLS)
         self._read_dir = None  # this turn's attachment directory, the only place Read may look
         self._loop = None
@@ -1815,7 +1832,7 @@ class SdkRunner:
         from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, HookMatcher, PermissionResultDeny
 
         gated = ("This tool is gated on the fast path. If the request needs it, reply __ESCALATE__ (alone)."
-                 if self.model == "sonnet" else "That tool is not available to this assistant.")
+                 if self.fast else "That tool is not available to this assistant.")
         exact = set(self.tools)
         servers = tuple(t + "__" for t in self.tools if t.startswith("mcp__") and t.count("__") == 1)
 
@@ -1855,6 +1872,7 @@ class SdkRunner:
 
         opts = ClaudeAgentOptions(
             model=self.model,
+            **({"effort": self.effort} if self.effort else {}),
             # The SDK ships its own copy of Claude Code, which only moves when the package is upgraded, and
             # the alias "sonnet" resolves to whatever model THAT copy knows. Running the installed CLI keeps
             # this path on the same models as every other turn instead of drifting a release behind.
@@ -1881,7 +1899,7 @@ class SdkRunner:
         await client.connect()
         self._client = client
         self._used = False
-        log(f"sdk runner: warm client up ({self.model}, {'safe' if self.model == 'sonnet' else 'full'} toolset)")
+        log(f"sdk runner: warm client up ({self.model}{' @' + self.effort if self.effort else ''}, {'safe' if self.fast else 'full'} toolset)")
 
     async def _teardown(self):
         if self._client is not None:
@@ -1978,7 +1996,7 @@ class SdkRunner:
         return retry
 
 
-SDK = SdkRunner()
+SDK = SdkRunner(effort=HUB_EFFORT)
 # Opus kept running too, where there is memory for it (WARM_OPUS=1: the Fly worker, 2GB). Its turns —
 # the gated tools, photos — then skip the ~3-4s CLI and MCP start a `claude -p` spawn pays every time.
 # Elsewhere escalation spawns, as before.
@@ -2588,6 +2606,9 @@ def process_request(db: Supabase, req: dict) -> None:
         prompt += ADDRESSING_DIRECTIVE + ROOM_SEND_DIRECTIVE
     else:
         prompt += DELIBERATE_DIRECTIVE
+    alt = (req.get("alt_transcript") or "").strip()
+    if alt:
+        prompt += ALT_TRANSCRIPT_DIRECTIVE.format(alt=alt)
 
     # ---- ONE dynamic route. Every hub command goes to Sonnet (safe tools + escalate); a request that needs
     # a gated WRITE tool escalates to a FRESH Opus (full tools). Photos skip straight to Opus (vision via the
@@ -2600,7 +2621,7 @@ def process_request(db: Supabase, req: dict) -> None:
         except Exception:  # noqa: BLE001
             attachments = []
     use_agent = session_agent   # full-agent (coding) mode → the unrestricted agent, on its own session
-    log(f"route={'fallback→opus agent' if fallback else 'agent' if use_agent else ('photo→opus' if attachments else 'dynamic sonnet→opus')} src={source}")
+    log(f"route={'fallback→opus agent' if fallback else 'agent' if use_agent else ('photo→opus' if attachments else f'dynamic {HUB_MODEL}@{HUB_EFFORT}→opus')} src={source}")
     ping_esp_led("blink")   # working — the ESP light blinks for EVERY command, not just ESP-sourced ones
     push_activity(transcript[:240], "working")   # bottom-strip: the prompt being worked
 

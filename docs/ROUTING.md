@@ -6,7 +6,7 @@ mic → transcript → voice_requests (Supabase)
               worker claims it (Fly primary, Pi then Mac fallback)
                         ↓
           ┌─────────────┴──────────────┐
-          │  Sonnet, the fast responder │   ← SAFE_TOOLS (allowed_tools on the warm SDK client)
+          │ Opus @ low, the fast path   │   ← SAFE_TOOLS (allowed_tools on the warm SDK client)
           └─────────────┬──────────────┘
                         │
         ┌───────────────┼────────────────┐
@@ -21,18 +21,18 @@ mic → transcript → voice_requests (Supabase)
 The bottom activity bar shows the prompt, tool calls, what the model says between them, and
 escalations (an `OPUS` chip stays lit for the rest of an escalated command). All three runners report
 in-between text the same way: held until the next tool call, dropped if none follows, since text after
-the last tool call is the reply. Photo turns skip Sonnet entirely and are not escalations.
+the last tool call is the reply. Photo turns skip the fast path entirely and are not escalations.
 
 ## `SAFE_TOOLS` must be an allow list — never `--disallowedTools`
 
 The two are not equivalent, and the difference is the whole escalation mechanism:
 
-| | in schema? | on call | Sonnet's behaviour |
+| | in schema? | on call | the fast path's behaviour |
 |---|---|---|---|
 | **omitted from `--allowedTools`** | **visible** | denied | sees it, knows it needs it, emits `__ESCALATE__` |
 | listed in `--disallowedTools` | **removed** | n/a | cannot see it — replies "that tool isn't available" |
 
-Escalation depends on Sonnet seeing a tool it may not call. A gated tool is gated by **omission**.
+Escalation depends on the fast path seeing a tool it may not call. A gated tool is gated by **omission**.
 Converting this list to a deny list disables escalation silently — every gated write starts answering
 "I can't do that" instead of handing the turn to Opus.
 
@@ -62,19 +62,19 @@ both lists).
 **Gmail and iMessage are Opus's, reads included** (`MAIL_TOOLS`, on `ALL_TOOLS` only). Jared's call:
 anything touching his email or texts goes to the capable model. They are visible-but-denied on the fast
 path like the nutrition writes, and `ESCALATE_DIRECTIVE` names them, so a mail or text request from
-Sonnet comes back as `__ESCALATE__`.
+the fast path comes back as `__ESCALATE__`.
 
 **Sending a text or an email (`SEND_TOOLS`) is decided per turn, by which mic heard it.** A pushed
 command — typed, the phone's button, the watch's — may send; one from an always-on mic (`voice_requests.always_on`)
 may not, because those hear the whole room and a sentence meant for someone else would
 reach a real person. The sends are on no allow list: the warm client's `_fence` hook allows them
-only on a runner whose tools include them (the warm Opus, never Sonnet) and only when
+only on a runner whose tools include them (the warm escalation Opus, never the fast path) and only when
 `SdkRunner.run(..., ambient=False)`, and every other runner gets `turn_tools(ambient)`
 (full-agent mode, which has no allow list, gets them as `--disallowedTools`).
 
 The fast path's list is enforced by a **PreToolUse hook** (`SdkRunner._fence`), not by `allowed_tools`
 alone. The warm client is Claude Code, which also applies the host user's settings, and the Mac's
-pre-approve every data, gmail and messages tool in auto mode — so `allowed_tools` let Sonnet on the Mac
+pre-approve every data, gmail and messages tool in auto mode — so `allowed_tools` let the fast path on the Mac
 call gated nutrition tools directly and let a room-mic turn send email. A hook's deny outranks any
 allow rule. The `claude -p` runs get `--setting-sources project` for the same reason; the worker runs
 from its own directory, which has none.
@@ -89,17 +89,17 @@ what they are mostly used for.
 `build_walmart_cart_url`, `record_walmart_cart` and `save_shopping_item` (`SESSION_TOOLS`) only mean
 something next to the signed-in browser, which no worker runner has. They are taken out of every
 runner's schema (`disallowed_tools` on the warm client, `--disallowedTools` on `claude -p`) — the one place `--disallowedTools` is right. Left merely gated, they would be
-visible-but-denied, which is exactly what makes Sonnet escalate, and a cart request would reach an
+visible-but-denied, which is exactly what makes the fast path escalate, and a cart request would reach an
 Opus turn that can only call them with made-up values. Out of sight, a cart request is a
 `start_session`, where a browser exists. The reads (`get_shopping_items`, `get_walmart_cart`) stay on
 the fast path.
 
 ## Asking for Opus
 
-Escalation also fires on request: "escalate to Opus", "use Opus" makes Sonnet reply `__ESCALATE__`
+Escalation also fires on request: "escalate to Opus", "use Opus" makes the fast path reply `__ESCALATE__`
 and the turn re-runs on Opus with his words unchanged. Lookups are answered in the turn itself; `start_session` is only for what needs his
 signed-in browser (acting on a site, or reading something behind his logins). **Destructiveness is not what the gate is for**; a wrong delete is a tool-description problem,
-and Sonnet already deletes list items and whole lists.
+and the fast path already deletes list items and whole lists.
 
 `create_list` is on the fast path for the same reason, despite making something new: it takes a name
 Jared said and invents nothing. It is a separate tool from `add_to_list` so that ADDING cannot create
@@ -109,7 +109,7 @@ a list by accident (data-layer `00094`); gating it would only move that accident
 
 `log_recipe` exists because of this table. Logging a recipe supplies nothing out of the model's
 knowledge — a name the user said, a serving count the user said, and macros written down when the
-recipe was saved — so by the rule it belongs to Sonnet. But it used to be a variant of
+recipe was saved — so by the rule it belongs to the fast path. But it used to be a variant of
 `log_nutrition`, and that tool is gated for good reason, so "log my overnight oats" bought a full
 Opus escalation to copy numbers that already existed.
 
@@ -121,10 +121,10 @@ first place is exactly the estimating job `log_nutrition` does.
 
 `log_set` is on the fast path because nearly every set is a movement the catalog already has, where the
 call is pass-through. Only a genuinely new movement needs a muscle map. The escalate directive tells
-Sonnet to read the catalog first and escalate if the name is not in it.
+the fast path to read the catalog first and escalate if the name is not in it.
 
 `logSets()` backs that up: it throws on an unknown exercise unless a `muscles` map comes with the call,
-so a Sonnet that skips the catalog read gets an error, not a corrupt row. What the server does NOT
+so a fast path that skips the catalog read gets an error, not a corrupt row. What the server does NOT
 enforce is "don't invent a map" — that guardrail is prompt-level, and it is the one thing here that is
 weaker than a mechanical gate. `setWatcher()` is stricter still: it cannot create a catalog entry at
 all, only error.
@@ -132,15 +132,28 @@ all, only error.
 ### Judge the instruction, not the conversation
 
 `recent_context()` prepends the day's hub conversation (since 4 AM, timestamped) to the prompt, so the escalation decision is
-made over a blob that often contains the last few nutrition turns. Sonnet used to read that and
+made over a blob that often contains the last few nutrition turns. The fast path used to read that and
 escalate a to-do add because the previous minute had been about food. The directive now says to decide
 from the current instruction alone; if escalations for lights and list adds reappear, that clause is
 what regressed.
 
+## A command can arrive with two transcripts
+
+The hub runs both Groq Whisper models on every command (status-hub `/api/voice-command`) and stores the
+second reading as `voice_requests.alt_transcript` when its words differ. The worker appends it to the
+prompt (`ALT_TRANSCRIPT_DIRECTIVE`), telling the model to act on whichever reading makes sense word by
+word and to ask when neither does. Neither model is the better transcriber: large-v3 hears "haircut" as
+"pair putt" where turbo gets it, and turbo hears "a to-do" as "to view" where large gets it. The thread,
+the activity bar and dedupe all use `transcript` alone.
+
 ## What the split is for — and how it bills
 
-**Sonnet answers without thinking; Opus thinks at its default effort.** The fast path's transcripts
-carry no thinking blocks, which is what keeps a quick question quick. Opus is not raised to `--effort
+**The fast path is Opus at LOW effort; an escalation is Opus at its default effort.** `HUB_MODEL` /
+`HUB_EFFORT` (default `opus` / `low`) set the fast path's warm client, and low effort is what keeps a
+quick question quick: warm, a one-line answer measured 1.3-1.5s. Opus rather than Sonnet because the
+fast path has to notice a misheard word: Sonnet saves "pair putt" as a to-do and then reports no haircut
+item while naming "pair putt" at the same hour, where Opus at low effort links the two. Low effort is NOT enough for macro estimates
+(the pad thai row below), which is why the gated tools still escalate. Opus is not raised to `--effort
 max`, because it buys nothing here. Measured 2026-10-16 on four meals (a Chipotle burrito, cereal with
 milk and a banana, two thirds of a restaurant pad thai, tofu with oil and cornstarch), asking Opus for
 calories and macros at each level:
@@ -154,7 +167,7 @@ calories and macros at each level:
 The "ultrathink" in `POWER_DIRECTIVE` sets no budget; the CLI turns it into a note asking for deeper
 reasoning.
 
-**Everything runs on the subscription, and nothing else.** Sonnet runs on the warm `SdkRunner` (a
+**Everything runs on the subscription, and nothing else.** The fast path runs on the warm `SdkRunner` (a
 long-lived headless Claude Code process holding the MCP servers); escalation runs Opus on a second
 warm `SdkRunner` where `WARM_OPUS=1` (the Fly worker, which has the memory for both) and through
 `claude -p` elsewhere. A failed run is retried on the subscription and then surfaced as an error — there is no
@@ -166,17 +179,17 @@ error path that did turned every noise judgment into an Opus run (the dispatch c
 So the reasons the split exists, in the order they hold:
 
 1. **What the fast path can REACH.** The allow list is a correctness gate — a tool that would have to
-   invent a number is not on Sonnet's allow list, so a call to it is refused and it cannot quietly
-   write one. It stays in the schema on purpose; that is what makes Sonnet escalate (§ above).
+   invent a number is not on the fast path's allow list, so a call to it is refused and it cannot quietly
+   write one. It stays in the schema on purpose; that is what makes the fast path escalate (§ above).
    Nothing to do with models or money.
-2. **Capacity, on the common case.** Every ordinary turn draws from the shared subscription window,
-   so the cheap fast model runs it and Opus only runs the rare gated turn.
+2. **Effort, on the common case.** Every ordinary turn runs at low effort, and only the rare gated
+   turn pays for Opus's default thinking. Opus on every turn draws more of the shared subscription
+   window than Sonnet did; that is the price of its judgment on misheard words.
 3. **Speed — from the RUNNER, not the model.** The warm client is what avoids `claude -p` spawning
    the CLI and four stdio MCP servers per command: 3.6s on the Pi, ~42% of a simple turn, before the
    model sees a token.
 
-The model choice contributes almost nothing to speed, which is worth knowing before anyone "optimises"
-it. Measured on the Mac, same runner for both (`claude -p --output-format json`, three runs, API time
+The model choice contributes little to speed. Measured on the Mac, same runner for both (`claude -p --output-format json`, three runs, API time
 only):
 
 | | short voice reply | ~490-token answer |
@@ -186,10 +199,12 @@ only):
 
 On a short reply — which is every voice turn — they are indistinguishable: the run-to-run spread is
 wider than the gap, and Opus won one of the three runs. Sonnet only pulls ahead once an answer is long
-(~63 tok/s vs ~47), and voice answers never are.
+(~63 tok/s vs ~47), and voice answers never are. At low effort on a one-line todo answer (2026-10-29,
+three runs each) Sonnet took about 2.0s and Opus about 3.4s of API time, and on tool-heavy turns both
+ran 4-8s with no clear gap.
 
 What escalation does cost is **time**: the whole turn is re-run, so a gated command pays a full
-Sonnet turn, then a CLI cold start, then a full Opus turn. That is why anything not needing the gate
+fast-path turn, then a CLI cold start, then a full Opus turn. That is why anything not needing the gate
 belongs on the fast path, and why the fix for latency, if one is ever wanted, is to continue an
 escalated turn rather than restart it.
 

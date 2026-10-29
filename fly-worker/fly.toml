@@ -20,6 +20,6 @@ kill_timeout = "20s"   # time for the worker to announce it is stopping; a turn 
 
 [[vm]]
   size = "shared-cpu-1x"
-  # 2GB: the warm Sonnet client and the warm Opus client each hold a Claude process and its MCP
+  # 2GB: the warm fast-path client and the warm escalation client each hold a Claude process and its MCP
   # servers (~550MB measured for one), with room for a full-agent or photo spawn on top.
   memory = "2gb"

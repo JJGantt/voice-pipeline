@@ -22,7 +22,7 @@ INPUTS (capture + enqueue only — no model logic):
                                                         │
 WORKER (worker/worker.py — the ONE brain):
   claims a request, runs it, writes the reply to voice_messages
-    hub turn      → Sonnet on SAFE_TOOLS, escalating to a fresh Opus run (docs/ROUTING.md)
+    hub turn      → Opus @ low effort on SAFE_TOOLS, escalating to a fresh Opus run (docs/ROUTING.md)
     full-agent    → the unrestricted Claude Code agent in `agent_cwd`, its own persistent session
                                                         │
 TOOLS (the only capabilities): data · voice · govee   (MCP, stdio)
@@ -47,8 +47,8 @@ and every ordinary stage bills the **subscription**:
 
 - **`SdkRunner`** — the warm Claude Agent SDK client: one long-lived headless Claude Code process
   holding the MCP servers (data, voice, lights, feeder and Gmail over stdio; iMessage over HTTP to the
-  Mac), pinned to Sonnet + `SAFE_TOOLS` at connect, which include WebSearch and WebFetch. It runs the
-  installed `claude` (`cli_path`), not the SDK's bundled copy: the bundled one lags, and the `sonnet` alias
+  Mac), pinned to `HUB_MODEL` at `HUB_EFFORT` (Opus, low) + `SAFE_TOOLS` at connect, which include WebSearch and WebFetch. It runs the
+  installed `claude` (`cli_path`), not the SDK's bundled copy: the bundled one lags, and the `opus` alias
   resolves to whatever model the running CLI knows. Each hub turn is a
   fresh `session_id` on that warm process, with the whole day's hub conversation (since 4 AM, each line timestamped) replayed into the prompt.
   This is the **fast path** on every worker: the spawn cost `claude -p` pays per command — CLI
@@ -72,7 +72,7 @@ Which host should run the agent, what each one can and cannot do, and measured s
 - **Worker claim priority** is `WORKER_PRIORITY`, **`fly,pi,mac`** everywhere: `worker/run.sh`'s
   default, the Pi's `worker/.env`, and the `jared-voice-worker` image. The highest-priority worker with
   a fresh heartbeat claims and the others defer, so **Fly takes a command whenever it is up**, then the
-  Pi, then the Mac. Fly is first because it answers the common Sonnet turn faster (2.8s median against
+  Pi, then the Mac. Fly is first because it answers the common fast-path turn faster (2.8s median against
   the Pi's 4.4s on identical commands) and is independent of the house; Opus turns cost about the same
   everywhere. It has no route to iMessage, Gmail or the feeder, which are rare enough not to count
   (`docs/WORKER-PLACEMENT.md`). The Mac is last so a session started by voice outlives the laptop
