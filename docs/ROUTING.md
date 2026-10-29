@@ -139,8 +139,10 @@ what regressed.
 
 ## A command can arrive with two transcripts
 
-The hub runs both Groq Whisper models on every command (status-hub `/api/voice-command`) and stores the
-second reading as `voice_requests.alt_transcript` when its words differ. The worker appends it to the
+Both transcribers that feed the queue — the hub for the watch, phone and web (status-hub
+`/api/voice-command`) and `server/server.py` for the ESP (`transcribe_alt`) — run both Groq Whisper
+models on every command in parallel and store the second reading as `voice_requests.alt_transcript` when
+its words differ. The Mac's own listeners (`wakefree.py`, `mac-listener`) do not; they are disabled. The worker appends it to the
 prompt (`ALT_TRANSCRIPT_DIRECTIVE`), telling the model to act on whichever reading makes sense word by
 word and to ask when neither does. Neither model is the better transcriber: large-v3 hears "haircut" as
 "pair putt" where turbo gets it, and turbo hears "a to-do" as "to view" where large gets it. The thread,

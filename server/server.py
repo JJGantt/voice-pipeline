@@ -41,6 +41,10 @@ WAKE_MODEL_POWER = os.environ.get("WAKE_MODEL_POWER", "hey_jarvis") # "Hey Jarvi
 WAKE_THRESHOLD = float(os.environ.get("WAKE_THRESHOLD", "0.5"))
 GAIN = float(os.environ.get("GAIN", "15"))   # software boost for the quiet 16-bit mic
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "whisper-large-v3-turbo")
+# The second opinion: the other Groq Whisper, run on the same clip in parallel. The two mishear different
+# words, so when their readings differ the worker hands the model both (voice_requests.alt_transcript,
+# docs/ROUTING.md § A command can arrive with two transcripts). The hub does the same for its commands.
+ALT_GROQ_MODEL = "whisper-large-v3" if GROQ_MODEL != "whisper-large-v3" else "whisper-large-v3-turbo"
 # Supabase enqueue target for transcripts (INSERT-only via anon key + RLS).
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
@@ -253,6 +257,19 @@ def _heard(text: str) -> str:
     return "" if _NOTHING_SAID.match(text) else text
 
 
+async def transcribe_alt(pcm: bytes) -> str | None:
+    """The second reading, from ALT_GROQ_MODEL. Best effort: no retry and no OpenAI fallback, because a
+    command is never held up or lost for want of its second opinion."""
+    try:
+        result = await asyncio.to_thread(lambda: groq.audio.transcriptions.create(
+            file=("utterance.wav", pcm_to_wav(pcm)), model=ALT_GROQ_MODEL,
+            response_format="text", language="en"))
+    except Exception as e:  # noqa: BLE001
+        log.warning("second transcriber (%s) failed: %s", ALT_GROQ_MODEL, e)
+        return None
+    return _heard((result if isinstance(result, str) else getattr(result, "text", "")).strip()) or None
+
+
 async def transcribe(pcm: bytes) -> str:
     wav = pcm_to_wav(pcm)
     # Groq SDK is sync; run off the event loop.
@@ -349,7 +366,7 @@ async def _close_request_error(rid: str, err: str) -> None:
 
 async def handle_transcript(text: str, duration_s: float, truncated: bool,
                             cap_start: str | None = None, cap_end: str | None = None,
-                            rid: str | None = None) -> bool:
+                            rid: str | None = None, alt: str | None = None) -> bool:
     """HANDOFF SEAM — the rest of the system hooks in here.
 
     `duration_s` is the captured length; `truncated` is True if the capture ended
@@ -360,8 +377,13 @@ async def handle_transcript(text: str, duration_s: float, truncated: bool,
     log.info("TRANSCRIPT (%.0fs%s): %r", duration_s, ", TRUNCATED" if truncated else "", text)
     # Strip a leading wake phrase the STT often captures ("Hey Rhasspy, …" / "Hey Jarvis, …") — it's the
     # trigger word, not part of the command. Tolerant of Whisper mishears (raspy/rhaspy/raspberry, jarvis/jarvas; "very").
-    text = re.sub(r"^\W*(hey|hi|ok|okay|very)?\W*(rhasspy|rhaspy|raspy|rasbee|rasby|raspberry|rasp|aspie|aspy|asbie|aspen|jarvis|jarvas|jervis)\b[\s,.!:;-]*",
-                  "", text or "", count=1, flags=re.IGNORECASE).strip()
+    wake = r"^\W*(hey|hi|ok|okay|very)?\W*(rhasspy|rhaspy|raspy|rasbee|rasby|raspberry|rasp|aspie|aspy|asbie|aspen|jarvis|jarvas|jervis)\b[\s,.!:;-]*"
+    text = re.sub(wake, "", text or "", count=1, flags=re.IGNORECASE).strip()
+    alt = re.sub(wake, "", alt or "", count=1, flags=re.IGNORECASE).strip()
+    words = lambda t: re.sub(r"[^a-z0-9]+", " ", t.lower()).strip()  # noqa: E731
+    alt_field = {"alt_transcript": alt} if alt and words(alt) != words(text) else {}
+    if alt_field:
+        log.info("transcribers disagree: %r vs %s %r", text[:120], ALT_GROQ_MODEL, alt[:120])
     if not (SUPABASE_URL and SUPABASE_ANON_KEY and text):
         return False
     try:
@@ -380,7 +402,7 @@ async def handle_transcript(text: str, duration_s: float, truncated: bool,
                                      "Content-Type": "application/json", "Prefer": "return=representation"},
                             # transcribed_at marks STT-done (transcribing→pending) so the created→claimed gap
                             # splits into STT (created→transcribed_at) vs worker pickup (transcribed_at→claimed_at).
-                            json={"transcript": text, "status": "pending",
+                            json={"transcript": text, "status": "pending", **alt_field,
                                   "transcribed_at": now, "updated_at": now},
                         )
                         r.raise_for_status()
@@ -403,7 +425,7 @@ async def handle_transcript(text: str, duration_s: float, truncated: bool,
                         "Content-Type": "application/json",
                         "Prefer": "return=minimal",
                     },
-                    json={"transcript": text, "source": "fly", "always_on": True,
+                    json={"transcript": text, "source": "fly", "always_on": True, **alt_field,
                           **({"capture_start": cap_start} if cap_start else {}),
                           **({"capture_end": cap_end} if cap_end else {})},
                 )
@@ -798,9 +820,11 @@ async def connection(ws):
                 _arm_led_safety(ws)   # backstop in case no done ever arrives
                 enqueued = False
                 try:
+                    second = asyncio.create_task(transcribe_alt(bytes(utterance)))
                     text = await transcribe(bytes(utterance))
                     enqueued = await handle_transcript(text, dur, truncated,
-                                                       started_wall.isoformat(), end_wall.isoformat(), rid=rid)
+                                                       started_wall.isoformat(), end_wall.isoformat(), rid=rid,
+                                                       alt=await second)
                 except Exception as e:
                     log.exception("transcription failed: %s", e)
                     asyncio.create_task(_notify_transcribe_failure())
