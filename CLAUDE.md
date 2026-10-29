@@ -113,9 +113,13 @@ run when it was asked for has usually stopped being wanted by the time the machi
 prompt that fires hours late is worse than one that never fired. Retry is a decision made afterwards,
 from the saved list.
 
-The other half is upstream: `data-layer`'s dispatch path checks the target machine is beating before
-it writes a command at all, because the queue itself has no way to fail — an unclaimed command simply
-expires while the caller has already been told a session started.
+The other half is upstream: `data-layer`'s dispatch path checks the target machine is beating AND
+signed in before it writes a command at all, because the queue itself has no way to fail — an
+unclaimed command simply expires, and a session launched on an expired `/login` answers "Login
+expired" and does nothing, while the caller has already been told a session started. Each desk
+heartbeat carries `info.login_expires_at` (`orchestrator/src/login.js`, re-read when the credential
+store changes); `desk.ts` `machinesReady` reads both beats and a new session goes to the other machine
+when the chosen one fails either test.
 
 ## Status `fallback` belongs to the Pi alone
 
