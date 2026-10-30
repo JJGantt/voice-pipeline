@@ -215,7 +215,10 @@ async function run(cmd) {
     const repo = String((cmd.payload || {}).repo || 'root').trim();
     if (!claudeId) throw new Error('no session id to resume');
     const dir = repoDir(repo);
-    const file = await mirrorDown(claudeId, dir);
+    const { moved, mid_turn: midTurn } = cmd.payload || {};
+    // A session the Pi moved mid-turn was closed with C-c, which Claude Code records as Jared rejecting
+    // the step it was on; mirrorDown rewrites those records so the session carries on here.
+    const file = await mirrorDown(claudeId, dir, { movedMidTurn: !!(moved && midTurn) });
     // Nothing mirrored means the session never sat idle long enough to be uploaded. Resuming would
     // open an empty conversation wearing its id, which is worse than not resuming at all.
     if (!file) throw new Error(`nothing has been mirrored for ${claudeId}`);
@@ -226,7 +229,6 @@ async function run(cmd) {
     try {
       // A prompt rides along when the Pi hands over a resume it had no room for (pi-desk handResumeToMac),
       // and `moved` when it closed a session mid-turn for doing heavy work there (pi-desk onHeavy).
-      const { moved, mid_turn: midTurn } = cmd.payload || {};
       const note = moved
         ? `${MOVED_NOTE.replace('{why}', String(moved))}\n\n${midTurn ? MOVED_MID_TURN : MOVED_BETWEEN_TURNS}` : null;
       const raw = await openFreshTab(dir, repo, (cmd.payload || {}).prompt || null, sessionId, claudeId, note);

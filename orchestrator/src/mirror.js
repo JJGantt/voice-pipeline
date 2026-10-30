@@ -34,6 +34,52 @@ export function localize(text) {
   return out;
 }
 
+// What Claude Code writes when it is sent C-c mid-turn — which is how pi-desk closes a session it moves
+// for doing heavy work (sessions.js evict). Left in place, these tell the resumed session that JARED
+// rejected the step and to "STOP and wait", which outweighs any system note and halts the work the move
+// exists to let it finish.
+const REJECTED = "The user doesn't want to proceed with this tool use.";
+const INTERRUPTED = '[Request interrupted by user';
+const MOVED_RESULT = 'Not finished: the session was moved from the Pi to the Mac while this was running, and '
+  + 'everything it had started on the Pi was stopped. Jared did not reject or interrupt it. Run it again here.';
+const MOVED_INTERRUPT = '[Cut off by the move from the Pi, not by Jared]';
+
+/**
+ * Rewrite the interrupt records the move left at the end of a transcript into what actually happened.
+ * Only the trailing run after the last assistant record is touched — that is the turn the move cut off;
+ * an interrupt anywhere earlier was Jared's.
+ */
+export function unmarkMoveInterrupt(text) {
+  const lines = text.split('\n');
+  let changed = false;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (!lines[i].trim()) continue;
+    let rec;
+    try { rec = JSON.parse(lines[i]); } catch { continue; }
+    if (rec.type === 'assistant') break;
+    const c = rec.type === 'user' ? rec.message?.content : null;
+    if (!Array.isArray(c) && typeof c !== 'string') continue;
+    let hit = false;
+    if (typeof c === 'string') {
+      if (c.startsWith(INTERRUPTED)) { rec.message.content = MOVED_INTERRUPT; hit = true; }
+    } else {
+      for (const b of c) {
+        if (b.type === 'text' && b.text?.startsWith(INTERRUPTED)) { b.text = MOVED_INTERRUPT; hit = true; }
+        if (b.type !== 'tool_result') continue;
+        if (typeof b.content === 'string' && b.content.startsWith(REJECTED)) { b.content = MOVED_RESULT; hit = true; }
+        if (Array.isArray(b.content) && b.content.some((x) => x.text?.startsWith(REJECTED))) {
+          b.content = [{ type: 'text', text: MOVED_RESULT }]; hit = true;
+        }
+      }
+    }
+    if (!hit) continue;
+    if (typeof rec.toolUseResult === 'string') rec.toolUseResult = MOVED_RESULT;   // "User rejected tool use"
+    lines[i] = JSON.stringify(rec);
+    changed = true;
+  }
+  return changed ? lines.join('\n') : text;
+}
+
 /**
  * Upload everything written since `offset`. Returns the new offset, or null if there was nothing.
  *
@@ -93,7 +139,7 @@ export async function mirrorReset(claudeId) {
  * Returns the file's path, or null if nothing has been mirrored — which is the honest answer when a
  * session was never idle long enough to be uploaded, and is far better than resuming an empty one.
  */
-export async function mirrorDown(claudeId, cwd) {
+export async function mirrorDown(claudeId, cwd, { movedMidTurn = false } = {}) {
   const names = await parts(claudeId);
   if (!names.length) return null;
   const chunks = [];
@@ -105,6 +151,7 @@ export async function mirrorDown(claudeId, cwd) {
   const dir = path.join(os.homedir(), '.claude', 'projects', cwd.replace(/[/.]/g, '-'));
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, `${claudeId}.jsonl`);
-  fs.writeFileSync(file, localize(Buffer.concat(chunks).toString('utf8')), { mode: 0o600 });
+  const text = localize(Buffer.concat(chunks).toString('utf8'));
+  fs.writeFileSync(file, movedMidTurn ? unmarkMoveInterrupt(text) : text, { mode: 0o600 });
   return file;
 }

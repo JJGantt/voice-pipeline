@@ -218,6 +218,11 @@ bucket at the END OF A TURN (`mirror.js`), which is the only moment it is a comp
 the delta goes up — one transcript here is 16MB and a turn adds tens of KB — as
 `<claude_session_id>/<offset>.part`, and `desk_sessions.mirror_offset` is how much is already there.
 
+A session the Pi moves mid-turn for memory (`pi-desk` `onHeavy`) is closed with C-c, and Claude Code
+records that as Jared rejecting the step it was on, with an instruction to stop and wait. On the way
+down `mirrorDown` rewrites those trailing records (`unmarkMoveInterrupt`) when the command says
+`moved` + `mid_turn`; without it the resumed session obeys the fake rejection and the work stops.
+
 The one rewrite that makes a transcript portable is the home directory: `/Users/jaredgantt` on the
 Mac, `/home/jaredgantt` on the Pi. `localize()` does it on the way down. Without it the resumed
 session points at a directory that does not exist.
