@@ -53,7 +53,8 @@ const expecting = new Map();   // session id -> [{ text, cmd, at }]
 const EXPECT_MS = 5 * 60 * 1000;
 export function expectPrompt(sessionId, text, cmd) {
   const list = expecting.get(sessionId) || [];
-  list.push({ text: flatten(text), cmd: String(cmd), at: Date.now() });
+  // Matched against the prompt as resolvePrompt shows it, so the same stripping applies to both sides.
+  list.push({ text: flatten(resolvePrompt(text).prompt || ''), cmd: String(cmd), at: Date.now() });
   expecting.set(sessionId, list);
 }
 function takeExpect(sessionId, prompt) {

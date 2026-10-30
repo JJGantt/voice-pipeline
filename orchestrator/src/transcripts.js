@@ -88,8 +88,15 @@ export function fromHim(text) {
  */
 export function resolvePrompt(text) {
   const body = unstash(text);
-  return body ? { prompt: unwrapPastes(body), stashed: true }
-              : { prompt: unwrapPastes(text) || null };
+  return body ? { prompt: dropSpeakNote(unwrapPastes(body)), stashed: true }
+              : { prompt: dropSpeakNote(unwrapPastes(text)) || null };
+}
+
+// The watch's speak mode appends an instruction for the model (status-hub server.js SPEAK_NOTE) in a
+// <speak-mode> tag. It is not his words, so it is cut wherever the prompt is shown or matched.
+const SPEAK_NOTE = /\s*<speak-mode>[\s\S]*?<\/speak-mode>/g;
+export function dropSpeakNote(text) {
+  return String(text || '').replace(SPEAK_NOTE, '').trim();
 }
 
 // A PASTE IS STILL HIS WORDS, NOT MARKUP.
