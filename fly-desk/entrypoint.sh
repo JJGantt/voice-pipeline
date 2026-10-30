@@ -3,8 +3,9 @@
 # the Mac and the Pi read, then the session host (pi-desk with DESK_MACHINE=fly) in the foreground.
 set -uo pipefail
 mkdir -p "$HOME/.claude" "$REPO_ROOT"
-exec > >(tee -a /data/desk.log) 2>&1
+# Trimmed BEFORE tee opens it: replacing the file afterwards leaves tee writing to the unlinked one.
 tail -n 20000 /data/desk.log > /data/desk.log.tmp 2>/dev/null && mv /data/desk.log.tmp /data/desk.log
+exec > >(tee -a /data/desk.log) 2>&1
 
 # git over HTTPS through gh's credential helper (GH_TOKEN), committing as Jared, as on the other machines.
 gh auth setup-git

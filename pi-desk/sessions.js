@@ -30,9 +30,11 @@ export async function liveSessions() {
     // session_created is the ONE authoritative start time. The database row's `started` is not: a row
     // can be deleted and recreated, which resets it to now and then wrongly excludes the session's own
     // (older) transcript from adoption. tmux knows when the session actually began.
-    const { stdout } = await exec('tmux', ['list-sessions', '-F', '#{session_name}\t#{session_created}'], { timeout: 10000 });
+    // Space-separated, not tab: tmux 3.3 (Debian bookworm, the Fly image) prints a tab in a format as
+    // `_`, which glued the two fields into one name. Neither field can contain a space.
+    const { stdout } = await exec('tmux', ['list-sessions', '-F', '#{session_name} #{session_created}'], { timeout: 10000 });
     names = stdout.split('\n').map((l) => l.trim()).filter(Boolean)
-      .map((l) => { const [n, c] = l.split('\t'); return { n, created: Number(c) * 1000 || 0 }; })
+      .map((l) => { const [n, c] = l.split(' '); return { n, created: Number(c) * 1000 || 0 }; })
       .filter((x) => x.n.startsWith('hub-'));
   } catch { return []; }   // no server running is a valid state, not an error
 
@@ -40,11 +42,11 @@ export async function liveSessions() {
   for (const { n: name, created } of names) {
     let alive = false, pid = null;
     try {
-      const { stdout: panes } = await exec('tmux', ['list-panes', '-t', name, '-F', '#{pane_current_command}\t#{pane_pid}'], { timeout: 10000 });
+      const { stdout: panes } = await exec('tmux', ['list-panes', '-t', name, '-F', '#{pane_current_command} #{pane_pid}'], { timeout: 10000 });
       // tmux keeps the shell alive after claude exits, so "the session exists" is a different
       // question from "claude is in it". Only the latter counts as live. launch.sh `exec`s claude, so
       // the pane's own process IS claude — the pid its session record is filed under.
-      const hit = panes.split('\n').map((l) => l.trim().split('\t')).find(([c]) => c === 'claude');
+      const hit = panes.split('\n').map((l) => l.trim().split(' ')).find(([c]) => c === 'claude');
       if (hit) { alive = true; pid = Number(hit[1]) || null; }
     } catch { alive = false; }
     out.push({ name, alive, created, pid });
