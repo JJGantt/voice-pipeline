@@ -114,7 +114,9 @@ unclaimed command simply expires, and a session launched on an expired `/login` 
 expired" and does nothing, while the caller has already been told a session started. Each desk
 heartbeat carries `info.login_expires_at` (`orchestrator/src/login.js`, re-read when the credential
 store changes); `desk.ts` `machinesReady` reads both beats and a new session goes to the other machine
-when the chosen one fails either test.
+when the chosen one fails either test. When both fail it goes to the Fly session machine
+(`fly-desk/README.md`), which is woken by an HTTP request because it is stopped almost always; only if
+that does not answer is the prompt dead-lettered.
 
 ## Status `fallback` belongs to the Pi alone
 

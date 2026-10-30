@@ -39,8 +39,11 @@ cd "$DIR" || exit 1
 # Remote Control — and, for the same reason, Claude in Chrome. Neither can attach to a credential
 # with no claude.ai account behind it. `claude /login` must therefore have been run on this host at
 # least once.
+#
+# Fly (DESK_MACHINE=fly) is the one exception: it has no interactive login, so the year-long token is
+# its credential, and its sessions go without Remote Control and Claude in Chrome (below).
 unset ANTHROPIC_API_KEY
-unset CLAUDE_CODE_OAUTH_TOKEN
+[ "${DESK_MACHINE:-pi}" = fly ] || unset CLAUDE_CODE_OAUTH_TOKEN
 
 # Model named explicitly rather than left to settings. A session started here runs unattended on a
 # machine nobody is watching, so it should not silently inherit whatever the config happens to say —
@@ -81,6 +84,12 @@ echo 800 > /proc/self/oom_score_adj 2>/dev/null || true
 # Every session, fresh or resumed, is told what this machine is for. One --append-system-prompt,
 # carrying a dispatch's own text too when there is one.
 SYS_TEXT="$(cat "$HERE/pi-session.txt")"
+# The flags that need the interactive login (Remote Control, the browser) are Pi-only.
+EXTRA=(--chrome --remote-control "$NAME")
+if [ "${DESK_MACHINE:-pi}" = fly ]; then
+  SYS_TEXT="$(cat "$HERE/fly-session.txt")"
+  EXTRA=()
+fi
 
 if [ -n "$PROMPT_FILE" ] && [ -s "$PROMPT_FILE" ]; then
   PROMPT="$(cat "$PROMPT_FILE")"
@@ -89,6 +98,6 @@ if [ -n "$PROMPT_FILE" ] && [ -s "$PROMPT_FILE" ]; then
   # dispatcher ("start a session in X and have it...") are not read as an order to dispatch again.
   # A system prompt, so surfaces still show only his words. The Mac's orchestrator reads the same file.
   [ -z "$RESUME_ID" ] && SYS_TEXT="$(cat "$HERE/../orchestrator/dispatched-session.txt")"$'\n\n'"$SYS_TEXT"
-  exec claude --model "$MODEL" --chrome "${RESUME[@]}" --remote-control "$NAME" --append-system-prompt "$SYS_TEXT" "$PROMPT"
+  exec claude --model "$MODEL" "${EXTRA[@]}" "${RESUME[@]}" --append-system-prompt "$SYS_TEXT" "$PROMPT"
 fi
-exec claude --model "$MODEL" --chrome "${RESUME[@]}" --remote-control "$NAME" --append-system-prompt "$SYS_TEXT"
+exec claude --model "$MODEL" "${EXTRA[@]}" "${RESUME[@]}" --append-system-prompt "$SYS_TEXT"

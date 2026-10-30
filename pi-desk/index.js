@@ -88,7 +88,13 @@ const MAC_STALE_S = Number(process.env.MAC_STALE_S || 90);
 const COMMAND_TTL_S = Number(process.env.COMMAND_TTL_S || 120);
 // How long a session gets to commit, push and update docs before it is closed regardless. Generous
 // on purpose: this is real work, and cutting it short is the thing wrapping up exists to prevent.
-const WORKER = 'pi-desk';
+// The same consumer runs on Fly as the last resort, when neither the Pi nor the Mac can take a session
+// (fly-desk/). Everything below that only makes sense on the Pi — memory cgroups, the hand-offs to the
+// Mac, the retention sweeps, the login date — is switched on MACHINE, so there is one copy of how a
+// session is launched, watched and parked.
+const MACHINE = process.env.DESK_MACHINE === 'fly' ? 'fly' : 'pi';
+const FLY = MACHINE === 'fly';
+const WORKER = FLY ? 'fly-desk' : 'pi-desk';
 // MEMORY is the only bound on how many sessions run here. A session holds ~250-420MB for as long as
 // it is open, whatever it is doing, and grows as its conversation does; its CPU use is negligible,
 // because a turn is almost entirely waiting on the API. So there is no session count and no cap on how
@@ -259,7 +265,7 @@ async function handResumeToMac(row, prompt, moved = null) {
     method: 'POST', headers: { Prefer: 'return=minimal' },
     body: JSON.stringify({ id, kind: 'resume_mirrored',
                            payload: { target: 'mac', claude_session_id: row.claude_session_id, repo: row.repo,
-                                      label: row.label, origin: row.origin || 'dispatched', from: 'pi',
+                                      label: row.label, origin: row.origin || 'dispatched', from: MACHINE,
                                       ...(prompt ? { prompt } : {}),
                                       ...(moved ? { moved, mid_turn: !!prompt } : {}) } }),
   });
@@ -374,7 +380,8 @@ async function heartbeat() {
       method: 'POST',
       headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
       body: JSON.stringify([{ worker: WORKER, last_seen: new Date().toISOString(),
-                              info: { ...hostStats(lastResidentCount), login_expires_at: loginExpiresAt() } }]),
+                              // Fly runs on the year-long token, which has no date to publish.
+                              info: { ...hostStats(lastResidentCount), ...(FLY ? {} : { login_expires_at: loginExpiresAt() }) } }]),
     });
   } catch (e) { console.error('[pi-desk] heartbeat:', e.message); }
 }
@@ -561,6 +568,7 @@ async function reconcileSessions() {
   const kept = await reapIdleSessions(residents);
   lastResidentCount = kept.length;   // what the next heartbeat publishes to the hub's status strip
   await runQueue(kept);
+  exitIfIdle(kept.length);
 }
 
 /**
@@ -757,8 +765,9 @@ function launch(dir, name, prompt, resumeId = null, reuse = null) {
 
   // The session's cgroup exists before it starts; launch.sh moves itself in before exec'ing claude, so
   // nothing the session ever runs is charged anywhere else.
-  const cg = limitSession(session);
-  watchSession(session, onHeavy);
+  // Fly has no cgroup budgets: the machine is the session's own, and there is no Mac hand-off to make.
+  const cg = FLY ? '' : limitSession(session);
+  if (!FLY) watchSession(session, onHeavy);
   const args = ['new-session', '-d', '-s', session, '-c', dir, launcher, dir, rcName, promptFile, resumeId || '', session, cg];
   // The first of these spawns creates the tmux SERVER, and the server keeps this environment for
   // its whole life — every later session in it inherits the lot, including ones a person opens by
@@ -766,8 +775,11 @@ function launch(dir, name, prompt, resumeId = null, reuse = null) {
   // ANTHROPIC_API_KEY and CLAUDE_CODE_OAUTH_TOKEN, and any `claude` started under it that does not
   // go through launch.sh silently bills the API or loses its account linkage. launch.sh strips them
   // for its own sessions; this covers everything else.
+  //
+  // Fly is the exception for CLAUDE_CODE_OAUTH_TOKEN: it has no interactive login, so the token IS its
+  // credential (see launch.sh).
   const env = { ...process.env };
-  for (const k of ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_AUTH_TOKEN']) delete env[k];
+  for (const k of ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', ...(FLY ? [] : ['CLAUDE_CODE_OAUTH_TOKEN'])]) delete env[k];
   const child = spawn('tmux', args, { detached: true, stdio: 'ignore', env });
   child.unref();
   return session;
@@ -798,7 +810,7 @@ async function deadLetter(cmd, reason) {
     await sb('desk_dead_letters', {
       method: 'POST', headers: { Prefer: 'return=minimal' },
       body: JSON.stringify([{ id: randomUUID(), command_id: cmd.id, kind: cmd.kind,
-                              payload: cmd.payload || {}, machine: 'pi',
+                              payload: cmd.payload || {}, machine: MACHINE,
                               reason: String(reason || '').slice(0, 500), source: WORKER }]),
     });
   } catch (e) { console.error('[pi-desk] dead letter:', e.message); }
@@ -985,7 +997,7 @@ async function run(cmd) {
   // session has stopped writing. Only then is the destination asked to pick it up.
   if (cmd.kind === 'transfer_session') {
     const id = String((cmd.payload || {}).session || '').trim();
-    const to = (cmd.payload || {}).to === 'mac' ? 'mac' : 'pi';
+    const to = ['mac', 'pi', 'fly'].includes((cmd.payload || {}).to) ? cmd.payload.to : 'pi';
     if (!/^hub-[A-Za-z0-9._-]+$/.test(id)) throw new Error(`unusable session name: ${id}`);
     const rows = await sb(`desk_sessions?id=eq.${encodeURIComponent(id)}&select=*`);
     const row = rows?.[0];
@@ -1003,9 +1015,9 @@ async function run(cmd) {
       method: 'POST', headers: { Prefer: 'return=minimal' },
       body: JSON.stringify({ id: randomUUID(), kind: 'resume_mirrored',
                              payload: { target: to, claude_session_id: row.claude_session_id, repo: row.repo,
-                                        label: row.label, origin: row.origin || 'dispatched', from: 'pi' } }),
+                                        label: row.label, origin: row.origin || 'dispatched', from: MACHINE } }),
     });
-    return `handed ${id} to the ${to === 'mac' ? 'Mac' : 'Pi'}`;
+    return `handed ${id} to the ${{ mac: 'Mac', pi: 'Pi', fly: 'Fly machine' }[to]}`;
   }
 
   // DESTINATION half: assemble the mirrored transcript here and resume it.
@@ -1060,11 +1072,12 @@ async function drain() {
   try {
     const rows = await sb('desk_commands?status=eq.pending&select=*&order=created.asc');
     if (!rows?.length) return;
-    const macAwake = await macIsAwake();
+    const macAwake = FLY || await macIsAwake();
 
     for (const cmd of rows) {
       const target = (cmd.payload || {}).target;
-      const mine = target === 'pi' || (!target && !macAwake);
+      // Fly takes only what is addressed to it: it is the last resort, chosen by the dispatcher.
+      const mine = FLY ? target === 'fly' : (target === 'pi' || (!target && !macAwake));
       if (!mine) continue;
 
       const ageS = (Date.now() - new Date(cmd.created).getTime()) / 1000;
@@ -1189,8 +1202,35 @@ async function sweepAbandonedClaims() {
   } catch (e) { console.error('[pi-desk] sweep claims:', e.message); }
 }
 
-console.log(`[pi-desk] watching desk_commands (repos in ${REPO_ROOT}, owner ${GITHUB_OWNER})`);
-{
+// ---- Fly: asleep unless there is work --------------------------------------
+// The Fly machine is stopped almost always. The dispatcher wakes it with a request to /wake — Fly's proxy
+// starts a stopped machine for any request to it, and answers once this server is listening — and then
+// writes the command, which the drain below finds on startup or over realtime.
+//
+// It stops itself: once nothing has run here for FLY_IDLE_EXIT_S, the process exits cleanly, and a
+// machine whose process exits 0 stays stopped (fly.toml's restart policy is on-failure). The check rides
+// the reconcile tick that already runs; idle sessions are parked first, by the same reaper as the Pi's.
+const FLY_IDLE_EXIT_S = Number(process.env.FLY_IDLE_EXIT_S || 600);
+let idleSince = Date.now();
+function exitIfIdle(residentCount) {
+  if (!FLY) return;
+  if (residentCount > 0 || draining) { idleSince = Date.now(); return; }
+  if (Date.now() - idleSince < FLY_IDLE_EXIT_S * 1000) return;
+  console.log(`[pi-desk] nothing has run for ${Math.round(FLY_IDLE_EXIT_S / 60)}m — stopping the machine`);
+  process.exit(0);
+}
+if (FLY) {
+  const http = await import('node:http');
+  http.createServer((req, res) => {
+    idleSince = Date.now();
+    if (req.url === '/wake') drain().catch(() => {});
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('awake\n');
+  }).listen(Number(process.env.PORT || 8080), '0.0.0.0');
+}
+
+console.log(`[pi-desk] ${WORKER} watching desk_commands (repos in ${REPO_ROOT}, owner ${GITHUB_OWNER})`);
+if (!FLY) {
   const live = await liveSessions();
   await setupCgroups(live);
   for (const l of live) if (l.alive) watchSession(l.name, onHeavy);
@@ -1224,5 +1264,8 @@ reconcileSessions();
 setInterval(reconcileSessions, PRESENCE_MS);
 sweepAbandonedClaims();
 setInterval(sweepAbandonedClaims, 300000);
-sweepRetention();
-setInterval(sweepRetention, 3600000);   // hourly is far more often than a daily boundary needs
+// One retention rule in one place: the Pi, which is always on. Fly is asleep almost always.
+if (!FLY) {
+  sweepRetention();
+  setInterval(sweepRetention, 3600000);   // hourly is far more often than a daily boundary needs
+}

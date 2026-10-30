@@ -1,0 +1,39 @@
+# jared-desk-fly: the last-resort machine for dispatched Claude sessions (see README.md). Stopped almost
+# always: a request to /wake starts it through Fly's proxy, and the process exits once nothing has run
+# for FLY_IDLE_EXIT_S, which leaves the machine stopped because the restart policy is on-failure.
+app = "jared-desk-fly"
+primary_region = "iad"
+kill_timeout = "30s"
+
+[build]
+
+[env]
+  TZ = "America/New_York"
+  DESK_MACHINE = "fly"
+  HOME = "/data/home"
+  REPO_ROOT = "/data/home/repos"
+  # Idle sessions are parked after 30 minutes, and the machine stops 10 minutes after the last one.
+  PI_DESK_IDLE_MAX_S = "1800"
+  FLY_IDLE_EXIT_S = "600"
+  PORT = "8080"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_start_machines = true
+  # Never stopped by the proxy: a session at work makes no requests, and the proxy would take that as idle.
+  auto_stop_machines = "off"
+  min_machines_running = 0
+
+[[restart]]
+  policy = "on-failure"
+  retries = 3
+
+[mounts]
+  source = "desk_data"
+  destination = "/data"
+
+[[vm]]
+  size = "shared-cpu-2x"
+  # A session holds ~250-420MB and grows with its conversation; 4GB leaves room for several plus a build.
+  memory = "4gb"
