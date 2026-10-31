@@ -180,7 +180,8 @@ def install(machine=None, service=None, spool=None):
     prev = sys.excepthook
 
     def hook(t, e, tb):
-        # Ctrl-C, or the SIGINT a deploy stops a process with, is a shutdown, not a crash.
+        # A KeyboardInterrupt reaching the top is a stop signal, not a crash: Fly stops a machine with
+        # SIGINT on every deploy and restart, so reporting it opens an incident per deploy.
         if issubclass(t, KeyboardInterrupt):
             return prev(t, e, tb)
         _send_now({"machine": MACHINE, "service": SERVICE, "message": "%s: %s" % (t.__name__, e),
