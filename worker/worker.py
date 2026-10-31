@@ -383,6 +383,17 @@ ATTACH_DIRECTIVE = (
     "\nPhotos:\n{paths}]"
 )
 
+# Pictures sent from the iPhone share sheet (source 'share', apps/Share in status-hub) — usually a
+# screenshot. ATTACH_DIRECTIVE's one-meal framing is wrong for these: a screenshot is something he wants
+# looked at or acted on, and logging it as food would be a confident wrong answer.
+SHARE_DIRECTIVE = (
+    "\n\n[The user shared {n} image(s) from their iPhone's share sheet — usually screenshots — saved "
+    "locally at the paths below. View EVERY image with the Read tool before answering. Do what their "
+    "text asks about them. With no text, work out from the image what they most likely want (what it "
+    "shows, what it means, or the obvious action it calls for) and answer that. Do not log nutrition "
+    "unless they ask.\nImages:\n{paths}]"
+)
+
 # Sentinel the model emits to silently drop a turn (wake-word false positive). Matched loosely below.
 IGNORE_SENTINEL = "__IGNORE__"
 
@@ -2463,7 +2474,8 @@ def process_request(db: Supabase, req: dict) -> None:
     if attachments:
         att_tmp, att_paths = fetch_attachments(attachments)
         if att_paths:
-            prompt += ATTACH_DIRECTIVE.format(n=len(att_paths), paths="\n".join(att_paths))
+            directive = SHARE_DIRECTIVE if source == "share" else ATTACH_DIRECTIVE
+            prompt += directive.format(n=len(att_paths), paths="\n".join(att_paths))
             log(f"attachments: {len(att_paths)} photo(s) staged in {att_tmp}")
         else:
             prompt += ("\n\n[The user attached photo(s), but they could not be retrieved — tell them "
