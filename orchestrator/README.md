@@ -88,7 +88,9 @@ Missing/wrong token → `401`.
    focused (tracked as `lastFocused {id, cwd}`): if Terminal is running with a
    window, Cmd-T a new tab into the front window (System Events keystroke) and
    `do script "cd <cwd>; claude --resume <id>" in front window`; if Terminal has
-   no window/isn't running, launch it and run there.
+   no window/isn't running, launch it and run there. The launchd daemon has no
+   Accessibility grant, so the keystroke fails and this falls back to a new
+   window (`applescript.js` `runInNewTerminal`).
 3. PATCH `voice_focus` id=1: `terminal_url = null`.
 
 ## Session registry

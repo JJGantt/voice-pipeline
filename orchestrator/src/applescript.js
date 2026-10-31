@@ -211,13 +211,14 @@ export async function sendToTty(tty, text) {
 // Events, which needs ACCESSIBILITY permission. The interactive shell inherits Terminal.app's
 // grant, but this daemon is spawned by launchd and has none, so from here the keystroke fails with
 // "osascript is not allowed to send keystrokes (1002)". A plain `do script` with no `in` clause
-// needs only Automation permission, which the daemon does have — and it lands as a TAB in the
-// front window, because Terminal on this Mac is set to `AppleWindowTabbingMode always`
-// (`defaults write com.apple.Terminal AppleWindowTabbingMode always`, read live, no restart).
-// Without that default it opens a new window per session.
+// needs only Automation permission, which the daemon does have — but it opens a new WINDOW, every
+// time: `AppleWindowTabbingMode always` (set for com.apple.Terminal on this Mac) governs windows a
+// person opens, not ones AppleScript creates. So until the keystroke has a process with the
+// Accessibility grant to send it, every dispatched session is its own window (the out log's
+// `newwindow` / `tab failed` lines).
 //
 // So: try the tab, and on any failure fall back to the plain `do script`. Either way the caller
-// gets a live shell running the command, which is all that matters.
+// gets a live shell running the command.
 async function runInNewTerminal(shellCmd) {
   // AppleScript string-escape: backslash + quote.
   const escaped = shellCmd.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
