@@ -251,18 +251,23 @@ deferring to it and an idle worker exits in a moment rather than at the stop tim
 
 ## Failure alerts
 
-When a command fails on a worker — handed on, passed on unclaimed, or ended as an error — the worker
-pushes to Jared's phone (hub `/api/notify`, title `Voice worker`, body `<host> · request · <class> ·
-<error>`, class ∈ `auth`/`billing`/`rate-limit`/`error`) AND dispatches a session in the `health` repo
-to investigate (`investigate`). That session runs on a machine other than the failing one when its
-session host (`desk` / `pi-desk` presence) is up, gets the error, the request and what became of it,
-and is told to fix what it can and give the failure a WATCHLIST row. It is an `open_session` written
-straight to `desk_commands`, so it does not move the voice focus. Overloaded, 5xx, rate-limit and
-network errors are retried a few times before any of this; auth and billing are not. One alert and one
-investigation per host per class per `ALERT_COOLDOWN_S` (default 3600), not gated by the hub's push
-toggle, which is for command results.
+When a command fails on a worker (handed on, passed on unclaimed, or ended as an error), the worker
+reports `<stage> · <class> · <error>` to the ops responder (`alert_failure`; health/responder/README.md),
+with the request and what became of it as the context the investigating agent is given. Class is one
+of `auth`/`billing`/`rate-limit`/`error`. The responder groups repeats into one incident, starts one
+agent for it and tells Jared; nothing in the worker throttles or dispatches. Overloaded, 5xx,
+rate-limit and network errors are retried a few times before any of this; auth and billing are not.
 
-What the classes mean on the phone:
+Every other failure the worker logs goes the same way: `log_error` prints the line and reports it.
+`log` is for lines that only announce a retry or a fallback. The reporter is `ops_report.py`, a copy of
+health/responder's `report/report.py` (edit it there and copy it out); it reads `OPS_TOKEN` from the
+environment or `~/.config/ops/env`.
+
+The worker's heartbeat to the responder rides the heartbeat thread but is sent only while the main loop
+has come round within `LOOP_STALL_S` (default 30 minutes, longer than any turn), so a wedged loop goes
+quiet the way a dead worker does.
+
+What the classes mean:
 
 - `auth` — the setup token is revoked or expired. Re-mint: `claude setup-token` → this `.env` on
   every host + `fly secrets set CLAUDE_CODE_OAUTH_TOKEN=… -a jared-voice-worker` → restart. A Google

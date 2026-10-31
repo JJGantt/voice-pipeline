@@ -46,7 +46,7 @@ RUN python3 -m venv /opt/gmail-venv && /opt/gmail-venv/bin/pip install --no-cach
 COPY gmail-mcp /app/gmail-mcp
 
 WORKDIR /app
-COPY worker.py entrypoint.sh ./
+COPY worker.py ops_report.py entrypoint.sh ./
 
 # /data is the volume: transcripts (CLAUDE_CONFIG_DIR), the worker's log and its state survive restarts.
 ENV DATA_MCP_JS=/app/data-layer/dist/mcp.js \

@@ -3,3 +3,4 @@ mcp-voice/
 govee-mcp/
 worker.py
 gmail-mcp/
+ops_report.py

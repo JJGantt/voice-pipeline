@@ -44,6 +44,8 @@ from pathlib import Path
 
 import httpx
 
+import ops_report as ops
+
 # --------------------------------------------------------------------------- #
 # Config (env, with sensible defaults)
 # --------------------------------------------------------------------------- #
@@ -151,23 +153,11 @@ def push_activity(text: str, state: str = "tool") -> None:
         pass
 
 
-# Native push to Jared's phone (APNs via the hub's /api/notify). Used only for the failure alerts
-# below: an orchestrator reply is never pushed, because it lands on the screen he asked from and a
-# notification arriving over it just covers the answer. Session replies are pushed by the hub itself.
-# The hub token rides the URL (same as the activity push above).
-HUB_NOTIFY_URL = os.environ.get(
-    "HUB_NOTIFY_URL",
-    "https://jared-status-hub.fly.dev/api/notify?token=REDACTED",
-)
-
-
 # Failure alerts. A request is not allowed to fail silently: a subscription run that still fails after
-# its retries (`run_subscription`) is pushed with its error, because a revoked or expired token is a
-# standing condition that every later request pays for. One push per host per (stage, class) per ALERT_COOLDOWN_S, so a burst of
-# the same fault does not flood the phone. Deliberately ignores the hub's push_enabled toggle —
-# that is for session replies, not outages.
-ALERT_COOLDOWN_S = float(os.environ.get("ALERT_COOLDOWN_S", "3600"))
-_alert_last: dict = {}
+# its retries (`run_subscription`), an orphaned request, a transcription that nothing could do — each is
+# reported to the ops responder (health/responder), which groups repeats into one incident, starts an
+# agent to investigate, and tells Jared. `<stage> · <class>` leads the message so repeats of one fault
+# group together however their error text differs.
 
 
 def classify_failure(err: str) -> str:
@@ -217,70 +207,12 @@ def run_subscription(run, label: str) -> dict:
 
 
 def alert_failure(stage: str, err: str, detail: str = "") -> None:
-    """Push a worker failure to Jared's phone (`<host> · <stage> · <class> · <error>`) and start a session in
-    the health repo to investigate it (`investigate`). `detail` is what that session is told about the
-    request and what became of it. Best-effort, threaded, and both share the one cooldown."""
+    """Report a worker failure to the ops responder. `detail` is what the investigating agent is told
+    about the request and what became of it."""
     kind = classify_failure(err)
-    key = f"{stage}:{kind}"
-    now = time.monotonic()
-    if now - _alert_last.get(key, -ALERT_COOLDOWN_S) < ALERT_COOLDOWN_S:
-        return
-    _alert_last[key] = now
-    body = f"{WORKER_ID} · {stage} · {kind} · {(err or '')[:180]}"
-    log(f"ALERT {body}")
-
-    def _send():
-        if HUB_NOTIFY_URL:
-            try:
-                httpx.post(HUB_NOTIFY_URL, json={"title": "Voice worker", "body": body[:300], "kind": "voice"}, timeout=5.0)
-            except Exception:  # noqa: BLE001
-                pass
-        investigate(stage, kind, err, detail)
-
-    threading.Thread(target=_send, daemon=True).start()
-
-
-# The machines a desk session can run on, by the presence row each one's session host beats.
-DESK_PRESENCE = {"pi": "pi-desk", "mac": "desk"}
-HEALTH_REPO = "health"   # by name in `repos`, whose path is what the session hosts accept; the Pi clones it
-
-
-def investigate(stage: str, kind: str, err: str, detail: str) -> None:
-    """Dispatch a session in the health repo to find out why this worker failed. It runs on a machine
-    other than this one when that machine's session host is up — the failing host may be failing for
-    the same reason — and on this one otherwise. Fly has no session host, so a Fly failure goes to the
-    Pi or the Mac. Writes the `open_session` command directly: no focus change, so his next spoken
-    follow-up still goes where it was going."""
-    order = ["mac", "pi"] if WORKER_ID == "pi" else ["pi", "mac"]
-    try:
-        hdr = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-        rows = httpx.get(f"{SUPABASE_URL}/rest/v1/worker_presence",
-                         params={"worker": f"in.({','.join(DESK_PRESENCE.values())})", "select": "worker,last_seen"},
-                         headers=hdr, timeout=5).json()
-        up = {r["worker"] for r in rows if _healthy(r)}
-        target = next((m for m in order if DESK_PRESENCE[m] in up), None)
-        if target is None:
-            log("investigate: no session host is up; nothing dispatched")
-            return
-        prompt = (
-            f"The voice worker on `{WORKER_ID}` failed at {now_iso()} (stage `{stage}`, class `{kind}`).\n\n"
-            f"Error: {err}\n\n{detail}\n\n"
-            "Find the cause and fix it if you can, on whichever machine it lives. Logs: the Pi's is "
-            "`journalctl -u voice-worker`, the Mac's is `~/repos/voice-pipeline/worker/worker.out.log`, "
-            "Fly's is `fly logs -a jared-voice`. The request is in Supabase `voice_requests`. Follow this "
-            "repo's CLAUDE.md: check function, not liveness, and give the failure a row in WATCHLIST.md. "
-            "Your last message should say what broke, what you changed, and what is still open."
-        )
-        repo = httpx.get(f"{SUPABASE_URL}/rest/v1/repos", params={"name": f"eq.{HEALTH_REPO}", "select": "path,name"},
-                         headers=hdr, timeout=5).json()[0]
-        httpx.post(f"{SUPABASE_URL}/rest/v1/desk_commands", headers={**hdr, "Content-Type": "application/json"},
-                   json={"id": str(uuid.uuid4()), "kind": "open_session",
-                         "payload": {"path": repo["path"], "name": repo["name"], "target": target, "prompt": prompt,
-                                     "label": f"Voice worker failure on {WORKER_ID}"}},
-                   timeout=5).raise_for_status()
-        log(f"investigate: health session dispatched to {target}")
-    except Exception as e:  # noqa: BLE001 — the alert already went; never take the worker down
-        log(f"investigate: dispatch failed: {e}")
+    msg = f"{stage} · {kind} · {(err or '')[:300]}"
+    log(f"ALERT {msg}")
+    ops.report(msg, context={"detail": detail[:2000]} if detail else None)
 
 
 # Drive the ESP light to reflect EVERY command's lifecycle (universal indicator, not just ESP-sourced):
@@ -645,6 +577,13 @@ def log(msg: str) -> None:
     print(f"{now_iso()} [{WORKER_ID}] {msg}", flush=True)
 
 
+def log_error(msg: str) -> None:
+    """A failure: logged like any line, and reported to the ops responder (health/responder), where a new
+    incident starts an agent. A line that only says a retry or a fallback is coming stays `log`."""
+    log(msg)
+    ops.report(msg)
+
+
 def headers() -> dict:
     return {
         "apikey": SUPABASE_KEY,
@@ -690,7 +629,7 @@ class Supabase:
             return r.json()
         except Exception as e:  # noqa: BLE001 — defensive on purpose
             _note_failure(e)
-            log(f"GET {table}?{query} failed: {e}")
+            log_error(f"GET {table}?{query} failed: {e}")
             return []
 
     def post(self, table: str, body, extra_headers: dict | None = None) -> list | None:
@@ -709,7 +648,7 @@ class Supabase:
             return None
         except Exception as e:  # noqa: BLE001
             _note_failure(e)
-            log(f"POST {table} failed: {e}")
+            log_error(f"POST {table} failed: {e}")
             return None
 
     def patch(self, table: str, query: str, body, extra_headers: dict | None = None):
@@ -727,7 +666,7 @@ class Supabase:
             return None
         except Exception as e:  # noqa: BLE001
             _note_failure(e)
-            log(f"PATCH {table}?{query} failed: {e}")
+            log_error(f"PATCH {table}?{query} failed: {e}")
             return None
 
     def upsert(self, table: str, body, on_conflict: str):
@@ -741,7 +680,7 @@ class Supabase:
             return True
         except Exception as e:  # noqa: BLE001
             _note_failure(e)
-            log(f"UPSERT {table} failed: {e}")
+            log_error(f"UPSERT {table} failed: {e}")
             return False
 
 
@@ -961,7 +900,7 @@ def transcribe_local(rec: dict) -> None:
                     headers={**hdr, "Content-Type": "application/json"}, timeout=10).raise_for_status()
         log(f"local Whisper transcribed {rid} in {time.monotonic() - t0:.1f}s: {text[:80]!r}")
     except Exception as e:  # noqa: BLE001
-        log(f"local Whisper failed for {rid}: {e}")
+        log_error(f"local Whisper failed for {rid}: {e}")
         try:
             httpx.patch(url + "&status=eq.transcribing", json={"status": "error", "error": f"local Whisper failed: {e}"[:300],
                         "updated_at": now_iso()}, headers={**hdr, "Content-Type": "application/json"}, timeout=10)
@@ -984,7 +923,7 @@ def sweep_untranscribed() -> None:
         for r in rows or []:
             threading.Thread(target=transcribe_local, args=(r,), daemon=True).start()
     except Exception as e:  # noqa: BLE001
-        log(f"untranscribed sweep failed: {e}")
+        log_error(f"untranscribed sweep failed: {e}")
 
 
 def claude_unready() -> str | None:
@@ -1046,7 +985,7 @@ def read_session(agent: bool) -> dict | None:
         if f.exists():
             return json.loads(f.read_text())
     except Exception as e:  # noqa: BLE001
-        log(f"read {f.name} failed: {e}")
+        log_error(f"read {f.name} failed: {e}")
     return None
 
 
@@ -1058,7 +997,7 @@ def write_session(agent: bool, session_id: str) -> None:
             json.dumps({"session_id": session_id, "last_activity_iso": now_iso()})
         )
     except Exception as e:  # noqa: BLE001
-        log(f"write {session_file(agent).name} failed: {e}")
+        log_error(f"write {session_file(agent).name} failed: {e}")
 
 
 # LIVE STATE: the settings a turn consults, the voice focus, and today's hub thread, held in memory.
@@ -1103,7 +1042,7 @@ def live_load() -> bool:
                 break
     except Exception as e:  # noqa: BLE001
         _note_failure(e)
-        log(f"live state load failed: {e}")
+        log_error(f"live state load failed: {e}")
         with _live_lock:
             _live["loaded"] = False
         return False
@@ -1202,7 +1141,7 @@ def maybe_auto_disable_wakefree() -> None:
                    timeout=10)
         log(f"always-on auto-disabled: last {AO_IGNORE_STREAK_OFF} turns all noise within the hour")
     except Exception as e:  # noqa: BLE001 — the governor must never take a turn down
-        log(f"wakefree auto-off check failed: {e}")
+        log_error(f"wakefree auto-off check failed: {e}")
 
 
 AO_AUTOOFF_COOLDOWN_S = 300     # minimum brake hold before a re-arm is even considered
@@ -1265,7 +1204,7 @@ def maybe_auto_reenable_wakefree() -> None:
         _set("wakefree_autooff_at", "")
         log(f"always-on auto-re-enabled: quiet after {int(age)}s braked")
     except Exception as e:  # noqa: BLE001 — never take the heartbeat down
-        log(f"wakefree auto-reenable check failed: {e}")
+        log_error(f"wakefree auto-reenable check failed: {e}")
 
 
 def publish_repo_dirs() -> None:
@@ -1292,7 +1231,7 @@ def publish_repo_dirs() -> None:
                    timeout=10)
         log(f"published {len(opts)} repo dirs for the agent cwd picker")
     except Exception as e:  # noqa: BLE001
-        log(f"publish_repo_dirs failed: {e}")
+        log_error(f"publish_repo_dirs failed: {e}")
 
 
 def should_reset_session(state: dict | None, agent: bool = False) -> bool:
@@ -1399,7 +1338,7 @@ def fetch_attachments(paths: list) -> tuple[str | None, list[str]]:
                           headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
                           timeout=30)
             if r.status_code != 200 or not r.content:
-                log(f"attachment fetch failed ({r.status_code}): {name}")
+                log_error(f"attachment fetch failed ({r.status_code}): {name}")
                 continue
             if tmpdir is None:
                 tmpdir = tempfile.mkdtemp(prefix="voice-att-")
@@ -1408,7 +1347,7 @@ def fetch_attachments(paths: list) -> tuple[str | None, list[str]]:
                 f.write(r.content)
             local.append(fp)
         except Exception as e:  # noqa: BLE001
-            log(f"attachment fetch error: {name}: {e}")
+            log_error(f"attachment fetch error: {name}: {e}")
     return tmpdir, local
 
 
@@ -1430,7 +1369,7 @@ def set_cmd_ts(value: str | None) -> None:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         CMD_TS_FILE.write_text(value or "")
     except Exception as e:  # noqa: BLE001
-        log(f"cmd_ts write failed: {e}")   # a stale stamp is worse than none, so this is never fatal
+        log_error(f"cmd_ts write failed: {e}")   # a stale stamp is worse than none, so this is never fatal
 
 
 def write_mcp_config() -> str:
@@ -1964,7 +1903,7 @@ def sweep_stuck_transcribing(db: Supabase) -> None:
                           "updated_at": now_iso()})
                 log(f"closed stuck transcribing request {r['id']}")
     except Exception as e:  # noqa: BLE001
-        log(f"transcribing sweep failed: {e}")
+        log_error(f"transcribing sweep failed: {e}")
 
 
 def reclaim_stale(db: Supabase) -> None:
@@ -2339,7 +2278,7 @@ def process_request(db: Supabase, req: dict) -> None:
         try:
             session_file(reset_agent).unlink(missing_ok=True)
         except Exception as e:
-            log(f"reset: unlink session failed: {e}")
+            log_error(f"reset: unlink session failed: {e}")
         db.patch("voice_requests", f"id=eq.{rid}",
                  {"status": "done", "result": "(context reset)", "updated_at": now_iso()})
         log(f"{'agent' if reset_agent else 'hub'} context reset — session dropped")
@@ -2718,7 +2657,7 @@ class RealtimeWaker:
                 if _running and self._sock.is_connected:
                     log("realtime waker recycling socket (proactive half-open guard)")
             except Exception as e:  # noqa: BLE001
-                log(f"realtime listener error: {e}; retrying in 5s (poll fallback active)")
+                log_error(f"realtime listener error: {e}; retrying in 5s (poll fallback active)")
             self.healthy = False   # disconnected (or never subscribed) → main loop tightens its poll
             try:
                 if self._sock:
@@ -2756,7 +2695,7 @@ class RealtimeWaker:
             live_event(str(d.get("table") or ""), str(d.get("type") or "").split(".")[-1].upper(),
                        d.get("record") or {}, d.get("old_record") or {})
         except Exception as e:  # noqa: BLE001 — a bad frame must not take the listener down
-            log(f"live event failed: {e}")
+            log_error(f"live event failed: {e}")
 
     def _on_sub(self, state, err=None) -> None:
         self.healthy = "SUBSCRIBED" in str(state).upper()   # any other state (TIMED_OUT/CLOSED/ERROR) → degraded poll
@@ -2833,6 +2772,15 @@ def one_iteration(db: Supabase) -> bool:
     return True
 
 
+# The ops responder's heartbeat (health/responder) says the WORK loop is alive, not just this process.
+# It is sent from the heartbeat thread because the main loop legitimately blocks for a whole turn, so it
+# goes out only while the main loop has come round within LOOP_STALL_S: longer than any turn should take,
+# so a turn is never mistaken for a hang, and a loop wedged past it goes quiet like a dead worker.
+LOOP_STALL_S = float(os.environ.get("LOOP_STALL_S", "1800"))
+OPS_BEAT_S = 60
+_loop_at = time.monotonic()
+
+
 def _heartbeat_loop(stop_evt: threading.Event) -> None:
     """Heartbeat on its OWN thread + client so the worker stays 'present' even while a long command blocks
     the main loop. Otherwise its presence goes stale mid-task and a lower-priority worker poaches the
@@ -2845,9 +2793,12 @@ def _heartbeat_loop(stop_evt: threading.Event) -> None:
         while not stop_evt.is_set():
             try:
                 heartbeat(hb_db)
+                if time.monotonic() - _loop_at < LOOP_STALL_S:
+                    ops.beat(max(OPS_BEAT_S, STANDBY_HEARTBEAT_S if _standby else HEARTBEAT_INTERVAL_S),
+                             {"standby": bool(_standby)})
                 maybe_auto_reenable_wakefree()   # self-throttled to ~5 min; rides the beat, no extra timer
             except Exception as e:  # noqa: BLE001
-                log(f"heartbeat thread error: {e}")
+                log_error(f"heartbeat thread error: {e}")
             # Standing by → beat slowly (but still < HEARTBEAT_FRESH_S so we never look dead).
             stop_evt.wait(STANDBY_HEARTBEAT_S if _standby else HEARTBEAT_INTERVAL_S)
 
@@ -2873,7 +2824,7 @@ def _listener_supervisor(stop_evt: threading.Event) -> None:
                     subprocess.run(["launchctl", "kickstart", f"gui/{os.getuid()}/{LISTENER_LABEL}"],
                                    capture_output=True, timeout=10)
         except Exception as e:  # noqa: BLE001
-            log(f"listener supervisor error: {e}")
+            log_error(f"listener supervisor error: {e}")
         stop_evt.wait(60)
 
 
@@ -2888,6 +2839,7 @@ def main() -> int:
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
+    ops.install(machine=WORKER_ID, service="voice-worker")
     log(f"starting (priority={WORKER_PRIORITY}, state_dir={STATE_DIR}, once={once})")
 
     with httpx.Client(timeout=HTTP_TIMEOUT_S) as client:
@@ -2915,11 +2867,13 @@ def main() -> int:
             threading.Thread(target=_listener_supervisor, args=(hb_stop,), name="listener-supervisor", daemon=True).start()
 
         try:
+            global _loop_at
             while _running:
+                _loop_at = time.monotonic()
                 try:
                     processed = one_iteration(db)
                 except Exception as e:  # noqa: BLE001 — a failed claim must not end the worker
-                    log(f"iteration failed: {e}")
+                    log_error(f"iteration failed: {e}")
                     processed = False
                 # Loop quickly if we just worked (drain the queue); else wait for the next INSERT.
                 # waker.wait wakes instantly on a realtime INSERT; the timeout is only the missed-event

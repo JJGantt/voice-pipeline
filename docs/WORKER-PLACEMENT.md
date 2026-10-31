@@ -51,8 +51,8 @@ The code is the same everywhere; only the environment differs.
   jared-voice-worker` holds only the last 100. Before the volume, a Fly restart erased its history,
   which is why the Fly numbers below come from `voice_requests` rather than worker logs.
 - **No session host on Fly.** The machine runs `entrypoint.sh` and `worker.py` — no orchestrator, no
-  desk host, and `worker_presence` has no Fly desk row. `investigate()` sends a Fly failure's health
-  session to the Pi or the Mac. `start_session` still works from Fly because it is a database write that the Pi's or
+  desk host, and `worker_presence` has no Fly desk row. Its failures go to the ops responder like every
+  worker's, which runs the investigation elsewhere. `start_session` still works from Fly because it is a database write that the Pi's or
   the Mac's desk host picks up.
 
 **Every host keeps Claude Code current.** The Mac and the Pi run the native install
