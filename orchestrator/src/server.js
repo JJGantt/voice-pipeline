@@ -141,6 +141,12 @@ wss.on('connection', (ws) => {
 // ---- boot -----------------------------------------------------------------
 
 function preflight() {
+  // An empty token would let a request with no token through authed()'s equality check.
+  if (!config.ORCH_TOKEN) {
+    console.error('[orchestrator] ORCH_TOKEN is not set (EnvironmentVariables in the launchd plist); refusing to start.');
+    process.exit(1);
+  }
+  if (!config.HUB_TOKEN) console.error('[orchestrator] HUB_TOKEN is not set: session activity will not reach the hub.');
   if (!config.SUPABASE_KEY) {
     console.error(
       '[orchestrator] WARNING: SUPABASE_KEY is empty — focus watcher, registry & desk control will fail. Set it in the environment.'

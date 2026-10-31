@@ -85,6 +85,7 @@ routed once it gets here is `../docs/ROUTING.md`.
 | `MESSAGES_MCP_URL` | `http://127.0.0.1:27187/mcp` on the Mac, empty elsewhere; Fly's `entrypoint.sh` sets the Mac's tailnet address once Tailscale is up | iMessage (Opus only), always over HTTP: only the Mac's `messages-http` job has the Full Disk Access `chat.db` needs, so a stdio copy spawned here would fail every read. The Pi sets the Mac's address. |
 | `MESSAGES_MCP_TOKEN` | *(none)* | That endpoint's bearer token, the same value as in `messages-mcp/.env`. Without it (or the URL) the iMessage tools are left out entirely. |
 | `ORCH_URL` / `ORCH_TOKEN` | `http://localhost:7682` | The Mac orchestrator, for injecting into a focused session. |
+| `HUB_URL` / `HUB_TOKEN` | `https://jared-status-hub.fly.dev` / _(empty)_ | The status hub and its kiosk token, for the live tool-call activity bar. Set in `.env` (Fly: a secret); unset, the worker reports an error at start and pushes nothing. |
 | `CLAUDE_TIMEOUT_S` | `300` | Max seconds for a single hub run. |
 | `AGENT_TIMEOUT_S` | `900` | Full-agent (coding) runs get a longer leash. |
 

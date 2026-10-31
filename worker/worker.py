@@ -131,11 +131,11 @@ HAS_MESSAGES = bool(MESSAGES_MCP_URL and MESSAGES_MCP_TOKEN)
 
 # Low-latency activity push to the status-hub server: transient "what the assistant is doing" events go
 # straight to the SSE clients (bypassing Supabase realtime) so the on-screen activity bar tracks
-# tool calls in real time. Authenticated by the hub's kiosk token in the URL.
-HUB_PUSH_URL = os.environ.get(
-    "HUB_PUSH_URL",
-    "https://jared-status-hub.fly.dev/api/voice-activity?token=REDACTED",
-)
+# tool calls in real time. Authenticated by the hub's kiosk token, HUB_TOKEN, which comes from the
+# environment (worker/.env, a Fly secret on jared-voice-worker) and is never written in code.
+HUB_URL = os.environ.get("HUB_URL", "https://jared-status-hub.fly.dev").rstrip("/")
+HUB_TOKEN = os.environ.get("HUB_TOKEN", "")
+HUB_PUSH_URL = f"{HUB_URL}/api/voice-activity?token={HUB_TOKEN}" if HUB_TOKEN else ""
 
 
 # Set for the duration of a FALLBACK command (`process_request`): the hub is the thing that did not answer,
@@ -2845,6 +2845,8 @@ def main() -> int:
         print("FATAL: SUPABASE_KEY is required (service_role key). See README.",
               file=sys.stderr)
         return 2
+    if not HUB_TOKEN:
+        log_error("HUB_TOKEN is not set: tool-call activity will not reach the hub")
 
     once = "--once" in sys.argv
 

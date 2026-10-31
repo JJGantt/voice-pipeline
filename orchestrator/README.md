@@ -38,7 +38,7 @@ launchctl load ~/Library/LaunchAgents/com.jaredgantt.voice-orchestrator.plist
 | `SUPABASE_KEY`    | _(empty — must set; service_role key)_             |
 | `PORT`            | `7682`                                             |
 | `MAC_HOST`        | `Jareds-MacBook-Air.local`                         |
-| `ORCH_TOKEN`      | `REDACTED`             |
+| `ORCH_TOKEN`      | _(empty: must set; the orchestrator refuses to start without it)_ |
 | `CLAUDE_BIN`      | `/Users/jaredgantt/.local/bin/claude`              |
 | `FOCUS_POLL_MS`   | `10000` (realtime backstop; 60s while it's healthy) |
 | `REGISTRY_POLL_MS`| `15000`                                            |
@@ -49,7 +49,7 @@ launchctl load ~/Library/LaunchAgents/com.jaredgantt.voice-orchestrator.plist
 | `PRESENCE_MS`     | `30000`                                            |
 | `PRESENCE_FAIL_EXIT_MS` | `300000` — presence failing this long exits the process for launchd to restart |
 | `HUB_URL`         | `https://jared-status-hub.fly.dev`                 |
-| `HUB_TOKEN`       | the kiosk token (live session activity → the wall) |
+| `HUB_TOKEN`       | _(empty: must set)_ the hub's kiosk token, for live session activity → the wall |
 | `PTY_COLS`/`PTY_ROWS` | `200` / `50`                                   |
 | `REGISTRY_LIMIT`  | `5`                                                |
 

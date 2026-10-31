@@ -5,7 +5,8 @@
   Install (parent does this, NOT the build step):
     cp com.jaredgantt.voice-orchestrator.plist ~/Library/LaunchAgents/
     launchctl load ~/Library/LaunchAgents/com.jaredgantt.voice-orchestrator.plist
-  Edit SUPABASE_KEY below to the service_role key before loading.
+  Fill in SUPABASE_KEY (service_role), ORCH_TOKEN and HUB_TOKEN (the hub's TV_TOKEN) before
+  loading. They live only in the installed copy, never in this file.
 -->
 <plist version="1.0">
 <dict>
@@ -38,7 +39,9 @@
     <key>MAC_HOST</key>
     <string>Jareds-MacBook-Air.local</string>
     <key>ORCH_TOKEN</key>
-    <string>REDACTED</string>
+    <string>FILL_IN</string>
+    <key>HUB_TOKEN</key>
+    <string>FILL_IN</string>
     <key>CLAUDE_BIN</key>
     <string>/Users/jaredgantt/.local/bin/claude</string>
     <!-- PATH so node-pty's spawned shells/claude resolve normally -->
