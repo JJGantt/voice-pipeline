@@ -185,6 +185,25 @@ log = logging.getLogger("voice")
 import ops_report as ops  # noqa: E402
 ops.install(machine="fly", service="voice-server")
 
+
+def _demote(logger_name, test):
+    """Re-level a library's ERROR record to WARNING when `test(record)` says it is a recovered event, so it
+    stays in `fly logs` but does not open an ops incident (the reporter forwards ERROR and above)."""
+    def f(record):
+        if record.levelno == logging.ERROR and test(record):
+            record.levelno, record.levelname = logging.WARNING, "WARNING"
+        return True
+    logging.getLogger(logger_name).addFilter(f)
+
+
+# The ESP32 vanishing mid-handshake (WiFi blip, reboot): websockets logs it at ERROR, then the puck reconnects.
+_demote("websockets.server", lambda r: r.getMessage() == "opening handshake failed" and r.exc_info
+        and isinstance(r.exc_info[1], (websockets.exceptions.ConnectionClosed, EOFError, OSError)))
+# realtime-py logs each failed connect attempt and each socket close at ERROR and then retries / reconnects
+# by itself. Giving up still arrives as an ERROR ("Connection failed permanently…"), which is not demoted.
+_demote("realtime._async.client", lambda r: r.getMessage().startswith(
+    ("Connection attempt failed:", "WebSocket connection closed with code:")))
+
 groq = Groq(api_key=os.environ["GROQ_API_KEY"])
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")   # second transcription provider, after Groq
 oww = Model(wakeword_models=[WAKE_MODEL, WAKE_MODEL_POWER], inference_framework="onnx")
@@ -1501,4 +1520,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:   # Fly stops the machine with SIGINT on every deploy/restart: a clean exit
+        log.info("stopped (SIGINT)")
