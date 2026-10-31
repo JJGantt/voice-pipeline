@@ -189,7 +189,11 @@ what the reply contains, because a confirmation routinely carries information â€
 for the TV and what it is about, the past entry a staged meal was copied from â€” and judged by its
 content the model flags those, and the room-noise "that wasn't meant for me" replies with them. A
 request that FAILED, or only partly worked, is flagged regardless: he gives a command and looks away
-assuming it worked, so a failure is exactly the reply he must not miss. `take_read_marker` strips it
+assuming it worked, so a failure is exactly the reply he must not miss.
+
+A failure caused by a BROKEN or MISSING tool also starts a session to fix it (`DELIBERATE_DIRECTIVE`),
+with his request, the tool and its exact error as the prompt; a failure that is the state of the world
+(the TV is off) starts nothing, since there is no code to change. `take_read_marker` strips it
 before the reply is stored or spoken and sets `voice_messages.needs_read`, which the watch uses to
 keep the answer reachable until it has been on screen (status-hub `docs/WATCH.md`, "Unread answers").
 The replayed day puts the marker back on flagged replies (`_line`), for the same reason the ignore
