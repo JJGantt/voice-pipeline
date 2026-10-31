@@ -37,6 +37,10 @@ let launching = 0;
 export function beginLaunch() { launching++; }
 export function endLaunch() { launching = Math.max(0, launching - 1); }
 
+// Mirror upload failures per row: when the streak started and whether it has been raised yet.
+const mirrorFailing = new Map();
+const MIRROR_FAIL_RAISE_MS = 5 * 60 * 1000;
+
 const ms = (t) => (t ? new Date(t).getTime() : 0);
 const later = (a, b) => (!a ? b || null : !b ? a : ms(a) >= ms(b) ? a : b);
 
@@ -231,7 +235,20 @@ async function reconcile(row, proc) {
     try {
       const at = await mirrorUp(row.claude_session_id, row.transcript_path, row.mirror_offset || 0);
       if (at != null) { patch.mirror_offset = at; patch.mirror_at = new Date().toISOString(); }
-    } catch (e) { console.error('[desk-sessions] mirror:', e.message); }
+      mirrorFailing.delete(row.id);
+    } catch (e) {
+      // A failed upload leaves mirror_offset where it was, so the next idle tick sends the same bytes
+      // again and one network blip costs nothing. Only a mirror that stays broken is an error: a
+      // console.error opens an incident, so it is raised once per failing streak, not per tick.
+      const f = mirrorFailing.get(row.id) || { since: Date.now(), raised: false };
+      mirrorFailing.set(row.id, f);
+      if (!f.raised && Date.now() - f.since >= MIRROR_FAIL_RAISE_MS) {
+        f.raised = true;
+        console.error(`[desk-sessions] mirror failing for ${row.id} since ${new Date(f.since).toISOString()}:`, e.message);
+      } else {
+        console.warn('[desk-sessions] mirror (will retry):', e.message);
+      }
+    }
   }
 
   if (!alive && ageS > LAUNCH_GRACE_S) {
