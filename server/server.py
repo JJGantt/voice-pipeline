@@ -196,9 +196,14 @@ def _demote(logger_name, test):
     logging.getLogger(logger_name).addFilter(f)
 
 
-# One ESP32 drop is a blip and is not reported; a run of them is the puck's link failing, and is.
+# The puck's WiFi link is poor: it drops every few minutes and is back within seconds, and that is its
+# normal behaviour, not a fault. Two things are reported instead. Being OFFLINE for ESP_OFFLINE_REPORT_S
+# straight (unplugged, WiFi gone, firmware wedged) — _esp_offline_watch. And FLAPPING so often that it is
+# mostly down even though each drop recovers: more than ESP_DROP_LIMIT drops in ESP_DROP_WINDOW_S, about
+# one every 20s, against a normal rate of a few per 10 min.
+ESP_OFFLINE_REPORT_S = 600.0
 ESP_DROP_WINDOW_S = 600.0
-ESP_DROP_LIMIT = 5                # more drops than this inside the window opens an incident
+ESP_DROP_LIMIT = 30               # more drops than this inside the window opens an incident
 # One loss of the link ends the open socket AND fails the reconnect handshakes already in flight, all
 # inside the same second or two; counted separately, a single blip reads as three drops.
 ESP_DROP_COALESCE_S = 5.0
@@ -220,6 +225,27 @@ def _note_esp_drop(kind):
         _esp_drops_reported = True
         log.error("ESP32 keeps dropping: %d drops in %d min (latest: %s)",
                   len(_esp_drops), int(ESP_DROP_WINDOW_S // 60), kind)
+
+
+_esp_offline_task = None          # the pending offline report, armed while no ESP32 is connected
+
+
+def _esp_gone():
+    """No ESP32 connected: arm the one-shot offline report, unless it is already armed."""
+    global _esp_offline_task
+    if _esp_offline_task is None or _esp_offline_task.done():
+        _esp_offline_task = asyncio.create_task(_esp_offline_watch())
+
+
+def _esp_back():
+    if _esp_offline_task is not None and not _esp_offline_task.done():
+        _esp_offline_task.cancel()
+
+
+async def _esp_offline_watch():
+    await asyncio.sleep(ESP_OFFLINE_REPORT_S)
+    if _active_esp is None:
+        log.error("ESP32 offline for %d min", int(ESP_OFFLINE_REPORT_S // 60))
 
 
 def _esp_handshake_drop(r):
@@ -551,6 +577,7 @@ async def connection(ws):
             return
     log.info("ESP32 connected: %s", peer)
     _active_esp = ws
+    _esp_back()
     _led_working = False
     _led_capturing = False
     _led_last_sent = None           # the firmware boots with the LED off
@@ -922,6 +949,7 @@ async def connection(ws):
 
     if _active_esp is ws:
         _active_esp = None
+        _esp_gone()
     log.info("ESP32 disconnected: %s", peer)
 
 
@@ -1545,6 +1573,7 @@ async def main():
     asyncio.create_task(_ops_beat())
     asyncio.create_task(_settings_listener())   # Fly owns its own state (app_settings: boot + live)
     asyncio.create_task(_alive_beacon())        # ESP-mic liveness → voice_presence.alive_at
+    _esp_gone()                                 # nothing is connected yet; reported if none arrives
     # ping_interval=None: the ESP32 is a continuous PCM pump and doesn't reliably answer
     # WebSocket keepalive pings, so server-initiated pings were closing the connection mid-
     # utterance ("keepalive ping timeout"). The constant audio stream keeps the socket live;
