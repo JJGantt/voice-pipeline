@@ -12,6 +12,16 @@ is ever rebuilt (gate by omission from an allow list, never `--disallowedTools`)
 wake words ("Hey Rhasspy" / "Hey Jarvis") are equivalent triggers — routing is the worker's one
 route, and `app_settings.wakefree_route` is likewise an inert leftover row.
 
+## Errors are reported, not just printed
+
+The worker, `pi-desk` and the orchestrator send their failures and heartbeats to the ops responder
+(health/responder/README.md), where a new incident starts an agent. The reporters are copies of that
+repo's: `worker/ops_report.py` and `orchestrator/src/ops_report.cjs` (which `pi-desk` also loads). Edit
+them there and copy them out. In the worker a failure is `log_error`, in the Node hosts it is
+`console.error`; `log` / `console.log` / `.catch(() => {})` are invisible to the responder and are only
+for a retry or fallback that is already handling it. The Fly session host reports errors but sends no
+heartbeat, because it sleeps whenever nothing runs.
+
 ## The worker never bills the API — `ANTHROPIC_API_KEY` is discarded
 
 Every turn, on every worker (Pi, Mac, and Fly, which holds its own `CLAUDE_CODE_OAUTH_TOKEN`), runs on

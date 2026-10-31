@@ -11,6 +11,7 @@
 // (publish ~/repos to Supabase, drain the hub's launch queue) + desk session reconcile (is each
 // dispatched session still up, and what did it last say).
 import http from 'node:http';
+import { createRequire } from 'node:module';
 import { WebSocketServer } from 'ws';
 import { config } from './config.js';
 import { attachClient, handleClientMessage, inject, hasActive } from './pty.js';
@@ -20,6 +21,14 @@ import { markTtyRead } from './deskSessions.js';
 import { startRepos } from './repos.js';
 import { startCommands } from './commands.js';
 import { startDeskSessions } from './deskSessions.js';
+
+// Errors go to the ops responder (health/responder) through a copy of its reporter. The orchestrator is
+// event-driven, so the event loop is its work loop: a beat from a timer on it stops when the loop is
+// blocked or the process is gone. The Mac sleeps with its lid; the responder knows not to chase that.
+const ops = createRequire(import.meta.url)('./ops_report.cjs');
+ops.install({ machine: 'mac', service: 'orchestrator' });
+setInterval(() => ops.beat(60), 60e3);
+ops.beat(60);
 
 // ---- auth -----------------------------------------------------------------
 

@@ -368,7 +368,7 @@ export function reportTurnEnd(id, tail, turn = null) {
                    ...(turn ? { turn: turn.key, events: turn.events } : {}) });
   summarise(tail.lastReply).then((summary) => push({
     session: id, state: 'summary', text: tail.lastReply.slice(0, 400), at: tail.replyAt || null, summary,
-  })).catch(() => {});
+  })).catch((e) => console.error('[sessionWatch] summary push:', e.message));
   return p;
 }
 

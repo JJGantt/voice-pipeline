@@ -41,9 +41,11 @@ import { loginExpiresAt } from '../orchestrator/src/login.js';
 // reads the same files for the same reason.
 import { sessionOf } from '../orchestrator/src/discover.js';
 import { sweepScratch } from './scratch.js';
+import { createRequire } from 'node:module';
 import { setupCgroups, limitSession, watchSession, liftBudget, sessionUsage, SESSION_BUDGET_MB } from './cgroups.js';
 import { syncSessionWatch, reportTurnEnd, expectPrompt } from '../orchestrator/src/sessionWatch.js';
 import { relayFirstReply } from '../orchestrator/src/relay.js';
+
 // Shared with the Mac rather than reimplemented: both halves of a transfer must agree byte for
 // byte on what a mirrored transcript is.
 import { mirrorUp, mirrorDown, mirrorReset } from '../orchestrator/src/mirror.js';
@@ -67,6 +69,12 @@ const QUEUE_BACKSTOP_MS = 10 * 60 * 1000;
 // its header documents a hard-won lesson — supabase-js does not reliably recover a dead channel, and
 // callers that fall back to a tight poll burn ~20k reads a day without noticing.
 import { watchTable } from '../orchestrator/src/realtime.js';
+
+// Errors go to the ops responder (health/responder) through a copy of its reporter, as does the beat from
+// the reconcile tick below. The Fly host sleeps whenever nothing runs, so it sends no beat: its silence
+// is its normal state, not a fault.
+const ops = createRequire(import.meta.url)('../orchestrator/src/ops_report.cjs');
+ops.install({ machine: process.env.DESK_MACHINE === 'fly' ? 'fly' : 'pi', service: process.env.DESK_MACHINE === 'fly' ? 'fly-desk' : 'pi-desk' });
 
 const exec = promisify(execFile);
 
@@ -202,7 +210,7 @@ async function park(name) {
   await sb(`desk_sessions?id=eq.${encodeURIComponent(name)}`, {
     method: 'PATCH', headers: { Prefer: 'return=minimal' },
     body: JSON.stringify({ status: 'evicted', ended: new Date().toISOString() }),
-  }).catch(() => {});
+  }).catch((e) => console.error('[pi-desk] mark evicted:', e.message));
 }
 
 /**
@@ -666,7 +674,8 @@ async function runQueue(residents) {
                        payload: { name: next.repo, prompt: next.prompt, label: next.label, resume_id: next.resume_id } },
                      `queued launch failed: ${e.message}`);
   }
-  await sb(`desk_queue?id=eq.${encodeURIComponent(next.id)}`, { method: 'DELETE', headers: { Prefer: 'return=minimal' } }).catch(() => {});
+  await sb(`desk_queue?id=eq.${encodeURIComponent(next.id)}`, { method: 'DELETE', headers: { Prefer: 'return=minimal' } })
+    .catch((e) => console.error('[pi-desk] dequeue:', e.message));
 }
 
 // Awake AND signed in: a Mac whose /login has expired launches a session that does nothing, which is
@@ -1302,13 +1311,13 @@ drain();
 // that dies silently degrades to slow-but-working instead of stopping altogether.
 let pollTimer = null;
 const pollLoop = () => {
-  drain().catch(() => {});
+  drain().catch((e) => console.error('[pi-desk] drain:', e.message));
   pollTimer = setTimeout(pollLoop, rt.isHealthy && rt.isHealthy() ? POLL_MS : POLL_DEGRADED_MS);
 };
 pollTimer = setTimeout(pollLoop, POLL_DEGRADED_MS);
 
 reconcileSessions();
-setInterval(reconcileSessions, PRESENCE_MS);
+setInterval(() => { if (!FLY) ops.beat(Math.max(60, PRESENCE_MS / 1000)); reconcileSessions(); }, PRESENCE_MS);
 sweepAbandonedClaims();
 setInterval(sweepAbandonedClaims, 300000);
 // One retention rule in one place: the Pi, which is always on. Fly is asleep almost always.
