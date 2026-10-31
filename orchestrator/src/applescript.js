@@ -161,6 +161,35 @@ export async function closeTabForTty(tty) {
 }
 
 /**
+ * Close the window left behind by a dispatched session that has exited — only when nothing at all is
+ * running on its tty any more (the launch command's `exit 0` ended the shell) and it is the window's
+ * only tab. A tty is reused by the next tab opened, so a live process there means the tty is someone
+ * else's now, and that window is left alone.
+ */
+export async function closeHuskForTty(tty) {
+  if (!tty) return false;
+  try {
+    const { stdout } = await execFileP('ps', ['-t', tty.replace('/dev/', ''), '-o', 'pid='], { timeout: 10000 });
+    if (stdout.trim()) return false;
+  } catch (e) {
+    // ps exits 1 when the tty has no processes, which is the case being looked for.
+    if (String(e.stdout || '').trim()) return false;
+  }
+  const out = await osascript(
+    `tell application "Terminal"
+       repeat with w in windows
+         if (count of tabs of w) is 1 and (tty of item 1 of tabs of w) is "${tty}" then
+           close w
+           return "closed"
+         end if
+       end repeat
+       return ""
+     end tell`
+  ).catch(() => '');
+  return out === 'closed';
+}
+
+/**
  * Type text into an already-running session, addressed by the tty of its tab.
  *
  * The tty is the only stable handle a Terminal tab has: tab indexes shift as tabs open and close, and
@@ -293,7 +322,12 @@ export async function openFreshTab(cwd, name, prompt, sessionId = null, resumeId
   // the Pi mid-turn is told why and what was cut off (commands.js resume_mirrored).
   const sysText = [(pf && !resumeId) ? DISPATCHED : '', note || ''].filter(Boolean).join('\n\n');
   const sys = sysText ? ` --append-system-prompt ${shQuote(sysText)}` : '';
-  return runInNewTerminal(`cd ${shQuote(cwd)}; ${env}${shQuote(config.CLAUDE_BIN)}${model}${resume}${rc}${sys}${first}`);
+  // `exit 0` after claude: a dispatched tab is the session's and nothing else's, so when the session
+  // ends, however it ends, the shell goes too. With the profile's "When the shell exits: Close if the
+  // shell exited cleanly" the tab then closes itself — the only way a TAB closes, since AppleScript
+  // cannot close one. Without that setting it is left as "[Process completed]", which
+  // closeHuskForTty clears when it is a window's only tab.
+  return runInNewTerminal(`cd ${shQuote(cwd)}; ${env}${shQuote(config.CLAUDE_BIN)}${model}${resume}${rc}${sys}${first}; exit 0`);
 }
 
 /**

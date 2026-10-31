@@ -37,6 +37,7 @@ import { openFreshTab, sendToTty, closeTabForTty } from './applescript.js';
 import { withAttachments, transcriptSize, awaitSubmitted } from './handoff.js';
 import { expectPrompt } from './sessionWatch.js';
 import { mirrorUp, mirrorDown } from './mirror.js';
+import { fingerprint, noteRemoteInput } from './idle.js';
 
 // Appended only when a dispatch ASKED for a write-up (`report` on the command payload, set by the
 // voice tool when Jared says so). Reports are opt-in because most dispatched work just needs
@@ -97,6 +98,8 @@ async function deliver(row, text, { expect = null, cmd = null } = {}) {
   const tpath = s?.transcriptPath || row.transcript_path || null;
   const from = tpath ? transcriptSize(tpath) : 0;
   if (cmd) expectPrompt(row.id, text, cmd);
+  // Before sending, so the idle reaper never reads these words in the transcript as typed at the Mac.
+  await noteRemoteInput(row, text).catch((e) => console.error('[commands] note remote input:', e.message));
   const line = await sendToTty(row.tty, text);
   if (!tpath) return `sent ${text.length} chars to ${row.tty} (unconfirmed: no transcript bound yet)`;
   if (!(await awaitSubmitted(tpath, from, expect || line))) {
@@ -178,6 +181,10 @@ async function run(cmd) {
         origin: row.origin || 'dispatched', command_id: cmd.id, tty: tty || null,
         label: row.label || null, claude_session_id: row.claude_session_id,
         transcript_path: row.transcript_path, mirror_offset: row.mirror_offset || 0,
+        remote_inputs: prompt ? [fingerprint(prompt)] : [],
+        // A session he used at the Mac stays his through a resume: the new row's transcript scan
+        // starts at its own start, so it would otherwise read as hosted-only and be parked again.
+        touched_at: row.touched_at || null,
         active_at: new Date().toISOString(),
       });
       return `resumed ${id} here (${how})`;
@@ -240,6 +247,7 @@ async function run(cmd) {
         claude_session_id: claudeId, transcript_path: file,
         // Everything already uploaded stays uploaded: this machine carries on appending from here.
         mirror_offset: fs.statSync(file).size,
+        remote_inputs: (cmd.payload || {}).prompt ? [fingerprint((cmd.payload || {}).prompt)] : [],
         active_at: new Date().toISOString(),
       });
       return `resumed ${claudeId.slice(0, 8)} here (${how})`;
@@ -293,6 +301,7 @@ async function run(cmd) {
         status: 'resident', origin: 'dispatched', command_id: cmd.id, tty: tty || null,
         label: (cmd.payload || {}).label || null,
         prompt: prompt ? prompt.slice(0, 500) : null,
+        remote_inputs: prompt ? [fingerprint(prompt)] : [],
         active_at: new Date().toISOString(),
       });
     } catch (e) { console.error('[commands] publish:', e.message); }

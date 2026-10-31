@@ -252,6 +252,14 @@ session said after its last completed turn, which is nothing, because that is wh
 Closing a session on the Mac is `/exit` typed into the tab, then SIGTERM if it is ignored. A Terminal
 TAB does not understand AppleScript's `close` (it answers -1708), which is why `closeTabForTty` used
 to report failure and close nothing; the window is closed only when that tab is the last one in it.
+A dispatched session's launch command ends in `exit 0`, so when the session ends by any route its
+shell goes too: with the Terminal profile's "When the shell exits: Close if the shell exited cleanly"
+the TAB closes itself (the only way a tab closes), and without it `closeHuskForTty` closes the window
+when that was its only tab and nothing is left running on the tty.
+
+Sessions open as WINDOWS, not tabs, until the orchestrator's `/usr/local/bin/node` holds the
+Accessibility grant: a tab needs a Cmd-T keystroke, and the plain `do script` fallback opens a window
+whatever `AppleWindowTabbingMode` says. The out log's `tab failed` lines are this.
 
 ## Typing into a running session: short text only, and "sent" means the transcript has it
 
@@ -311,11 +319,22 @@ name, same row, flipped back to `resident`. The Remote Control name is the sessi
 Claude app, and a fresh one made a reaped-and-resumed conversation show up there as a different
 session. The Mac still opens a resume as a new row with a new name.
 
-The Mac's `deskSessions.js` tick is still smaller than the Pi's: no memory admission and no eviction of
-its own. Those exist because a headless 4GB machine must decide what to close; on the Mac Jared can
-see the tabs. What it does do each tick: bind each running row to its process (`pid`) and that
-process's current conversation, close a row whose process has exited, adopt any process no row owns,
-publish the last completed turn and the last turn boundary (`active_at`), and mirror the tail.
+The Mac's `deskSessions.js` tick is still smaller than the Pi's: no memory admission. What it does do
+each tick: bind each running row to its process (`pid`) and that process's current conversation,
+close a row whose process has exited, adopt any process no row owns, publish the last completed turn
+and the last turn boundary (`active_at`), mirror the tail, and run the idle reaper.
+
+**The idle reaper (`idle.js`) parks a session the Mac only HOSTED** — dispatched (from the watch, the
+phone, the responder) and never typed into at the keyboard — once it has been idle 30 minutes
+(`IDLE_PARK_MS`), with its mirror complete and no Bash tool still running under it. A session he typed
+into at the Mac, or opened there himself (`origin = adopted`), is never parked; he closes it. The
+transcript records a keyboard prompt and a pasted-in one identically, so the orchestrator
+fingerprints every prompt it sends (`remote_inputs`, written BEFORE sending) and a human prompt
+matching none of them stamps `touched_at`, which is never cleared and survives a resume. Remote
+Control input from the Claude app is indistinguishable from the keyboard and counts as it, which
+errs toward keeping a session. Ticks never overlap: parking takes seconds per session, and an
+overlapping tick acting on rows read before the first wrote anything parked a session the first had
+just found typed into.
 
 ## Docs
 

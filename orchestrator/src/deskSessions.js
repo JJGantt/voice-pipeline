@@ -1,9 +1,11 @@
 // What the Mac's sessions are doing — published on a tick, the way the Pi publishes its own. Both
 // the ones dispatched to it and the ones Jared opened himself (see `adopt` below).
 //
-// The Mac deliberately does NOT get the Pi's session management: residency caps, eviction and resume
-// exist because a headless 4GB machine has to decide what to close, and here Jared can see the tabs
-// and close them himself. What it does need is the facts every surface reads:
+// The Mac does NOT get the Pi's residency caps: those exist because a headless 4GB machine has to
+// decide what to close under memory pressure. What it does get is the idle reaper (idle.js), which
+// parks a session the Mac only hosted — dispatched and never typed into at the keyboard — once it
+// has sat idle; a session he used at the Mac stays until he closes it. Beyond that it needs the facts
+// every surface reads:
 //
 //   1. IS IT STILL UP. A row that claims to be running for ever keeps a closed session on the wall and
 //      in the numbering, looking exactly like a live one.
@@ -24,6 +26,9 @@ import { mirrorUp, mirrorReset } from './mirror.js';
 import { readTail } from './transcripts.js';
 import { syncSessionWatch, reportTurnEnd } from './sessionWatch.js';
 import { relayFirstReply } from './relay.js';
+import { reapIdle } from './idle.js';
+import { closeHuskForTty } from './applescript.js';
+import fs from 'node:fs';
 
 // A tab is opened, the shell starts, then claude starts. Ending a session that is still coming up
 // would delete a job the instant it was dispatched.
@@ -95,8 +100,10 @@ async function adopt(s, rows) {
   if (existing) {
     // The same conversation running again — `claude --resume` by hand, in a new tab. Revive the row
     // rather than making a second one: its label, its origin and its history are still right.
+    // Resumed at the keyboard, so it is his now whatever opened it first: never parked by idle.js.
     await patchDeskSession(existing.id, { status: 'resident', ended: null, tty: s.tty, pid: s.pid,
                                           started: startedIso, transcript_path: s.transcriptPath,
+                                          touched_at: existing.touched_at || startedIso,
                                           last_seen: new Date().toISOString() });
     console.log(`[desk-sessions] ${existing.id} is running again (${s.tty})`);
     return;
@@ -267,6 +274,11 @@ async function reconcile(row, proc) {
     patch.working = false;
     row.status = patch.status;   // stop watching it on this tick, not the next
     console.log(`[desk-sessions] ${row.id} ${patch.status} (its process has exited)`);
+    // A dispatched session's window is the session's alone; once it has exited nothing in it is
+    // anyone's. A window he opened himself is left for him.
+    if (row.origin !== 'adopted') {
+      closeHuskForTty(row.tty).catch((e) => console.error('[desk-sessions] close husk:', e.message));
+    }
   }
   // The watcher pushes every real change the moment it happens; this tick is the net under it. So a
   // tick that found nothing new writes nothing: an unconditional PATCH per resident session every 30s
@@ -322,7 +334,16 @@ async function tick() {
   for (const row of residents) {
     const proc = processOf(row, live, byPid, claimed);
     if (proc) claimed.add(proc.pid);
-    try { await reconcile(row, proc); patchFailing.delete(row.id); }
+    try {
+      await reconcile(row, proc);
+      patchFailing.delete(row.id);
+      if (row.status === 'resident' && proc) {
+        let bytes = 0;
+        try { bytes = row.transcript_path ? fs.statSync(row.transcript_path).size : 0; } catch { /* not written yet */ }
+        try { await reapIdle(row, proc, bytes); }
+        catch (e) { console.error(`[desk-sessions] idle reaper on ${row.id}:`, e.message); }
+      }
+    }
     catch (e) {
       const f = patchFailing.get(row.id) || { since: Date.now(), raised: false };
       patchFailing.set(row.id, f);
@@ -363,8 +384,18 @@ async function tick() {
     });
 }
 
+// One tick at a time. Parking a session takes seconds (`/exit`, then a wait), so a tick that parks
+// several outlasts the interval — and a second tick started on rows read before the first wrote
+// anything would act on stale state: it parked a session the first had just found typed into.
+let ticking = false;
+async function tickOnce() {
+  if (ticking) return;
+  ticking = true;
+  try { await tick(); } finally { ticking = false; }
+}
+
 export function startDeskSessions() {
-  tick();
-  const timer = setInterval(tick, config.PRESENCE_MS);
+  tickOnce();
+  const timer = setInterval(tickOnce, config.PRESENCE_MS);
   return () => clearInterval(timer);
 }
