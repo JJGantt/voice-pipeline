@@ -196,9 +196,38 @@ def _demote(logger_name, test):
     logging.getLogger(logger_name).addFilter(f)
 
 
-# The ESP32 vanishing mid-handshake (WiFi blip, reboot): websockets logs it at ERROR, then the puck reconnects.
-_demote("websockets.server", lambda r: r.getMessage() == "opening handshake failed" and r.exc_info
-        and isinstance(r.exc_info[1], (websockets.exceptions.ConnectionClosed, EOFError, OSError)))
+# One ESP32 drop is a blip and is not reported; a run of them is the puck's link failing, and is.
+ESP_DROP_WINDOW_S = 600.0
+ESP_DROP_LIMIT = 5                # more drops than this inside the window opens an incident
+_esp_drops: deque = deque()
+_esp_drops_reported = False       # one report per run of drops; re-armed once the window is clear
+
+
+def _note_esp_drop(kind):
+    global _esp_drops_reported
+    now = time.monotonic()
+    _esp_drops.append(now)
+    while _esp_drops and now - _esp_drops[0] > ESP_DROP_WINDOW_S:
+        _esp_drops.popleft()
+    if len(_esp_drops) == 1:
+        _esp_drops_reported = False
+    if len(_esp_drops) > ESP_DROP_LIMIT and not _esp_drops_reported:
+        _esp_drops_reported = True
+        log.error("ESP32 keeps dropping: %d drops in %d min (latest: %s)",
+                  len(_esp_drops), int(ESP_DROP_WINDOW_S // 60), kind)
+
+
+def _esp_handshake_drop(r):
+    """The ESP32 vanishing mid-handshake (WiFi blip, reboot): websockets logs it at ERROR, then the puck
+    reconnects. Counted as a drop, and demoted."""
+    if r.getMessage() == "opening handshake failed" and r.exc_info and isinstance(
+            r.exc_info[1], (websockets.exceptions.ConnectionClosed, EOFError, OSError)):
+        _note_esp_drop("mid-handshake")
+        return True
+    return False
+
+
+_demote("websockets.server", _esp_handshake_drop)
 # realtime-py logs each failed connect attempt and each socket close at ERROR and then retries / reconnects
 # by itself. Giving up still arrives as an ERROR ("Connection failed permanently…"), which is not demoted.
 _demote("realtime._async.client", lambda r: r.getMessage().startswith(
@@ -494,13 +523,15 @@ async def _device_frames(ws, peer):
     The ESP32 losing WiFi or rebooting ends the TCP stream with no close handshake, which websockets
     raises as ConnectionClosedError. That is an ordinary disconnect (the puck reconnects within a
     second), not a fault: left uncaught it escapes the handler, websockets logs it at ERROR (an ops
-    incident), and the handler's own cleanup after the loop never runs.
+    incident), and the handler's own cleanup after the loop never runs. A run of drops is reported
+    (_note_esp_drop).
     """
     try:
         async for msg in ws:
             yield msg
     except websockets.exceptions.ConnectionClosedError as e:
         log.info("ESP32 dropped without a close frame: %s (%s)", peer, e)
+        _note_esp_drop("no close frame")
 
 
 async def connection(ws):
