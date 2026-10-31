@@ -24,7 +24,7 @@
 //   - it has no target AND the Mac's presence is stale   (nobody else is going to take it)
 // The staleness check is what makes this a fallback rather than a race: while the Mac is awake and
 // beating, untargeted commands are left alone.
-import { spawn, execFile } from 'node:child_process';
+import { spawn, execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -1214,16 +1214,63 @@ const FLY_IDLE_EXIT_S = Number(process.env.FLY_IDLE_EXIT_S || 600);
 let idleSince = Date.now();
 function exitIfIdle(residentCount) {
   if (!FLY) return;
-  if (residentCount > 0 || draining) { idleSince = Date.now(); return; }
+  if (residentCount > 0 || draining || incidentRuns > 0) { idleSince = Date.now(); return; }
   if (Date.now() - idleSince < FLY_IDLE_EXIT_S * 1000) return;
   console.log(`[pi-desk] nothing has run for ${Math.round(FLY_IDLE_EXIT_S / 60)}m — stopping the machine`);
   process.exit(0);
 }
+// The ops responder's way in when Supabase is down (health/responder/README.md). Every other route to a
+// session here reads or writes Supabase, so this one touches neither: the responder wakes the machine,
+// posts the incident prompt, and it runs as a plain `claude -p` in the health checkout. Nothing about it
+// appears in the session list, which is itself in Supabase. When it exits the run is reported done, so
+// whatever it left open is handed to Jared.
+let incidentRuns = 0;
+const OPS_URL = process.env.OPS_URL || 'https://ops-responder.fly.dev';
+async function incidentRun(run, prompt) {
+  const dir = path.join(REPO_ROOT, 'health');
+  try {
+    if (fs.existsSync(path.join(dir, '.git'))) execFileSync('git', ['-C', dir, 'pull', '-q', '--ff-only'], { timeout: 60e3 });
+    else execFileSync('gh', ['repo', 'clone', 'JJGantt/health', dir], { timeout: 120e3 });
+  } catch (e) { console.error(`[pi-desk] incident ${run}: health checkout: ${e.message}`); }
+  incidentRuns += 1;
+  const log = fs.openSync(path.join(process.env.HOME || '/tmp', `incident-${run}.log`), 'a');
+  const child = spawn('claude', ['-p', prompt, '--output-format', 'text'], {
+    cwd: fs.existsSync(dir) ? dir : process.env.HOME, stdio: ['ignore', log, log],
+    env: { ...process.env, OPS_URL, OPS_TOKEN: process.env.OPS_TOKEN || '' },
+  });
+  const finish = async (why) => {
+    incidentRuns -= 1;
+    idleSince = Date.now();
+    try {
+      await fetch(`${OPS_URL}/runs/${run}/done`, { method: 'POST', signal: AbortSignal.timeout(15e3),
+        headers: { Authorization: `Bearer ${process.env.OPS_TOKEN || ''}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ note: why }) });
+    } catch (e) { console.error(`[pi-desk] incident ${run}: could not report done: ${e.message}`); }
+  };
+  child.on('error', (e) => { console.error(`[pi-desk] incident ${run}: claude did not start: ${e.message}`); finish(`claude did not start on fly-desk: ${e.message}`); });
+  child.on('exit', (code) => { console.log(`[pi-desk] incident ${run}: claude exited ${code}`); finish(`fly-desk claude exited ${code}`); });
+}
+
 if (FLY) {
   const http = await import('node:http');
   http.createServer((req, res) => {
     idleSince = Date.now();
-    if (req.url === '/wake') drain().catch(() => {});
+    if (req.method === 'POST' && req.url === '/incident') {
+      const token = process.env.OPS_TOKEN || '';
+      if (!token || req.headers.authorization !== `Bearer ${token}`) { res.writeHead(401); return res.end(); }
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        try {
+          const { run, prompt } = JSON.parse(body);
+          if (!Number.isInteger(run) || !prompt) throw new Error('needs run and prompt');
+          incidentRun(run, String(prompt));
+          res.writeHead(202); res.end('started\n');
+        } catch (e) { res.writeHead(400); res.end(`${e.message}\n`); }
+      });
+      return;
+    }
+    if (req.url === '/wake') drain().catch((e) => console.error('[pi-desk] drain after wake:', e.message));
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('awake\n');
   }).listen(Number(process.env.PORT || 8080), '0.0.0.0');

@@ -16,6 +16,14 @@ parking, follow-ups, resume and transfer all behave as on the Pi.
 - `auto_stop_machines` must stay `off`. A session at work makes no HTTP requests, and the proxy would
   read that as idle and stop the machine mid-turn.
 
+## Incident runs from the ops responder
+
+When Supabase is down nothing can be dispatched (every route in reads Supabase), so the ops responder
+(health/responder/README.md) wakes this machine and posts the incident to `POST /incident` (Bearer
+`OPS_TOKEN`). It runs as a plain `claude -p` in a `health` checkout, logs to `$HOME/incident-<run>.log`,
+and reports the run done to the responder when it exits. It counts as work for the idle exit, so the
+machine stays up until it finishes. It does not appear in the session list, which lives in Supabase.
+
 ## What differs from the Pi
 
 - **Credential:** the year-long `CLAUDE_CODE_OAUTH_TOKEN` (there is no interactive login), so sessions
@@ -32,7 +40,8 @@ parking, follow-ups, resume and transfer all behave as on the Pi.
 
 `CLAUDE_CODE_OAUTH_TOKEN`, `SUPABASE_URL`, `SUPABASE_KEY`, `GH_TOKEN` (the Mac's `gh` token),
 `FLY_API_TOKEN` (an org token, `fly tokens create org`, named `jared-desk-fly`), `SUPABASE_ACCESS_TOKEN`,
-`GOVEE_API_KEY`, `GOOGLE_CLIENT_ID` / `_SECRET` / `_REFRESH_TOKEN`. A Google password change revokes the
+`GOVEE_API_KEY`, `GOOGLE_CLIENT_ID` / `_SECRET` / `_REFRESH_TOKEN`, `OPS_TOKEN` (the ops responder's, for
+`/incident`). A Google password change revokes the
 Claude token here as everywhere; re-set it with `fly secrets set -a jared-desk-fly`.
 
 ## Deploy
