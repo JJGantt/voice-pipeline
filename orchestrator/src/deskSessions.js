@@ -40,6 +40,11 @@ export function endLaunch() { launching = Math.max(0, launching - 1); }
 // Mirror upload failures per row: when the streak started and whether it has been raised yet.
 const mirrorFailing = new Map();
 const MIRROR_FAIL_RAISE_MS = 5 * 60 * 1000;
+// Same for the row patch in tick(). The patch is re-derived from the row against reality on every
+// tick, so a write that fails (a Supabase gateway 502) is simply made again 30s later; only a streak
+// that outlasts this is an incident, raised once.
+const patchFailing = new Map();
+const PATCH_FAIL_RAISE_MS = 5 * 60 * 1000;
 
 const ms = (t) => (t ? new Date(t).getTime() : 0);
 const later = (a, b) => (!a ? b || null : !b ? a : ms(a) >= ms(b) ? a : b);
@@ -317,8 +322,17 @@ async function tick() {
   for (const row of residents) {
     const proc = processOf(row, live, byPid, claimed);
     if (proc) claimed.add(proc.pid);
-    try { await reconcile(row, proc); }
-    catch (e) { console.error('[desk-sessions] patch:', e.message); }
+    try { await reconcile(row, proc); patchFailing.delete(row.id); }
+    catch (e) {
+      const f = patchFailing.get(row.id) || { since: Date.now(), raised: false };
+      patchFailing.set(row.id, f);
+      if (!f.raised && Date.now() - f.since >= PATCH_FAIL_RAISE_MS) {
+        f.raised = true;
+        console.error(`[desk-sessions] patch failing for ${row.id} since ${new Date(f.since).toISOString()}:`, e.message);
+      } else {
+        console.warn('[desk-sessions] patch (will retry):', e.message.slice(0, 300));
+      }
+    }
   }
   if (!launching) {
     for (const s of live) {
