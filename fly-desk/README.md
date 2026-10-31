@@ -41,7 +41,7 @@ machine stays up until it finishes. It does not appear in the session list, whic
 `CLAUDE_CODE_OAUTH_TOKEN`, `SUPABASE_URL`, `SUPABASE_KEY`, `GH_TOKEN` (the Mac's `gh` token),
 `FLY_API_TOKEN` (an org token, `fly tokens create org`, named `jared-desk-fly`), `SUPABASE_ACCESS_TOKEN`,
 `GOVEE_API_KEY`, `GOOGLE_CLIENT_ID` / `_SECRET` / `_REFRESH_TOKEN`, `OPS_TOKEN` (the ops responder's, for
-`/incident`). A Google password change revokes the
+`/incident`), `HUB_TOKEN` (the hub's kiosk token, which sessions here use through status-hub's `bin/hub`). A Google password change revokes the
 Claude token here as everywhere; re-set it with `fly secrets set -a jared-desk-fly`.
 
 ## Deploy
