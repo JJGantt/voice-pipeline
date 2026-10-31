@@ -489,10 +489,14 @@ DELIBERATE_DIRECTIVE = (
 # shows the convention being followed rather than a run of untagged answers to copy.
 READ_MARKER = "[[read]]"
 READ_DIRECTIVE = (
-    "\n\n[If your reply gives him something he wanted to KNOW (an answer to a question, a lookup, a "
-    "summary, a recommendation, information he asked for), end it with " + READ_MARKER + " as the very "
-    "last thing. If it only confirms that something was done (a set logged, a light changed, an item "
-    "added, a session started), leave the marker off. The marker is removed before he sees the reply.]"
+    "\n\n[Decide by what he ASKED FOR, not by what your reply happens to contain. If he asked a question "
+    "or asked you to find something out for him (a fact, a lookup, a calculation, a summary, a "
+    "recommendation, what he did last time), end your reply with " + READ_MARKER + " as the very last "
+    "thing. If he asked you to DO something, leave it off, even when your reply describes what you "
+    "picked, copied, looked up along the way or worked out to do it: logging, staging or editing food, "
+    "a set, a list item, a light, putting something on the TV, starting, moving or messaging a session. "
+    "Also leave it off when you did nothing because the words were not meant for you. The marker is "
+    "removed before he sees the reply.]"
 )
 
 

@@ -183,8 +183,11 @@ rather than `Assistant`, so the model can tell which session said what and pass 
 turns none of this applies: talk naming no destination is assumed to be for a session already open,
 and `follow_up` there needs a handoff phrase (below).
 
-Every turn also gets `READ_DIRECTIVE`: a reply that tells him something he wanted to know ends with
-the `[[read]]` marker, and one that only confirms an action does not. `take_read_marker` strips it
+Every turn also gets `READ_DIRECTIVE`: a reply to a QUESTION ends with the `[[read]]` marker, and a
+reply to a request to DO something does not. The directive is worded around what he asked for, not
+what the reply contains, because a confirmation routinely carries information — the video picked
+for the TV and what it is about, the past entry a staged meal was copied from — and judged by its
+content the model flags those, and the room-noise "that wasn't meant for me" replies with them. `take_read_marker` strips it
 before the reply is stored or spoken and sets `voice_messages.needs_read`, which the watch uses to
 keep the answer reachable until it has been on screen (status-hub `docs/WATCH.md`, "Unread answers").
 The replayed day puts the marker back on flagged replies (`_line`), for the same reason the ignore
