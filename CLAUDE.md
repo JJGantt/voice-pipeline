@@ -249,6 +249,11 @@ destination is asked directly and the old row is marked `transferred`. That is t
 mechanism exists for — the laptop is shut and the work should carry on — and it costs whatever the
 session said after its last completed turn, which is nothing, because that is when mirroring runs.
 
+A session that asks to close ITSELF is never closed by a command: closing it mid-turn kills it before
+its reply is written. data-layer stamps `close_after_turn` instead, and the host (`closeAfterTurn`,
+both machines) parks it once that turn's reply has been reported and the transcript mirrored.
+status-hub `docs/SESSIONS.md` has the details.
+
 Closing a session on the Mac is `/exit` typed into the tab, then SIGTERM if it is ignored. A Terminal
 TAB does not understand AppleScript's `close` (it answers -1708), which is why `closeTabForTty` used
 to report failure and close nothing; the window is closed only when that tab is the last one in it.
