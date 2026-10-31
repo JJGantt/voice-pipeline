@@ -199,6 +199,9 @@ def _demote(logger_name, test):
 # One ESP32 drop is a blip and is not reported; a run of them is the puck's link failing, and is.
 ESP_DROP_WINDOW_S = 600.0
 ESP_DROP_LIMIT = 5                # more drops than this inside the window opens an incident
+# One loss of the link ends the open socket AND fails the reconnect handshakes already in flight, all
+# inside the same second or two; counted separately, a single blip reads as three drops.
+ESP_DROP_COALESCE_S = 5.0
 _esp_drops: deque = deque()
 _esp_drops_reported = False       # one report per run of drops; re-armed once the window is clear
 
@@ -206,6 +209,8 @@ _esp_drops_reported = False       # one report per run of drops; re-armed once t
 def _note_esp_drop(kind):
     global _esp_drops_reported
     now = time.monotonic()
+    if _esp_drops and now - _esp_drops[-1] < ESP_DROP_COALESCE_S:
+        return
     _esp_drops.append(now)
     while _esp_drops and now - _esp_drops[0] > ESP_DROP_WINDOW_S:
         _esp_drops.popleft()
