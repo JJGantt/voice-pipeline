@@ -187,7 +187,9 @@ Every turn also gets `READ_DIRECTIVE`: a reply to a QUESTION ends with the `[[re
 reply to a request to DO something does not. The directive is worded around what he asked for, not
 what the reply contains, because a confirmation routinely carries information — the video picked
 for the TV and what it is about, the past entry a staged meal was copied from — and judged by its
-content the model flags those, and the room-noise "that wasn't meant for me" replies with them. `take_read_marker` strips it
+content the model flags those, and the room-noise "that wasn't meant for me" replies with them. A
+request that FAILED, or only partly worked, is flagged regardless: he gives a command and looks away
+assuming it worked, so a failure is exactly the reply he must not miss. `take_read_marker` strips it
 before the reply is stored or spoken and sets `voice_messages.needs_read`, which the watch uses to
 keep the answer reachable until it has been on screen (status-hub `docs/WATCH.md`, "Unread answers").
 The replayed day puts the marker back on flagged replies (`_line`), for the same reason the ignore

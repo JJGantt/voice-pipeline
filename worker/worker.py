@@ -495,8 +495,10 @@ READ_DIRECTIVE = (
     "thing. If he asked you to DO something, leave it off, even when your reply describes what you "
     "picked, copied, looked up along the way or worked out to do it: logging, staging or editing food, "
     "a set, a list item, a light, putting something on the TV, starting, moving or messaging a session. "
-    "Also leave it off when you did nothing because the words were not meant for you. The marker is "
-    "removed before he sees the reply.]"
+    "Also leave it off when you did nothing because the words were not meant for you. One exception "
+    "overrides all of this: if anything you tried to do for him failed, was refused, only partly "
+    "worked, or could not be done, ALWAYS end with the marker, because he assumes it worked and needs "
+    "to find out it did not. The marker is removed before he sees the reply.]"
 )
 
 
