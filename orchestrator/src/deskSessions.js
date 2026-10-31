@@ -19,7 +19,7 @@
 // before was kept "running" by the next session opened in its tab, which then never got a row of its
 // own.
 import { config } from './config.js';
-import { deskSessionsFor, patchDeskSession, upsertDeskSession } from './supabase.js';
+import { deskSession, deskSessionsFor, patchDeskSession, upsertDeskSession } from './supabase.js';
 import { sweepStashedPrompts } from './handoff.js';
 import { liveClaudeSessions } from './discover.js';
 import { mirrorUp, mirrorReset } from './mirror.js';
@@ -27,7 +27,8 @@ import { readTail } from './transcripts.js';
 import { syncSessionWatch, reportTurnEnd } from './sessionWatch.js';
 import { relayFirstReply } from './relay.js';
 import { reapIdle } from './idle.js';
-import { closeHuskForTty } from './applescript.js';
+import { closeHuskForTty, closeTabForTty } from './applescript.js';
+import { sessionOf } from './discover.js';
 import fs from 'node:fs';
 
 // A tab is opened, the shell starts, then claude starts. Ending a session that is still coming up
@@ -289,6 +290,40 @@ async function reconcile(row, proc) {
     await patchDeskSession(row.id, { ...changes, last_seen: patch.last_seen });
   }
   if (unreported) reportTurnEnd(row.id, tail);
+  // The net under the watcher for a self-close whose turn end fs.watch dropped.
+  if (alive && !busy && row.close_after_turn) await closeAfterTurn(row.id, tail);
+}
+
+// Sessions being closed right now, so the watcher and the tick never both close one.
+const closing = new Set();
+
+/**
+ * Close a session that asked to close itself (end_session on its own row stamps `close_after_turn`),
+ * once the turn it asked in has ended and its reply is out. Asked mid-turn, closing at once would kill
+ * the process before the reply is written. Re-reads the row: the flag is set mid-turn, after the tick
+ * that the watcher's rows came from.
+ */
+async function closeAfterTurn(id, tail) {
+  if (closing.has(id)) return;
+  closing.add(id);
+  try {
+    const row = await deskSession(id);
+    if (!row || row.status !== 'resident' || !row.close_after_turn) return;
+    if (!tail?.replyAt || ms(tail.replyAt) <= ms(row.close_after_turn)) return;
+    if (row.pid && sessionOf(row.pid)?.busy) return;   // still writing; the next turn end or tick closes it
+    const patch = { status: row.claude_session_id ? 'evicted' : 'ended', ended: new Date().toISOString(),
+                    working: false, close_after_turn: null };
+    // The whole conversation goes up first, so it can be resumed on either machine.
+    if (row.claude_session_id && row.transcript_path) {
+      try {
+        const at = await mirrorUp(row.claude_session_id, row.transcript_path, row.mirror_offset || 0);
+        if (at != null) { patch.mirror_offset = at; patch.mirror_at = new Date().toISOString(); }
+      } catch (e) { console.error(`[desk-sessions] mirror before self-close of ${id}:`, e.message); }
+    }
+    if (row.tty) await closeTabForTty(row.tty);
+    await patchDeskSession(id, patch);
+    console.log(`[desk-sessions] closed ${id} after its reply, as it asked`);
+  } finally { closing.delete(id); }
 }
 
 /**
@@ -381,7 +416,8 @@ async function tick() {
     (id, at) => {
       patchDeskSession(id, { working: true, active_at: at })
         .catch((e) => console.error('[desk-sessions] turn-start patch:', e.message));
-    });
+    },
+    (id, tail) => closeAfterTurn(id, tail));
 }
 
 // One tick at a time. Parking a session takes seconds (`/exit`, then a wait), so a tick that parks

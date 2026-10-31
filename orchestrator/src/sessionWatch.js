@@ -341,7 +341,9 @@ function finish(st) {
   st.chain = st.chain
     .then(() => Promise.race([st.onTurnEnd(st.id, tail), new Promise((r) => setTimeout(r, 10000))]))
     .catch(() => { /* the tick will write it 30s from now regardless */ })
-    .then(() => reportTurnEnd(st.id, tail, mine));
+    .then(() => reportTurnEnd(st.id, tail, mine))
+    .then(() => st.onReported(st.id, tail))
+    .catch((e) => console.error('[sessionWatch] after turn end:', e.message));
 }
 
 /**
@@ -443,8 +445,10 @@ function detach(id) {
  *
  * `onTurnEnd(id, tail)` and `onActivity(id, isoTimestamp)` are the host writing its own row: the Mac
  * and the Pi patch `desk_sessions` through different clients, and this module should not know which.
+ * `onReported(id, tail)` runs once the hub has been told the turn ended — the moment a session that
+ * asked to close itself (`close_after_turn`) can go without losing its reply.
  */
-export function syncSessionWatch(rows, onTurnEnd, onActivity = () => {}) {
+export function syncSessionWatch(rows, onTurnEnd, onActivity = () => {}, onReported = () => {}) {
   const live = new Set();
   for (const r of rows || []) {
     if (r.status !== 'resident' || !r.transcript_path) continue;
@@ -458,7 +462,7 @@ export function syncSessionWatch(rows, onTurnEnd, onActivity = () => {}) {
     // tool calls onto the wall as though they were happening now.
     let offset = 0;
     try { offset = fs.statSync(r.transcript_path).size; } catch { continue; }
-    const st = { id: r.id, path: r.transcript_path, offset, rest: '', watcher: null, timer: null, onTurnEnd, onActivity,
+    const st = { id: r.id, path: r.transcript_path, offset, rest: '', watcher: null, timer: null, onTurnEnd, onActivity, onReported,
                  said: null, queue: [], chain: Promise.resolve(),
                  turn: null, last: null, partial: true, attachOffset: offset };
     watched.set(r.id, st);

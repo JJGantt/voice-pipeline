@@ -203,13 +203,45 @@ async function residentsNow() {
   });
 }
 
+// Sessions being closed right now, so the watcher and the tick never both close one.
+const closing = new Set();
+
+/**
+ * Close a session that asked to close itself (end_session on its own row stamps `close_after_turn`),
+ * once the turn it asked in has ended and its reply is out. Asked mid-turn, closing at once would kill
+ * the process before the reply is written. Re-reads the row: the flag is set mid-turn, after the tick
+ * that the watcher's rows came from. Returns true when it closed it.
+ */
+async function closeAfterTurn(name, tail) {
+  if (closing.has(name)) return false;
+  closing.add(name);
+  try {
+    const row = (await sb(`desk_sessions?id=eq.${encodeURIComponent(name)}&select=*`))?.[0];
+    if (!row || row.status !== 'resident' || !row.close_after_turn) return false;
+    const at = (t) => (t ? Date.parse(t) : 0);
+    if (!tail?.replyAt || at(tail.replyAt) <= at(row.close_after_turn)) return false;
+    if (row.pid && sessionOf(row.pid)?.busy) return false;   // still writing; the next turn end or tick closes it
+    // The whole conversation goes up first, so it can be resumed on either machine.
+    let mirror = {};
+    if (row.claude_session_id && row.transcript_path) {
+      try {
+        const to = await mirrorUp(row.claude_session_id, row.transcript_path, row.mirror_offset || 0);
+        if (to != null) mirror = { mirror_offset: to, mirror_at: new Date().toISOString() };
+      } catch (e) { console.error(`[pi-desk] mirror before self-close of ${name}:`, e.message); }
+    }
+    await park(name, { close_after_turn: null, working: false, ...mirror });
+    console.log(`[pi-desk] closed ${name} after its reply, as it asked`);
+    return true;
+  } finally { closing.delete(name); }
+}
+
 /** Close a session so it can be resumed later, and record that it was parked. */
-async function park(name) {
+async function park(name, extra = {}) {
   await evict(name);
   queueDirty = true;   // memory just came free, so queued work gets another look on the next tick
   await sb(`desk_sessions?id=eq.${encodeURIComponent(name)}`, {
     method: 'PATCH', headers: { Prefer: 'return=minimal' },
-    body: JSON.stringify({ status: 'evicted', ended: new Date().toISOString() }),
+    body: JSON.stringify({ status: 'evicted', ended: new Date().toISOString(), ...extra }),
   }).catch((e) => console.error('[pi-desk] mark evicted:', e.message));
 }
 
@@ -405,6 +437,7 @@ const laterOf = (a, b) => (!a ? b || null : !b ? a : (Date.parse(a) >= Date.pars
 let lastLiveKey = null;
 
 async function reconcileSessions() {
+  const selfClose = [];   // sessions that asked to close themselves and have finished their turn
   const live = await liveSessions();
   const residents = [];
   const liveKey = live.filter((l) => l.alive).map((l) => `${l.name}:${l.pid}`).sort().join(',');
@@ -529,6 +562,13 @@ async function reconcileSessions() {
     if (unreported) reportTurnEnd(name, tail);
     // The net under the watcher's relay below, for a finished turn fs.watch dropped.
     if (!busy) relayFirstReply(name, tail).catch((e) => console.error('[pi-desk] relay:', e.message));
+    // And under the watcher's self-close, for the same dropped turn end. Closed after this loop, so
+    // the publish above cannot land after the park and mark it running again.
+    if (!busy && row?.close_after_turn) selfClose.push([name, tail]);
+  }
+  for (const [name, tail] of selfClose) {
+    const i = residents.findIndex((r) => r.name === name);
+    if (await closeAfterTurn(name, tail) && i >= 0) residents.splice(i, 1);
   }
 
   // Rows we publish that tmux no longer has: mark evicted rather than delete, so the transcript stays
@@ -571,7 +611,8 @@ async function reconcileSessions() {
         method: 'PATCH', headers: { Prefer: 'return=minimal' },
         body: JSON.stringify({ working: true, active_at: at }),
       }).catch((e) => console.error('[pi-desk] turn-start patch:', e.message));
-    });
+    },
+    (id, tail) => closeAfterTurn(id, tail));
 
   const kept = await reapIdleSessions(residents);
   lastResidentCount = kept.length;   // what the next heartbeat publishes to the hub's status strip
