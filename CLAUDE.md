@@ -259,8 +259,12 @@ TAB does not understand AppleScript's `close` (it answers -1708), which is why `
 to report failure and close nothing; the window is closed only when that tab is the last one in it.
 A dispatched session's launch command ends in `exit 0`, so when the session ends by any route its
 shell goes too: with the Terminal profile's "When the shell exits: Close if the shell exited cleanly"
-the TAB closes itself (the only way a tab closes), and without it `closeHuskForTty` closes the window
-when that was its only tab and nothing is left running on the tty.
+(set on the Mac) the tab closes itself, and `closeHuskForTty` is the net when it does not.
+
+**Terminal's AppleScript sees a macOS-native tab as a WINDOW with one tab.** With
+`AppleWindowTabbingMode always`, nine tabs in one window answer as nine one-tab windows, so `count of
+tabs` is always 1 and `close w` closes just that tab. Count tabs with System Events instead (`radio
+buttons of tab group 1` of the window), or a merged window reads as a pile of separate ones.
 
 Sessions open as WINDOWS, not tabs, until the orchestrator's `/usr/local/bin/node` holds the
 Accessibility grant: a tab needs a Cmd-T keystroke, and the plain `do script` fallback opens a window

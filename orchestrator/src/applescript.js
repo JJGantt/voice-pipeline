@@ -324,9 +324,8 @@ export async function openFreshTab(cwd, name, prompt, sessionId = null, resumeId
   const sys = sysText ? ` --append-system-prompt ${shQuote(sysText)}` : '';
   // `exit 0` after claude: a dispatched tab is the session's and nothing else's, so when the session
   // ends, however it ends, the shell goes too. With the profile's "When the shell exits: Close if the
-  // shell exited cleanly" the tab then closes itself — the only way a TAB closes, since AppleScript
-  // cannot close one. Without that setting it is left as "[Process completed]", which
-  // closeHuskForTty clears when it is a window's only tab.
+  // shell exited cleanly" the tab then closes itself. Without that setting it is left as "[Process
+  // completed]", which closeHuskForTty clears.
   return runInNewTerminal(`cd ${shQuote(cwd)}; ${env}${shQuote(config.CLAUDE_BIN)}${model}${resume}${rc}${sys}${first}; exit 0`);
 }
 
