@@ -469,6 +469,21 @@ def _client_token(ws) -> str | None:
     return None
 
 
+async def _device_frames(ws, peer):
+    """The device's messages, ending quietly when it drops off without a close frame.
+
+    The ESP32 losing WiFi or rebooting ends the TCP stream with no close handshake, which websockets
+    raises as ConnectionClosedError. That is an ordinary disconnect (the puck reconnects within a
+    second), not a fault: left uncaught it escapes the handler, websockets logs it at ERROR (an ops
+    incident), and the handler's own cleanup after the loop never runs.
+    """
+    try:
+        async for msg in ws:
+            yield msg
+    except websockets.exceptions.ConnectionClosedError as e:
+        log.info("ESP32 dropped without a close frame: %s (%s)", peer, e)
+
+
 async def connection(ws):
     global _active_esp, _led_working, _led_capturing, _last_esp_frame, _led_last_sent
     peer = getattr(ws, "remote_address", "?")
@@ -519,7 +534,7 @@ async def connection(ws):
     mute_flush = False              # mute landed mid-capture on audio worth keeping → close it, don't bin it
     last_confirm = None             # wall-clock of the last confirm (send-suppression vs the other mic)
 
-    async for msg in ws:
+    async for msg in _device_frames(ws, peer):
         if not isinstance(msg, (bytes, bytearray)):
             # Non-audio control text from the device (e.g. "RSSI -67" signal telemetry). Log it so
             # WiFi signal strength is visible in `fly logs`, then keep going — it isn't audio.
