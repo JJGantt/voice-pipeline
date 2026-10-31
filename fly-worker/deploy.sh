@@ -18,4 +18,27 @@ cp $GV/govee_mcp.py govee-mcp/
 cp $GM/gmail_mcp.py gmail-mcp/   # the script only: its .env holds the credential, which Fly keeps as secrets
 cp $VP/worker/worker.py worker.py
 cp $VP/worker/ops_report.py ops_report.py   # health/responder reporter, which worker.py imports
-flyctl deploy --now -a jared-voice-worker --build-arg CLAUDE_CODE_VERSION="$(npm view @anthropic-ai/claude-code version)" "$@"
+# Build and push first, then swap the machine only while the worker is idle. A deploy stops the worker
+# with about 6-8s of grace (Fly follows SIGINT with SIGTERM and entrypoint.sh exits on it), and a turn
+# still running then is closed as an orphan and never answered; a build takes minutes, so gating only
+# the swap keeps that window to the few seconds the machine update itself takes.
+LABEL="deploy-$(date +%s)"
+flyctl deploy --build-only --push -a jared-voice-worker --image-label "$LABEL" \
+  --build-arg CLAUDE_CODE_VERSION="$(npm view @anthropic-ai/claude-code version)" "$@"
+wait_idle() {
+  local url="${SUPABASE_URL:-}" key="${SUPABASE_KEY:-}" busy i
+  if [ -z "$key" ] && [ -f "$DL/.env" ]; then
+    url=$(sed -n 's/^SUPABASE_URL=//p' "$DL/.env"); key=$(sed -n 's/^SUPABASE_KEY=//p' "$DL/.env")
+  fi
+  if [ -z "$key" ]; then echo "no Supabase key here; deploying without waiting for an idle worker" >&2; return; fi
+  for i in $(seq 1 60); do   # 5 minutes at most; a hub turn is well under that
+    busy=$(curl -fsS "$url/rest/v1/voice_requests?status=eq.claimed&claimed_by=eq.fly&select=id" \
+           -H "apikey: $key" -H "Authorization: Bearer $key") || { echo "idle check failed; deploying anyway" >&2; return; }
+    [ "$busy" = "[]" ] && return
+    [ "$i" = 1 ] && echo "worker is mid-turn; waiting for it to finish before swapping the machine"
+    sleep 5
+  done
+  echo "worker still busy after 5 minutes; deploying anyway" >&2
+}
+wait_idle
+flyctl deploy --now -a jared-voice-worker --image "registry.fly.io/jared-voice-worker:$LABEL"

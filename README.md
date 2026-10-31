@@ -33,7 +33,9 @@ ESP32 (I2S mic) ──wss://jared-voice.fly.dev/ws/audio──▶  Fly: jared-vo
 - `entrypoint.sh` restarts the worker whenever it exits, passes Fly's stop signal on to it, and
   updates Claude Code daily.
 - Deploy: `fly-worker/deploy.sh`, which assembles the build context from the checkouts and bakes in
-  the newest Claude Code. Secrets: `SUPABASE_URL`, `SUPABASE_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`,
+  the newest Claude Code. It builds and pushes first, then waits (up to 5 minutes) until no request is
+  claimed by `fly` before swapping the machine, because a turn running at the swap is orphaned and
+  never answered. Secrets: `SUPABASE_URL`, `SUPABASE_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`,
   `GOVEE_API_KEY`, `LED_TOKEN`.
 - It is a separate app from `jared-voice` because, sharing one, a deploy of either restarted both and
   the worker shared a CPU with transcription.
