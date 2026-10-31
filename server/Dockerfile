@@ -24,7 +24,7 @@ COPY govee-mcp/sync_devices.py /app/govee-mcp/sync_devices.py
 
 # app code
 WORKDIR /app
-COPY server.py entrypoint.sh ./
+COPY server.py ops_report.py entrypoint.sh ./
 
 EXPOSE 8080
 CMD ["./entrypoint.sh"]

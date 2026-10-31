@@ -180,6 +180,11 @@ ACCEPT_MAX_S = 15.0          # score at most this much of the clip: the encode i
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("voice")
 
+# Errors (log.error and anything uncaught) go to the ops responder (health/responder) through a copy of
+# its reporter (edit it there). A warning is for a failure a retry or fallback is already handling.
+import ops_report as ops  # noqa: E402
+ops.install(machine="fly", service="voice-server")
+
 groq = Groq(api_key=os.environ["GROQ_API_KEY"])
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")   # second transcription provider, after Groq
 oww = Model(wakeword_models=[WAKE_MODEL, WAKE_MODEL_POWER], inference_framework="onnx")
@@ -342,7 +347,7 @@ async def _open_request(cap_start: str | None = None, cap_end: str | None = None
             rows = r.json()
             return rows[0]["id"] if isinstance(rows, list) and rows else None
     except Exception as e:  # noqa: BLE001
-        log.warning("open-request failed: %s", e)
+        log.error("open-request failed: %s", e)
         return None
 
 
@@ -362,7 +367,7 @@ async def _close_request_error(rid: str, err: str) -> None:
                       "updated_at": datetime.now(timezone.utc).isoformat()},
             )
     except Exception as e:  # noqa: BLE001
-        log.warning("close-request failed: %s", e)
+        log.error("close-request failed: %s", e)
 
 
 async def handle_transcript(text: str, duration_s: float, truncated: bool,
@@ -432,7 +437,7 @@ async def handle_transcript(text: str, duration_s: float, truncated: bool,
                 )
         return True
     except Exception as e:
-        log.warning("supabase enqueue failed: %s", e)
+        log.error("supabase enqueue failed: %s", e)
         return False
 
 
@@ -961,7 +966,7 @@ def _get_settings(keys):
                       timeout=15)
         return {row["key"]: row["value"] for row in r.json()}
     except Exception as e:  # noqa: BLE001
-        log.warning("settings read failed: %s", e)
+        log.error("settings read failed: %s", e)
         return {}
 
 
@@ -1393,7 +1398,7 @@ async def _settings_listener() -> None:
                     rec = (payload.get("data") or {}).get("record") or {}
                     _apply_setting(rec.get("key"), rec.get("value"))
                 except Exception as e:  # noqa: BLE001
-                    log.warning("settings apply failed: %s", e)
+                    log.error("settings apply failed: %s", e)
 
             def _on_request(payload) -> None:
                 # Authoritative LED 'working' state from the command lifecycle itself: in flight
@@ -1457,8 +1462,17 @@ async def _settings_listener() -> None:
         await asyncio.sleep(5.0)
 
 
+async def _ops_beat():
+    """The server is event-driven, so the event loop is its work loop: this beat stops when the loop is
+    blocked or the process is gone (health/responder)."""
+    while True:
+        ops.beat(60)
+        await asyncio.sleep(60)
+
+
 async def main():
     log.info("voice backend up on :%d  wake=%s  stt=%s", PORT, WAKE_MODEL, GROQ_MODEL)
+    asyncio.create_task(_ops_beat())
     asyncio.create_task(_settings_listener())   # Fly owns its own state (app_settings: boot + live)
     asyncio.create_task(_alive_beacon())        # ESP-mic liveness → voice_presence.alive_at
     # ping_interval=None: the ESP32 is a continuous PCM pump and doesn't reliably answer
