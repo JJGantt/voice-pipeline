@@ -331,15 +331,15 @@ async function onHeavy(name, usage) {
   if (moving.has(name)) return;
   moving.add(name);
   try {
-    const why = `holding ${usage.anonMb}MB, over its ${SESSION_BUDGET_MB}MB budget on the Pi`;
+    const why = `its work was holding ${usage.anonMb}MB, over its ${SESSION_BUDGET_MB}MB budget on the Pi, which is not for memory-heavy work`;
     if (!(await macIsAwake(false))) {
-      console.log(`[pi-desk] ${name} is ${why}, and the Mac is asleep — it stays, unthrottled`);
+      console.log(`[pi-desk] ${name}: ${why}. The Mac is asleep — it stays, unthrottled`);
       liftBudget(name);
       return;
     }
     const row = (await sb(`desk_sessions?id=eq.${encodeURIComponent(name)}&select=*`))?.[0];
     if (!row?.claude_session_id) {
-      console.log(`[pi-desk] ${name} is ${why}, but has no transcript to move — it stays, unthrottled`);
+      console.log(`[pi-desk] ${name}: ${why}, but it has no transcript to move — it stays, unthrottled`);
       liftBudget(name);
       return;
     }
@@ -350,7 +350,7 @@ async function onHeavy(name, usage) {
     const pid = (await liveSessions()).find((l) => l.name === name)?.pid;
     const rec = pid ? sessionOf(pid) : null;
     const midTurn = rec?.busy === true && !rec.waiting;
-    console.log(`[pi-desk] ${name} is ${why} — moving it to the Mac (${midTurn ? 'mid-turn' : 'between turns'})`);
+    console.log(`[pi-desk] ${name}: ${why} — moving it to the Mac (${midTurn ? 'mid-turn' : 'between turns'})`);
     await evict(name);
     const id = await handResumeToMac(row, midTurn ? MOVED_MARKER : null, why);
     console.log(`[pi-desk] ${name} handed to the Mac as ${id}`);
@@ -1053,6 +1053,13 @@ async function run(cmd) {
     const row = rows?.[0];
     if (!row) throw new Error(`no such session: ${id}`);
     if (!row.claude_session_id) throw new Error(`${id} has no transcript recorded — nothing to hand over`);
+    // A session that moves ITSELF — because the work needs the Mac (an iOS build, the login keychain) —
+    // is always mid-turn: the move is the tool call it is making. Closing it cuts that turn off, so
+    // the Mac restarts it with the marker and the moved note, as for heavy work (onHeavy), or it lands
+    // there idle and the task stops. Read from the live process before it is closed.
+    const pid = (await liveSessions()).find((l) => l.name === id)?.pid;
+    const rec = pid ? sessionOf(pid) : null;
+    const midTurn = to === 'mac' && rec?.busy === true && !rec.waiting;
     await evict(id);
     const at = await mirrorUp(row.claude_session_id, row.transcript_path, row.mirror_offset || 0);
     const now = new Date().toISOString();
@@ -1065,7 +1072,8 @@ async function run(cmd) {
       method: 'POST', headers: { Prefer: 'return=minimal' },
       body: JSON.stringify({ id: randomUUID(), kind: 'resume_mirrored',
                              payload: { target: to, claude_session_id: row.claude_session_id, repo: row.repo,
-                                        label: row.label, origin: row.origin || 'dispatched', from: MACHINE } }),
+                                        label: row.label, origin: row.origin || 'dispatched', from: MACHINE,
+                                        ...(midTurn ? { prompt: MOVED_MARKER, moved: 'it was transferred there while working, so it can use the Mac', mid_turn: true } : {}) } }),
     });
     return `handed ${id} to the ${{ mac: 'Mac', pi: 'Pi', fly: 'Fly machine' }[to]}`;
   }
