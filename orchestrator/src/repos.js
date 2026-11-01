@@ -20,6 +20,7 @@ import { promisify } from 'node:util';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { codexReady } from './codex.js';
 import { config } from './config.js';
 import { upsertRepos, pruneRepos, heartbeatDesk } from './supabase.js';
 import { loginExpiresAt } from './login.js';
@@ -128,7 +129,8 @@ let failingSince = null;
 
 async function beat() {
   try {
-    await heartbeatDesk('desk', { host: os.hostname(), login_expires_at: loginExpiresAt() });
+    // `codex`: whether a Codex session can start here (data-layer routes agent=codex on it).
+    await heartbeatDesk('desk', { host: os.hostname(), login_expires_at: loginExpiresAt(), codex: codexReady() });
     failingSince = null;
   } catch (e) {
     const cause = e.cause ? ` (${e.cause.code || e.cause.message || e.cause})` : '';

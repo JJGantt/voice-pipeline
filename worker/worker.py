@@ -1393,13 +1393,17 @@ def set_cmd_ts(value: str | None) -> None:
         log_error(f"cmd_ts write failed: {e}")   # a stale stamp is worse than none, so this is never fatal
 
 
-def mcp_servers() -> dict:
-    """Every MCP server a hub turn gets, keyed by name, in Claude Code's --mcp-config shape."""
+def mcp_servers(codex_sessions: bool = False) -> dict:
+    """Every MCP server a hub turn gets, keyed by name, in Claude Code's --mcp-config shape.
+
+    `codex_sessions` is for a turn running because Claude could not take it (the Codex fallback, the
+    credits runner at the usage limit): sessions it dispatches start on Codex (DATA_AGENT, read by
+    data-layer start_session), since a Claude session would hit the same wall."""
     env = {"SUPABASE_URL": SUPABASE_URL, "SUPABASE_KEY": SUPABASE_KEY}
     # DATA_CALLER=hub marks sessions this worker dispatches, so their first reply is relayed back
     # into the hub thread (data-layer startSession → orchestrator/src/relay.js).
     data_env = {**env, "DATA_TS_FILE": str(CMD_TS_FILE),
-                "DATA_CALLER": "hub"}
+                "DATA_CALLER": "hub", **({"DATA_AGENT": "codex"} if codex_sessions else {})}
     cfg = {
         "mcpServers": {
             "data": {"command": "node", "args": [DATA_MCP_JS], "env": data_env},
@@ -1423,8 +1427,8 @@ def mcp_servers() -> dict:
     return cfg["mcpServers"]
 
 
-def write_mcp_config() -> str:
-    cfg = {"mcpServers": mcp_servers()}
+def write_mcp_config(codex_sessions: bool = False) -> str:
+    cfg = {"mcpServers": mcp_servers(codex_sessions)}
     # alwaysLoad makes Claude Code connect a server BEFORE the first turn. Without it, `-p` connects
     # --mcp-config servers in the background and the model's first request carries only whichever ones
     # had finished starting: on Fly the voice server (~1.6s) made it and data (~2s) did not, so the
@@ -1775,7 +1779,8 @@ class SdkRunner:
             # the alias "sonnet" resolves to whatever model THAT copy knows. Running the installed CLI keeps
             # this path on the same models as every other turn instead of drifting a release behind.
             cli_path=shutil.which(CLAUDE_BIN),
-            mcp_servers=write_mcp_config(),
+            # The credits runner is the usage-limit fallback, so the sessions it starts run on Codex.
+            mcp_servers=write_mcp_config(codex_sessions=self.credits),
             allowed_tools=list(self.tools),
             disallowed_tools=list(SESSION_TOOLS),   # browser-only: out of sight entirely
             # The stable hub framing lives here so the prefix caches across turns; per-turn context
@@ -1916,8 +1921,8 @@ class SdkRunner:
 # Billed to Jared's ChatGPT plan through `codex exec`, which is the only programmatic way in: the plan has
 # no API access. Used for a watch/phone/web hub turn that Claude could not answer at all (the subscription
 # failed for a reason other than its usage limit, or the credits run failed too) and that called no tool
-# first, so nothing is done twice. It gets the same MCP servers minus start_session: it exists to keep
-# nutrition, lists and the rest of life data working, not to dispatch work. Each machine signs in to
+# first, so nothing is done twice. It gets the same MCP servers, start_session included, and a session it
+# dispatches runs on Codex too (DATA_AGENT, `mcp_servers(codex_sessions=True)`). Each machine signs in to
 # Codex separately (`codex login --device-auth`): a ChatGPT login copied between machines breaks when
 # one of them rotates the refresh token.
 CODEX_BIN = shutil.which(os.environ.get("CODEX_BIN", "codex"))
@@ -1947,7 +1952,7 @@ def run_codex(prompt: str) -> dict:
     """One hub turn on Codex. Same result shape as an SDK turn; `used_tools` is True whenever it ran,
     since nothing here reports what it called."""
     over = ["-c", 'approval_policy="never"', "-c", 'model_reasoning_effort="medium"']
-    for name, srv in mcp_servers().items():
+    for name, srv in mcp_servers(codex_sessions=True).items():
         key = f"mcp_servers.{name}"   # bare: `-c` splits the path on dots and does not unquote a segment
         if srv.get("type") == "http":
             over += ["-c", f"{key}.url={_toml(srv['url'])}"]
@@ -1958,8 +1963,6 @@ def run_codex(prompt: str) -> dict:
             if srv.get("env"):
                 over += ["-c", f"{key}.env={_toml(srv['env'])}"]
         over += ["-c", f'{key}.default_tools_approval_mode="approve"']
-        if name == "data":
-            over += ["-c", f'{key}.disabled_tools=["start_session"]']
     fd, out = tempfile.mkstemp(prefix="voice-codex-", suffix=".txt")
     os.close(fd)
     full = HUB_SYSTEM + "\n\n" + SHARED_STATE_NOTE + "\n\n" + prompt

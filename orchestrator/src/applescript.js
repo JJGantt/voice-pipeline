@@ -114,11 +114,12 @@ export async function enumerateTtys() {
 //
 // The window is closed only when that tab is the last one in it: closing a window with other tabs
 // takes unrelated sessions down with it.
+// The agent's process on a tty: `claude`, or a Codex session's native `codex`.
 async function claudePidOnTty(tty) {
   try {
     const { stdout } = await execFileP('ps', ['-t', tty.replace('/dev/', ''), '-o', 'pid=,comm='], { timeout: 10000 });
     const hit = stdout.split('\n').map((l) => l.trim().split(/\s+/))
-      .find(([, comm]) => comm && comm.split('/').pop() === 'claude');
+      .find(([, comm]) => comm && ['claude', 'codex'].includes(comm.split('/').pop()));
     return hit ? Number(hit[0]) : null;
   } catch { return null; }
 }
@@ -131,8 +132,8 @@ export async function closeTabForTty(tty) {
   if (running !== 'true') return false;
   if (!(await claudePidOnTty(tty))) return false;   // nothing running there
 
-  // `/exit` is Claude Code's own way out: it flushes the transcript and leaves the repo alone. A
-  // signal would do neither, which is why it is only the fallback.
+  // `/exit` is Claude Code's own way out (and Codex's): it flushes the transcript and leaves the repo
+  // alone. A signal would do neither, which is why it is only the fallback.
   await osascript(
     `tell application "Terminal"
        repeat with w in windows
@@ -327,6 +328,18 @@ export async function openFreshTab(cwd, name, prompt, sessionId = null, resumeId
   // shell exited cleanly" the tab then closes itself. Without that setting it is left as "[Process
   // completed]", which closeHuskForTty clears.
   return runInNewTerminal(`cd ${shQuote(cwd)}; ${env}${shQuote(config.CLAUDE_BIN)}${model}${resume}${rc}${sys}${first}; exit 0`);
+}
+
+// A Codex session is started by the same launcher the Pi uses (pi-desk/launch-codex.sh): the flags that
+// make an unattended Codex session work are one list, kept there. It reads and deletes the prompt file.
+const CODEX_LAUNCHER = new URL('../../pi-desk/launch-codex.sh', import.meta.url).pathname;
+
+/** openFreshTab for a Codex session: a new tab running `codex` in `cwd`, or `codex resume <id>`. */
+export async function openCodexTab(cwd, name, prompt, sessionId, resumeId = null) {
+  const pf = prompt ? promptFile(prompt) : '';
+  // `exit 0` after it, for the reason given in openFreshTab.
+  return runInNewTerminal(`cd ${shQuote(cwd)}; DESK_MACHINE=mac ${shQuote(CODEX_LAUNCHER)} ${shQuote(cwd)} `
+    + `${shQuote(name || 'root')} ${shQuote(pf)} ${shQuote(resumeId || '')} ${shQuote(sessionId || '')}; exit 0`);
 }
 
 /**

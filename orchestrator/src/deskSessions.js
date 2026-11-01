@@ -29,6 +29,7 @@ import { relayFirstReply } from './relay.js';
 import { reapIdle } from './idle.js';
 import { closeHuskForTty, closeTabForTty } from './applescript.js';
 import { sessionOf } from './discover.js';
+import { liveCodexSessions, codexSessionOf } from './codex.js';
 import fs from 'node:fs';
 
 // A tab is opened, the shell starts, then claude starts. Ending a session that is still coming up
@@ -69,7 +70,7 @@ function startedWith(row, p) {
 function processOf(row, live, byPid, claimed) {
   if (row.pid) {
     const p = byPid.get(row.pid);
-    return p && startedWith(row, p) ? p : null;
+    return p && p.agent === (row.agent || 'claude') && startedWith(row, p) ? p : null;
   }
   // Not recorded yet: a dispatch whose claude is still coming up, or a row from before rows carried a
   // pid. Its process is the claude on its tab that started with it.
@@ -244,7 +245,8 @@ async function reconcile(row, proc) {
   // Idle-only on purpose: uploading mid-turn would ship half an answer, and the tail is re-read on
   // the next tick anyway. This is what makes a session pickable up on the other machine later —
   // including when this one is asleep, which is exactly when it matters.
-  if (tail && !busy && row.claude_session_id && tail.bytes > (row.mirror_offset || 0)) {
+  // A Codex rollout is not mirrored: Codex sessions are resumed only on the machine that ran them.
+  if (tail && !busy && row.claude_session_id && row.agent !== 'codex' && tail.bytes > (row.mirror_offset || 0)) {
     try {
       const at = await mirrorUp(row.claude_session_id, row.transcript_path, row.mirror_offset || 0);
       if (at != null) { patch.mirror_offset = at; patch.mirror_at = new Date().toISOString(); }
@@ -310,11 +312,12 @@ async function closeAfterTurn(id, tail) {
     const row = await deskSession(id);
     if (!row || row.status !== 'resident' || !row.close_after_turn) return;
     if (!tail?.replyAt || ms(tail.replyAt) <= ms(row.close_after_turn)) return;
-    if (row.pid && sessionOf(row.pid)?.busy) return;   // still writing; the next turn end or tick closes it
+    const rec = row.pid ? (row.agent === 'codex' ? codexSessionOf(row.pid) : sessionOf(row.pid)) : null;
+    if (rec?.busy) return;   // still writing; the next turn end or tick closes it
     const patch = { status: row.claude_session_id ? 'evicted' : 'ended', ended: new Date().toISOString(),
                     working: false, close_after_turn: null };
     // The whole conversation goes up first, so it can be resumed on either machine.
-    if (row.claude_session_id && row.transcript_path) {
+    if (row.claude_session_id && row.transcript_path && row.agent !== 'codex') {
       try {
         const at = await mirrorUp(row.claude_session_id, row.transcript_path, row.mirror_offset || 0);
         if (at != null) { patch.mirror_offset = at; patch.mirror_at = new Date().toISOString(); }
@@ -360,14 +363,16 @@ async function tick() {
   let rows;
   try { rows = await deskSessionsFor('desk'); }
   catch (e) { return console.error('[desk-sessions] list:', e.message); }
-  const live = await liveClaudeSessions();
+  // Codex sessions (`agent = 'codex'`) too, read from the rollout each holds open (codex.js). Only the
+  // ones a row was written for: a `codex` Jared opens by hand is not adopted.
+  const live = [...(await liveClaudeSessions()).map((p) => ({ ...p, agent: 'claude' })), ...liveCodexSessions()];
   const byPid = new Map(live.map((p) => [p.pid, p]));
   const claimed = new Set();
 
   // Every running row finds its process first, so what is left over is exactly what nobody tracks.
   const residents = rows.filter((r) => r.status === 'resident');
   for (const row of residents) {
-    const proc = processOf(row, live, byPid, claimed);
+    const proc = processOf(row, live.filter((p) => p.agent === (row.agent || 'claude')), byPid, claimed);
     if (proc) claimed.add(proc.pid);
     try {
       await reconcile(row, proc);
@@ -392,7 +397,7 @@ async function tick() {
   }
   if (!launching) {
     for (const s of live) {
-      if (claimed.has(s.pid)) continue;
+      if (claimed.has(s.pid) || s.agent === 'codex') continue;
       try { await adopt(s, rows); }
       catch (e) { console.error('[desk-sessions] adopt:', e.message); }
     }

@@ -26,6 +26,7 @@ import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { config } from './config.js';
 import { readTail, turnStart, turnStartBefore, resolvePrompt, gist, flatten, fromHim } from './transcripts.js';
+import { codexPrompt, codexCommentary, codexToolLine, codexTurnStart, codexTurnEnd } from './codex.js';
 
 // fs.watch fires several times for one append, so coalesce. Long enough to batch a write, far short
 // of anything a person notices.
@@ -150,6 +151,7 @@ function emit(st, body) {
  * Returns true when the record ends the turn.
  */
 export function step(st, d, out, live) {
+  if (CODEX_RECORDS.has(d.type)) return codexStep(st, d, out, live);
   // TYPED WHILE A TURN IS RUNNING. Claude Code QUEUES it and writes `queue-operation` records; there
   // is no `user` record at all for one absorbed into a running turn. Two moments, and they are
   // different facts:
@@ -249,6 +251,46 @@ export function step(st, d, out, live) {
   // a turn ends with `end_turn` — the same marker readTail keys off.
   if (msg.stop_reason === 'end_turn') { st.said = null; return true; }
   return false;
+}
+
+// A Codex rollout's record types (codex.js). Claude Code's are `user`, `assistant`, `queue-operation`
+// and its bookkeeping types, none of which a rollout uses, so the type alone says which reader applies.
+const CODEX_RECORDS = new Set(['session_meta', 'event_msg', 'response_item', 'turn_context', 'world_state',
+                               'token_usage_record', 'compacted']);
+
+/**
+ * One Codex rollout record, as the same events `step` makes of a Claude transcript record.
+ *
+ * A turn is `task_started` .. `task_complete` / `turn_aborted`. His words are the UserMessage item, which
+ * Codex writes when a prompt reaches the model — at the turn's start, or mid-turn for words typed while it
+ * works (Codex steers the running turn with them rather than queueing them, so there is no `queued`
+ * moment to report). What it says between tool calls is an AgentMessage item that is not the final
+ * answer; the final answer arrives on `done`, read by readTail like any reply.
+ */
+function codexStep(st, d, out, live) {
+  const turn = codexTurnStart(d);
+  if (turn !== null) {
+    st.turn = newTurn({ uuid: turn, timestamp: d.timestamp });
+    if (live && typeof d.timestamp === 'string') {
+      try { st.onActivity(st.id, d.timestamp); } catch { /* the tick writes it regardless */ }
+    }
+    return false;
+  }
+  const said = codexPrompt(d);
+  if (said) {
+    // Older rollouts record the same words twice (a `user_message` event and the item); once is the event.
+    const flat = flatten(said);
+    if (st.lastSaid === flat && st.lastSaidTurn === (st.turn && st.turn.key)) return false;
+    st.lastSaid = flat; st.lastSaidTurn = st.turn && st.turn.key;
+    const cmd = takeExpect(st.id, said);
+    out({ session: st.id, state: 'said', text: said, id: randomUUID(), ...(cmd ? { cmd } : {}) });
+    return false;
+  }
+  const words = codexCommentary(d);
+  if (words) { out({ session: st.id, state: 'text', text: words }); return false; }
+  const tool = codexToolLine(d);
+  if (tool) { out({ session: st.id, state: 'tool', text: tool }); return false; }
+  return codexTurnEnd(d);
 }
 
 /**

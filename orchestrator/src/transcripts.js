@@ -8,6 +8,8 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+// A Codex session's transcript is its rollout, read by codex.js; readTail hands it over.
+import { isRollout, readCodexTail } from './codex.js';
 
 const PROJECTS = process.env.CLAUDE_PROJECTS_DIR || path.join(os.homedir(), '.claude', 'projects');
 
@@ -240,6 +242,7 @@ const PROMPT_CACHE_MAX = 200;
  * or written by an older version. Reporting the last thing said beats reporting nothing.
  */
 export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
+  if (isRollout(transcriptPath)) return readCodexTail(transcriptPath, { maxBytes });
   const empty = { working: false, lastReply: null, replyAt: null, turnAt: null, title: null, customTitle: null, bytes: 0, lastActivity: 0 };
   // Only ever a regular file. A path that is anything else must not be read: `desk_sessions` rows
   // written before the tty got its own column carry a device path here, and readFileSync on

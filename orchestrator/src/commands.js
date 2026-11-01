@@ -24,6 +24,10 @@ const exec = promisify(execFile);
 import { pendingCommands, claimCommand, finishCommand, upsertDeskSession, deskSession,
          patchDeskSession, deadLetterCommand, abandonedClaims, insertCommand } from './supabase.js';
 import { awaitSessionOn, sessionOf } from './discover.js';
+import { awaitCodexOn, codexSessionOf, codexReady } from './codex.js';
+
+/** The conversation a row's process is in, read the way its agent records it. */
+const sessionFor = (row) => (!row?.pid ? null : row.agent === 'codex' ? codexSessionOf(row.pid) : sessionOf(row.pid));
 import { beginLaunch, endLaunch } from './deskSessions.js';
 import { watchTable } from './realtime.js';
 import { isKnownRepo } from './repos.js';
@@ -33,7 +37,7 @@ import { isKnownRepo } from './repos.js';
 const [MOVED_NOTE, MOVED_MID_TURN, MOVED_BETWEEN_TURNS] = fs.readFileSync(new URL('../moved-session.txt', import.meta.url), 'utf8')
   .split(/^---$/m).map((s) => s.trim());
 import { ensureTrusted } from './trust.js';
-import { openFreshTab, sendToTty, closeTabForTty } from './applescript.js';
+import { openFreshTab, openCodexTab, sendToTty, closeTabForTty } from './applescript.js';
 import { withAttachments, transcriptSize, awaitSubmitted } from './handoff.js';
 import { expectPrompt } from './sessionWatch.js';
 import { mirrorUp, mirrorDown } from './mirror.js';
@@ -93,7 +97,7 @@ function repoDir(name) {
 async function deliver(row, text, { expect = null, cmd = null } = {}) {
   if (!row) throw new Error('no such session');
   if (!row.tty) throw new Error(`no terminal recorded for ${row.id}`);
-  const s = row.pid ? sessionOf(row.pid) : null;
+  const s = sessionFor(row);
   if (s?.waiting) throw new Error(`${row.id} is waiting on a ${s.waiting} — not typing into it`);
   const tpath = s?.transcriptPath || row.transcript_path || null;
   const from = tpath ? transcriptSize(tpath) : 0;
@@ -132,6 +136,12 @@ async function run(cmd) {
     const row = await deskSession(id);
     if (!row) throw new Error(`no such session: ${id}`);
     if (row.status !== 'resident') throw new Error(`${id} is not running`);
+    // Codex has no rename a session records, so a Codex session's name lives on its row (`custom_title`,
+    // which the tick keeps, as it keeps a name typed with /rename).
+    if (row.agent === 'codex') {
+      await patchDeskSession(id, { label: name, custom_title: name });
+      return `renamed ${id} to ${name}`;
+    }
     // The receipt is the `custom-title` record carrying the name, not the command text.
     await deliver(row, `/rename ${name}`, { expect: name });
     return `renamed ${id} to ${name}`;
@@ -170,14 +180,17 @@ async function run(cmd) {
     // The sender's message id, stamped on the prompt these words become, as `deliver` does for a
     // running session — without it the sender's placeholder stays under the whole turn.
     if (prompt) expectPrompt(sessionId, prompt, (cmd.payload || {}).msg || cmd.id);
+    if (row.agent === 'codex' && !codexReady()) throw new Error('Codex is not signed in on the Mac');
     beginLaunch();   // until the row exists — see open_session below
     try {
-      const raw = await openFreshTab(dir, row.repo, prompt, sessionId, row.claude_session_id);
+      const raw = row.agent === 'codex'
+        ? await openCodexTab(dir, row.repo, prompt, sessionId, row.claude_session_id)
+        : await openFreshTab(dir, row.repo, prompt, sessionId, row.claude_session_id);
       const [how, tty] = String(raw).split('\t');
       // A NEW row for the new tab, exactly as the Pi makes a new tmux session on resume. The old row
       // stays parked until retention drops it; it is where that stretch of the conversation happened.
       await upsertDeskSession({
-        id: sessionId, worker: 'desk', repo: row.repo, status: 'resident',
+        id: sessionId, worker: 'desk', repo: row.repo, status: 'resident', agent: row.agent || 'claude',
         origin: row.origin || 'dispatched', command_id: cmd.id, tty: tty || null,
         label: row.label || null, claude_session_id: row.claude_session_id,
         transcript_path: row.transcript_path, mirror_offset: row.mirror_offset || 0,
@@ -203,6 +216,7 @@ async function run(cmd) {
     const row = await deskSession(id);
     if (!row) throw new Error(`no such session: ${id}`);
     if (!row.claude_session_id) throw new Error(`${id} has no transcript recorded — nothing to hand over`);
+    if (row.agent === 'codex') throw new Error(`${id} is a Codex session, and Codex sessions do not move between machines`);
     if (row.tty) await closeTabForTty(row.tty);
     await new Promise((r) => setTimeout(r, 2000));   // let claude exit and flush its last records
     const at = await mirrorUp(row.claude_session_id, row.transcript_path, row.mirror_offset || 0);
@@ -283,12 +297,16 @@ async function run(cmd) {
   const prompt = [staleWarning, spoken, (wantsReport && spoken) ? REPORT_DIRECTIVE : null].filter(Boolean).join('\n\n') || null;
   const startedAt = Date.now() - 1000;   // slack: ps reports a start time to the whole second
   const sessionId = `mac-${cmd.id.slice(0, 8)}`;
+  const agent = (cmd.payload || {}).agent === 'codex' ? 'codex' : 'claude';
+  if (agent === 'codex' && !codexReady()) throw new Error('Codex is not signed in on the Mac');
   // Held from before the tab opens until its row exists. In between, the new claude looks exactly
   // like a session nobody dispatched, and adopting it would give one session two rows.
   beginLaunch();
   let how, tty;
   try {
-    const raw = await openFreshTab(target, name, prompt, sessionId);
+    const raw = agent === 'codex'
+      ? await openCodexTab(target, name, prompt, sessionId)
+      : await openFreshTab(target, name, prompt, sessionId);
     // openFreshTab reports "<how>\t<tty>"; the tty is the handle a later follow-up addresses.
     [how, tty] = String(raw).split('\t');
     console.log(`[commands] opened session in ${target} (${how}${tty ? `, tty ${tty}` : ''}, trust: ${trust}`
@@ -297,7 +315,7 @@ async function run(cmd) {
     // Publish it, as the most recently active session: it is the work he just asked for.
     try {
       await upsertDeskSession({
-        id: sessionId, worker: 'desk', repo: name || 'root',
+        id: sessionId, worker: 'desk', repo: name || 'root', agent,
         status: 'resident', origin: 'dispatched', command_id: cmd.id, tty: tty || null,
         label: (cmd.payload || {}).label || null,
         prompt: prompt ? prompt.slice(0, 500) : null,
@@ -311,9 +329,9 @@ async function run(cmd) {
   // Async on purpose: the launch has already happened and nothing should wait on it coming up. The
   // reconcile tick binds the same way, so a miss here costs one tick, not the session.
   if (tty) {
-    awaitSessionOn(tty, startedAt).then((s) => {
-      if (!s) return console.error(`[commands] no claude came up on ${tty} for ${sessionId}`);
-      console.log(`[commands] ${sessionId} -> claude session ${s.claudeId}`);
+    (agent === 'codex' ? awaitCodexOn(tty, startedAt) : awaitSessionOn(tty, startedAt)).then((s) => {
+      if (!s) return console.error(`[commands] no ${agent} came up on ${tty} for ${sessionId}`);
+      console.log(`[commands] ${sessionId} -> ${agent} session ${s.claudeId}`);
       return patchDeskSession(sessionId, { pid: s.pid, claude_session_id: s.claudeId, transcript_path: s.transcriptPath });
     }).catch((e) => console.error('[commands] session:', e.message));
   }

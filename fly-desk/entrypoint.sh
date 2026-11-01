@@ -35,4 +35,21 @@ c.mcpServers = {
 fs.writeFileSync(f, JSON.stringify(c, null, 2));
 JS
 
+# Codex's config: the same MCP servers, each with its tools approved (a Codex session runs with approvals
+# off, which refuses any MCP tool without it). Rewritten every boot like ~/.claude.json; the login
+# (auth.json) beside it is left alone.
+mkdir -p "$CODEX_HOME"
+node - <<'JS' > "$CODEX_HOME/config.toml"
+const env = (...ks) => '{ ' + ks.filter((k) => process.env[k]).map((k) => `${k} = ${JSON.stringify(process.env[k])}`).join(', ') + ' }';
+const srv = (name, command, args, e) => `[mcp_servers.${name}]\ncommand = ${JSON.stringify(command)}\nargs = ${JSON.stringify(args)}\n`
+  + `env = ${e}\ndefault_tools_approval_mode = "approve"\n`;
+process.stdout.write([
+  'approval_policy = "never"', 'sandbox_mode = "danger-full-access"', 'check_for_update_on_startup = false', '',
+  srv('data', 'node', ['/app/data-layer/dist/mcp.js'], env('SUPABASE_URL', 'SUPABASE_KEY')),
+  srv('govee-lights', 'python3', ['/app/govee-mcp/govee_mcp.py'], env('GOVEE_API_KEY', 'SUPABASE_URL', 'SUPABASE_KEY')),
+  srv('gmail', '/opt/gmail-venv/bin/python', ['/app/gmail-mcp/gmail_mcp.py'], env('GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REFRESH_TOKEN')),
+].join('\n'));
+JS
+chmod 600 "$CODEX_HOME/config.toml"
+
 cd /app/host/pi-desk && exec node index.js

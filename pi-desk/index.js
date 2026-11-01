@@ -40,6 +40,8 @@ import { loginExpiresAt } from '../orchestrator/src/login.js';
 // Which conversation a process is in, from Claude Code's own record — shared with the Mac, which
 // reads the same files for the same reason.
 import { sessionOf } from '../orchestrator/src/discover.js';
+// The same, for a Codex session (`agent = 'codex'`): its conversation is the rollout its process holds open.
+import { codexSessionOf, codexReady } from '../orchestrator/src/codex.js';
 import { sweepScratch } from './scratch.js';
 import { createRequire } from 'node:module';
 import { setupCgroups, limitSession, watchSession, liftBudget, sessionUsage, SESSION_BUDGET_MB } from './cgroups.js';
@@ -77,6 +79,9 @@ const ops = createRequire(import.meta.url)('../orchestrator/src/ops_report.cjs')
 ops.install({ machine: process.env.DESK_MACHINE === 'fly' ? 'fly' : 'pi', service: process.env.DESK_MACHINE === 'fly' ? 'fly-desk' : 'pi-desk' });
 
 const exec = promisify(execFile);
+
+/** The conversation a pane's process is in, read the way its agent records it. */
+const sessionFor = (agent, pid) => (!pid ? null : agent === 'codex' ? codexSessionOf(pid) : sessionOf(pid));
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://felyggqjjhltwokdfhop.supabase.co';
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
@@ -220,10 +225,11 @@ async function closeAfterTurn(name, tail) {
     if (!row || row.status !== 'resident' || !row.close_after_turn) return false;
     const at = (t) => (t ? Date.parse(t) : 0);
     if (!tail?.replyAt || at(tail.replyAt) <= at(row.close_after_turn)) return false;
-    if (row.pid && sessionOf(row.pid)?.busy) return false;   // still writing; the next turn end or tick closes it
-    // The whole conversation goes up first, so it can be resumed on either machine.
+    if (row.pid && sessionFor(row.agent, row.pid)?.busy) return false;   // still writing; the next turn end or tick closes it
+    // The whole conversation goes up first, so it can be resumed on either machine. A Codex rollout is
+    // not mirrored: it is resumed only where it ran.
     let mirror = {};
-    if (row.claude_session_id && row.transcript_path) {
+    if (row.claude_session_id && row.transcript_path && row.agent !== 'codex') {
       try {
         const to = await mirrorUp(row.claude_session_id, row.transcript_path, row.mirror_offset || 0);
         if (to != null) mirror = { mirror_offset: to, mirror_at: new Date().toISOString() };
@@ -338,8 +344,8 @@ async function onHeavy(name, usage) {
       return;
     }
     const row = (await sb(`desk_sessions?id=eq.${encodeURIComponent(name)}&select=*`))?.[0];
-    if (!row?.claude_session_id) {
-      console.log(`[pi-desk] ${name}: ${why}, but it has no transcript to move — it stays, unthrottled`);
+    if (!row?.claude_session_id || row.agent === 'codex') {
+      console.log(`[pi-desk] ${name}: ${why}, but ${row?.agent === 'codex' ? 'a Codex session cannot move' : 'it has no transcript to move'} — it stays, unthrottled`);
       liftBudget(name);
       return;
     }
@@ -421,7 +427,9 @@ async function heartbeat() {
       headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
       body: JSON.stringify([{ worker: WORKER, last_seen: new Date().toISOString(),
                               // Fly runs on the year-long token, which has no date to publish.
-                              info: { ...hostStats(lastResidentCount), ...(FLY ? {} : { login_expires_at: loginExpiresAt() }) } }]),
+                              // `codex`: whether a Codex session can start here (data-layer routes agent=codex on it).
+                              info: { ...hostStats(lastResidentCount), codex: codexReady(),
+                                      ...(FLY ? {} : { login_expires_at: loginExpiresAt() }) } }]),
     });
   } catch (e) { console.error('[pi-desk] heartbeat:', e.message); }
 }
@@ -443,7 +451,7 @@ async function reconcileSessions() {
   const liveKey = live.filter((l) => l.alive).map((l) => `${l.name}:${l.pid}`).sort().join(',');
   if (liveKey !== lastLiveKey) { lastLiveKey = liveKey; sweepScratch(); }
 
-  for (const { name, alive, created, pid } of live) {
+  for (const { name, alive, created, pid, agent: paneAgent } of live) {
     if (!alive) {
       // A husk: tmux session whose claude has exited. These are what accumulate, one per launch.
       try { await exec('tmux', ['kill-session', '-t', name], { timeout: 10000 }); } catch {}
@@ -462,7 +470,11 @@ async function reconcileSessions() {
     let cid = row?.claude_session_id || null;
     let mirrorFrom = row?.mirror_offset || 0;
     let rebound = false;   // what the old conversation last said is not what this one said
-    const s = pid ? sessionOf(pid) : null;
+    // Which agent: the pane says, once its process is up; until then the row (written at launch) does.
+    const agent = paneAgent || row?.agent || 'claude';
+    const s = sessionFor(agent, pid);
+    // A Codex resume may write its turns to a rollout of its own under the same thread id: follow the file.
+    if (s && s.claudeId === cid && s.transcriptPath !== tpath) tpath = s.transcriptPath;
     if (s && s.claudeId !== cid) {
       // `/clear` leaves the OLD conversation's uploaded parts with nothing pointing at them: the row
       // is about to name the new one, and the mirror is keyed by conversation id. Clear them here or
@@ -491,7 +503,7 @@ async function reconcileSessions() {
     // Mirror at the end of a turn — the only moment the transcript is a complete thought — so this
     // session can be picked up on the Mac later, including while this machine is unreachable.
     let mirrored = null;
-    if (!busy && cid && tpath && tail.bytes > mirrorFrom) {
+    if (!busy && cid && tpath && agent !== 'codex' && tail.bytes > mirrorFrom) {
       try { mirrored = await mirrorUp(cid, tpath, mirrorFrom); }
       catch (e) { console.error('[pi-desk] mirror:', e.message); }
     }
@@ -506,7 +518,7 @@ async function reconcileSessions() {
     // Upsert, not patch-if-known: a session tmux is running that the table never saw must still
     // appear, or "tmux is the source of truth" is not true.
     const payload = {
-          id: name, worker: WORKER, status: 'resident',
+          id: name, worker: WORKER, status: 'resident', agent,
           repo: row?.repo || name.replace(/^hub-/, '').replace(/-[^-]*$/, ''),
           claude_session_id: cid,
           transcript_path: tpath,
@@ -685,7 +697,8 @@ async function runQueue(residents) {
 
   try {
     // A queued resume names its conversation; everything else about it comes from the parked row.
-    let args = { name: next.repo, prompt: next.prompt, report: next.report === true, label: next.label || null };
+    const agent = next.agent === 'codex' ? 'codex' : 'claude';
+    let args = { name: next.repo, prompt: next.prompt, report: next.report === true, label: next.label || null, agent };
     const parked = next.resume_id
       ? (await sb(`desk_sessions?claude_session_id=eq.${encodeURIComponent(next.resume_id)}` +
           '&select=*&order=started.desc.nullslast&limit=1').catch(() => null))?.[0]
@@ -695,7 +708,13 @@ async function runQueue(residents) {
                     : { ...args, resumeId: next.resume_id };
     }
     let detail;
-    if (toMac && next.resume_id) {
+    if (toMac && next.resume_id && agent === 'codex' && why) {
+      // Not mirrored, so it cannot go to the Mac: it keeps waiting here for room.
+      await sb(`desk_queue?id=eq.${encodeURIComponent(next.id)}`, { method: 'PATCH', headers: { Prefer: 'return=minimal' },
+        body: JSON.stringify({ claimed: null }) }).catch((e) => console.error('[pi-desk] requeue:', e.message));
+      console.log(`[pi-desk] holding queued Codex resume: ${why}`);
+      return;
+    } else if (toMac && next.resume_id) {
       if (!parked) throw new Error(`no parked row for ${next.resume_id}`);
       detail = `handed to the Mac as ${await handResumeToMac(parked, next.prompt)}`;
     } else if (toMac) {
@@ -703,7 +722,8 @@ async function runQueue(residents) {
       if (!p) throw new Error(`the Mac has no project ${next.repo}`);
       detail = `handed to the Mac as ${await handOpenToMac({ name: next.repo, path: p, prompt: next.prompt || undefined,
                                                               report: next.report === true || undefined,
-                                                              label: next.label || undefined })}`;
+                                                              label: next.label || undefined,
+                                                              ...(agent === 'codex' ? { agent } : {}) })}`;
     } else {
       detail = await startSession(args);
     }
@@ -791,7 +811,7 @@ const REPORT_DIRECTIVE =
   + 'well: the report is an extra artifact, never a replacement for replying.]';
 
 // ---- launching ------------------------------------------------------------
-function launch(dir, name, prompt, resumeId = null, reuse = null) {
+function launch(dir, name, prompt, resumeId = null, reuse = null, agent = 'claude') {
   const session = reuse || `hub-${name}-${Date.now().toString(36)}`;
   // The Remote Control name is an IDENTITY in the Claude app and must be unique per SESSION. The
   // tmux name already carries a timestamp suffix for exactly that reason, so the RC name reuses it
@@ -803,7 +823,8 @@ function launch(dir, name, prompt, resumeId = null, reuse = null) {
   // has made sure nothing by that name is running.
   const rcName = session.slice(4);
   const here = path.dirname(new URL(import.meta.url).pathname);
-  const launcher = path.join(here, 'launch.sh');
+  // A Codex session has its own launcher, taking the same arguments.
+  const launcher = path.join(here, agent === 'codex' ? 'launch-codex.sh' : 'launch.sh');
 
   // The prompt goes to a file, not an argv string: tmux runs its command through a shell, and
   // dictated speech is full of quotes and apostrophes. launch.sh reads and deletes it.
@@ -874,12 +895,12 @@ const finish = (id, status, detail) =>
   }).catch((e) => console.error('[pi-desk] finish:', e.message));
 
 /** Record which conversation a just-launched session is in, as soon as its claude has written its record. */
-async function bindWhenUp(session, { attempts = 90, delayMs = 1000 } = {}) {
+async function bindWhenUp(session, { attempts = 90, delayMs = 1000, agent = 'claude' } = {}) {
   for (let i = 0; i < attempts; i++) {
     const me = (await liveSessions()).find((x) => x.name === session);
-    const s = me?.pid ? sessionOf(me.pid) : null;
+    const s = sessionFor(me?.agent || agent, me?.pid);
     if (s) {
-      console.log(`[pi-desk] ${session} -> claude session ${s.claudeId}`);
+      console.log(`[pi-desk] ${session} -> ${agent} session ${s.claudeId}`);
       return sb(`desk_sessions?id=eq.${encodeURIComponent(session)}`, {
         method: 'PATCH', headers: { Prefer: 'return=minimal' },
         body: JSON.stringify({ pid: me.pid, claude_session_id: s.claudeId, transcript_path: s.transcriptPath }),
@@ -887,7 +908,7 @@ async function bindWhenUp(session, { attempts = 90, delayMs = 1000 } = {}) {
     }
     await new Promise((r) => setTimeout(r, delayMs));
   }
-  console.error(`[pi-desk] no claude came up in ${session} — it will not be resumable`);
+  console.error(`[pi-desk] no ${agent} came up in ${session} — it will not be resumable`);
 }
 
 /**
@@ -905,14 +926,15 @@ function resumeArgs(row, { prompt = null, report = false, commandId = null, msg 
   return { name: row.repo, prompt: prompt || '', resumeId: row.claude_session_id, commandId, report, msg,
            // Only one of this machine's own names can come back as itself; a Mac row's id is not a tmux name.
            reuse: row.worker === WORKER && /^hub-[A-Za-z0-9._-]+$/.test(row.id) ? row.id : null,
-           label: row.label || null, origin: row.origin || null,
+           label: row.label || null, origin: row.origin || null, agent: row.agent || 'claude',
            knownClaudeId: row.claude_session_id, transcriptPath: row.transcript_path || null,
            mirrorOffset: row.mirror_offset || 0 };
 }
 
 async function startSession({ name, prompt, resumeId = null, commandId = null, report = false, label = null,
                               knownClaudeId = null, transcriptPath = null, mirrorOffset = null, origin = null,
-                              reuse = null, msg = null }) {
+                              reuse = null, msg = null, agent = 'claude' }) {
+  if (agent === 'codex' && !codexReady()) throw new Error(`Codex is not signed in on the ${FLY ? 'Fly machine' : 'Pi'}`);
   if (reuse) {
     const same = (await liveSessions()).find((l) => l.name === reuse);
     // Running already: a second process on one transcript forks the conversation (see resume_session).
@@ -929,7 +951,7 @@ async function startSession({ name, prompt, resumeId = null, commandId = null, r
   // doing, and a report on a one-line change is noise — so it is opt-in, set by the voice tool
   // when Jared actually asks. A bare session with no prompt has nothing to report on either way.
   const full = [warning, spoken, (report && spoken) ? REPORT_DIRECTIVE : null].filter(Boolean).join('\n\n');
-  const session = launch(dir, name, full, resumeId, reuse);
+  const session = launch(dir, name, full, resumeId, reuse, agent);
   // The sender's message id, stamped on the prompt these words become, exactly as a follow-up typed
   // into a running session is (`typeInto`). Without it the device that sent the words never sees its
   // own id come back, and its placeholder stays under the whole turn.
@@ -942,7 +964,7 @@ async function startSession({ name, prompt, resumeId = null, commandId = null, r
     // only durable handle the caller had at the time, since the session did not exist yet.
     // The most recently active session from the moment it exists: it is the work he just asked for.
     // `ended: null` for a resume under its own name: the row was parked, and is running again.
-    body: JSON.stringify([{ id: session, worker: WORKER, repo: name, status: 'resident', command_id: commandId,
+    body: JSON.stringify([{ id: session, worker: WORKER, repo: name, status: 'resident', command_id: commandId, agent,
                             label: label || null, active_at: new Date().toISOString(), ended: null,
                             ...(origin ? { origin } : {}),
                             ...(knownClaudeId ? { claude_session_id: knownClaudeId, transcript_path: transcriptPath,
@@ -960,7 +982,7 @@ async function startSession({ name, prompt, resumeId = null, commandId = null, r
   // Which conversation it is, from the process's own record once claude is up. Async on purpose — the
   // caller should not wait on the session coming up to learn that the launch happened. The reconcile
   // tick reads the same record, so a miss here costs one tick, not the session.
-  bindWhenUp(session).catch((e) => console.error('[pi-desk] session:', e.message));
+  bindWhenUp(session, { agent }).catch((e) => console.error('[pi-desk] session:', e.message));
 
   return `tmux ${session} in ${dir}${full ? ' with a prompt' : ''}${resumeId ? ' (resumed)' : ''}`
     + `${warning ? ' (stale checkout)' : ''} (trust: ${trust})`;
@@ -987,6 +1009,16 @@ async function run(cmd) {
     const name = String((cmd.payload || {}).name || '').replace(/[\r\n]+/g, ' ').trim().slice(0, 60);
     if (!/^hub-[A-Za-z0-9._-]+$/.test(target)) throw new Error(`unusable session name: ${target}`);
     if (!name) throw new Error('no name to set');
+    // Codex has no rename command a session records, so a Codex session's name lives on its row, where
+    // the reconcile tick carries it (`custom_title` outranks the dispatch label as a typed name would).
+    const named = (await sb(`desk_sessions?id=eq.${encodeURIComponent(target)}&select=agent`))?.[0];
+    if (named?.agent === 'codex') {
+      await sb(`desk_sessions?id=eq.${encodeURIComponent(target)}`, {
+        method: 'PATCH', headers: { Prefer: 'return=minimal' },
+        body: JSON.stringify({ label: name, custom_title: name }),
+      });
+      return `renamed ${target} to ${name}`;
+    }
     // The receipt is the `custom-title` record carrying the name, not the command text.
     await typeInto(target, `/rename ${name}`, { expect: name });
     return `renamed ${target} to ${name}`;
@@ -1026,15 +1058,16 @@ async function run(cmd) {
     const report = (cmd.payload || {}).report === true;
     // A resume is admitted exactly like new work (makeRoom): here if memory allows, else on the Mac
     // with its whole conversation, else queued until one of them can take it.
+    // A Codex conversation is not mirrored, so it cannot be handed to the Mac: it waits here for room.
     const why = await makeRoom(await residentsNow(), id);
     if (why) {
-      if (await macIsAwake(false)) return `handed to the Mac as ${await handResumeToMac(row, prompt)} — ${why}`;
+      if (row.agent !== 'codex' && await macIsAwake(false)) return `handed to the Mac as ${await handResumeToMac(row, prompt)} — ${why}`;
       await sb('desk_queue', {
         method: 'POST', headers: { Prefer: 'return=minimal' },
         body: JSON.stringify([{ id: randomUUID(), worker: WORKER, repo: row.repo, prompt, report,
-                                label: row.label || null, resume_id: row.claude_session_id }]),
+                                label: row.label || null, resume_id: row.claude_session_id, agent: row.agent || 'claude' }]),
       });
-      return `queued resume of ${id} — ${why}, and the Mac is asleep`;
+      return `queued resume of ${id} — ${why}${row.agent === 'codex' ? '' : ', and the Mac is asleep'}`;
     }
     return startSession(resumeArgs(row, { prompt, report, commandId: cmd.id, msg: (cmd.payload || {}).msg || cmd.id }));
   }
@@ -1053,6 +1086,7 @@ async function run(cmd) {
     const row = rows?.[0];
     if (!row) throw new Error(`no such session: ${id}`);
     if (!row.claude_session_id) throw new Error(`${id} has no transcript recorded — nothing to hand over`);
+    if (row.agent === 'codex') throw new Error(`${id} is a Codex session, and Codex sessions do not move between machines`);
     // A session that moves ITSELF — because the work needs the Mac (an iOS build, the login keychain) —
     // is always mid-turn: the move is the tool call it is making. Closing it cuts that turn off, so
     // the Mac restarts it with the marker and the moved note, as for heavy work (onHeavy), or it lands
@@ -1101,6 +1135,8 @@ async function run(cmd) {
   const payload = cmd.payload || {};
   const name = safeName(payload.name);
   if (!name) throw new Error(`unusable project name: ${JSON.stringify(payload.name)}`);
+  const agent = payload.agent === 'codex' ? 'codex' : 'claude';
+  if (agent === 'codex' && !codexReady()) throw new Error(`Codex is not signed in on the ${FLY ? 'Fly machine' : 'Pi'}`);
 
   // Capacity is checked HERE, not inside startSession, so a request that cannot run on this Pi goes to
   // the Mac, or waits as a queued row when the Mac is asleep, rather than being dropped or forced onto a
@@ -1116,11 +1152,11 @@ async function run(cmd) {
       body: JSON.stringify([{ id: randomUUID(), worker: WORKER, repo: name,
                               prompt: spoken || null,
                               report: payload.report === true,
-                              label: payload.label || null }]),
+                              label: payload.label || null, agent }]),
     });
     return `queued — ${why}, and the Mac is asleep`;
   }
-  return startSession({ name, prompt: spoken, commandId: cmd.id, report: payload.report === true, label: payload.label || null });
+  return startSession({ name, prompt: spoken, commandId: cmd.id, report: payload.report === true, label: payload.label || null, agent });
 }
 
 let draining = false;

@@ -12,6 +12,8 @@ kill_timeout = "30s"
   DESK_MACHINE = "fly"
   HOME = "/data/home"
   REPO_ROOT = "/data/home/repos"
+  # Codex's login and rollouts, on the volume so a stop keeps them.
+  CODEX_HOME = "/data/home/.codex"
   # Idle sessions are parked after 30 minutes, and the machine stops 10 minutes after the last one.
   PI_DESK_IDLE_MAX_S = "1800"
   FLY_IDLE_EXIT_S = "600"

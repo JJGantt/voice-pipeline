@@ -17,4 +17,5 @@ cp $GM/gmail_mcp.py gmail-mcp/
 cp -R $VP/pi-desk host/pi-desk
 cp -R $VP/orchestrator/src host/orchestrator/src
 cp $VP/orchestrator/dispatched-session.txt host/orchestrator/
-flyctl deploy --now -a jared-desk-fly --build-arg CLAUDE_CODE_VERSION="$(npm view @anthropic-ai/claude-code version)" "$@"
+flyctl deploy --now -a jared-desk-fly --build-arg CLAUDE_CODE_VERSION="$(npm view @anthropic-ai/claude-code version)" \
+  --build-arg CODEX_VERSION="$(npm view @openai/codex version)" "$@"

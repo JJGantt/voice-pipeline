@@ -20,6 +20,10 @@ RUN curl -fsSL https://github.com/supabase/cli/releases/latest/download/supabase
 
 ARG CLAUDE_CODE_VERSION=latest
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
+# Codex CLI, for sessions dispatched with agent=codex (pi-desk/launch-codex.sh). Its login lives in
+# CODEX_HOME on the volume (fly.toml) and is made once by hand: `codex login --device-auth`.
+ARG CODEX_VERSION=latest
+RUN npm install -g @openai/codex@${CODEX_VERSION}
 
 # MCP servers: data (built), govee (mcp<2, see fly-worker/Dockerfile), gmail (its own venv, mcp 2.x).
 RUN pip3 install --no-cache-dir --break-system-packages httpx==0.27.2 'mcp<2' python-dotenv

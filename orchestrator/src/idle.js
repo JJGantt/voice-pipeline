@@ -25,6 +25,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { patchDeskSession } from './supabase.js';
 import { closeTabForTty } from './applescript.js';
+import { codexPrompt } from './codex.js';
 
 const exec = promisify(execFile);
 
@@ -62,6 +63,10 @@ const touchedIds = new Set();
 
 /** The text of a human prompt record, or null when the record is not one. */
 function humanPrompt(r) {
+  // A Codex rollout records his words as a UserMessage item (codex.js), with no mark of where they came
+  // from; the fingerprints decide that, as for Claude.
+  const codex = codexPrompt(r);
+  if (codex) return codex;
   if (r.type !== 'user' || r.isMeta || r.isSidechain || r.isCompactSummary) return null;
   const c = r.message && r.message.content;
   const text = typeof c === 'string' ? c
@@ -149,7 +154,8 @@ export async function reapIdle(row, proc, transcriptBytes) {
   const idleFor = Date.now() - Date.parse(row.active_at || row.started);
   if (!(idleFor >= IDLE_PARK_MS)) return false;
   // The mirror has to hold the whole conversation, or a resume on the other machine starts short.
-  if (row.claude_session_id && (row.mirror_offset || 0) < transcriptBytes) return false;
+  // (A Codex rollout is never mirrored, and resumes only here.)
+  if (row.claude_session_id && row.agent !== 'codex' && (row.mirror_offset || 0) < transcriptBytes) return false;
   if (await runningCommand(proc.pid)) return false;
 
   await closeTabForTty(row.tty);

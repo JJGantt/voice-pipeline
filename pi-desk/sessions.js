@@ -13,6 +13,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { awaitSession } from '../orchestrator/src/discover.js';
+import { awaitCodexSession } from '../orchestrator/src/codex.js';
 import { typeable, transcriptSize, awaitSubmitted } from '../orchestrator/src/handoff.js';
 import { expectPrompt } from '../orchestrator/src/sessionWatch.js';
 import { removeSessionCgroup } from './cgroups.js';
@@ -23,7 +24,19 @@ const exec = promisify(execFile);
 // same final reply — so it lives in one place and is re-exported here for this module's callers.
 export { readTail } from '../orchestrator/src/transcripts.js';
 
-/** tmux sessions this daemon owns, and whether a claude process is actually inside each. */
+// What a pane's foreground command says about which agent is in it.
+const AGENT_OF = { claude: 'claude', codex: 'codex', node: 'codex' };
+
+/**
+ * The conversation a live pane is in, from whichever agent runs there, waiting a few seconds for a
+ * process that has only just started. Null when it has not written its record (Claude) or opened its
+ * rollout (Codex) yet.
+ */
+export function awaitPaneSession(pane, timeoutMs = 15000) {
+  return pane.agent === 'codex' ? awaitCodexSession(pane.pid, timeoutMs) : awaitSession(pane.pid, timeoutMs);
+}
+
+/** tmux sessions this daemon owns, whether an agent process is actually inside each, and which agent. */
 export async function liveSessions() {
   let names = [];
   try {
@@ -40,16 +53,18 @@ export async function liveSessions() {
 
   const out = [];
   for (const { n: name, created } of names) {
-    let alive = false, pid = null;
+    let alive = false, pid = null, agent = null;
     try {
       const { stdout: panes } = await exec('tmux', ['list-panes', '-t', name, '-F', '#{pane_current_command} #{pane_pid}'], { timeout: 10000 });
       // tmux keeps the shell alive after claude exits, so "the session exists" is a different
       // question from "claude is in it". Only the latter counts as live. launch.sh `exec`s claude, so
       // the pane's own process IS claude — the pid its session record is filed under.
-      const hit = panes.split('\n').map((l) => l.trim().split(' ')).find(([c]) => c === 'claude');
-      if (hit) { alive = true; pid = Number(hit[1]) || null; }
+      // A Codex session (launch-codex.sh) shows as `node`: `codex` is a node wrapper around the native
+      // binary, and the wrapper is what the launcher exec'd. codex.js finds the rollout under it.
+      const hit = panes.split('\n').map((l) => l.trim().split(' ')).find(([c]) => AGENT_OF[c]);
+      if (hit) { alive = true; pid = Number(hit[1]) || null; agent = AGENT_OF[hit[0]]; }
     } catch { alive = false; }
-    out.push({ name, alive, created, pid });
+    out.push({ name, alive, created, pid, agent });
   }
   return out;
 }
@@ -80,8 +95,8 @@ export async function typeInto(target, text, { expect = null, cmd = null } = {})
   const pane = (await liveSessions()).find((l) => l.name === target && l.alive);
   if (!pane?.pid) throw new Error(`${target} is not running`);
   // A session launched a moment ago may not have written its record yet; it does within a second.
-  const s = await awaitSession(pane.pid);
-  if (!s) throw new Error(`${target} has no Claude Code session record — it has not started`);
+  const s = await awaitPaneSession(pane);
+  if (!s) throw new Error(`${target} has no ${pane.agent === 'codex' ? 'Codex rollout open' : 'Claude Code session record'} — it has not started`);
   if (s.waiting) throw new Error(`${target} is waiting on a ${s.waiting} — not typing into it`);
 
   const from = transcriptSize(s.transcriptPath);
