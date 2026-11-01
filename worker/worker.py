@@ -77,11 +77,16 @@ FALLBACK_OUTAGE_S = 30 * 60
 STATE_DIR = Path(os.path.expanduser(os.environ.get("STATE_DIR", "~/.voice-worker")))
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 
-# The worker never bills the Console API: every turn runs on the Claude subscription, and a failure is
-# retried and then surfaced, never finished on the key. The key may still be in the environment (older
-# .env files, the Fly secret), so it is popped at import — a subprocess that inherited it would quietly
-# bill the API instead of the subscription.
-os.environ.pop("ANTHROPIC_API_KEY", None)
+# Every turn runs on the Claude subscription. The Console key is used for exactly one case: a deliberate
+# hub turn (not a room mic's always-on capture) refused because the subscription's usage limit is hit,
+# which is re-run on the key so nutrition and lists keep working until the window resets (Jared,
+# 2026-11-01). The Max plan's $100/month of Console credits pays for it. An overloaded or erroring
+# subscription is retried and surfaced, never moved onto the key: on 2026-09-21 one 529 did that to an
+# Opus turn, and on 2026-08-30 noise judging on the key drained the Console balance in an evening.
+#
+# The key is popped from the environment at import, so no subprocess inherits it and quietly bills it;
+# only the credits runner (SDK_CREDITS) passes it on, explicitly.
+CREDITS_API_KEY = os.environ.pop("ANTHROPIC_API_KEY", None) or ""
 # Every hub turn runs on ONE model with the full toolset: Opus at its default effort, which is adaptive —
 # it thinks as hard as the turn needs. Quality over speed, by Jared's call (2026-10-29): there is no fast
 # first responder and no escalation. Low effort was measurably worse on macro estimates and `max` bought
@@ -1633,6 +1638,34 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
 _SDK_LOOP_LOCK = threading.Lock()
 
 
+def report_usage(info: dict) -> None:
+    """Record the subscription's usage windows from a turn's `rate_limit_event` in Supabase
+    `claude_usage` (data-layer 00144), off the turn's thread. The table drops a reading identical to the
+    newest, so a turn that moved nothing writes nothing. This is the worker's only way to see usage: its
+    CLAUDE_CODE_OAUTH_TOKEN lacks the user:profile scope the usage endpoint needs."""
+    w = (info or {}).get("unifiedWindows") or {}
+    five, week = w.get("five_hour") or {}, w.get("seven_day") or {}
+    if five.get("utilization") is None or week.get("utilization") is None:
+        return
+
+    def at(ts):
+        return datetime.fromtimestamp(ts, timezone.utc).isoformat() if ts else None
+
+    row = {"source": f"worker:{WORKER_ID}", "status": info.get("status"),
+           "five_hour_pct": round(five["utilization"] * 100, 1), "five_hour_resets_at": at(five.get("resetsAt")),
+           "seven_day_pct": round(week["utilization"] * 100, 1), "seven_day_resets_at": at(week.get("resetsAt"))}
+
+    def _go():
+        try:
+            r = httpx.post(f"{SUPABASE_URL}/rest/v1/claude_usage", json=row, timeout=HTTP_TIMEOUT_S,
+                           headers={**headers(), "Prefer": "return=minimal"})
+            if r.status_code >= 300:
+                log_error(f"claude_usage insert HTTP {r.status_code}: {r.text[:200]}")
+        except Exception as e:  # noqa: BLE001
+            log_error(f"claude_usage insert failed: {e}")
+    threading.Thread(target=_go, name="usage-report", daemon=True).start()
+
+
 class SdkRunner:
     """Warm Claude Agent SDK client — every hub turn runs here, billed to the subscription.
 
@@ -1643,11 +1676,13 @@ class SdkRunner:
     spawns. A failed turn is retried by `run_subscription` and then surfaced, never moved onto the paid API.
     """
 
-    def __init__(self, model: str = HUB_MODEL, effort: "str | None" = HUB_EFFORT):
+    def __init__(self, model: str = HUB_MODEL, effort: "str | None" = HUB_EFFORT, credits: bool = False):
         """The full toolset plus Read, which the fence allows only inside the current turn's photo
-        directory."""
+        directory. `credits` bills the Console key instead of the subscription (see CREDITS_API_KEY)."""
         self.model = model
         self.effort = effort
+        self.credits = credits
+        self.limit_hit = False   # the last turn's rate_limit_event said the subscription refused it
         self.tools = ALL_TOOLS + ["Read"]
         self._read_dir = None  # this turn's attachment directory, the only place Read may look
         self._loop = None
@@ -1738,7 +1773,10 @@ class SdkRunner:
             system_prompt={"type": "preset", "preset": "claude_code",
                            "append": HUB_SYSTEM + "\n\n" + SHARED_STATE_NOTE,
                            "exclude_dynamic_sections": True},
-            env={"ENABLE_TOOL_SEARCH": "false"},   # all schemas inline, same as the -p path
+            # All schemas inline, same as the -p path. The credits runner swaps the auth: an API key in the
+            # environment outranks both the OAuth token and the machine's login.
+            env={"ENABLE_TOOL_SEARCH": "false",
+                 **({"ANTHROPIC_API_KEY": CREDITS_API_KEY, "CLAUDE_CODE_OAUTH_TOKEN": ""} if self.credits else {})},
             can_use_tool=_deny,
             hooks={"PreToolUse": [HookMatcher(matcher=None, hooks=[_fence])]},
             cwd=os.path.expanduser("~"),
@@ -1764,7 +1802,7 @@ class SdkRunner:
 
     async def _turn(self, prompt, on_event):
         await self._ensure()
-        from claude_agent_sdk import AssistantMessage, TextBlock, ToolUseBlock, ResultMessage
+        from claude_agent_sdk import AssistantMessage, TextBlock, ToolUseBlock, ResultMessage, RateLimitEvent
         # `/clear` is what makes this turn a fresh conversation; the `session_id` passed to query() is
         # only a label and starts nothing. Without it every turn appends to one conversation that also
         # re-receives the whole day as `ctx`, so it grows quadratically: ~977k tokens after 112 turns,
@@ -1774,6 +1812,7 @@ class SdkRunner:
             async for _ in self._client.receive_response():
                 pass
         self._used = True
+        self.limit_hit = False
         await self._client.query(prompt, session_id=uuid.uuid4().hex)
         chunks, result_text, ok, raw_error = [], "", True, None
         used_tools = False
@@ -1796,6 +1835,9 @@ class SdkRunner:
                                 on_event("tool", {"name": b.name, "input": b.input})
                             except Exception:  # noqa: BLE001
                                 pass
+            elif isinstance(msg, RateLimitEvent):
+                self.limit_hit = msg.rate_limit_info.status == "rejected"
+                report_usage(msg.rate_limit_info.raw)
             elif isinstance(msg, ResultMessage):
                 ok = not msg.is_error
                 result_text = msg.result or ""
@@ -1803,6 +1845,15 @@ class SdkRunner:
                     raw_error = result_text or msg.subtype
         return {"session_id": None, "text": "\n".join(chunks).strip(), "used_tools": used_tools,
                 "result": result_text, "ok": ok, "raw_error": raw_error}
+
+    def close(self):
+        """Drop the warm client, if there is one, without starting another."""
+        if self._client is None or self._loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self._teardown(), self._loop).result(timeout=15)
+        except Exception as e:  # noqa: BLE001
+            log_error(f"sdk close failed: {e}")
 
     def _recycle(self):
         """Drop the warm client and connect a fresh one in the background, before the next turn needs it."""
@@ -1840,6 +1891,8 @@ class SdkRunner:
         self._recycle()
         if result.get("used_tools"):
             return result   # it acted, or may have: never replay side effects
+        if limit_refused(result, self):
+            return result   # refused for usage: a retry is refused too, and only delays the credits run
         # Nothing was called, so re-running is side-effect free and keeps the turn on the subscription
         # instead of spending the caller's fallback. A genuinely refusable turn just fails twice, fast.
         log(f"sdk turn failed ({result.get('raw_error')}) — recycled warm client, retrying once")
@@ -1850,6 +1903,16 @@ class SdkRunner:
 
 
 SDK = SdkRunner()
+# Connected only when a turn first needs it, and dropped once the subscription answers again, so a machine
+# that never hits the limit never holds a second Claude process.
+SDK_CREDITS = SdkRunner(credits=True)
+
+
+def limit_refused(result: dict, runner: "SdkRunner | None" = None) -> bool:
+    """The subscription refused this turn for its usage limit: the stream said so, or the CLI's message
+    did ("You've hit your 5-hour limit · resets 2:30am")."""
+    e = (result.get("raw_error") or result.get("result") or "").lower()
+    return (runner or SDK).limit_hit or bool(re.search(r"hit your .{0,30}limit", e))
 
 
 def get_focus() -> str:
@@ -2509,10 +2572,17 @@ def process_request(db: Supabase, req: dict) -> None:
     else:
         # The warm SDK client, not a per-command `claude -p`: that spawn (CLI + four stdio MCP servers)
         # measured 3.6s on the Pi before the model saw a token; the warm client pays it once.
-        result = run_subscription(
-            lambda: SDK.run(hub_prompt + NUTRITION_DIRECTIVE + TOOLS_DIRECTIVE, on_event=_emit,
-                            ambient=ambient, read_dir=att_tmp if att_paths else None),
-            "subscription hub")
+        run_hub = lambda sdk: sdk.run(hub_prompt + NUTRITION_DIRECTIVE + TOOLS_DIRECTIVE, on_event=_emit,  # noqa: E731
+                                      ambient=ambient, read_dir=att_tmp if att_paths else None)
+        result = run_subscription(lambda: run_hub(SDK), "subscription hub")
+        if result.get("ok"):
+            SDK_CREDITS.close()   # the subscription answers again; the credits client has no more work
+        elif not ambient and limit_refused(result) and CREDITS_API_KEY:
+            # Every worker shares the one account, so handing this on would only fail again elsewhere.
+            log(f"subscription limit hit ({result.get('raw_error')}) — running on API credits")
+            push_activity("On API credits")
+            result = run_hub(SDK_CREDITS)
+            result["_limit"] = True
 
     if att_tmp:
         shutil.rmtree(att_tmp, ignore_errors=True)   # staged photos served their turn
@@ -2536,7 +2606,8 @@ def process_request(db: Supabase, req: dict) -> None:
 
     # A failure here is this machine's, not the command's, until every machine has tried it: hand it on.
     # Nothing has been written to the thread yet, so the worker that takes it writes the whole turn.
-    if not result.get("ok") and not fallback and not req.get("_acted") and hand_off(db, req, result.get("raw_error") or "unknown error"):
+    if (not result.get("ok") and not fallback and not req.get("_acted") and not result.get("_limit")
+            and not limit_refused(result) and hand_off(db, req, result.get("raw_error") or "unknown error")):
         return
 
     # Tag every row with the mode so the hub UI can show this mode's thread separately and switch live.

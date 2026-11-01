@@ -116,9 +116,10 @@ SUPABASE_KEY=<service-role-key> ./run.sh --once
 `python3` does **not** have `httpx` installed.
 
 `run.sh` loads a gitignored `.env` beside it. `worker.py` pops `ANTHROPIC_API_KEY`
-out of the environment at import and never uses it: the worker only runs on the
-subscription, and popping it means no spawned subprocess — the warm SDK client,
-`claude -p`, the MCP servers — can inherit it and silently bill the API.
+out of the environment at import, so no spawned subprocess (the warm SDK client,
+`claude -p`, the MCP servers) can inherit it and silently bill the API. Only the
+usage-limit fallback client passes it on (CLAUDE.md, "The worker bills the API in
+exactly one case").
 
 ### On the Pi: systemd
 

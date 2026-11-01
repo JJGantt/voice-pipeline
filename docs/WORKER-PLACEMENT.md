@@ -40,8 +40,9 @@ The code is the same everywhere; only the environment differs.
   toolset, driving the INSTALLED CLI (`cli_path=shutil.which("claude")`). It connects at worker start
   (`SDK.warm`) and again right after any recycle, then stays up for the life of the process (each turn
   is a `/clear` on it). Full-agent turns are a fresh `claude -p --model opus` (`run_claude`).
-- **Billing:** the Claude subscription (`CLAUDE_CODE_OAUTH_TOKEN`) on all three. `worker.py` pops any
-  `ANTHROPIC_API_KEY` at import, before any client or subprocess starts, so no turn inherits one.
+- **Billing:** the Claude subscription (`CLAUDE_CODE_OAUTH_TOKEN`) on all three. `worker.py` pops
+  `ANTHROPIC_API_KEY` at import, before any client or subprocess starts, so no turn inherits one; only
+  the usage-limit fallback (`SDK_CREDITS`, see CLAUDE.md) passes it on.
 - **Session transcripts:** on the Pi and Mac they land in `~/.claude/projects/` and persist. On Fly
   `CLAUDE_CONFIG_DIR=/data/claude`, on the volume, pruned to 30 days by the entrypoint's daily loop.
   `STATE_DIR` is `/data/voice-worker`, also on the volume.

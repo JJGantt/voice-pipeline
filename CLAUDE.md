@@ -23,17 +23,28 @@ Node hosts `console.error`; `log` / `console.log` / `.catch(() => {})` are invis
 for a retry or fallback that is already handling it. The Fly session host reports errors but sends no
 heartbeat, because it sleeps whenever nothing runs.
 
-## The worker never bills the API — `ANTHROPIC_API_KEY` is discarded
+## The worker bills the API in exactly one case: the subscription's usage limit
 
 Every turn, on every worker (Pi, Mac, and Fly, which holds its own `CLAUDE_CODE_OAUTH_TOKEN`), runs on
-the Claude subscription. A run that fails transiently (overloaded, 5xx, rate limit, network) is retried
-on the subscription (`run_subscription`, `SUBSCRIPTION_RETRY_S`) and then surfaced as an error; there
-is no paid fallback: one at the same model tier turns a passing "529 Overloaded" on an Opus turn into
-a Console-billed Opus run with thinking and the full toolset.
+the Claude subscription. A run that fails transiently (overloaded, 5xx, network) is retried on the
+subscription (`run_subscription`, `SUBSCRIPTION_RETRY_S`) and then surfaced as an error, never moved
+onto the key: that turns a passing "529 Overloaded" on an Opus turn into a Console-billed Opus run.
 
-The CLI and the Agent SDK silently prefer the key over the subscription login and bill the API, so
-`worker.py` pops it from the environment at import and never reads it; nothing it spawns can inherit
-it. `pi-desk/launch.sh` strips it separately (it sources the worker's `.env` itself).
+The one exception is a deliberate hub turn (`always_on` false) that the subscription refuses for its
+usage limit (`limit_refused`: the turn's `rate_limit_event` said `rejected`, or the CLI's "You've hit
+your 5-hour limit"). It re-runs on `SDK_CREDITS`, a second warm client billed to `ANTHROPIC_API_KEY`,
+which the Max plan's monthly Console credits pay for. It is not handed to another worker, since every
+worker shares the account. Always-on captures are never re-run there: judging room noise on the key is
+what drained the Console balance once. `SDK_CREDITS` connects on first use and closes on the next turn
+the subscription answers.
+
+The CLI and the Agent SDK silently prefer the key over the subscription login, so `worker.py` pops it
+from the environment at import into `CREDITS_API_KEY`, and only `SDK_CREDITS` passes it on, explicitly
+(with `CLAUDE_CODE_OAUTH_TOKEN` blanked). Nothing else it spawns can inherit it. `pi-desk/launch.sh`
+strips it separately (it sources the worker's `.env` itself). Fly holds it as a secret.
+
+Every SDK turn's `rate_limit_event` also goes to Supabase `claude_usage` (`report_usage`), which is how
+the system knows how close the 5-hour and weekly windows are.
 
 ## `server/` and `fly-worker/` are build contexts, not source
 
