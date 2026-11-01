@@ -5,9 +5,8 @@ a WebSocket, runs openWakeWord on it, and on a wake-word hit captures the follow
 utterance (ending on trailing silence) and transcribes it with Groq's whisper.
 
 The pipeline STOPS at the transcript. `handle_transcript()` is the handoff seam:
-it logs the text and, if SUPABASE_URL/SUPABASE_ANON_KEY are set, enqueues it into the
-Supabase `voice_requests` table (INSERT-only via the anon key + RLS) for downstream
-consumers to pick up. Wire the rest of the system off that queue.
+it logs the text and enqueues it into the Supabase `voice_requests` table with the
+service key for downstream consumers to pick up. Wire the rest of the system off that queue.
 
 The WebSocket optionally requires a device token: if VOICE_DEVICE_TOKEN is set,
 clients must present it (via `?token=` on the ws path or an X-Device-Token /
@@ -45,9 +44,9 @@ GROQ_MODEL = os.environ.get("GROQ_MODEL", "whisper-large-v3-turbo")
 # words, so when their readings differ the worker hands the model both (voice_requests.alt_transcript,
 # docs/ROUTING.md § A command can arrive with two transcripts). The hub does the same for its commands.
 ALT_GROQ_MODEL = "whisper-large-v3" if GROQ_MODEL != "whisper-large-v3" else "whisper-large-v3-turbo"
-# Supabase enqueue target for transcripts (INSERT-only via anon key + RLS).
+# Supabase enqueue target for transcripts. Every write here uses SUPABASE_SERVICE_KEY: anon has no
+# INSERT on voice_requests, because a pending row is run by the worker as Jared with every tool.
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
 # Optional device-token auth on the ws handshake; enforced only when set.
 VOICE_DEVICE_TOKEN = os.environ.get("VOICE_DEVICE_TOKEN")
 # Shared secret the worker uses to ping POST /led-off when the model finishes (turns the ESP LED off).
@@ -469,11 +468,11 @@ async def handle_transcript(text: str, duration_s: float, truncated: bool,
     alt_field = {"alt_transcript": alt} if alt and words(alt) != words(text) else {}
     if alt_field:
         log.info("transcribers disagree: %r vs %s %r", text[:120], ALT_GROQ_MODEL, alt[:120])
-    if not (SUPABASE_URL and SUPABASE_ANON_KEY and text):
+    if not (SUPABASE_URL and SUPABASE_SERVICE_KEY and text):
         return False
     try:
         async with httpx.AsyncClient(timeout=10) as c:
-            if rid and SUPABASE_SERVICE_KEY:
+            if rid:
                 now = datetime.now(timezone.utc).isoformat()
                 # Checked and retried: an unchecked PATCH that failed left the row 'transcribing' with
                 # the transcript in hand, until the worker's sweep closed it as a dead capturer. Guarded
@@ -501,12 +500,12 @@ async def handle_transcript(text: str, duration_s: float, truncated: bool,
                         log.warning("enqueue patch failed (%s); retrying in %.1fs", e, pause)
                         await asyncio.sleep(pause)
             else:
-                # Fallback (no lifecycle row): insert at enqueue, as before. The anon key is INSERT-only by RLS.
-                await c.post(
+                # Fallback (no lifecycle row): insert at enqueue. Checked, so a refused insert is an error.
+                r = await c.post(
                     f"{SUPABASE_URL}/rest/v1/voice_requests",
                     headers={
-                        "apikey": SUPABASE_ANON_KEY,
-                        "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+                        "apikey": SUPABASE_SERVICE_KEY,
+                        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
                         "Content-Type": "application/json",
                         "Prefer": "return=minimal",
                     },
@@ -514,6 +513,7 @@ async def handle_transcript(text: str, duration_s: float, truncated: bool,
                           **({"capture_start": cap_start} if cap_start else {}),
                           **({"capture_end": cap_end} if cap_end else {})},
                 )
+                r.raise_for_status()
         return True
     except Exception as e:
         log.error("supabase enqueue failed: %s", e)
@@ -1159,7 +1159,7 @@ def _backfill(history) -> int:
 def _upload_voiceprint(bank) -> bool:
     """Write the merged exemplar bank back to app_settings.voiceprint — the shared source of truth every
     mic loads from."""
-    key = SUPABASE_SERVICE_KEY or SUPABASE_ANON_KEY
+    key = SUPABASE_SERVICE_KEY
     if not (SUPABASE_URL and key):
         return False
     import base64
@@ -1233,7 +1233,7 @@ async def _alive_beacon() -> None:
     """Mic-liveness beacon: stamp voice_presence.alive_at (source 'esp') every 30s WHILE audio frames
     are arriving from the device. Gated on _last_esp_frame — real audio flow, not process/socket
     existence — so a stale beacon always means the ESP mic is genuinely down."""
-    key = SUPABASE_SERVICE_KEY or SUPABASE_ANON_KEY
+    key = SUPABASE_SERVICE_KEY
     if not (SUPABASE_URL and key):
         return
     while True:
@@ -1255,7 +1255,7 @@ async def _publish_presence(jared: bool) -> None:
     """Upsert this ESP's row in the shared voice_presence — the system-wide 'who is hearing Jared' truth.
     Fire-and-forget on each confirmed check; any mic's fresh heard_jared_at makes the whole system
     'Hearing Jared' (drives every indicator + lets the other mic suppress a partial capture)."""
-    key = SUPABASE_SERVICE_KEY or SUPABASE_ANON_KEY
+    key = SUPABASE_SERVICE_KEY
     if not (SUPABASE_URL and key):
         return
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -1277,7 +1277,7 @@ async def _other_heard_jared():
     """Most recent time a mic OTHER than this ESP confirmed Jared (datetime, or None). Used at capture
     close to suppress a partial: if the Mac still has you, the ESP drops its fragment and the Mac sends
     the whole utterance."""
-    key = SUPABASE_SERVICE_KEY or SUPABASE_ANON_KEY
+    key = SUPABASE_SERVICE_KEY
     if not (SUPABASE_URL and key):
         return None
     try:
@@ -1474,7 +1474,7 @@ SETTINGS_SOCKET_MAX_S = 300.0   # recycle the realtime socket this often so a ha
 async def _settings_listener() -> None:
     """Restore state from app_settings on boot, then react to hub changes live over realtime — so the
     ESP's mode survives server restarts and hub toggles even with the Mac off."""
-    key = SUPABASE_SERVICE_KEY or SUPABASE_ANON_KEY
+    key = SUPABASE_SERVICE_KEY
     if not (SUPABASE_URL and key):
         log.warning("settings listener: no supabase creds; ESP state will rely on the Mac bridge only")
         return

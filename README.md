@@ -15,7 +15,7 @@ ESP32 (I2S mic) ──wss://jared-voice.fly.dev/ws/audio──▶  Fly: jared-vo
 ## server/ (Fly app `jared-voice`)
 - WebSocket server, openWakeWord, Groq STT. Always-on 2GB machine.
 - Config via env: `GROQ_API_KEY` (secret), `WAKE_MODEL` (default `hey_rhasspy`),
-  `WAKE_THRESHOLD`, `GROQ_MODEL`, `SUPABASE_URL` + `SUPABASE_ANON_KEY` (where
+  `WAKE_THRESHOLD`, `GROQ_MODEL`, `SUPABASE_URL` + `SUPABASE_SERVICE_KEY` (where
   transcripts enqueue), `VOICE_DEVICE_TOKEN` (optional ws auth — see below).
 - Deploy: `./assemble.sh && flyctl deploy --now -a jared-voice`, from `server/`. The assemble step
   is not optional — the Govee sync script is copied in from the govee-mcp checkout (`CLAUDE.md`). Set
@@ -42,9 +42,10 @@ ESP32 (I2S mic) ──wss://jared-voice.fly.dev/ws/audio──▶  Fly: jared-vo
 
 ### The handoff seam
 `handle_transcript(text)` logs the transcript and, if `SUPABASE_URL` and
-`SUPABASE_ANON_KEY` are set, enqueues it into the Supabase `voice_requests` table
-(`INSERT` of `{"transcript": ..., "source": "fly"}` via the anon key — INSERT-only
-by RLS; the table fills the rest with defaults). Downstream consumers read off that
+`SUPABASE_SERVICE_KEY` are set, enqueues it into the Supabase `voice_requests` table
+(normally by PATCHing the row opened at capture-accept to `pending`, else an `INSERT`).
+Anon has no INSERT on `voice_requests`: a pending row is run by the worker as Jared with
+every tool, so only server-side holders of the service key may write one. Downstream consumers read off that
 queue. It's best-effort and never raises.
 
 ### WebSocket auth
