@@ -2663,11 +2663,13 @@ def process_request(db: Supabase, req: dict) -> None:
             push_activity("On API credits")
             result = run_hub(SDK_CREDITS)
             result["_limit"] = True
+            result["_engine"] = "credits"
         if (not result.get("ok") and not result.get("used_tools") and source not in ROOM_MIC_SOURCES
                 and codex_ready()):
             log_error(f"Claude could not answer ({result.get('raw_error')}) — running the turn on Codex")
             push_activity("On Codex")
-            result = {**run_codex(hub_prompt + NUTRITION_DIRECTIVE + TOOLS_DIRECTIVE), "_limit": result.get("_limit")}
+            result = {**run_codex(hub_prompt + NUTRITION_DIRECTIVE + TOOLS_DIRECTIVE), "_limit": result.get("_limit"),
+                      "_engine": "codex"}
             if not result.get("ok"):
                 log_error(f"codex fallback failed: {result.get('raw_error')}")
 
@@ -2728,7 +2730,10 @@ def process_request(db: Supabase, req: dict) -> None:
         db.post(
             "voice_messages",
             {"request_id": rid, "focus": "hub", "mode": msg_mode, "role": "assistant",
-             "text": text, "done": True, "worker": WORKER_ID, "needs_read": needs_read},
+             "text": text, "done": True, "worker": WORKER_ID, "needs_read": needs_read,
+             # Which engine wrote it, when not the subscription: the surfaces colour the reply by it
+             # (credits amber, Codex blue), so a fallback is visible on the reply itself.
+             **({"engine": result["_engine"]} if result.get("_engine") else {})},
         )
         db.patch(
             "voice_requests",

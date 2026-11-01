@@ -57,6 +57,9 @@ A session either fallback dispatches runs on Codex too: `run_codex` and `SDK_CRE
 agent, because a Claude session would hit the same wall. Codex sessions themselves (`desk_sessions.agent`,
 `pi-desk/launch-codex.sh`, `orchestrator/src/codex.js`) are status-hub `docs/SESSIONS.md` § Codex sessions.
 
+A reply written on credits or Codex is stamped `voice_messages.engine` (`credits` / `codex`), which every
+surface colours (status-hub HUB-INTERNALS § Fallback replies are coloured).
+
 Every SDK turn's `rate_limit_event` also goes to Supabase `claude_usage` (`report_usage`), which is how
 the system knows how close the 5-hour and weekly windows are.
 
