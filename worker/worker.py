@@ -1393,7 +1393,8 @@ def set_cmd_ts(value: str | None) -> None:
         log_error(f"cmd_ts write failed: {e}")   # a stale stamp is worse than none, so this is never fatal
 
 
-def write_mcp_config() -> str:
+def mcp_servers() -> dict:
+    """Every MCP server a hub turn gets, keyed by name, in Claude Code's --mcp-config shape."""
     env = {"SUPABASE_URL": SUPABASE_URL, "SUPABASE_KEY": SUPABASE_KEY}
     # DATA_CALLER=hub marks sessions this worker dispatches, so their first reply is relayed back
     # into the hub thread (data-layer startSession → orchestrator/src/relay.js).
@@ -1419,6 +1420,11 @@ def write_mcp_config() -> str:
         cfg["mcpServers"]["gmail"] = {"command": GMAIL_PY, "args": [GMAIL_MCP_PY], "env": g_env}
     if HAS_MESSAGES:
         cfg["mcpServers"]["messages"] = {"type": "http", "url": MESSAGES_MCP_URL, "headers": MESSAGES_HEADERS}
+    return cfg["mcpServers"]
+
+
+def write_mcp_config() -> str:
+    cfg = {"mcpServers": mcp_servers()}
     # alwaysLoad makes Claude Code connect a server BEFORE the first turn. Without it, `-p` connects
     # --mcp-config servers in the background and the model's first request carries only whichever ones
     # had finished starting: on Fly the voice server (~1.6s) made it and data (~2s) did not, so the
@@ -1904,6 +1910,73 @@ class SdkRunner:
         if not retry.get("ok"):
             self._recycle()   # the cold client failed too; don't hand the next turn a used one
         return retry
+
+
+# ── Codex: the hub's last resort when Claude itself is down ────────────────────────────────────────
+# Billed to Jared's ChatGPT plan through `codex exec`, which is the only programmatic way in: the plan has
+# no API access. Used for a watch/phone/web hub turn that Claude could not answer at all (the subscription
+# failed for a reason other than its usage limit, or the credits run failed too) and that called no tool
+# first, so nothing is done twice. It gets the same MCP servers minus start_session: it exists to keep
+# nutrition, lists and the rest of life data working, not to dispatch work. Each machine signs in to
+# Codex separately (`codex login --device-auth`): a ChatGPT login copied between machines breaks when
+# one of them rotates the refresh token.
+CODEX_BIN = shutil.which(os.environ.get("CODEX_BIN", "codex"))
+CODEX_TIMEOUT_S = float(os.environ.get("CODEX_TIMEOUT_S", "240"))
+
+
+def _toml(v) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, (list, tuple)):
+        return "[" + ", ".join(_toml(x) for x in v) + "]"
+    if isinstance(v, dict):
+        # Bare keys: `-c` takes quoted ones without complaint and then drops the table. Env var names and
+        # header names are all bare-key safe.
+        return "{" + ", ".join(f"{k} = {_toml(x)}" for k, x in v.items()) + "}"
+    return json.dumps(str(v))
+
+
+def codex_ready() -> bool:
+    home = pathlib.Path(os.environ.get("CODEX_HOME") or pathlib.Path.home() / ".codex")
+    return bool(CODEX_BIN) and (home / "auth.json").exists()
+
+
+def run_codex(prompt: str) -> dict:
+    """One hub turn on Codex. Same result shape as an SDK turn; `used_tools` is True whenever it ran,
+    since nothing here reports what it called."""
+    over = ["-c", 'approval_policy="never"', "-c", 'model_reasoning_effort="medium"']
+    for name, srv in mcp_servers().items():
+        key = f"mcp_servers.{name}"   # bare: `-c` splits the path on dots and does not unquote a segment
+        if srv.get("type") == "http":
+            over += ["-c", f"{key}.url={_toml(srv['url'])}"]
+            if srv.get("headers"):
+                over += ["-c", f"{key}.http_headers={_toml(srv['headers'])}"]
+        else:
+            over += ["-c", f"{key}.command={_toml(srv['command'])}", "-c", f"{key}.args={_toml(srv.get('args', []))}"]
+            if srv.get("env"):
+                over += ["-c", f"{key}.env={_toml(srv['env'])}"]
+        over += ["-c", f'{key}.default_tools_approval_mode="approve"']
+        if name == "data":
+            over += ["-c", f'{key}.disabled_tools=["start_session"]']
+    fd, out = tempfile.mkstemp(prefix="voice-codex-", suffix=".txt")
+    os.close(fd)
+    full = HUB_SYSTEM + "\n\n" + SHARED_STATE_NOTE + "\n\n" + prompt
+    try:
+        proc = subprocess.run([CODEX_BIN, "exec", "--ephemeral", "--skip-git-repo-check", "--ignore-user-config",
+                               "-s", "read-only", *over, "-o", out, "-"],
+                              input=full,   # stdin: a day of replayed context outgrows Linux's 128KB per-argument cap
+                              cwd=os.path.expanduser("~"), capture_output=True, text=True, timeout=CODEX_TIMEOUT_S)
+        text = pathlib.Path(out).read_text().strip()
+        ok = proc.returncode == 0 and bool(text)
+        return {"session_id": None, "text": text, "result": text, "ok": ok, "used_tools": True,
+                "raw_error": None if ok else f"codex exit {proc.returncode}: {(proc.stderr or proc.stdout)[-300:]}"}
+    except Exception as e:  # noqa: BLE001
+        return {"session_id": None, "text": "", "result": "", "ok": False, "used_tools": True,
+                "raw_error": f"codex run failed: {e}"}
+    finally:
+        pathlib.Path(out).unlink(missing_ok=True)
 
 
 SDK = SdkRunner()
@@ -2587,6 +2660,13 @@ def process_request(db: Supabase, req: dict) -> None:
             push_activity("On API credits")
             result = run_hub(SDK_CREDITS)
             result["_limit"] = True
+        if (not result.get("ok") and not result.get("used_tools") and source not in ROOM_MIC_SOURCES
+                and codex_ready()):
+            log_error(f"Claude could not answer ({result.get('raw_error')}) — running the turn on Codex")
+            push_activity("On Codex")
+            result = {**run_codex(hub_prompt + NUTRITION_DIRECTIVE + TOOLS_DIRECTIVE), "_limit": result.get("_limit")}
+            if not result.get("ok"):
+                log_error(f"codex fallback failed: {result.get('raw_error')}")
 
     if att_tmp:
         shutil.rmtree(att_tmp, ignore_errors=True)   # staged photos served their turn

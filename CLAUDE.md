@@ -45,6 +45,13 @@ from the environment at import into `CREDITS_API_KEY`, and only `SDK_CREDITS` pa
 (with `CLAUDE_CODE_OAUTH_TOKEN` blanked). Nothing else it spawns can inherit it. `pi-desk/launch.sh`
 strips it separately (it sources the worker's `.env` itself). Fly holds it as a secret.
 
+When Claude cannot answer at all (the subscription failed for any other reason, or the credits run
+failed too), a watch/phone/web hub turn that called no tool is re-run on Codex (`run_codex`: `codex exec`
+on Jared's ChatGPT plan, the same MCP servers minus `start_session`, read-only sandbox, prompt on stdin),
+on any worker where `codex_ready()` (the binary plus a login in `CODEX_HOME`). Each machine needs its own
+`codex login --device-auth`: one ChatGPT login copied to two machines breaks when either rotates its
+refresh token.
+
 Every SDK turn's `rate_limit_event` also goes to Supabase `claude_usage` (`report_usage`), which is how
 the system knows how close the 5-hour and weekly windows are.
 
