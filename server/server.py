@@ -585,7 +585,7 @@ async def connection(ws):
             log.warning("rejected unauthenticated/invalid connection: %s", peer)
             await ws.close(code=1008, reason="invalid device token")
             return
-    log.info("ESP32 connected: %s", peer)
+    log.info("ESP32 connected: %s%s", peer, " (device token presented)" if _client_token(ws) else "")
     _active_esp = ws
     _esp_back()
     _led_working = False

@@ -8,6 +8,9 @@
 #include <WebSocketsClient.h>
 #include <driver/i2s.h>
 #include "config.h"
+#ifndef DEVICE_TOKEN
+#error "config.h has no DEVICE_TOKEN; copy it from config.h.example"
+#endif
 
 static const i2s_port_t I2S_PORT = I2S_NUM_0;
 static const int SAMPLE_RATE = 16000;
@@ -96,6 +99,9 @@ void setup() {
 
   setupI2S();
 
+  // The server rejects the socket without this once VOICE_DEVICE_TOKEN is set on Fly. The library
+  // keeps the pointer, so it must be a literal.
+  ws.setExtraHeaders("X-Device-Token: " DEVICE_TOKEN);
   if (WS_TLS) ws.beginSSL(WS_HOST, WS_PORT, WS_PATH);
   else        ws.begin(WS_HOST, WS_PORT, WS_PATH);
   ws.onEvent(onWsEvent);

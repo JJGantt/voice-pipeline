@@ -48,14 +48,23 @@ Anon has no INSERT on `voice_requests`: a pending row is run by the worker as Ja
 every tool, so only server-side holders of the service key may write one. Downstream consumers read off that
 queue. It's best-effort and never raises.
 
-### WebSocket auth
-If `VOICE_DEVICE_TOKEN` is set, the ws handshake must present that token — via
-`?token=...` on the ws path, an `X-Device-Token` header, or `Authorization: Bearer
-...` — or the connection is closed (1008). If it's unset, all connections are
-accepted, so existing firmware keeps working until it's updated to send the token.
+### Auth
+Every HTTP control route requires a token in `?token=`: `/led-*`, `/enroll-*`, `/capture-*` and
+`/wakefree-*` take `LED_TOKEN` (the workers and the Mac listener hold it), `/verify` takes
+`VERIFY_TOKEN` (the hub holds it). The server refuses to start without both, or without
+`SUPABASE_SERVICE_KEY`.
+
+The ws handshake must present `VOICE_DEVICE_TOKEN` — via `?token=...` on the ws path, an
+`X-Device-Token` header, or `Authorization: Bearer ...` — or it is closed (1008). While that secret is
+unset every connection is accepted, and the connect log line says `(device token presented)` when the
+puck sent one. The firmware sends `DEVICE_TOKEN` from its gitignored `config.h`; set the secret only
+with `firmware/bin/enable-device-token.sh`, which flashes the puck, waits for it to present the token,
+sets the secret, and removes it again if the puck is then rejected. Setting it any other way before
+the puck sends the token locks the puck out.
 
 ## firmware/ (ESP32, PlatformIO)
-- Copy `src/config.h.example` → `src/config.h`, fill WiFi + server + I2S mic pins.
+- Copy `src/config.h.example` → `src/config.h`, fill WiFi + server + I2S mic pins and `DEVICE_TOKEN`
+  (must equal `VOICE_DEVICE_TOKEN` on `jared-voice`; see Auth above).
 - Build/flash: `~/.platformio/penv/bin/pio run -t upload` from `firmware/`.
 - It's a dumb pump: reads the I2S mic and streams PCM continuously. No on-device logic.
 

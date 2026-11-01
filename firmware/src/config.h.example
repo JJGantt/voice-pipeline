@@ -12,6 +12,9 @@
 #define WS_PORT  443
 #define WS_PATH  "/ws/audio"
 #define WS_TLS   true        // wss://
+// Sent as X-Device-Token on the ws handshake; must equal VOICE_DEVICE_TOKEN on jared-voice.
+// Generate with: openssl rand -hex 32
+#define DEVICE_TOKEN "replace-with-a-random-hex-token"
 
 // --- I2S mic wiring (from the proven ESP32-AudioRelay setup) ---
 #define I2S_SCK_PIN  14      // BCLK / SCK
