@@ -147,6 +147,7 @@ function preflight() {
     process.exit(1);
   }
   if (!config.HUB_TOKEN) console.error('[orchestrator] HUB_TOKEN is not set: session activity will not reach the hub.');
+  if (!config.TERM_BASE) console.error('[orchestrator] TERM_BASE is not set: the terminal_url it advertises will not resolve.');
   if (!config.SUPABASE_KEY) {
     console.error(
       '[orchestrator] WARNING: SUPABASE_KEY is empty — focus watcher, registry & desk control will fail. Set it in the environment.'

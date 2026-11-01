@@ -77,7 +77,7 @@ called). Seconds are to `initialize`, one cold run then warm runs on Fly, one ru
 | govee-lights (5) | 1.16s | 0.43s | 0.75–0.95s |
 | petlibro-feeder (4) | 3.70s | 0.48s | **absent** — registered only where its files exist |
 | gmail (8) | 2.10s | present | in the image (own venv, mcp 2.x); registered only while the three `GOOGLE_*` secrets are set |
-| messages (HTTP) | via `http://Jareds-MacBook-Air.local:27187/mcp` | loopback | over Tailscale to the Mac's `<mac-tailnet-ip>`, only while `TAILSCALE_AUTHKEY` is set and the tailnet came up at boot |
+| messages (HTTP) | via `http://Jareds-MacBook-Air.local:27187/mcp` | loopback | over Tailscale to the Mac's tailnet address (the `MESSAGES_TAILNET_URL` secret), only while `TAILSCALE_AUTHKEY` is set and the tailnet came up at boot |
 
 Everything else that differs, from the code (`grep -n WORKER_ID worker/worker.py`):
 

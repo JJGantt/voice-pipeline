@@ -22,3 +22,6 @@ worker/worker.err.log
 # wake-free listener runtime log
 voice-id/wakefree.out.log
 voice-id/wakefree.err.log
+
+# orchestrator dependencies: installed with `npm install` in orchestrator/, never committed
+orchestrator/node_modules/

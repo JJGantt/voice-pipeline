@@ -36,6 +36,7 @@ update_claude() {
 # tailnet. State lives on the volume so a restart rejoins as the same node instead of minting a new one.
 # Nothing here retries: a tailnet that will not come up costs the iMessage tools until the next restart,
 # and every other tool is unaffected.
+# MESSAGES_TAILNET_URL (a Fly secret) is the Mac's iMessage server at its tailnet address.
 if [ -n "${TAILSCALE_AUTHKEY:-}" ]; then
   mkdir -p /data/tailscale /var/run/tailscale
   tailscaled --state=/data/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock >/dev/null 2>&1 &

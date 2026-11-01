@@ -16,8 +16,9 @@ export const config = {
   MAC_HOST: process.env.MAC_HOST || 'Jareds-MacBook-Air.local',
   // Public base the TV/Pi uses to reach the terminal ws. MUST be wss:// — the /tv page is
   // HTTPS, so an insecure ws:// is blocked as mixed content. Tailscale Serve fronts the local
-  // orchestrator (127.0.0.1:PORT) with a valid TLS cert on the tailnet FQDN at :443.
-  TERM_BASE: process.env.TERM_BASE || 'wss://<the Mac>.<tailnet>.ts.net',
+  // orchestrator (127.0.0.1:PORT) with a valid TLS cert on the tailnet FQDN at :443, so this is
+  // wss://<the Mac's tailnet FQDN>, set in the launchd plist.
+  TERM_BASE: process.env.TERM_BASE || '',
   ORCH_TOKEN: process.env.ORCH_TOKEN || '',
   // The status hub, for pushing live session activity (sessionWatch.js). Same base and same kiosk
   // token the voice worker posts its tool calls to; both go to the wall the same way.

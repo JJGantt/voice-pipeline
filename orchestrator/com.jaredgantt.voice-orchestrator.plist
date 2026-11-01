@@ -38,6 +38,9 @@
     <string>7682</string>
     <key>MAC_HOST</key>
     <string>Jareds-MacBook-Air.local</string>
+    <!-- wss://<the Mac's tailnet FQDN> (Tailscale Serve) -->
+    <key>TERM_BASE</key>
+    <string>FILL_IN</string>
     <key>ORCH_TOKEN</key>
     <string>FILL_IN</string>
     <key>HUB_TOKEN</key>

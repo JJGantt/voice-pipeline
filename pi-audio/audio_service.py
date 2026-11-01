@@ -48,7 +48,7 @@ _muted = False                 # push-to-talk / FAB active → cut off + hold re
 # Deliberately NOT a hearing light: blue is Jared's ambient color, and the hearing edge lagged. The lamp
 # only signals processing — amber the moment a command is claimed, off when it's done. LAN-direct UDP off
 # the cached IP, no cloud. (Hearing still shows on the ESP LED + Mac HUD, just not here.)
-FLOOR_DEV  = os.environ.get("FLOOR_DEV", "")
+FLOOR_DEV  = os.environ.get("FLOOR_DEV", "")   # the lamp's Govee device id; unset matches by SKU
 FLOOR_SKU  = os.environ.get("FLOOR_SKU", "H6072")
 LAMP_MCAST = ("239.255.255.250", 4001)
 LAMP_RECV_PORT, LAMP_CMD_PORT = 4002, 4003

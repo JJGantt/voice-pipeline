@@ -38,6 +38,7 @@ launchctl load ~/Library/LaunchAgents/com.jaredgantt.voice-orchestrator.plist
 | `SUPABASE_KEY`    | _(empty — must set; service_role key)_             |
 | `PORT`            | `7682`                                             |
 | `MAC_HOST`        | `Jareds-MacBook-Air.local`                         |
+| `TERM_BASE`       | _(empty: must set)_ `wss://<the Mac's tailnet FQDN>`, the base of the advertised `terminal_url` |
 | `ORCH_TOKEN`      | _(empty: must set; the orchestrator refuses to start without it)_ |
 | `CLAUDE_BIN`      | `/Users/jaredgantt/.local/bin/claude`              |
 | `FOCUS_POLL_MS`   | `10000` (realtime backstop; 60s while it's healthy) |
