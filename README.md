@@ -16,7 +16,7 @@ ESP32 (I2S mic) ──wss://jared-voice.fly.dev/ws/audio──▶  Fly: jared-vo
 - WebSocket server, openWakeWord, Groq STT. Always-on 2GB machine.
 - Config via env: `GROQ_API_KEY` (secret), `WAKE_MODEL` (default `hey_rhasspy`),
   `WAKE_THRESHOLD`, `GROQ_MODEL`, `SUPABASE_URL` + `SUPABASE_SERVICE_KEY` (where
-  transcripts enqueue), `VOICE_DEVICE_TOKEN` (optional ws auth — see below).
+  transcripts enqueue), `LED_TOKEN`, `VERIFY_TOKEN`, `VOICE_DEVICE_TOKEN` (see Auth below).
 - Deploy: `./assemble.sh && flyctl deploy --now -a jared-voice`, from `server/`. The assemble step
   is not optional — the Govee sync script is copied in from the govee-mcp checkout (`CLAUDE.md`). Set
   the key: `fly secrets set GROQ_API_KEY=...`.
