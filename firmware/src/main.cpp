@@ -88,7 +88,7 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);          // disable modem power-save — the #1 cause of periodic streaming drops
   // Both the router and the extender are registered; WiFiMulti scans and joins whichever is
-  // STRONGEST from where the puck actually sits, so moving it doesn't need a reflash. The mic
+  // STRONGEST from where the ESP actually sits, so moving it doesn't need a reflash. The mic
   // streams ~256 kbps, so a solid client link matters more than the extender's backhaul headroom.
   wifiMulti.addAP(WIFI_SSID, WIFI_PASSWORD);
   wifiMulti.addAP(WIFI_SSID_ALT, WIFI_PASSWORD_ALT);

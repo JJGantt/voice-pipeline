@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Flash the puck with src/config.h's DEVICE_TOKEN, then make jared-voice require it.
+# Flash the ESP with src/config.h's DEVICE_TOKEN, then make jared-voice require it.
 #
-# Order is the whole point: VOICE_DEVICE_TOKEN on Fly locks out any puck that does not send it, so the
+# Order is the whole point: VOICE_DEVICE_TOKEN on Fly locks out any ESP that does not send it, so the
 # secret is set only after the server has logged a connection that presented a token, and removed
-# again if the puck is rejected afterwards. Run with the puck plugged into this Mac over USB.
+# again if the ESP is rejected afterwards. Run with the ESP plugged into this Mac over USB.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 APP=jared-voice
@@ -18,8 +18,8 @@ since() { fly logs -a "$APP" --no-tail 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' |
 t_flash=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 ~/.platformio/penv/bin/pio run -t upload
 
-# Wait for the server to see the flashed puck present its token.
-echo "waiting for the puck to reconnect with its token..."
+# Wait for the server to see the flashed ESP present its token.
+echo "waiting for the ESP to reconnect with its token..."
 for _ in $(seq 1 40); do
   if since "$t_flash" | grep -q "device token presented"; then found=1; break; fi
   sleep 3
@@ -28,15 +28,15 @@ done
 
 t0=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 printf 'VOICE_DEVICE_TOKEN=%s\n' "$tok" | fly secrets import -a "$APP" >/dev/null
-echo "VOICE_DEVICE_TOKEN set; waiting for the restarted server to accept the puck..."
+echo "VOICE_DEVICE_TOKEN set; waiting for the restarted server to accept the ESP..."
 for _ in $(seq 1 40); do
   recent=$(since "$t0")
   if grep -q "rejected unauthenticated" <<<"$recent"; then
     fly secrets unset VOICE_DEVICE_TOKEN -a "$APP" >/dev/null
-    echo "FAILED: the server rejected the puck; VOICE_DEVICE_TOKEN removed again"; exit 1
+    echo "FAILED: the server rejected the ESP; VOICE_DEVICE_TOKEN removed again"; exit 1
   fi
   if grep -q "voice backend up" <<<"$recent" && grep -q "device token presented" <<<"$recent"; then
-    echo "OK: the puck is connected and the server now requires its token"; exit 0
+    echo "OK: the ESP is connected and the server now requires its token"; exit 0
   fi
   sleep 3
 done

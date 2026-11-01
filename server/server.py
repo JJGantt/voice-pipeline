@@ -11,7 +11,7 @@ service key for downstream consumers to pick up. Wire the rest of the system off
 Every HTTP control route (/led-*, /enroll-*, /capture-*, /wakefree-*) requires LED_TOKEN and /verify
 requires VERIFY_TOKEN; the server refuses to start without both. The WebSocket requires a device
 token when VOICE_DEVICE_TOKEN is set (via `?token=` on the ws path or an X-Device-Token /
-Authorization header); it stays optional only until the puck's firmware sends one.
+Authorization header); it stays optional only until the ESP firmware sends one.
 """
 
 import asyncio
@@ -205,7 +205,7 @@ def _demote(logger_name, test):
     logging.getLogger(logger_name).addFilter(f)
 
 
-# The puck's WiFi link is poor: it drops every few minutes and is back within seconds, and that is its
+# The ESP's WiFi link is poor: it drops every few minutes and is back within seconds, and that is its
 # normal behaviour, not a fault. Two things are reported instead. Being OFFLINE for ESP_OFFLINE_REPORT_S
 # straight (unplugged, WiFi gone, firmware wedged) — _esp_offline_watch. And FLAPPING so often that it is
 # mostly down even though each drop recovers: more than ESP_DROP_LIMIT drops in ESP_DROP_WINDOW_S, about
@@ -258,7 +258,7 @@ async def _esp_offline_watch():
 
 
 def _esp_handshake_drop(r):
-    """The ESP32 vanishing mid-handshake (WiFi blip, reboot): websockets logs it at ERROR, then the puck
+    """The ESP32 vanishing mid-handshake (WiFi blip, reboot): websockets logs it at ERROR, then the ESP
     reconnects. Counted as a drop, and demoted."""
     if r.getMessage() == "opening handshake failed" and r.exc_info and isinstance(
             r.exc_info[1], (websockets.exceptions.ConnectionClosed, EOFError, OSError)):
@@ -562,7 +562,7 @@ async def _device_frames(ws, peer):
     """The device's messages, ending quietly when it drops off without a close frame.
 
     The ESP32 losing WiFi or rebooting ends the TCP stream with no close handshake, which websockets
-    raises as ConnectionClosedError. That is an ordinary disconnect (the puck reconnects within a
+    raises as ConnectionClosedError. That is an ordinary disconnect (the ESP reconnects within a
     second), not a fault: left uncaught it escapes the handler, websockets logs it at ERROR (an ops
     incident), and the handler's own cleanup after the loop never runs. A run of drops is reported
     (_note_esp_drop).

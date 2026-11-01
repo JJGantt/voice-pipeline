@@ -31,7 +31,7 @@ subscription (`run_subscription`, `SUBSCRIPTION_RETRY_S`) and then surfaced as a
 onto the key: that turns a passing "529 Overloaded" on an Opus turn into a Console-billed Opus run.
 
 The one exception is a hub turn from the watch, phone or web (`source` not in `ROOM_MIC_SOURCES`, the
-ESP puck and the Mac listener) that the subscription refuses for its
+ESP and the Mac listener) that the subscription refuses for its
 usage limit (`limit_refused`: the turn's `rate_limit_event` said `rejected`, or the CLI's "You've hit
 your 5-hour limit"). It re-runs on `SDK_CREDITS`, a second warm client billed to `ANTHROPIC_API_KEY`,
 which the Max plan's monthly Console credits pay for. It is not handed to another worker, since every

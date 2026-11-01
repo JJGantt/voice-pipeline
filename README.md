@@ -57,10 +57,10 @@ Every HTTP control route requires a token in `?token=`: `/led-*`, `/enroll-*`, `
 The ws handshake must present `VOICE_DEVICE_TOKEN` — via `?token=...` on the ws path, an
 `X-Device-Token` header, or `Authorization: Bearer ...` — or it is closed (1008). While that secret is
 unset every connection is accepted, and the connect log line says `(device token presented)` when the
-puck sent one. The firmware sends `DEVICE_TOKEN` from its gitignored `config.h`; set the secret only
-with `firmware/bin/enable-device-token.sh`, which flashes the puck, waits for it to present the token,
-sets the secret, and removes it again if the puck is then rejected. Setting it any other way before
-the puck sends the token locks the puck out.
+ESP sent one. The firmware sends `DEVICE_TOKEN` from its gitignored `config.h`; set the secret only
+with `firmware/bin/enable-device-token.sh`, which flashes the ESP, waits for it to present the token,
+sets the secret, and removes it again if the ESP is then rejected. Setting it any other way before
+the ESP sends the token locks the ESP out.
 
 ## firmware/ (ESP32, PlatformIO)
 - Copy `src/config.h.example` → `src/config.h`, fill WiFi + server + I2S mic pins and `DEVICE_TOKEN`

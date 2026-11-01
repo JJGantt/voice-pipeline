@@ -289,11 +289,11 @@ def _apply_mute(on: bool) -> None:
 
 def set_mac_mic(on: bool) -> None:
     """Mac-mic-only kill switch (app_settings.mac_mic_enabled). Silences THIS Mac — the wake-word loop
-    and wakefree.py — while the ESP stays fully live, so the puck can be exercised in isolation.
+    and wakefree.py — while the ESP stays fully live, so the ESP can be exercised in isolation.
 
     Deliberately NOT voice_muted: that flag is global and deafens every source, and push-to-talk owns
     it. This one is per-device and leaves that plumbing untouched, so dictating still mutes the ESP
-    (otherwise the puck would hear and act on everything you dictate)."""
+    (otherwise the ESP would hear and act on everything you dictate)."""
     if on == _mic_on.is_set():
         return
     # Cleared FIRST so the supervisor sees the new state and won't respawn the kill below.
@@ -536,7 +536,7 @@ def _write_setting(key: str, value: str) -> None:
     """Write a hub setting, CREATING it if it is not there yet. This is how the Mac holds the global mute
     (`voice_mute_mac`, which the hub folds into `voice_muted`), and an update alone does nothing to a row
     that does not exist: the hold never reached the table, `voice_muted` stayed 0, and the Fly server's
-    settings backstop took that 0 as a missed update and unmuted the ESP mid-dictation, so the puck heard
+    settings backstop took that 0 as a missed update and unmuted the ESP mid-dictation, so the ESP heard
     the rest and ran it as a command."""
     try:
         r = httpx.post(f"{SUPABASE_URL}/rest/v1/app_settings",
