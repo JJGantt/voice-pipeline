@@ -30,12 +30,14 @@ the Claude subscription. A run that fails transiently (overloaded, 5xx, network)
 subscription (`run_subscription`, `SUBSCRIPTION_RETRY_S`) and then surfaced as an error, never moved
 onto the key: that turns a passing "529 Overloaded" on an Opus turn into a Console-billed Opus run.
 
-The one exception is a deliberate hub turn (`always_on` false) that the subscription refuses for its
+The one exception is a hub turn from the watch, phone or web (`source` not in `ROOM_MIC_SOURCES`, the
+ESP puck and the Mac listener) that the subscription refuses for its
 usage limit (`limit_refused`: the turn's `rate_limit_event` said `rejected`, or the CLI's "You've hit
 your 5-hour limit"). It re-runs on `SDK_CREDITS`, a second warm client billed to `ANTHROPIC_API_KEY`,
 which the Max plan's monthly Console credits pay for. It is not handed to another worker, since every
-worker shares the account. Always-on captures are never re-run there: judging room noise on the key is
-what drained the Console balance once. `SDK_CREDITS` connects on first use and closes on the next turn
+worker shares the account. Room-mic captures are never re-run there, wake-word ones included (they
+arrive with `always_on` false but carry most of the overheard TV): judging room noise on the key is what
+drained the Console balance once. `SDK_CREDITS` connects on first use and closes on the next turn
 the subscription answers.
 
 The CLI and the Agent SDK silently prefer the key over the subscription login, so `worker.py` pops it

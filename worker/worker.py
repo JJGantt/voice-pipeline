@@ -77,8 +77,8 @@ FALLBACK_OUTAGE_S = 30 * 60
 STATE_DIR = Path(os.path.expanduser(os.environ.get("STATE_DIR", "~/.voice-worker")))
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 
-# Every turn runs on the Claude subscription. The Console key is used for exactly one case: a deliberate
-# hub turn (not a room mic's always-on capture) refused because the subscription's usage limit is hit,
+# Every turn runs on the Claude subscription. The Console key is used for exactly one case: a hub turn
+# from the watch, phone or web (never a room mic) refused because the subscription's usage limit is hit,
 # which is re-run on the key so nutrition and lists keep working until the window resets (Jared,
 # 2026-11-01). The Max plan's $100/month of Console credits pays for it. An overloaded or erroring
 # subscription is retried and surfaced, never moved onto the key: on 2026-09-21 one 529 did that to an
@@ -87,6 +87,10 @@ CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 # The key is popped from the environment at import, so no subprocess inherits it and quietly bills it;
 # only the credits runner (SDK_CREDITS) passes it on, explicitly.
 CREDITS_API_KEY = os.environ.pop("ANTHROPIC_API_KEY", None) or ""
+# The room mics: the ESP puck (through the Fly server) and the Mac's listener. Their wake-word captures
+# arrive with always_on false, yet they are where overheard TV and conversation comes from, so the credits
+# fallback is decided by source, never by that flag.
+ROOM_MIC_SOURCES = ("fly", "mac")
 # Every hub turn runs on ONE model with the full toolset: Opus at its default effort, which is adaptive —
 # it thinks as hard as the turn needs. Quality over speed, by Jared's call (2026-10-29): there is no fast
 # first responder and no escalation. Low effort was measurably worse on macro estimates and `max` bought
@@ -2577,7 +2581,7 @@ def process_request(db: Supabase, req: dict) -> None:
         result = run_subscription(lambda: run_hub(SDK), "subscription hub")
         if result.get("ok"):
             SDK_CREDITS.close()   # the subscription answers again; the credits client has no more work
-        elif not ambient and limit_refused(result) and CREDITS_API_KEY:
+        elif source not in ROOM_MIC_SOURCES and limit_refused(result) and CREDITS_API_KEY:
             # Every worker shares the one account, so handing this on would only fail again elsewhere.
             log(f"subscription limit hit ({result.get('raw_error')}) — running on API credits")
             push_activity("On API credits")
