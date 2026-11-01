@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -e
-mkdir -p /data/claude /data/voice-worker
+mkdir -p /data/claude /data/voice-worker /data/codex
 # Everything this machine prints also lands in /data/worker.log, which survives restarts; `fly logs`
 # keeps only the last 100 lines.
 exec > >(tee -a /data/worker.log) 2>&1

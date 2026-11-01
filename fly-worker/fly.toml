@@ -13,6 +13,8 @@ kill_timeout = "20s"   # time for the worker to announce it is stopping; a turn 
   # The Mac's iMessage server at its tailnet address. entrypoint.sh exports it as MESSAGES_MCP_URL only
   # once Tailscale is up, so a machine without the tailnet registers no iMessage server at all.
   MESSAGES_TAILNET_URL = "http://<mac-tailnet-ip>:27187/mcp"
+  # Codex's login and state, on the volume so a deploy keeps the sign-in.
+  CODEX_HOME = "/data/codex"
 
 [mounts]
   source = "worker_data"

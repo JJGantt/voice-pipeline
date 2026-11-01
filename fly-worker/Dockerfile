@@ -17,6 +17,9 @@ COPY --from=docker.io/tailscale/tailscale:v1.104.2 /usr/local/bin/tailscaled /us
 # ships and a fresh machine boots current. entrypoint.sh updates a long-running machine daily.
 ARG CLAUDE_CODE_VERSION=latest
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
+# Codex, the worker's fallback when Claude is down (worker.py run_codex). Its login lives on the volume
+# (CODEX_HOME in fly.toml), signed in once on this machine with `codex login --device-auth`.
+RUN npm install -g @openai/codex@latest
 
 # `mcp<2`: govee_mcp.py imports mcp.server.fastmcp, which 2.x removed — an unpinned rebuild leaves the
 # worker with no lights tool and no error anywhere but the server's stderr.
