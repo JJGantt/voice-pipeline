@@ -27,6 +27,7 @@ Design notes:
 
 import asyncio
 import json
+import logging
 import os
 import pathlib
 import re
@@ -2840,6 +2841,13 @@ def _listener_supervisor(stop_evt: threading.Event) -> None:
         stop_evt.wait(60)
 
 
+def _demote_realtime_retry(record):
+    if record.levelno == logging.ERROR and record.getMessage().startswith(
+            ("Connection attempt failed:", "WebSocket connection closed with code:")):
+        record.levelno, record.levelname = logging.WARNING, "WARNING"
+    return True
+
+
 def main() -> int:
     if not SUPABASE_KEY:
         print("FATAL: SUPABASE_KEY is required (service_role key). See README.",
@@ -2854,6 +2862,11 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _handle_signal)
 
     ops.install(machine=WORKER_ID, service="voice-worker")
+    # realtime-py logs each failed connect attempt and each socket close at ERROR, then retries by itself;
+    # with the socket recycled every 5 min, one slow handshake would open an incident for a reconnect that
+    # lands seconds later. Re-level those to WARNING (the reporter forwards ERROR and above). Giving up
+    # ("Connection failed permanently…") is not demoted, and RealtimeWaker reports its own failures.
+    logging.getLogger("realtime._async.client").addFilter(_demote_realtime_retry)
     log(f"starting (priority={WORKER_PRIORITY}, state_dir={STATE_DIR}, once={once})")
 
     with httpx.Client(timeout=HTTP_TIMEOUT_S) as client:
