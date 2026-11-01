@@ -266,13 +266,24 @@ async function runInNewTerminal(shellCmd) {
   const windows = await osascript('tell application "Terminal" to count windows').catch(() => '0');
   if (parseInt(windows, 10) === 0) return newWindow();
 
+  // `do script … in front window` runs in whatever tab is selected there, so a Cmd-T that made no tab
+  // (Terminal not yet frontmost — activating into a full-screen Space takes longer than the delay)
+  // types the launch line into the input of the session already in that tab, where it sits as an
+  // unsent paste until someone presses Enter. A fresh tab's shell is idle; a tab running anything is
+  // `busy`. So the target has to be idle before anything is typed into it, or this takes the window path.
   try {
     const tty = await osascript(`tell application "Terminal" to activate
       delay 0.2
       tell application "System Events" to keystroke "t" using command down
       delay 0.4
       tell application "Terminal"
-        set t to do script "${escaped}" in front window
+        set t to selected tab of front window
+        repeat 10 times
+          if not (busy of t) then exit repeat
+          delay 0.2
+        end repeat
+        if busy of t then error "the front tab is running something, so no new tab was made"
+        set t to do script "${escaped}" in t
         return tty of t
       end tell`);
     return `newtab\t${String(tty).trim()}`;
