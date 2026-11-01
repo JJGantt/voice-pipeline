@@ -47,10 +47,15 @@ strips it separately (it sources the worker's `.env` itself). Fly holds it as a 
 
 When Claude cannot answer at all (the subscription failed for any other reason, or the credits run
 failed too), a watch/phone/web hub turn that called no tool is re-run on Codex (`run_codex`: `codex exec`
-on Jared's ChatGPT plan, the same MCP servers minus `start_session`, read-only sandbox, prompt on stdin),
+on Jared's ChatGPT plan, the same MCP servers, read-only sandbox, prompt on stdin),
 on any worker where `codex_ready()` (the binary plus a login in `CODEX_HOME`). Each machine needs its own
 `codex login --device-auth`: one ChatGPT login copied to two machines breaks when either rotates its
 refresh token.
+
+A session either fallback dispatches runs on Codex too: `run_codex` and `SDK_CREDITS` give the data MCP
+`DATA_AGENT=codex` (`mcp_servers(codex_sessions=True)`), which is data-layer `start_session`'s default
+agent, because a Claude session would hit the same wall. Codex sessions themselves (`desk_sessions.agent`,
+`pi-desk/launch-codex.sh`, `orchestrator/src/codex.js`) are status-hub `docs/SESSIONS.md` § Codex sessions.
 
 Every SDK turn's `rate_limit_event` also goes to Supabase `claude_usage` (`report_usage`), which is how
 the system knows how close the 5-hour and weekly windows are.
@@ -166,6 +171,9 @@ said. They were one column once, and a Mac row's "transcript path" was really a 
 nothing could read a Mac session's replies.
 
 ## A process's conversation is read from Claude Code's own record — never matched or guessed
+
+(For a Codex session it is read from the rollout file its process holds open — `orchestrator/src/codex.js`.
+The same rule holds: read, never inferred from which rollout is newest.)
 
 The Mac recognises `claude` processes it did not start — a terminal Jared opened himself — and
 publishes them into `desk_sessions` with `origin='adopted'`, so liveness and the last reply work the

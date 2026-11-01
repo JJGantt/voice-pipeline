@@ -32,9 +32,19 @@ machine stays up until it finishes. It does not appear in the session list, whic
   `--dangerously-skip-permissions`. An MCP server missing from that list stops a session on a prompt
   nobody can answer, so a server added in `entrypoint.sh` needs its line there too.
 - **No cgroup budgets, no hand-offs to the Mac, no retention sweeps** (the Pi does those for everyone).
-- **MCP:** data, gmail, govee-lights. No iMessage (no tailnet here), no browser.
+- **MCP:** data, gmail, govee-lights (for Claude in `~/.claude.json`, for Codex in `$CODEX_HOME/config.toml`). No iMessage (no tailnet here), no browser.
 - `$HOME` is `/data/home` on the `desk_data` volume, so checkouts, transcripts and `~/.claude.json`
   survive a stop. The host's log is `/data/desk.log`.
+
+## Codex
+
+Codex sessions (`agent = 'codex'`, status-hub `docs/SESSIONS.md` § Codex sessions) run here too, once
+Codex is signed in. The CLI is baked into the image (`deploy.sh` passes the newest `@openai/codex`);
+`CODEX_HOME` is `/data/home/.codex` on the volume, and `entrypoint.sh` rewrites its `config.toml` every boot
+with the same MCP servers as `~/.claude.json`, each with its tools approved. The login (`auth.json`) is
+made once, by hand, with the machine awake: wake it (`curl https://jared-desk-fly.fly.dev/wake`), then
+`fly ssh console -a jared-desk-fly -C 'codex login --device-auth'` and approve the code it prints. Until
+then its heartbeat-less dispatch refuses a Codex session with "Codex is not signed in on the Fly machine".
 
 ## Secrets
 

@@ -12,7 +12,9 @@
 //     an interface, so every field the orchestrators read must be present and well-formed — this is
 //     what catches a `claude` update that renames or drops one, which would otherwise make sessions
 //     vanish from the wall or order wrongly without anything erroring;
-//   - this machine's running rows in `desk_sessions`.
+//   - this machine's running Claude rows in `desk_sessions`. Codex rows (`agent = 'codex'`) are not
+//     checked here: they have no ~/.claude record, and codex.js reads their conversation from the
+//     rollout the process holds open.
 //
 // PASS: every process has a well-formed record and exactly one running row carrying its pid and its
 // current conversation, and no running row names a process that is not running.
@@ -94,7 +96,7 @@ function recordProblems(r) {
 const readRecord = (pid) => { try { return JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, `${pid}.json`), 'utf8')); } catch { return null; } };
 
 if (!KEY) { console.log('FAIL no SUPABASE_KEY (env, worker/.env or data-layer/.env)'); process.exit(1); }
-const res = await fetch(`${SUPABASE_URL}/rest/v1/desk_sessions?worker=eq.${WORKER}&status=eq.resident&select=id,pid,claude_session_id,started`,
+const res = await fetch(`${SUPABASE_URL}/rest/v1/desk_sessions?worker=eq.${WORKER}&status=eq.resident&agent=eq.claude&select=id,pid,claude_session_id,started`,
   { headers: { apikey: KEY, Authorization: `Bearer ${KEY}` } });
 if (!res.ok) { console.log(`FAIL desk_sessions ${res.status}: ${await res.text()}`); process.exit(1); }
 const rows = await res.json();
