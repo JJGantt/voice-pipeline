@@ -237,13 +237,17 @@ def _recompute_capture() -> None:
 
 
 JARED_VOICE_URL = os.environ.get("JARED_VOICE_URL", "https://jared-voice.fly.dev").rstrip("/")
+LED_TOKEN = os.environ.get("LED_TOKEN", "")   # the server refuses every control route without it
 
 
 def _ping_esp_capture(on: bool) -> None:
     """Tell the jared-voice server to mute/unmute the ESP, so the global mute reaches it too."""
     try:
-        httpx.get(f"{JARED_VOICE_URL}/capture-{'off' if on else 'on'}", timeout=3)
-    except Exception:  # noqa: BLE001
+        httpx.get(f"{JARED_VOICE_URL}/capture-{'off' if on else 'on'}",
+                  params={"token": LED_TOKEN}, timeout=3).raise_for_status()
+    except httpx.HTTPStatusError as e:   # a refused token is a misconfiguration, not a network blip
+        log(f"ERROR esp capture bridge refused: {e.response.status_code}")
+    except Exception:  # noqa: BLE001 — redundant fast-path; the server also reads voice_muted itself
         pass
 
 
@@ -251,8 +255,11 @@ def _ping_esp_wakefree(on: bool) -> None:
     """Bridge the global wake-free mode to the ESP — it switches to speaker-ID capture (on) or back to
     wake words (off), congruent with the Mac. Generous timeout: the server lazy-loads ECAPA on turn-on."""
     try:
-        httpx.get(f"{JARED_VOICE_URL}/wakefree-{'on' if on else 'off'}", timeout=20)
-    except Exception:  # noqa: BLE001
+        httpx.get(f"{JARED_VOICE_URL}/wakefree-{'on' if on else 'off'}",
+                  params={"token": LED_TOKEN}, timeout=20).raise_for_status()
+    except httpx.HTTPStatusError as e:
+        log(f"ERROR esp wakefree bridge refused: {e.response.status_code}")
+    except Exception:  # noqa: BLE001 — redundant fast-path; the server also reads wakefree_enabled itself
         pass
 
 
@@ -900,15 +907,12 @@ def transcribe(pcm: np.ndarray) -> str:
             pass
 
 
-LED_TOKEN = os.environ.get("LED_TOKEN", "")
-
-
 def _esp_blink() -> None:
     """Blink the ESP the instant a Mac-captured command is committed (capture-accept), so both
     working indicators start together instead of waiting for the worker's claim ping."""
     try:
         httpx.get(f"{JARED_VOICE_URL}/led-blink",
-                  params={"token": LED_TOKEN} if LED_TOKEN else None, timeout=3)
+                  params={"token": LED_TOKEN}, timeout=3)
     except Exception:  # noqa: BLE001
         pass
 

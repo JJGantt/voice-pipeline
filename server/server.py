@@ -8,13 +8,14 @@ The pipeline STOPS at the transcript. `handle_transcript()` is the handoff seam:
 it logs the text and enqueues it into the Supabase `voice_requests` table with the
 service key for downstream consumers to pick up. Wire the rest of the system off that queue.
 
-The WebSocket optionally requires a device token: if VOICE_DEVICE_TOKEN is set,
-clients must present it (via `?token=` on the ws path or an X-Device-Token /
-Authorization header) or the connection is rejected. If it's unset, all
-connections are accepted (so existing firmware keeps working).
+Every HTTP control route (/led-*, /enroll-*, /capture-*, /wakefree-*) requires LED_TOKEN and /verify
+requires VERIFY_TOKEN; the server refuses to start without both. The WebSocket requires a device
+token when VOICE_DEVICE_TOKEN is set (via `?token=` on the ws path or an X-Device-Token /
+Authorization header); it stays optional only until the puck's firmware sends one.
 """
 
 import asyncio
+import hmac
 import io
 import math
 import logging
@@ -49,10 +50,16 @@ ALT_GROQ_MODEL = "whisper-large-v3" if GROQ_MODEL != "whisper-large-v3" else "wh
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 # Optional device-token auth on the ws handshake; enforced only when set.
 VOICE_DEVICE_TOKEN = os.environ.get("VOICE_DEVICE_TOKEN")
-# Shared secret the worker uses to ping POST /led-off when the model finishes (turns the ESP LED off).
+# Shared secret for every control route: the worker's /led-*, the Mac listener's /capture-* and
+# /wakefree-*, and /enroll-*. Required — main() refuses to start without it.
 LED_TOKEN = os.environ.get("LED_TOKEN", "")
-# Shared with the hub, which asks /verify whether an uploaded clip sounds like Jared.
+# Shared with the hub, which asks /verify whether an uploaded clip sounds like Jared. Required.
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "")
+
+
+def _token_ok(given, want: str) -> bool:
+    """Constant-time token check. An unset `want` never matches."""
+    return bool(want) and isinstance(given, str) and hmac.compare_digest(given.encode(), want.encode())
 # The currently-connected ESP, so the /led-off HTTP handler can reach it. One device → one global ref.
 _active_esp = None
 # Push-to-talk active anywhere (Hammerspoon dictation) → the ESP ignores ALL audio: the mute is global,
@@ -64,6 +71,9 @@ _suppress_safety = None
 # pasted into the focused Mac window. The ESP must go deaf for it (Mac-only listening), so the server gates
 # its own capture off here, read straight from app_settings (survives restarts / a sleeping Mac).
 _inject = False
+# The ESP's own off switch (app_settings.esp_mic_enabled, absent = on). Off, it drops every frame the way
+# inject mode does, so neither its wake word nor wake-free can start a capture.
+_esp_off = False
 # Wake-free (speaker-ID) mode for the ESP, congruent with the Mac: the global wakefree_enabled toggle is
 # bridged here by the Mac listener via /wakefree-on|off. When ON, the ESP captures on speech ENERGY (no
 # wake word) and verifies the utterance is Jared's voice (ECAPA + the shared voiceprint) before
@@ -571,7 +581,7 @@ async def connection(ws):
     # Device-token gate: enforced only when VOICE_DEVICE_TOKEN is set, so existing
     # firmware that doesn't send a token keeps working until it's updated.
     if VOICE_DEVICE_TOKEN:
-        if _client_token(ws) != VOICE_DEVICE_TOKEN:
+        if not _token_ok(_client_token(ws), VOICE_DEVICE_TOKEN):
             log.warning("rejected unauthenticated/invalid connection: %s", peer)
             await ws.close(code=1008, reason="invalid device token")
             return
@@ -638,7 +648,7 @@ async def connection(ws):
                 # are level-robust — they need fidelity, not volume; each normalizes at point of use.
                 frame = np.clip(frame.astype(np.float32) * GAIN, -32768, 32767).astype(np.int16)
 
-            if _suppressed or _inject:    # push-to-talk mute OR inject mode (Mac-only) → ESP drops everything
+            if _suppressed or _inject or _esp_off:   # push-to-talk mute, inject mode (Mac-only), or switched off
                 if capturing:
                     # The mute exists so the ESP doesn't ALSO capture the dictation you're about to
                     # start — that argument covers audio recorded AFTER the mute, and only that.
@@ -1305,7 +1315,7 @@ async def process_request(connection, request):
         from urllib.parse import urlparse, parse_qs
         u = urlparse(path)
         tok = parse_qs(u.query).get("token", [None])[0]
-        if LED_TOKEN and tok != LED_TOKEN:
+        if not _token_ok(tok, LED_TOKEN):
             return connection.respond(HTTPStatus.FORBIDDEN, "forbidden\n")
         # The worker drives these for ANY command (universal indicator), not just ESP-sourced ones:
         # /led-blink while working, /led-off when done, /led-on as a solid 'listening' cue. They feed the
@@ -1337,7 +1347,7 @@ async def process_request(connection, request):
         from urllib.parse import urlparse, parse_qs
         u = urlparse(path)
         q = parse_qs(u.query)
-        if VERIFY_TOKEN and q.get("token", [None])[0] != VERIFY_TOKEN:
+        if not _token_ok(q.get("token", [None])[0], VERIFY_TOKEN):
             return connection.respond(HTTPStatus.FORBIDDEN, "forbidden\n")
         obj = (q.get("p", [""])[0] or "").strip()
         if not obj or ".." in obj:
@@ -1361,6 +1371,10 @@ async def process_request(connection, request):
         except Exception as e:  # noqa: BLE001 — a verification that cannot run must not eat a command
             log.warning("verify %s failed: %s", obj, e)
             return connection.respond(HTTPStatus.OK, "0\n")
+    if path.startswith(("/capture-o", "/wakefree-o")):
+        from urllib.parse import urlparse, parse_qs
+        if not _token_ok(parse_qs(urlparse(path).query).get("token", [None])[0], LED_TOKEN):
+            return connection.respond(HTTPStatus.FORBIDDEN, "forbidden\n")
     if path.startswith("/capture-o"):     # /capture-off | /capture-on — global push-to-talk mute.
         # Instant fast-path; the SOURCE OF TRUTH is the voice_muted DB flag (read live by
         # _settings_listener), which holds the mute exactly as long as push-to-talk is active. No
@@ -1389,7 +1403,7 @@ async def process_request(connection, request):
         global _enroll_left, _enroll_new
         u = urlparse(path)
         tok = parse_qs(u.query).get("token", [None])[0]
-        if LED_TOKEN and tok != LED_TOKEN:
+        if not _token_ok(tok, LED_TOKEN):
             return connection.respond(HTTPStatus.FORBIDDEN, "forbidden\n")
         if u.path == "/enroll-start":
             if not _wakefree:
@@ -1432,7 +1446,11 @@ def _load_voiceid_bg() -> None:
 
 def _apply_setting(key, value) -> None:
     """Apply one app_settings change to the server's own state (no Mac bridge required)."""
-    global _wakefree, _suppressed, _inject, _ao_braked
+    global _wakefree, _suppressed, _inject, _ao_braked, _esp_off
+    if key == "esp_mic_enabled":
+        _esp_off = not _truthy(value)
+        log.info("ESP mic %s (esp_mic_enabled)", "OFF" if _esp_off else "on")
+        return
     if key == "voice_inject_mode":
         _inject = _truthy(value)
         log.info("voice inject mode %s (from app_settings) — ESP %s", "ON" if _inject else "off",
@@ -1478,8 +1496,8 @@ async def _settings_listener() -> None:
     if not (SUPABASE_URL and key):
         log.warning("settings listener: no supabase creds; ESP state will rely on the Mac bridge only")
         return
-    s = _get_settings(["wakefree_enabled", "voice_muted", "voice_inject_mode", "wakefree_autooff_at"])
-    for k in ("voice_muted", "wakefree_enabled", "voice_inject_mode", "wakefree_autooff_at"):
+    s = _get_settings(["wakefree_enabled", "voice_muted", "voice_inject_mode", "wakefree_autooff_at", "esp_mic_enabled"])
+    for k in ("voice_muted", "wakefree_enabled", "voice_inject_mode", "wakefree_autooff_at", "esp_mic_enabled"):
         if k in s:
             _apply_setting(k, s[k])
     log.info("startup state from DB: wakefree=%s muted=%s inject=%s", _wakefree, _suppressed, _inject)
@@ -1537,9 +1555,9 @@ async def _settings_listener() -> None:
                 # the ESP mute / inject / wake-free stuck on a stale value.
                 try:
                     s = _get_settings(["wakefree_enabled", "voice_muted", "voice_inject_mode",
-                                       "wakefree_autooff_at"])
+                                       "wakefree_autooff_at", "esp_mic_enabled"])
                     for k, cur in (("voice_muted", _suppressed), ("voice_inject_mode", _inject),
-                                   ("wakefree_enabled", _wakefree)):
+                                   ("wakefree_enabled", _wakefree), ("esp_mic_enabled", not _esp_off)):
                         if k in s and _truthy(s[k]) != cur:
                             log.warning("settings backstop: realtime missed %s → applying from poll", k)
                             _apply_setting(k, s[k])
@@ -1569,6 +1587,11 @@ async def _ops_beat():
 
 
 async def main():
+    missing = [n for n, v in (("LED_TOKEN", LED_TOKEN), ("VERIFY_TOKEN", VERIFY_TOKEN),
+                              ("SUPABASE_SERVICE_KEY", SUPABASE_SERVICE_KEY)) if not v]
+    if missing:
+        log.error("refusing to start: %s not set", ", ".join(missing))
+        raise SystemExit(2)
     log.info("voice backend up on :%d  wake=%s  stt=%s", PORT, WAKE_MODEL, GROQ_MODEL)
     asyncio.create_task(_ops_beat())
     asyncio.create_task(_settings_listener())   # Fly owns its own state (app_settings: boot + live)
