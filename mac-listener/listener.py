@@ -32,7 +32,7 @@ from openwakeword.model import Model
 
 # ---- config (env, with sane defaults) -------------------------------------
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://felyggqjjhltwokdfhop.supabase.co").rstrip("/")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")   # service_role or anon — only needs INSERT on voice_requests
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")   # must be service_role: anon has no access to voice_requests
 WAKE_MODEL = os.environ.get("WAKE_MODEL", "hey_rhasspy")            # "Hey Rhasspy" — equivalent wake words:
 WAKE_MODEL_POWER = os.environ.get("WAKE_MODEL_POWER", "hey_jarvis") # "Hey Jarvis" — either one wakes capture
 WAKE_THRESHOLD = float(os.environ.get("WAKE_THRESHOLD", "0.5"))
