@@ -4,3 +4,4 @@ worker.py
 entrypoint logs
 *.log
 govee-mcp/
+endpointing.py

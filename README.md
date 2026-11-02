@@ -49,13 +49,14 @@ every tool, so only server-side holders of the service key may write one. Downst
 queue. It's best-effort and never raises.
 
 ### Auth
-Every HTTP control route requires a token in `?token=`: `/led-*`, `/enroll-*`, `/capture-*` and
-`/wakefree-*` take `LED_TOKEN` (the workers and the Mac listener hold it), `/verify` takes
-`VERIFY_TOKEN` (the hub holds it). The server refuses to start without both, or without
+Every HTTP control route requires a token in an `X-Token` header (or `Authorization: Bearer`), never
+the query string, which lands in proxy logs: `/led-*`, `/enroll-*`, `/capture-*` and `/wakefree-*`
+take `LED_TOKEN` (the workers and the Mac listener hold it), `/verify` takes `VERIFY_TOKEN` (the hub
+holds it). The server refuses to start without both, or without
 `SUPABASE_SERVICE_KEY`.
 
-The ws handshake must present `VOICE_DEVICE_TOKEN` — via `?token=...` on the ws path, an
-`X-Device-Token` header, or `Authorization: Bearer ...` — or it is closed (1008). While that secret is
+The ws handshake must present `VOICE_DEVICE_TOKEN` in an `X-Device-Token` header (or
+`Authorization: Bearer ...`), or it is closed (1008). While that secret is
 unset every connection is accepted, and the connect log line says `(device token presented)` when the
 ESP sent one. The firmware sends `DEVICE_TOKEN` from its gitignored `config.h`; set the secret only
 with `firmware/bin/enable-device-token.sh`, which flashes the ESP, waits for it to present the token,

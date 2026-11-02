@@ -9,9 +9,9 @@ it logs the text and enqueues it into the Supabase `voice_requests` table with t
 service key for downstream consumers to pick up. Wire the rest of the system off that queue.
 
 Every HTTP control route (/led-*, /enroll-*, /capture-*, /wakefree-*) requires LED_TOKEN and /verify
-requires VERIFY_TOKEN; the server refuses to start without both. The WebSocket requires a device
-token when VOICE_DEVICE_TOKEN is set (via `?token=` on the ws path or an X-Device-Token /
-Authorization header); it stays optional only until the ESP firmware sends one.
+requires VERIFY_TOKEN, in an X-Token (or Authorization: Bearer) header; the server refuses to start
+without both. The WebSocket requires a device token in an X-Device-Token / Authorization header when
+VOICE_DEVICE_TOKEN is set; it stays optional only until the ESP firmware sends one.
 """
 
 import asyncio
@@ -60,6 +60,22 @@ VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "")
 def _token_ok(given, want: str) -> bool:
     """Constant-time token check. An unset `want` never matches."""
     return bool(want) and isinstance(given, str) and hmac.compare_digest(given.encode(), want.encode())
+
+
+def _http_token(request) -> str | None:
+    """The token on a control request: `X-Token: <token>` or `Authorization: Bearer <token>`. Never the
+    query string, which ends up in proxy logs and shell history. TRANSITION: `?token=` is still read
+    until every caller sends the header (worker, wakefree, mac-listener, the hub's /verify)."""
+    headers = getattr(request, "headers", None)
+    if headers is not None:
+        tok = headers.get("X-Token")
+        if tok:
+            return tok
+        auth = headers.get("Authorization") or ""
+        if auth.startswith("Bearer "):
+            return auth[len("Bearer "):]
+    from urllib.parse import urlparse, parse_qs
+    return parse_qs(urlparse(getattr(request, "path", "") or "").query).get("token", [None])[0]
 # The currently-connected ESP, so the /led-off HTTP handler can reach it. One device → one global ref.
 _active_esp = None
 # Push-to-talk active anywhere (Hammerspoon dictation) → the ESP ignores ALL audio: the mute is global,
@@ -136,55 +152,23 @@ LONG_UTTERANCE_WARN_S = 300.0  # warn if a single capture runs this long
 # both clips you mid-sentence and holds the capture open for ages). Keep the capture alive on YOUR
 # verified presence: re-score the trailing window with ECAPA off the event loop and close only after
 # you've been absent (no confirmed-Jared window) for the hangover. Tune from the logged vad/endpoint lines.
-VAD_WINDOW_S = 2.0           # trailing audio fed to ECAPA per check
-VAD_CHECK_EVERY_S = 0.7      # re-score cadence while capturing
 SENSE_EVERY_S = 5.0          # brake-sensor cadence: at most one ECAPA check per this much room speech
-VAD_ABSENT_MISSES_MIN = 1   # consecutive non-confirms that close a SHORT capture (event-based, not a
-                            # timer that races the cadence and clips you between words). The requirement
-                            # scales up with how long you have been talking — see _absent_misses below.
-VAD_ABSENT_MISSES_MAX = 5   # ceiling — past this only MAX_UTTERANCE_S stops a runaway capture
-VAD_ABSENT_RAMP_S = 8.0     # +1 tolerated miss per this much speech (~2.0s of pause at the floor,
-                            # ~4.8s at the ceiling — a 50s dictated command survives a 4s thinking-pause)
 VAD_FIRST_CHECK_S = 1.8      # wait for this much audio before the first check
-VAD_NO_JARED_ABORT_S = 3.5  # never confirmed you within this much audio → it's noise/TV, drop cheap
 VAD_KEEPALIVE_MIN = 0.14     # once confirmed, KEEP the capture alive until the match falls to clearly-not-you
                              # / silence (~0.14, just above the ≤0.11 room/TV noise ceiling). ABSOLUTE and
                              # DECOUPLED from the confirm bar (_vthresh) on purpose: if this tracked _vthresh
                              # with a margin, lowering voiceid_threshold dragged it UNDER the noise floor and
                              # captures held open forever (0.20 threshold made it 0.04 — a capture ran 78s until
                              # push-to-talk aborted it). Keep this fixed regardless of how low the confirm bar goes.
-PREROLL_S = 1.2              # audio kept from BEFORE the energy trigger, so a soft first syllable that only
-                            # crosses the threshold mid-word isn't clipped. Longer than the trigger latency to
-                            # be safe. CRITICAL: the VAD timing below subtracts this (seed_len_s) so the pre-roll
-                            # never counts toward the first-check / no-Jared-abort timers — measuring the speaker
-                            # window on the INFLATED total is exactly what broke the earlier walk-back version.
-# Back-fill: a capture that never confirms him inside VAD_NO_JARED_ABORT_S is dropped as noise, and while he
-# is talking the next capture opens on the very next frame — mid-sentence. Until 2026-09-10 the dropped audio
-# was gone: 56 of 184 Mac commands that week began within 1s of such a drop, and their transcripts start
-# mid-sentence ("scoop of protein powder to the smoothie", "of the calf raises at 14 reps"). So the raw audio
-# from before the trigger is kept, and once a capture is ACCEPTED the ECAPA gate walks BACKWARD through it in
-# BACKFILL_STEP_S steps, prepending each VAD_WINDOW_S window that still scores as him, until it meets silence,
-# another voice, or BACKFILL_MAX_S. The bar is lower than the confirm bar on purpose: these windows are the
-# ones that failed 0.30 while he was audibly talking. Measured 2026-09-10 on 1,123 two-second windows of his
-# own close-mic recordings: 11.7% score under 0.30 and 0.9% under 0.22, while TV-only windows on this mic top
-# out around 0.18. MUST match voice-id/wakefree.py — both mics have to reach back the same way.
-HISTORY_S = 8.0              # raw audio retained from before the trigger (bounds the back-fill's reach)
-BACKFILL_MAX_S = 5.0         # never reach further back than this — covers a full 3.5s noise-abort plus the restart
-BACKFILL_STEP_S = 0.5
-BACKFILL_THR = 0.22
-# Whole-clip re-verify at accept. The live gate only ever scores 2s slices, and ONE slice at or over the
-# confirm bar commits the whole capture — so a TV voice that flukes a single slice past 0.30 got
-# transcribed and ran a model turn that answered __IGNORE__ (203 such turns from this mic in the week to
-# 2026-09-10). A longer clip gives a far steadier embedding than any slice: measured on his own recordings,
-# whole clips of 4s never scored under 0.23 (n=266), 6s never under 0.29, 10s never under 0.37, and only 2
-# of 427 clips as short as 2.5s fell under 0.22; JFK's speech scores 0.16 whole-clip and synthetic male
-# voices 0.06–0.20. So one more encode on the finished clip, and a clip under the bar is dropped before
-# STT. The bar is app_settings.voiceid_accept_threshold (default below), separate from the confirm bar so
-# either can move alone; every accepted clip logs its whole-clip score so the bar can be tuned from data.
-ACCEPT_THR_DEFAULT = 0.22
-ACCEPT_MAX_S = 15.0          # score at most this much of the clip: the encode is linear in length on this
-                             # shared vCPU (~0.1s per second of audio), and a 10s clip is already steadier
-                             # than the bar needs (his 10s clips never scored under 0.37)
+# Everything that decides a capture's SPAN (the VAD window and cadence, the absent-miss ramp, the no-Jared
+# abort, the pre-roll, the back-fill and the whole-clip accept bar) is shared with the Mac's wake-free
+# capture, because the two mics must endpoint identically: shared/endpointing.py, copied into this build
+# context by assemble.sh. The reasoning and the measurements behind each value are there.
+from endpointing import (  # noqa: E402
+    VAD_WINDOW_S, VAD_CHECK_EVERY_S, VAD_NO_JARED_ABORT_S, absent_misses as _absent_misses, PREROLL_S,
+    HISTORY_S, BACKFILL_MAX_S, BACKFILL_STEP_S, BACKFILL_THR, ACCEPT_THRESHOLD as ACCEPT_THR_DEFAULT,
+    ACCEPT_MAX_S,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("voice")
@@ -275,17 +259,32 @@ _demote("realtime._async.client", lambda r: r.getMessage().startswith(
 
 groq = Groq(api_key=os.environ["GROQ_API_KEY"])
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")   # second transcription provider, after Groq
-oww = Model(wakeword_models=[WAKE_MODEL, WAKE_MODEL_POWER], inference_framework="onnx")
 
 
-def _absent_misses(audio_s: float) -> int:
-    """Consecutive non-confirms needed to close a capture that has run this long. A short command is one
-    breath, so the first non-confirm ends it the moment he stops rather than recording the room after.
-    A long multi-part command has real thinking-pauses in it, and cutting one in half loses the whole
-    command — worth far more than a second of trailing silence. MUST match the Mac's copy in
-    voice-id/wakefree.py: the two mics have to endpoint identically, or the same sentence is cut
-    differently depending on which one heard it and the pair stops collapsing into one command."""
-    return min(VAD_ABSENT_MISSES_MAX, VAD_ABSENT_MISSES_MIN + int(audio_s // VAD_ABSENT_RAMP_S))
+def _new_wake_model() -> Model:
+    """One wake-word model PER CONNECTION. openWakeWord's Model is stateful (its melspectrogram and
+    embedding buffers and the per-model score history), so a module-level one shared between two live
+    sockets, an ESP reconnecting while its half-open predecessor is still being read, interleaves both
+    streams' audio into one state and can fire, or miss, on the mix. ~80ms to build."""
+    return Model(wakeword_models=[WAKE_MODEL, WAKE_MODEL_POWER], inference_framework="onnx")
+
+
+# Fire-and-forget tasks are held here until they finish. The event loop keeps only a weak reference to a
+# task, so one nobody holds can be garbage-collected mid-run (asyncio docs, create_task), silently
+# dropping a presence publish or a request close.
+_bg_tasks: set = set()
+
+
+def _spawn(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+
+    def _done(t: asyncio.Task) -> None:
+        _bg_tasks.discard(t)
+        if not t.cancelled() and t.exception() is not None:
+            log.error("background task failed: %r", t.exception())
+    task.add_done_callback(_done)
+    return task
 
 
 def pcm_to_wav(pcm: bytes) -> bytes:
@@ -531,23 +530,10 @@ async def handle_transcript(text: str, duration_s: float, truncated: bool,
 
 
 def _client_token(ws) -> str | None:
-    """Pull the device token off the handshake (websockets 15 asyncio API).
-
-    Checks, in order: the `?token=` query param on the ws path, then the
-    `X-Device-Token` header, then a `Bearer ...` Authorization header. In
-    websockets 15 the server handler gets a ServerConnection whose `.request`
-    is the handshake Request — `.path` carries the full request target
-    (path + query) and `.headers` is the Headers mapping.
-    """
-    request = getattr(ws, "request", None)
-    path = getattr(request, "path", "") or ""
-    if "?" in path:
-        from urllib.parse import parse_qs
-        qs = parse_qs(path.split("?", 1)[1])
-        tok = qs.get("token", [None])[0]
-        if tok:
-            return tok
-    headers = getattr(request, "headers", None)
+    """The device token on the ws handshake: the `X-Device-Token` header, or `Authorization: Bearer ...`.
+    Never `?token=` on the path, which lands in proxy logs; the firmware sends the header
+    (firmware/src/main.cpp). websockets 15: the handler's ServerConnection has `.request.headers`."""
+    headers = getattr(getattr(ws, "request", None), "headers", None)
     if headers is not None:
         tok = headers.get("X-Device-Token")
         if tok:
@@ -591,7 +577,7 @@ async def connection(ws):
     _led_working = False
     _led_capturing = False
     _led_last_sent = None           # the firmware boots with the LED off
-    oww.reset()
+    oww = await asyncio.to_thread(_new_wake_model)   # this stream's own wake-word state
 
     pending = bytearray()           # raw bytes not yet aligned to a frame
     history = bytearray()           # rolling RAW audio, always kept (capturing or not): the pre-roll is its tail,
@@ -720,7 +706,7 @@ async def connection(ws):
                                 _sim = 0.0
                             sense_task = None
                             if _sim >= _vthresh:
-                                asyncio.create_task(_publish_presence(True))
+                                _spawn(_publish_presence(True))
                     elif sense_buf:
                         sense_buf.clear()
                 if woke:
@@ -795,7 +781,7 @@ async def connection(ws):
                                 log.info("wake-free: Jared confirmed (sim=%.2f after %.1fs) — tracking", sim, audio_s)
                                 _led_capturing = True        # LED → solid: confirmed it's YOU
                                 await _render_led(ws, "confirmed Jared")
-                            asyncio.create_task(_publish_presence(True))   # shared 'Hearing Jared' truth
+                            _spawn(_publish_presence(True))   # shared 'Hearing Jared' truth
                             last_confirm = datetime.now(timezone.utc)
                         elif jared_seen:
                             miss += 1
@@ -945,11 +931,11 @@ async def connection(ws):
                                                        alt=await second, always_on=not by_wake)
                 except Exception as e:
                     log.exception("transcription failed: %s", e)
-                    asyncio.create_task(_notify_transcribe_failure())
+                    _spawn(_notify_transcribe_failure())
                 if not enqueued:
                     # Nothing intelligible / enqueue failed → close the lifecycle row (lamp off) and idle the LED.
                     if rid:
-                        asyncio.create_task(_close_request_error(rid, "empty or failed transcription"))
+                        _spawn(_close_request_error(rid, "empty or failed transcription"))
                     _led_working = False
                     _led_capturing = False
                     await _render_led(ws, "nothing to run")
@@ -1009,7 +995,7 @@ def _on_presence(payload) -> None:
         return
     _other_hearing_jared = True
     if _active_esp is not None:
-        asyncio.create_task(_render_led(_active_esp, f"{rec.get('source')} hears Jared"))
+        _spawn(_render_led(_active_esp, f"{rec.get('source')} hears Jared"))
     if _other_clear_task:
         _other_clear_task.cancel()
     _other_clear_task = asyncio.create_task(_clear_other_hearing_after())
@@ -1307,15 +1293,14 @@ async def _other_heard_jared():
 
 
 async def process_request(connection, request):
-    """Plain HTTP on the same port (websockets 15 asyncio API). The worker POSTs /led-off?token=... when
+    """Plain HTTP on the same port (websockets 15 asyncio API). The worker GETs /led-off (X-Token) when
     the model finishes, so the ESP light goes blink (working) → off. Returning a Response short-circuits
     the handshake; returning None lets the WS upgrade proceed."""
     path = request.path
     if path.startswith("/led-"):
         from urllib.parse import urlparse, parse_qs
         u = urlparse(path)
-        tok = parse_qs(u.query).get("token", [None])[0]
-        if not _token_ok(tok, LED_TOKEN):
+        if not _token_ok(_http_token(request), LED_TOKEN):
             return connection.respond(HTTPStatus.FORBIDDEN, "forbidden\n")
         # The worker drives these for ANY command (universal indicator), not just ESP-sourced ones:
         # /led-blink while working, /led-off when done, /led-on as a solid 'listening' cue. They feed the
@@ -1347,7 +1332,7 @@ async def process_request(connection, request):
         from urllib.parse import urlparse, parse_qs
         u = urlparse(path)
         q = parse_qs(u.query)
-        if not _token_ok(q.get("token", [None])[0], VERIFY_TOKEN):
+        if not _token_ok(_http_token(request), VERIFY_TOKEN):
             return connection.respond(HTTPStatus.FORBIDDEN, "forbidden\n")
         obj = (q.get("p", [""])[0] or "").strip()
         if not obj or ".." in obj:
@@ -1372,8 +1357,7 @@ async def process_request(connection, request):
             log.warning("verify %s failed: %s", obj, e)
             return connection.respond(HTTPStatus.OK, "0\n")
     if path.startswith(("/capture-o", "/wakefree-o")):
-        from urllib.parse import urlparse, parse_qs
-        if not _token_ok(parse_qs(urlparse(path).query).get("token", [None])[0], LED_TOKEN):
+        if not _token_ok(_http_token(request), LED_TOKEN):
             return connection.respond(HTTPStatus.FORBIDDEN, "forbidden\n")
     if path.startswith("/capture-o"):     # /capture-off | /capture-on — global push-to-talk mute.
         # Instant fast-path; the SOURCE OF TRUTH is the voice_muted DB flag (read live by
@@ -1402,8 +1386,7 @@ async def process_request(connection, request):
         from urllib.parse import urlparse, parse_qs
         global _enroll_left, _enroll_new
         u = urlparse(path)
-        tok = parse_qs(u.query).get("token", [None])[0]
-        if not _token_ok(tok, LED_TOKEN):
+        if not _token_ok(_http_token(request), LED_TOKEN):
             return connection.respond(HTTPStatus.FORBIDDEN, "forbidden\n")
         if u.path == "/enroll-start":
             if not _wakefree:
@@ -1539,7 +1522,7 @@ async def _settings_listener() -> None:
                 else:
                     return
                 if _active_esp is not None:
-                    asyncio.create_task(_render_led(_active_esp, f"request {status}"))
+                    _spawn(_render_led(_active_esp, f"request {status}"))
 
             ch.on_postgres_changes("UPDATE", callback=_cb, schema="public", table="app_settings")
             ch.on_postgres_changes("UPDATE", callback=_on_presence, schema="public", table="voice_presence")
@@ -1593,9 +1576,9 @@ async def main():
         log.error("refusing to start: %s not set", ", ".join(missing))
         raise SystemExit(2)
     log.info("voice backend up on :%d  wake=%s  stt=%s", PORT, WAKE_MODEL, GROQ_MODEL)
-    asyncio.create_task(_ops_beat())
-    asyncio.create_task(_settings_listener())   # Fly owns its own state (app_settings: boot + live)
-    asyncio.create_task(_alive_beacon())        # ESP-mic liveness → voice_presence.alive_at
+    _spawn(_ops_beat())
+    _spawn(_settings_listener())   # Fly owns its own state (app_settings: boot + live)
+    _spawn(_alive_beacon())        # ESP-mic liveness → voice_presence.alive_at
     _esp_gone()                                 # nothing is connected yet; reported if none arrives
     # ping_interval=None: the ESP32 is a continuous PCM pump and doesn't reliably answer
     # WebSocket keepalive pings, so server-initiated pings were closing the connection mid-

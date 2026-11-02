@@ -78,47 +78,15 @@ MAX_UTTER_S = 600.0   # runaway backstop ONLY (matches the ESP server) — the s
 MIN_UTTER_S = 0.5
 # Speaker-gated endpointing: keep the utterance alive on Jared's VERIFIED presence (rolling ECAPA), not a
 # blind energy timeout — so thinking-pauses don't chop a command. Mirrors the Fly ESP server's design.
-VAD_WINDOW_S = 2.0           # trailing audio scored per check
-VAD_CHECK_EVERY_S = 0.7      # re-score cadence while capturing
 VAD_FIRST_CHECK_S = 1.4      # min audio before the first check (the close Mac mic confirms fast)
-VAD_NO_JARED_ABORT_S = 3.5  # never confirmed within this much audio → not Jared, drop
 KEEPALIVE_MARGIN = 0.16      # hysteresis: once confirmed, stay locked unless match falls to ~not-you/silence
-# How many CONSECUTIVE non-confirming checks close a capture — event-based, NOT a timer that can race
-# the check cadence and cut you off between words. The number SCALES with how long you have been
-# talking, because the two cases pull opposite ways. A short command is one breath: closing on the
-# first non-confirm ends it the moment you stop, instead of holding the mic open over whatever is said
-# next. A long, multi-part command has real thinking-pauses in it, and cutting one in half loses the
-# whole command — which costs far more than a second of trailing silence. Each extra miss buys roughly
-# another VAD_CHECK_EVERY_S of pause.
-ABSENT_MISSES_MIN = 1        # short command: close on the first non-confirm (~2s of silence)
-ABSENT_MISSES_MAX = 5        # ceiling — past this only MAX_UTTER_S is left to stop a runaway capture
-ABSENT_RAMP_S = 8.0          # +1 tolerated miss per this much speech (~2.0s of pause at the floor,
-                             # ~4.8s at the ceiling — a 50s dictated command survives a 4s thinking-pause)
-PREROLL_S = 1.2              # audio kept from before the energy trigger (same as the ESP server). Was one
-                             # 100ms frame here, which clipped a soft first syllable the gate only caught
-                             # mid-word. Excluded from the VAD timing (seed_s) exactly as the server does.
-# Back-fill — see server/server.py for the full reasoning and the measurements behind BACKFILL_THR. A capture
-# that never confirms you inside VAD_NO_JARED_ABORT_S is dropped as noise; if you are mid-sentence the next
-# capture opens on the next frame and used to lose everything before it (56 of 184 Mac commands in the week
-# to 2026-09-10 began within 1s of such a drop). Now the raw audio before the trigger is kept, and an ACCEPTED
-# capture walks backward through it, prepending each 2s window that still scores as you. MUST match server.py.
-HISTORY_S = 8.0
-BACKFILL_MAX_S = 5.0
-BACKFILL_STEP_S = 0.5
-BACKFILL_THR = 0.22
-# Whole-clip re-verify at accept — see server/server.py for the reasoning and the measurements. One 2s slice
-# over the confirm bar commits a capture; the finished clip is scored once more as a whole, and a clip under
-# this bar is dropped before STT (118 TV turns from this mic in the week to 2026-09-10 got through). Overridden
-# by app_settings.voiceid_accept_threshold at boot, like THRESHOLD; every accepted clip logs its score.
-ACCEPT_THRESHOLD = 0.22
-ACCEPT_MAX_S = 15.0          # score at most this much of the clip (matches the server)
-
-
-def absent_misses(audio_s: float) -> int:
-    """Consecutive non-confirms needed to close a capture that has run this long. MUST match the ESP
-    server (server/server.py): the two mics have to endpoint identically, or the same sentence is cut
-    differently depending on which one heard it and the pair stops collapsing into one command."""
-    return min(ABSENT_MISSES_MAX, ABSENT_MISSES_MIN + int(audio_s // ABSENT_RAMP_S))
+# Everything that decides a capture's SPAN is shared with the ESP server, because the two mics must endpoint
+# identically: shared/endpointing.py. ACCEPT_THRESHOLD is rebound at boot from app_settings.
+sys.path.insert(0, str(HERE.parent / "shared"))
+from endpointing import (  # noqa: E402
+    VAD_WINDOW_S, VAD_CHECK_EVERY_S, VAD_NO_JARED_ABORT_S, absent_misses, PREROLL_S,
+    HISTORY_S, BACKFILL_MAX_S, BACKFILL_STEP_S, BACKFILL_THR, ACCEPT_THRESHOLD, ACCEPT_MAX_S,
+)
 
 
 # CoreAudio liveness: stream.read returns at a fixed hardware cadence (every 100ms), muted or not. The
@@ -353,7 +321,7 @@ def _esp_working() -> None:
     copy as 'not Jared', would briefly show idle before the worker's slower blink-ping lands."""
     try:
         httpx.get(f"{JARED_VOICE_URL}/led-blink",
-                  params={"token": LED_TOKEN} if LED_TOKEN else None, timeout=3)
+                  headers={"X-Token": LED_TOKEN} if LED_TOKEN else None, timeout=3)
     except Exception:  # noqa: BLE001
         pass
 

@@ -69,8 +69,8 @@ Two Fly apps, each deployed from its own directory, and most of what they ship i
 time. Editing a copy is lost work; edit the source.
 
 - **`server/` → `jared-voice`**: the ESP wake-word/transcription server and the Govee inventory sync.
-  `assemble.sh` copies `sync_devices.py` in from the govee-mcp checkout. `server/server.py` is the one
-  file there that is genuinely source. Deploy with:
+  `assemble.sh` copies `sync_devices.py` in from the govee-mcp checkout and `endpointing.py` from
+  `shared/`. `server/server.py` is the one file there that is genuinely source. Deploy with:
 
       cd server && ./assemble.sh && flyctl deploy --now -a jared-voice
 
@@ -92,11 +92,12 @@ a deploy started from the Pi runs on the Pi, with `FLY_API_TOKEN=$(cat ~/.fly/to
 
 The ESP and the Mac hear the same sentence, and the worker collapses the pair by *recording-window
 overlap* (`_duplicate_of_recent`), keeping whichever arrived first. That only holds while the two agree
-on where the sentence ended, so the endpointing constants in `voice-id/wakefree.py` and
-`server/server.py` are one setting written twice — change both together. The same goes for where a
-sentence STARTED: `PREROLL_S`, `HISTORY_S` and the `BACKFILL_*` constants (how far an accepted capture
-reaches back for the words spoken before its trigger) live in both files and must match, as do the
-whole-clip accept defaults (`ACCEPT_THR_DEFAULT` / `ACCEPT_THRESHOLD`, `ACCEPT_MAX_S`).
+on where the sentence started and ended, so every value that decides a capture's span (the VAD window
+and cadence, the absent-miss ramp, the no-Jared abort, `PREROLL_S`, `HISTORY_S`, the `BACKFILL_*`
+constants and the whole-clip accept defaults) lives once, in `shared/endpointing.py`, which
+`voice-id/wakefree.py` imports and `server/assemble.sh` copies into the Fly build context. Change it
+there; a value redefined locally in either file reopens the failure below. `VAD_FIRST_CHECK_S` is
+per-mic on purpose (the close Mac mic confirms faster) and changes only when a capture is first scored.
 
 When they disagree the failure is silent and total. The mic that closes early enqueues a mid-sentence
 fragment; the fragment is discarded as a false positive; the other mic's *complete* capture then

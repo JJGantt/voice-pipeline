@@ -244,7 +244,7 @@ def _ping_esp_capture(on: bool) -> None:
     """Tell the jared-voice server to mute/unmute the ESP, so the global mute reaches it too."""
     try:
         httpx.get(f"{JARED_VOICE_URL}/capture-{'off' if on else 'on'}",
-                  params={"token": LED_TOKEN}, timeout=3).raise_for_status()
+                  headers={"X-Token": LED_TOKEN}, timeout=3).raise_for_status()
     except httpx.HTTPStatusError as e:   # a refused token is a misconfiguration, not a network blip
         log(f"ERROR esp capture bridge refused: {e.response.status_code}")
     except Exception:  # noqa: BLE001 — redundant fast-path; the server also reads voice_muted itself
@@ -256,7 +256,7 @@ def _ping_esp_wakefree(on: bool) -> None:
     wake words (off), congruent with the Mac. Generous timeout: the server lazy-loads ECAPA on turn-on."""
     try:
         httpx.get(f"{JARED_VOICE_URL}/wakefree-{'on' if on else 'off'}",
-                  params={"token": LED_TOKEN}, timeout=20).raise_for_status()
+                  headers={"X-Token": LED_TOKEN}, timeout=20).raise_for_status()
     except httpx.HTTPStatusError as e:
         log(f"ERROR esp wakefree bridge refused: {e.response.status_code}")
     except Exception:  # noqa: BLE001 — redundant fast-path; the server also reads wakefree_enabled itself
@@ -912,7 +912,7 @@ def _esp_blink() -> None:
     working indicators start together instead of waiting for the worker's claim ping."""
     try:
         httpx.get(f"{JARED_VOICE_URL}/led-blink",
-                  params={"token": LED_TOKEN}, timeout=3)
+                  headers={"X-Token": LED_TOKEN}, timeout=3)
     except Exception:  # noqa: BLE001
         pass
 
