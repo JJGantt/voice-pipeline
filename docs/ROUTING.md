@@ -67,24 +67,44 @@ saved recipe's name and a serving count.
 A pushed command — typed, the phone's button, the watch's — may send a text or an email (`SEND_TOOLS`);
 one from an always-on mic (`voice_requests.always_on`) may not, because those hear the whole room and a
 sentence meant for someone else would reach a real person. The warm client's `_fence` PreToolUse hook
-allows the sends only when `SdkRunner.run(..., ambient=False)`; full-agent mode, which has no allow list,
-gets them as `--disallowedTools` on room-mic turns.
+allows the sends only when `SdkRunner.run(..., ambient=False)`. The unrestricted agent (`run_claude`)
+has no fence and keeps them, which is safe only because it runs nothing but manual commands (below).
 
 The fence, not `allowed_tools`, is what holds the list. The warm client is Claude Code, which also
 applies the host user's settings, and the Mac's pre-approve every data, gmail and messages tool in auto
-mode — with `allowed_tools` alone a room-mic turn sent email. A hook's deny outranks any allow rule. The
-`claude -p` runs get `--setting-sources project` for the same reason; the worker runs from its own
-directory, which has none. The fence also allows `Read` only inside the current turn's photo directory.
+mode — with `allowed_tools` alone a room-mic turn sent email. A hook's deny outranks any allow rule.
+The fence also allows `Read` only inside the current turn's photo directory.
 
-Room-mic turns carry `ROOM_SEND_DIRECTIVE`, which tells the model not to reach a send another way, by
-starting a session whose own tools could send it. That route is instruction-only: `start_session` stays
-on the room mics because dictating work to a session is what they are mostly used for.
+Room-mic turns carry `ROOM_SEND_DIRECTIVE`, which tells the model a send has to come from a press. The
+other way round a send, starting a session whose own tools could send it, is closed by the next rule.
+
+## Sessions and the unrestricted agent need a press
+
+Anything that reaches the worker without a manual press cannot start a session. A command may reach a
+Claude session (`start_session`, `follow_up`, `resume_session`, `transfer_session`, or the pty inject
+into a focused Mac session), the unrestricted agent (`run_claude`, `--dangerously-skip-permissions`:
+full-agent mode and the watch's fallback path), Codex (`run_codex`, every MCP tool pre-approved) or the
+credits runner only when `is_manual(req)`: its `source` is in `MANUAL_SOURCES` AND it is not stamped
+`always_on`. The labels there are the ones only a press or a keyboard writes: `watch-cmd` (the watch's
+Hub control), `watch-fallback` (the same press through Supabase when the hub is down), `web` and
+`web-quick` (the hub's mic buttons and its typed box) and `share` (the iPhone share sheet).
+
+It **fails closed**. A wake-word capture (`fly`/`mac` with `always_on` false) is not manual, because the
+TV can say the wake word; nor is any listener (`watch`, `phone`, `mac`, `fly` wake-free), any label a
+client invents, or an unstamped row. The hub lets an uploading client name its own `source`, so a new
+device is not manual until its label is added here, after checking that every writer of it is a button.
+
+Enforced at each point, not once: `process_request` routes a non-manual command to the fenced warm client
+even with agent mode on or a session focused; the fence refuses `SESSION_START_TOOLS` unless
+`SdkRunner.run(..., manual=True)`; `run_claude` and `run_codex` refuse outright unless called with
+`manual=True`. A non-manual turn also carries `NO_SESSION_DIRECTIVE`, so the model says it needs the
+button rather than trying. Sends stay on the `always_on` rule above, so a wake-word turn can still send.
 
 ## Browser-only tools are removed from the schema
 
 `build_walmart_cart_url`, `record_walmart_cart` and `save_shopping_item` (`SESSION_TOOLS`) only mean
 something next to the signed-in browser, which no worker runner has. They are taken out of every
-runner's schema (`disallowed_tools` on the warm client, `--disallowedTools` on `claude -p`), so a cart
+runner's schema (`disallowed_tools` on the warm client, `--disallowedTools` on `run_claude`), so a cart
 request becomes a `start_session`, where a browser exists. The reads (`get_shopping_items`,
 `get_walmart_cart`) stay.
 
@@ -161,8 +181,9 @@ Which is which is `voice_requests.always_on`, stamped by whoever captured the cl
 listener and wake-free capture, and the hub for an uploaded clip from a listener label
 (`GATED_SOURCES` in status-hub). The worker never decides it from `source`: one device can be both a
 listener and a button, and a second list of labels here is how the phone's listener ended up counted
-as a press. An unstamped row is a press, so a new capture path that forgets the flag gets answered,
-never silently dropped.
+as a press. An unstamped row is a press for this, so a new capture path that forgets the flag gets
+answered, never silently dropped. What a command may DO is the stricter `is_manual` above, which reads
+`source` too and fails the other way: a wake-word capture is deliberate here but not manual there.
 
 Only a room-mic turn can be ignored: the `__IGNORE__` sentinel is taught in `ADDRESSING_DIRECTIVE`
 alone. That alone does not keep it from a deliberate turn, because every turn replays the day's thread
@@ -179,9 +200,9 @@ goes back to that session through `follow_up`. When it is unclear which of the t
 model starts a new session rather than asking: he gives a command and looks away, so a clarifying
 question usually goes unseen. For that, `_line` names a session's reply in the
 replayed thread as `Session "<label>" (<id>)` (from `voice_messages.session_id` / `session_label`)
-rather than `Assistant`, so the model can tell which session said what and pass its id. On room-mic
-turns none of this applies: talk naming no destination is assumed to be for a session already open,
-and `follow_up` there needs a handoff phrase (below).
+rather than `Assistant`, so the model can tell which session said what and pass its id. None of this
+applies on a turn that is not manual (a wake-word capture is deliberate but not manual): the session
+tools are refused there, and `NO_SESSION_DIRECTIVE` tells the model to say it needs the button.
 
 Every turn also gets `READ_DIRECTIVE`: a reply to a QUESTION ends with the `[[read]]` marker, and a
 reply to a request to DO something does not. The directive is worded around what he asked for, not
@@ -208,20 +229,12 @@ It carries only what the model cannot work out from the text itself:
 4. development talk naming no destination is him speaking to a session already open elsewhere —
    which has heard him already, through its own channel.
 
-Point 4 is the one that cost something, and the rule is STRUCTURAL — it is not about what the words
-mean. Any sentence can be a dispatch or not, depending only on whether Jared handed it over, so on a
-room-mic turn a follow-up needs an explicit handoff phrase ("send a follow-up", "tell it to") and is
-judged by nothing about subject matter. (On a deliberate turn, a plain reply to a session's posted
-message is itself a handoff; the `follow_up` tool description allows it and the room directive's
-"anything later needs him to hand it over" overrides it on room-mic turns.) Listing example sentences that are "not for you" is the wrong shape of instruction
-and was removed: it teaches that certain CONTENT is never a dispatch, when the same words forwarded
-deliberately are exactly that.
-
-5. focusing a session NAMES the destination — everything after "focus the X session", in that same
-   turn, goes to that session as a follow-up, with no handoff phrase needed. Point 4 says the
-   opposite for talk that names no destination, and without this clause it wins: the model reads the
-   remainder as belonging to a session that already heard him, forwards nothing, and then reports
-   having sent a follow-up it never sent.
+Point 4 is STRUCTURAL — it is not about what the words mean. Any sentence can be a dispatch or not,
+depending only on whether Jared handed it over. Listing example sentences that are "not for you" is the
+wrong shape of instruction: it teaches that certain CONTENT is never a dispatch, when the same words
+forwarded deliberately are exactly that. A room-mic turn cannot dispatch at all now (it is not manual),
+so points 3 and 4 decide only whether the model answers or ignores; point 3 is what makes it answer
+dictated work with "that needs the button" instead of silence.
 
 **Keep it that short.** Anything that helps the model spot noise, or argues about what a mistake
 would cost, misfires on dictated development work — which rambles, names a machine, and is the most

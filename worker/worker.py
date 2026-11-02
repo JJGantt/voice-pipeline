@@ -87,10 +87,26 @@ CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 # The key is popped from the environment at import, so no subprocess inherits it and quietly bills it;
 # only the credits runner (SDK_CREDITS) passes it on, explicitly.
 CREDITS_API_KEY = os.environ.pop("ANTHROPIC_API_KEY", None) or ""
-# The room mics: the ESP puck (through the Fly server) and the Mac's listener. Their wake-word captures
-# arrive with always_on false, yet they are where overheard TV and conversation comes from, so the credits
-# fallback is decided by source, never by that flag.
-ROOM_MIC_SOURCES = ("fly", "mac")
+# PROVENANCE: was this command started by a deliberate act of his hand? Only such a command may reach
+# anything that can do unbounded work in his name: a Claude session (start_session, follow_up, a pty
+# inject into a focused one), the unrestricted full agent (--dangerously-skip-permissions), Codex, or the
+# Console-billed credits runner. Everything a microphone heard by itself (always-on capture, a wake word
+# the TV can say, a watch or phone listener) is not, because nothing guarantees he was the one talking.
+#
+# A row is manual only when it says so twice: its `source` is one of these labels, each of which is only
+# ever written by a press or by typing, AND it is not stamped `always_on`. Anything else, a new capture
+# path, a label a client chose, an unstamped row, is treated as not manual: FAIL CLOSED. Adding a label
+# here is a claim that every writer of it is a button or a keyboard; check them all first.
+#   watch-cmd       the watch's Hub control (status-hub apps/Watch/Hub.swift; `watch` is its listener)
+#   watch-fallback  the same press, through Supabase's voice-fallback function when the hub is down
+#   web, web-quick  the hub's mic buttons and its typed box (/api/voice-command default, /api/voice-text)
+#   share           the iPhone share sheet (/api/voice-text shared:true)
+MANUAL_SOURCES = frozenset({"watch-cmd", "watch-fallback", "web", "web-quick", "share"})
+
+
+def is_manual(req: dict) -> bool:
+    """True only for a command started by a press or typed (see MANUAL_SOURCES). Fails closed."""
+    return not req.get("always_on") and (req.get("source") or "").strip() in MANUAL_SOURCES
 # Every hub turn runs on ONE model with the full toolset: Opus at its default effort, which is adaptive —
 # it thinks as hard as the turn needs. Quality over speed, by Jared's call (2026-10-29): there is no fast
 # first responder and no escalation. Low effort was measurably worse on macro estimates and `max` bought
@@ -352,6 +368,12 @@ SEND_TOOLS = ["mcp__messages__send_message", "mcp__gmail__send_email"]
 # runner's schema: a cart request has to become a start_session, never a turn with no browser.
 SESSION_TOOLS = ["mcp__data__build_walmart_cart_url", "mcp__data__record_walmart_cart",
                  "mcp__data__save_shopping_item"]
+# The tools that start a Claude session or put words into one. Refused on every turn that is not
+# manual (`is_manual`) by the fence (SdkRunner._fence); a non-manual turn never reaches a runner without
+# that fence. Named one by one because the data server's other session tools (list, focus, rename, end)
+# only look at or tidy what is already running.
+SESSION_START_TOOLS = ["mcp__data__start_session", "mcp__data__follow_up", "mcp__data__resume_session",
+                       "mcp__data__transfer_session"]
 ALL_TOOLS = ["mcp__data", "mcp__voice", "mcp__govee-lights", "mcp__petlibro-feeder", *WEB_TOOLS, *MAIL_TOOLS, *SEND_TOOLS]
 
 
@@ -491,13 +513,7 @@ ADDRESSING_DIRECTIVE = (
     f"'{IGNORE_SENTINEL}' and nothing else — never explain that it wasn't a command."
     "\n\nOne parsing note: when he dictates development work — 'send a command to the Mac agent…', 'in "
     "my status-hub repo I want you to…' — the machine he names is where to SEND the work, not someone "
-    "else being addressed instead of you. Those are for you. Development talk that names no destination is him speaking to a session already open elsewhere, which has heard him already."
-    "\n\nOne narrow exception. An utterance that itself asks to focus a session — 'focus the X session' or 'pin the X session', followed "
-    "by an instruction, IN THAT SAME UTTERANCE, sends that instruction to that session. THAT IS THE ONLY "
-    "CASE. A session being focused by an earlier command does NOT make later speech an instruction to "
-    "it — the mic keeps hearing the room long after he has stopped talking to you, and forwarding that "
-    "into a live session is the worst thing you can do here. Anything later needs him to hand it over: "
-    "'tell it to', 'send a follow-up', 'reply to it'.]"
+    "else being addressed instead of you. Those are for you. Development talk that names no destination is him speaking to a session already open elsewhere, which has heard him already.]"
 )
 
 # The room mics can never send a text or an email. The send tools are denied on those turns by every
@@ -505,8 +521,17 @@ ADDRESSING_DIRECTIVE = (
 # reach for — starting a session whose own tools would send it.
 ROOM_SEND_DIRECTIVE = (
     "\n\n[This came from an always-on room mic, which cannot send texts or email. If it asks you to "
-    "send, reply to or forward a text or an email, do not do it by any route — no session — and say it "
-    "has to come from the button on his phone or watch.]"
+    "send, reply to or forward a text or an email, do not do it, and say it has to come from the button "
+    "on his phone or watch.]"
+)
+
+# Every turn that is not manual (`is_manual`): a microphone heard it, so it cannot reach a session. The
+# session tools are refused by the fence regardless; this keeps the model from promising or attempting it.
+NO_SESSION_DIRECTIVE = (
+    "\n\n[This came from a microphone that was not started by his press, so it cannot start a Claude "
+    "session or send anything into one: start_session, follow_up, resume_session and transfer_session are "
+    "refused on this turn. If what he said needs a session, do not try another route; say it has to come "
+    "from the button on his phone or watch, or typed.]"
 )
 
 # Role framing for every hub turn. The base preset is claude_code (a coding agent), so without this
@@ -1453,23 +1478,24 @@ def _kill_group(proc) -> None:
             pass
 
 
-def run_claude(transcript: str, resume_session_id: str | None, on_event=None, system_append: str = "",
-               model: str = HUB_MODEL, agent: bool = False, cwd: str | None = None,
-               allow_read: bool = False, allowed_tools: "list | None" = None,
-               deny_tools: "list | None" = None) -> dict:
-    """Run `claude -p` headless and STREAM the stream-json output, parsing events as they arrive.
+def run_claude(transcript: str, resume_session_id: str | None, *, manual: bool, on_event=None,
+               system_append: str = "", model: str = "opus", cwd: str | None = None) -> dict:
+    """Run the UNRESTRICTED Claude Code agent headless (`claude -p --dangerously-skip-permissions`) and
+    STREAM its stream-json output, parsing events as they arrive. Full-agent mode and the watch's
+    fallback path are its only callers; every hub turn runs on the fenced SdkRunner instead.
 
-    on_event(kind, payload) fires live during the run so progress can be surfaced — currently
-    on_event("tool", {"name", "input"}) for each tool call. Returns {"session_id", "text",
-    "result", "ok", "raw_error"}.
+    Every native tool executes, alongside the MCP tools, in `cwd`, for up to AGENT_TIMEOUT_S. There is no
+    fence on this path, which is why it refuses outright unless the caller says the command was started
+    by a press (`manual`, from is_manual): a microphone must never reach it.
 
-    Two shapes:
-      · HUB (agent=False): tool allowlist restricted to the MCP servers — no Bash/Edit/Read. In headless
-        `-p` mode a tool not in --allowedTools is DENIED (not prompted), so the run never hangs.
-      · FULL AGENT (agent=True): the unrestricted Claude Code agent — every native tool executes (via
-        --dangerously-skip-permissions, since `-p` can't prompt) ALONGSIDE the MCP tools, runs in `cwd`,
-        and gets the longer AGENT_TIMEOUT_S. No hub framing; an all-purpose voice agent (coding, etc.).
+    on_event(kind, payload) fires live during the run so progress can be surfaced — on_event("tool",
+    {"name", "input"}) for each tool call, on_event("text", ...) for narration a tool call followed.
+    Returns {"session_id", "text", "result", "ok", "raw_error"}.
     """
+    if manual is not True:
+        log_error("run_claude refused a command that was not started by a press")
+        return {"session_id": None, "text": "", "result": "", "ok": False,
+                "raw_error": "the unrestricted agent only runs commands started by a press"}
     mcp_path = write_mcp_config()
     cmd = [CLAUDE_BIN, "-p", transcript]
     if resume_session_id:
@@ -1480,24 +1506,13 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
         "--strict-mcp-config",
         "--output-format", "stream-json",
         "--verbose",
+        "--dangerously-skip-permissions",   # all native tools execute; MCP tools still present
+        # Out of the schema: the browser-only tools, which no worker has the browser for.
+        "--disallowedTools", *SESSION_TOOLS,
     ]
-    if agent:
-        cmd += ["--dangerously-skip-permissions"]   # all native tools execute; MCP tools still present
-    else:
-        allowed = list(allowed_tools) if allowed_tools is not None else list(ALL_TOOLS)
-        if allow_read:
-            allowed.append("Read")   # photo turns only: Read is how the CLI views image files
-        cmd += ["--allowedTools", *allowed]   # a tool not listed is DENIED (not prompted) in -p mode
-        # Only this run's flags decide what it may do. Claude Code otherwise also applies the host
-        # user's settings, and the Mac's pre-approve the data, gmail and messages tools in auto mode,
-        # which widens the list above. The worker runs from its own directory, so "project" loads none.
-        cmd += ["--setting-sources", "project"]
-    # Out of the schema, not just refused: the browser-only tools on every run, and the sends on a
-    # room-mic turn. A deny beats any allow rule, and taking them out of sight loses nothing.
-    cmd += ["--disallowedTools", *SESSION_TOOLS, *(deny_tools or [])]
     if system_append:
         cmd += ["--append-system-prompt", system_append]
-    timeout_s = AGENT_TIMEOUT_S if agent else CLAUDE_TIMEOUT_S
+    timeout_s = AGENT_TIMEOUT_S
     if cwd and not os.path.isdir(cwd):   # a published path may not exist on the worker that runs it
         log(f"agent cwd {cwd!r} not present here; falling back to $HOME")
         cwd = os.path.expanduser("~")
@@ -1611,11 +1626,11 @@ def run_claude(transcript: str, resume_session_id: str | None, on_event=None, sy
             gen  = f"{t_end - t_first:.1f}s" if t_first else "n/a"
             log(f"timing: cold-start(spawn→mcp) {cold} | first-token {ttf} | "
                 f"gen+{n_tools}tools {gen} | total {t_end - t_spawn:.1f}s | "
-                f"model={model} resume={'y' if resume_session_id else 'n'} agent={'y' if agent else 'n'}")
+                f"model={model} resume={'y' if resume_session_id else 'n'} agent=y")
 
         if timed_out["v"]:
             return {"session_id": session_id, "text": "", "result": "",
-                    "ok": False, "raw_error": f"claude timed out after {CLAUDE_TIMEOUT_S}s"}
+                    "ok": False, "raw_error": f"claude timed out after {timeout_s}s"}
         if proc.returncode not in (0, None) and not result_text and not assistant_chunks:
             raw_error = raw_error or f"claude exited {proc.returncode}: {stderr[:500]}"
 
@@ -1702,6 +1717,7 @@ class SdkRunner:
         self._loop = None
         self._client = None
         self._ambient = True   # the turn in flight came from a room mic; set by run() before each turn
+        self._manual = False   # the turn in flight was started by a press (is_manual); set by run()
         self._used = False     # the warm client has run a turn since it connected, so needs a /clear
         self._lock = None      # serialises connects; created on the SDK loop
 
@@ -1751,6 +1767,12 @@ class SdkRunner:
             # messages tool in auto mode; with allowed_tools alone a room-mic turn sent an email in the
             # first test of the send rule. A hook's deny outranks any allow rule, so the list holds here.
             name = input_data.get("tool_name") or ""
+            if name in SESSION_START_TOOLS and not self._manual:
+                # No session from a turn a microphone started by itself (is_manual). Fails closed: the
+                # flag is False unless run() was told this turn was pressed.
+                return _decide("deny", "Starting or messaging a Claude session is off for commands a "
+                                       "microphone heard by itself. It has to come from the button on his "
+                                       "phone or watch, or be typed.")
             if name in SEND_TOOLS and name in exact:
                 # The one per-turn decision: the client is warm across turns, so only the flag run()
                 # sets can say which mic this turn came from.
@@ -1888,12 +1910,13 @@ class SdkRunner:
             return {"session_id": None, "text": "", "result": "", "ok": False, "used_tools": True,
                     "raw_error": f"sdk run failed: {e}"}
 
-    def run(self, transcript, on_event=None, ambient=True, read_dir=None) -> dict:
-        """`ambient` says the turn came from a room mic, which is what _gate reads for the sends;
-        `read_dir` is where this turn's photos are. Turns run one at a time, so a flag on the runner is
-        exactly one turn's."""
+    def run(self, transcript, on_event=None, ambient=True, manual=False, read_dir=None) -> dict:
+        """`ambient` says the turn came from a room mic, which is what the fence reads for the sends;
+        `manual` says it was started by a press (is_manual), which is what it reads for the session tools;
+        `read_dir` is where this turn's photos are. Both flags default to the restrictive answer. Turns run
+        one at a time, so a flag on the runner is exactly one turn's."""
         self._start_loop()
-        self._ambient, self._read_dir = ambient, read_dir
+        self._ambient, self._manual, self._read_dir = ambient, manual, read_dir
         result = self._attempt(transcript, on_event)
         if result.get("ok"):
             return result
@@ -1948,9 +1971,14 @@ def codex_ready() -> bool:
     return bool(CODEX_BIN) and (home / "auth.json").exists()
 
 
-def run_codex(prompt: str) -> dict:
+def run_codex(prompt: str, *, manual: bool) -> dict:
     """One hub turn on Codex. Same result shape as an SDK turn; `used_tools` is True whenever it ran,
-    since nothing here reports what it called."""
+    since nothing here reports what it called. Codex has no fence (every MCP tool is pre-approved, sends
+    and start_session included), so it refuses a command that was not started by a press."""
+    if manual is not True:
+        log_error("run_codex refused a command that was not started by a press")
+        return {"session_id": None, "text": "", "result": "", "ok": False, "used_tools": False,
+                "raw_error": "Codex only runs commands started by a press"}
     over = ["-c", 'approval_policy="never"', "-c", 'model_reasoning_effort="medium"']
     for name, srv in mcp_servers(codex_sessions=True).items():
         key = f"mcp_servers.{name}"   # bare: `-c` splits the path on dots and does not unquote a segment
@@ -2455,7 +2483,13 @@ def process_request(db: Supabase, req: dict) -> None:
     global _hub_unreachable
     _hub_unreachable = fallback
 
-    focus = "hub" if fallback else get_focus()
+    # Started by a press or typed? Only then may this command reach a session, the unrestricted agent,
+    # Codex or the credits runner. Fails closed: see MANUAL_SOURCES.
+    manual = is_manual(req)
+
+    # A focused Mac session receives typed-into-its-terminal words, so only a pressed command goes there;
+    # anything a microphone heard by itself is answered as an ordinary hub turn instead.
+    focus = "hub" if fallback or not manual else get_focus()
 
     # Focus is a specific Mac session → inject the transcript into that session's
     # wall terminal (the orchestrator owns the live `claude --resume` pty) instead
@@ -2492,7 +2526,9 @@ def process_request(db: Supabase, req: dict) -> None:
     # turn is a FRESH process handed the recent transcript (recent_context), so the two models never share a
     # session and can't cross-contaminate. Only agent mode reads/writes a persisted session id.
     ag = agent_settings()
-    session_agent = ag["mode"] and WORKER_ID != "fly"
+    # The full agent runs with --dangerously-skip-permissions, so a command a microphone heard by itself
+    # never gets it, even with agent mode on: it is answered on the fenced hub client.
+    session_agent = ag["mode"] and WORKER_ID != "fly" and manual
     ctx = ""
     if session_agent:
         state = read_session(True)
@@ -2593,6 +2629,8 @@ def process_request(db: Supabase, req: dict) -> None:
         prompt += ADDRESSING_DIRECTIVE + ROOM_SEND_DIRECTIVE
     else:
         prompt += DELIBERATE_DIRECTIVE
+    if not manual:
+        prompt += NO_SESSION_DIRECTIVE
     prompt += READ_DIRECTIVE
     alt = (req.get("alt_transcript") or "").strip()
     if alt:
@@ -2608,7 +2646,8 @@ def process_request(db: Supabase, req: dict) -> None:
             attachments = []
     use_agent = session_agent   # full-agent (coding) mode → the unrestricted agent, on its own session
     hub_route = f"hub {HUB_MODEL}@{HUB_EFFORT or 'default'}" + (" +photo" if attachments else "")
-    log(f"route={'fallback→opus agent' if fallback else 'agent' if use_agent else hub_route} src={source}")
+    log(f"route={'fallback→opus agent' if fallback else 'agent' if use_agent else hub_route} src={source}"
+        f" manual={'y' if manual else 'n'}")
     ping_esp_led("blink")   # working — the ESP light blinks for EVERY command, not just ESP-sourced ones
     push_activity(transcript[:240], "working")   # bottom-strip: the prompt being worked
 
@@ -2633,42 +2672,41 @@ def process_request(db: Supabase, req: dict) -> None:
     # → the warm SDK client. A failure that called no tool is handed to another worker below rather than
     # ended here.
     hub_prompt = ctx + prompt   # ctx is "" in agent mode (uses --resume) or when there's no live conversation
-    room_deny = SEND_TOOLS if ambient else None   # the room mics never send a text or an email
     unready = claude_unready()
     if unready:
         result = {"session_id": None, "text": "", "result": "", "ok": False, "raw_error": unready}
-    elif fallback:
+    elif fallback and manual:
         # Opus, the unrestricted agent, a FRESH run with the day's conversation replayed — whatever broke,
         # it can handle the command and see enough to say what is wrong. Never the --resume agent session.
         fb_prompt = (ctx or recent_context()) + prompt + fallback_directive(db, rid)
         result = run_subscription(
-            lambda: run_claude(fb_prompt, None, on_event=_emit, system_append=AGENT_SYSTEM + "\n\n" + SHARED_STATE_NOTE,
-                               model="opus", agent=True, cwd=os.path.expanduser("~")),
+            lambda: run_claude(fb_prompt, None, manual=manual, on_event=_emit,
+                               system_append=AGENT_SYSTEM + "\n\n" + SHARED_STATE_NOTE,
+                               model="opus", cwd=os.path.expanduser("~")),
             "subscription Opus (fallback)")
     elif use_agent:
-        result = run_claude(prompt, resume_id, on_event=_emit, system_append=AGENT_SYSTEM + "\n\n" + SHARED_STATE_NOTE, model="opus",
-                            agent=True, cwd=ag["cwd"], allow_read=bool(att_paths),
-                            deny_tools=room_deny)
+        result = run_claude(prompt, resume_id, manual=manual, on_event=_emit,
+                            system_append=AGENT_SYSTEM + "\n\n" + SHARED_STATE_NOTE, model="opus",
+                            cwd=ag["cwd"])
     else:
         # The warm SDK client, not a per-command `claude -p`: that spawn (CLI + four stdio MCP servers)
         # measured 3.6s on the Pi before the model saw a token; the warm client pays it once.
         run_hub = lambda sdk: sdk.run(hub_prompt + NUTRITION_DIRECTIVE + TOOLS_DIRECTIVE, on_event=_emit,  # noqa: E731
-                                      ambient=ambient, read_dir=att_tmp if att_paths else None)
+                                      ambient=ambient, manual=manual, read_dir=att_tmp if att_paths else None)
         result = run_subscription(lambda: run_hub(SDK), "subscription hub")
         if result.get("ok"):
             SDK_CREDITS.close()   # the subscription answers again; the credits client has no more work
-        elif source not in ROOM_MIC_SOURCES and limit_refused(result) and CREDITS_API_KEY:
+        elif manual and limit_refused(result) and CREDITS_API_KEY:
             # Every worker shares the one account, so handing this on would only fail again elsewhere.
             log(f"subscription limit hit ({result.get('raw_error')}) — running on API credits")
             push_activity("On API credits")
             result = run_hub(SDK_CREDITS)
             result["_limit"] = True
             result["_engine"] = "credits"
-        if (not result.get("ok") and not result.get("used_tools") and source not in ROOM_MIC_SOURCES
-                and codex_ready()):
+        if not result.get("ok") and not result.get("used_tools") and manual and codex_ready():
             log_error(f"Claude could not answer ({result.get('raw_error')}) — running the turn on Codex")
             push_activity("On Codex")
-            result = {**run_codex(hub_prompt + NUTRITION_DIRECTIVE + TOOLS_DIRECTIVE), "_limit": result.get("_limit"),
+            result = {**run_codex(hub_prompt + NUTRITION_DIRECTIVE + TOOLS_DIRECTIVE, manual=manual), "_limit": result.get("_limit"),
                       "_engine": "codex"}
             if not result.get("ok"):
                 log_error(f"codex fallback failed: {result.get('raw_error')}")
@@ -2688,7 +2726,8 @@ def process_request(db: Supabase, req: dict) -> None:
     # context to mimic; the prompt already carries DELIBERATE_DIRECTIVE.
     if not ambient and is_ignore(text) and not result.get("used_tools"):
         log("deliberate turn answered __IGNORE__ → clean re-run (no context)")
-        result = SDK.run(prompt + NUTRITION_DIRECTIVE + TOOLS_DIRECTIVE, on_event=_emit, ambient=ambient)
+        result = SDK.run(prompt + NUTRITION_DIRECTIVE + TOOLS_DIRECTIVE, on_event=_emit, ambient=ambient,
+                         manual=manual)
         text = (result.get("text") or "").strip()
 
     text, needs_read = take_read_marker(text)

@@ -30,14 +30,14 @@ the Claude subscription. A run that fails transiently (overloaded, 5xx, network)
 subscription (`run_subscription`, `SUBSCRIPTION_RETRY_S`) and then surfaced as an error, never moved
 onto the key: that turns a passing "529 Overloaded" on an Opus turn into a Console-billed Opus run.
 
-The one exception is a hub turn from the watch, phone or web (`source` not in `ROOM_MIC_SOURCES`, the
-ESP and the Mac listener) that the subscription refuses for its
+The one exception is a hub turn started by a press or typed (`is_manual`, docs/ROUTING.md § Sessions
+and the unrestricted agent need a press) that the subscription refuses for its
 usage limit (`limit_refused`: the turn's `rate_limit_event` said `rejected`, or the CLI's "You've hit
 your 5-hour limit"). It re-runs on `SDK_CREDITS`, a second warm client billed to `ANTHROPIC_API_KEY`,
 which the Max plan's monthly Console credits pay for. It is not handed to another worker, since every
-worker shares the account. Room-mic captures are never re-run there, wake-word ones included (they
-arrive with `always_on` false but carry most of the overheard TV): judging room noise on the key is what
-drained the Console balance once. `SDK_CREDITS` connects on first use and closes on the next turn
+worker shares the account. Nothing a microphone heard by itself is re-run there, wake-word captures and
+the watch's and phone's listeners included: judging room noise on the key is what drained the Console
+balance once. `SDK_CREDITS` connects on first use and closes on the next turn
 the subscription answers.
 
 The CLI and the Agent SDK silently prefer the key over the subscription login, so `worker.py` pops it
@@ -46,7 +46,7 @@ from the environment at import into `CREDITS_API_KEY`, and only `SDK_CREDITS` pa
 strips it separately (it sources the worker's `.env` itself). Fly holds it as a secret.
 
 When Claude cannot answer at all (the subscription failed for any other reason, or the credits run
-failed too), a watch/phone/web hub turn that called no tool is re-run on Codex (`run_codex`: `codex exec`
+failed too), a manual hub turn that called no tool is re-run on Codex (`run_codex`: `codex exec`
 on Jared's ChatGPT plan, the same MCP servers, read-only sandbox, prompt on stdin),
 on any worker where `codex_ready()` (the binary plus a login in `CODEX_HOME`). Each machine needs its own
 `codex login --device-auth`: one ChatGPT login copied to two machines breaks when either rotates its
