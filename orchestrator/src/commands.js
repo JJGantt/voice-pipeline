@@ -33,7 +33,7 @@ import { watchTable } from './realtime.js';
 import { isKnownRepo } from './repos.js';
 
 // What a session the Pi closed for doing heavy work is told when it resumes here: what happened, then
-// one of two endings, for a session cut off mid-turn and for one that was waiting on Jared.
+// one of two endings, for a session cut off mid-turn and for one that was waiting on the user.
 const [MOVED_NOTE, MOVED_MID_TURN, MOVED_BETWEEN_TURNS] = fs.readFileSync(new URL('../moved-session.txt', import.meta.url), 'utf8')
   .split(/^---$/m).map((s) => s.trim());
 import { ensureTrusted } from './trust.js';
@@ -44,12 +44,12 @@ import { mirrorUp, mirrorDown } from './mirror.js';
 import { fingerprint, noteRemoteInput } from './idle.js';
 
 // Appended only when a dispatch ASKED for a write-up (`report` on the command payload, set by the
-// voice tool when Jared says so). Reports are opt-in because most dispatched work just needs
+// voice tool when the user says so). Reports are opt-in because most dispatched work just needs
 // doing, and a page about a one-line change is noise.
 //
 // It rides in the prompt rather than living in CLAUDE.md so it can be per-request at all: a file
-// both machines share applies to every session, including the ones Jared opens by hand at the
-// keyboard, which have no business filing reports at him.
+// both machines share applies to every session, including the ones opened by hand at the
+// keyboard, which have no business filing reports at the user.
 const REPORT_DIRECTIVE =
   '[When you have finished this work, call the publish_report tool with an HTML write-up of what '
   + 'you did — that is how Jared reads the outcome on his phone. Then answer normally here as '
@@ -135,7 +135,7 @@ async function run(cmd) {
     return deliver(row, prompt, { cmd: (cmd.payload || {}).msg || cmd.id });
   }
 
-  // Name the session itself. `/rename` is the command Jared types, so this is the same act rather than
+  // Name the session itself. `/rename` is the command the user types, so this is the same act rather than
   // a parallel label: Claude Code renames itself, the tab title changes, and it writes the
   // `custom-title` record the reconcile tick reads straight back into the row.
   if (cmd.kind === 'rename_session') {
@@ -204,7 +204,7 @@ async function run(cmd) {
         label: row.label || null, claude_session_id: row.claude_session_id,
         transcript_path: row.transcript_path, mirror_offset: row.mirror_offset || 0,
         remote_inputs: prompt ? [fingerprint(prompt)] : [],
-        // A session he used at the Mac stays his through a resume: the new row's transcript scan
+        // A session the user used at the Mac stays the user's through a resume: the new row's transcript scan
         // starts at its own start, so it would otherwise read as hosted-only and be parked again.
         touched_at: row.touched_at || null,
         active_at: new Date().toISOString(),
@@ -246,7 +246,7 @@ async function run(cmd) {
     if (!claudeId) throw new Error('no session id to resume');
     const dir = repoDir(repo);
     const { moved, mid_turn: midTurn } = cmd.payload || {};
-    // A session the Pi moved mid-turn was closed with C-c, which Claude Code records as Jared rejecting
+    // A session the Pi moved mid-turn was closed with C-c, which Claude Code records as the user rejecting
     // the step it was on; mirrorDown rewrites those records so the session carries on here.
     const file = await mirrorDown(claudeId, dir, { movedMidTurn: !!(moved && midTurn) });
     // Nothing mirrored means the session never sat idle long enough to be uploaded. Resuming would
@@ -321,7 +321,7 @@ async function run(cmd) {
     console.log(`[commands] opened session in ${target} (${how}${tty ? `, tty ${tty}` : ''}, trust: ${trust}`
       + `${prompt ? `, prompt: "${prompt.slice(0, 60)}"` : ''})`);
 
-    // Publish it, as the most recently active session: it is the work he just asked for.
+    // Publish it, as the most recently active session: it is the work the user just asked for.
     try {
       await upsertDeskSession({
         id: sessionId, worker: 'desk', repo: name || 'root', agent,

@@ -29,8 +29,8 @@ export const config = {
   // A session started here is unattended, and the machine default is whatever `/model` last wrote to
   // ~/.claude/settings.json. That default is invisible from an interactive session in ~, because
   // ~/.claude/settings.local.json doubles as the PROJECT settings for the project rooted at the home
-  // directory and outranks it — so the default can be wrong for months while every session Jared
-  // opens himself looks right. Desk sessions run in a repo, where nothing shadows it. (pi-desk pins
+  // directory and outranks it — so the default can be wrong for months while every session the user
+  // opens by hand looks right. Desk sessions run in a repo, where nothing shadows it. (pi-desk pins
   // the same way, in launch.sh.)
   DESK_MODEL: process.env.DESK_MODEL || 'opus',
 

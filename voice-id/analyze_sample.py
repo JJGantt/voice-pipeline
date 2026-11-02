@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Replay a recorded voice sample through the EXACT wake-free speaker-gated scoring and print a
-per-check timeline — so we can SEE where/why it would drop Jared mid-speech. Same voiceprint
+per-check timeline — so we can SEE where/why it would drop the speaker mid-speech. Same voiceprint
 (exemplars.npy), same ECAPA, same 2.0s rolling window, 0.7s cadence, threshold + keep-alive
 hysteresis, and the consecutive-miss close rule as wakefree.py.
 

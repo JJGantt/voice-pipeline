@@ -1,5 +1,5 @@
 // A session started from the hub conversation answers back into it — once, with its first finished
-// reply. After that it is a session like any other: Jared reads it where it runs and talks to it with
+// reply. After that it is a session like any other: the user reads it where it runs and talks to it with
 // a follow-up. Nothing later is relayed, so a long job cannot flood the thread.
 //
 // Which sessions: those whose desk_commands payload carries `relay`. data-layer's start_session sets it

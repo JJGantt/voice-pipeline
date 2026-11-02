@@ -4,10 +4,10 @@
 // THREE THINGS BOTH MACHINES MUST AGREE ON, which is why they live here and not in either consumer:
 //
 // 1. WHAT MAY BE TYPED. Claude Code decides whether input is a paste by its shape, and a paste reaches
-//    the model wrapped in <pasted_content> tags — framed as material to look at, not as what he asked.
+//    the model wrapped in <pasted_content> tags — framed as material to look at, not as what the user asked.
 //    Measured on 2.1.284, typing through tmux: 790 characters arrive as a plain message and 810 arrive
 //    wrapped; three lines arrive plain and four arrive wrapped. The same limits hold for bracketed paste
-//    and for plain keystrokes. A wrapped message is still acted on as his: every long dictation he
+//    and for plain keystrokes. A wrapped message is still acted on as the user's: every long dictation the user
 //    pastes at the keyboard arrives as a bare <pasted_content> block and is answered as a request. So a
 //    message of any length is simply pasted; transcripts.js unwraps the tags for every surface.
 //
@@ -42,7 +42,7 @@ export function typeable(text) {
  *
  * NOT a day: the stub typed into a session names its file, and `unstash` in transcripts.js reads it back
  * so every surface shows the words instead of the stub. Sweeping it while the session is still on
- * screen turns his message back into the stub wherever it is drawn.
+ * screen turns the user's message back into the stub wherever it is drawn.
  */
 export function sweepStashedPrompts(maxAgeMs = 30 * 86400000) {
   let names;

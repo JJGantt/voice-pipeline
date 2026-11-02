@@ -46,10 +46,10 @@ CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 
 # Every turn runs on the Claude subscription. The Console key is used for exactly one case: a hub turn
 # from the watch, phone or web (never a room mic) refused because the subscription's usage limit is hit,
-# which is re-run on the key so nutrition and lists keep working until the window resets (Jared,
-# 2026-11-01). The Max plan's $100/month of Console credits pays for it. An overloaded or erroring
-# subscription is retried and surfaced, never moved onto the key: on 2026-09-21 one 529 did that to an
-# Opus turn, and on 2026-08-30 noise judging on the key drained the Console balance in an evening.
+# which is re-run on the key so nutrition and lists keep working until the window resets (owner's
+# decision). The Max plan's $100/month of Console credits pays for it. An overloaded or erroring
+# subscription is retried and surfaced, never moved onto the key: a 529 there becomes a Console-billed
+# Opus turn, and noise judging on the key drains the Console balance.
 #
 # The key is popped from the environment at import, so no subprocess inherits it and quietly bills it;
 # only the credits runner (SDK_CREDITS) passes it on, explicitly.
@@ -57,7 +57,7 @@ CREDITS_API_KEY = os.environ.pop("ANTHROPIC_API_KEY", None) or ""
 
 
 # Every hub turn runs on ONE model with the full toolset: Opus at its default effort, which is adaptive —
-# it thinks as hard as the turn needs. Quality over speed, by Jared's call (2026-10-29): there is no fast
+# it thinks as hard as the turn needs. Quality over speed, by decision: there is no fast
 # first responder and no escalation. Low effort was measurably worse on macro estimates and `max` bought
 # nothing over the default (docs/ROUTING.md). Override with HUB_MODEL / HUB_EFFORT (empty = the default).
 HUB_MODEL = os.environ.get("HUB_MODEL", "opus")
@@ -233,7 +233,7 @@ DEDUP_WINDOW_S = 10.0         # fallback only: 2 mics' enqueue times for rows th
 DEDUP_TOL_S = 0.75            # pad each recording window by this (Fly↔Mac clock skew + ESP→Fly stream latency)
 
 
-# A mic still hearing Jared means the utterance is NOT FINISHED, whoever else has already enqueued a
+# A mic still hearing the speaker means the utterance is NOT FINISHED, whoever else has already enqueued a
 # row for it. Claiming during that window is how a mid-sentence fragment gets acted on while the mic
 # that has the whole thing is still recording.
 MIC_QUIET_S = float(os.environ.get("MIC_QUIET_S", "2.5"))
@@ -275,7 +275,7 @@ _NOTHING_SAID = re.compile(r"^\W*thank\s+you\W*$", re.IGNORECASE)
 WEB_TOOLS = ["WebSearch", "WebFetch"]
 
 
-# His email and texts, named tool by tool so the two sends can be held apart below.
+# The user's email and texts, named tool by tool so the two sends can be held apart below.
 MAIL_TOOLS = [
     "mcp__gmail__search_email", "mcp__gmail__get_email", "mcp__gmail__get_email_thread",
     "mcp__gmail__list_labels", "mcp__gmail__find_email_contact", "mcp__gmail__create_draft",
@@ -286,14 +286,14 @@ MAIL_TOOLS = [
 
 
 # Sending a text or an email reaches another person, so it is decided per TURN, not per list: allowed
-# only on a command he pressed for or typed (is_manual), never on one a microphone heard by itself, wake
+# only on a command the user pressed for or typed (is_manual), never on one a microphone heard by itself, wake
 # word included, which could send a sentence that was never meant for the assistant. See SdkRunner.gate,
 # which also holds back switching JaredBot (the group-chat auto-replier) ON, since that sends texts too.
 SEND_TOOLS = ["mcp__messages__send_message", "mcp__gmail__send_email"]
 JAREDBOT_TOOL = "mcp__voice__set_jaredbot"
 
 
-# Tools that only mean something next to his signed-in browser, which this worker does not have: a cart
+# Tools that only mean something next to the user's signed-in browser, which this worker does not have: a cart
 # URL has to be opened there, a cart recording is what its /cart page showed, and an item id is read off
 # the retailer's site. Here they could only be called with made-up values, so they are REMOVED from every
 # runner's schema: a cart request has to become a start_session, never a turn with no browser.

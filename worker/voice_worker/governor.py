@@ -10,7 +10,7 @@ from .db import headers
 from .logs import log, log_error, now_iso
 
 
-AO_IGNORE_STREAK_OFF = 3    # consecutive ignored turns that put the brakes on… (Jared's numbers)
+AO_IGNORE_STREAK_OFF = 3    # consecutive ignored turns that put the brakes on… (owner-chosen values)
 
 
 AO_IGNORE_WINDOW_S = 300    # …when they all land within this window — a rate, not a lifetime count
@@ -40,7 +40,7 @@ def maybe_auto_disable_wakefree() -> None:
         grows = g.json()
         if not (grows and str(grows[0].get("value")).strip().lower() in ("1", "true", "on", "yes")):
             return   # already off — nothing to flip
-        # Marker FIRST, then the flip: an auto-off must stay distinguishable from Jared turning
+        # Marker FIRST, then the flip: an auto-off must stay distinguishable from the user turning
         # always-on off by voice — only a MARKED off self-heals after the cooldown below.
         httpx.post(f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
                    headers={**headers(), "Prefer": "resolution=merge-duplicates"},
@@ -97,7 +97,7 @@ def maybe_auto_reenable_wakefree() -> None:
                 _set("wakefree_autooff_at", "")   # re-enabled by hand before the cooldown — clear the stale marker
             return
         if not marker:
-            return   # manual off — stays off until Jared says otherwise
+            return   # manual off — stays off until the user says otherwise
         _ao_reenable_check["interval"] = 60.0   # brake active → watch for the release more closely
         age = (datetime.now(timezone.utc)
                - datetime.fromisoformat(marker.replace("Z", "+00:00"))).total_seconds()

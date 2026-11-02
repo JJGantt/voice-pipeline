@@ -45,7 +45,7 @@ if [ -n "$PROMPT_FILE" ] && [ -s "$PROMPT_FILE" ]; then
 fi
 DEV="$(printf '%s' "$SYS_TEXT" | node -e 'process.stdout.write(JSON.stringify(require("fs").readFileSync(0,"utf8")))')"
 
-# Full access with no approvals, as Jared runs Codex himself: nobody is at this terminal to answer one.
+# Full access with no approvals, as Codex is run by hand: nobody is at this terminal to answer one.
 # MCP tools need their own approval mode, or approval_policy=never refuses every call. The update check
 # is off because its prompt would sit on the screen waiting for a keypress.
 OPTS=(-a never -s danger-full-access -C "$DIR"

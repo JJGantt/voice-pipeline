@@ -23,11 +23,11 @@ from .prompts import ADDRESSING_DIRECTIVE, AGENT_SYSTEM, ALT_TRANSCRIPT_DIRECTIV
 from .runners import SDK, SDK_CREDITS, codex_ready, limit_refused, run_claude, run_codex, run_subscription, set_cmd_ts
 
 
-# PROVENANCE: was this command started by a deliberate act of his hand? Only such a command may reach
-# anything that can do unbounded work in his name: a Claude session (start_session, follow_up, a pty
+# PROVENANCE: was this command started by a deliberate act of the user's hand? Only such a command may reach
+# anything that can do unbounded work in the user's name: a Claude session (start_session, follow_up, a pty
 # inject into a focused one), the unrestricted full agent (--dangerously-skip-permissions), Codex, or the
 # Console-billed credits runner. Everything a microphone heard by itself (always-on capture, a wake word
-# the TV can say, a watch or phone listener) is not, because nothing guarantees he was the one talking.
+# the TV can say, a watch or phone listener) is not, because nothing guarantees the user was the one talking.
 #
 # A row is manual only when it says so twice: its `source` is one of these labels, each of which is only
 # ever written by a press or by typing, AND it is not stamped `always_on`. Anything else, a new capture
@@ -106,7 +106,7 @@ def process_request(db: Supabase, req: dict) -> None:
     log(f"claimed request {rid}: {transcript[:80]!r}")
 
     # Timestamp carry-through: the data MCP defaults every write's timestamp to when the audio recording
-    # STARTED (not ~30s later at pipeline end), so a voice-logged set lands at Jared's rest-clock moment.
+    # STARTED (not ~30s later at pipeline end), so a voice-logged set lands at the user's rest-clock moment.
     # Only for audio captures (typed/web commands have no capture_start → real wall clock).
     set_cmd_ts((req.get("capture_start") or "").strip() or None)
 
@@ -300,27 +300,27 @@ def _activity_emitter(db: Supabase, req: dict):
 
 
 def build_prompt(req: dict, transcript: str, *, ambient: bool, manual: bool) -> str:
-    """The prompt for one command: his words, the clock to anchor relative times to, and the directives
+    """The prompt for one command: the user's words, the clock to anchor relative times to, and the directives
     for how it reached us. Rides on the prompt, NOT the cached system block, so it never changes the
     per-command system prefix and breaks the prompt cache."""
     prompt = transcript
     # Give the model a clock so any relative date/time resolves correctly — without it the model defaults
     # to its training era (e.g. logging "yesterday" against 2024). Pure wall-clock, no timezone concept.
-    # Priority, BEST ANCHOR FIRST — what we want is the moment Jared SPOKE, not the moment we got here:
-    #  1. capture_start — when the mic started recording, i.e. when he started talking. That's what
-    #     relative arithmetic has to hang off: "a timer for 11 minutes" means 11 minutes from when he
+    # Priority, BEST ANCHOR FIRST — what we want is the moment the user SPOKE, not the moment we got here:
+    #  1. capture_start — when the mic started recording, i.e. when the user started talking. That's what
+    #     relative arithmetic has to hang off: "a timer for 11 minutes" means 11 minutes from when the user
     #     said it. Stamped UTC by the capture side, so convert into this machine's local wall clock to
     #     read like the other two branches.
     #  2. client_now — the REQUESTING DEVICE's own clock (phone/browser), for typed commands that carry
-    #     no recording window; better than ours because the worker is only "wherever Jared is" when the
+    #     no recording window; better than ours because the worker is only "wherever the user is" when the
     #     request came from home.
     #  3. this worker's clock — last resort (and what typed/local commands legitimately land on). For a
-    #     voice command it's the wrong anchor: it reads at claim/transcription time, ~25s after he
+    #     voice command it's the wrong anchor: it reads at claim/transcription time, ~25s after the user
     #     started speaking on a HEALTHY run and much later when the Mac worker is down and the job falls
     #     through to the Pi or Fly, so every "in N minutes" would quietly lose that lag.
     # To the SECOND, in both the readable clock and the literal occurred_at value: a set's stamp is the
     # zero of the watch's m:ss rest clock, and a minute-precision stamp let the model pass HH:MM:00,
-    # which started that clock up to 59s before he had finished the set.
+    # which started that clock up to 59s before the user had finished the set.
     # Rides on the prompt, NOT the cached system block, so it can't change the per-command system prefix
     # and break the prompt cache.
     _cap = _parse_ts((req.get("capture_start") or "").strip())
@@ -415,9 +415,9 @@ def _record_outcome(db: Supabase, req: dict, result: dict, prompt: str, *, trans
     rid = req["id"]
     text = (result.get("text") or "").strip()
 
-    # The same net for __IGNORE__ on a turn he MEANT. Only room-mic turns are taught the sentinel, but a
+    # The same net for __IGNORE__ on a turn the user MEANT. Only room-mic turns are taught the sentinel, but a
     # model can still pick it up (it did, from replayed history) — and on a deliberate turn there is no
-    # ignore branch to catch it, so it was saved and pushed to him as the reply. Re-run clean, with no
+    # ignore branch to catch it, so it was saved and pushed to the user as the reply. Re-run clean, with no
     # context to mimic; the prompt already carries DELIBERATE_DIRECTIVE.
     if not ambient and is_ignore(text) and not result.get("used_tools"):
         log("deliberate turn answered __IGNORE__ → clean re-run (no context)")
@@ -439,7 +439,7 @@ def _record_outcome(db: Supabase, req: dict, result: dict, prompt: str, *, trans
     # Wake-word false positive: the model judged the transcript noise or a mishear. No ASSISTANT turn is
     # written — nothing was done and nothing is spoken — but the words are KEPT, flagged `ignored`.
     #
-    # They used to be erased entirely, and that made a wrong judgement unrecoverable: Jared could not
+    # They used to be erased entirely, and that made a wrong judgement unrecoverable: the user could not
     # say "do the one you ignored", and a following "answer my question" pointed at something that, as
     # far as the model could see, had never been said. Which is precisely what happened on 2026-08-28.
     if ambient and is_ignore(text):

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enroll Jared's voiceprint from SEPARATE command-like phrases.
+"""Enroll the speaker's voiceprint from SEPARATE command-like phrases.
 
 Records a set of DISTINCT phrases one at a time — mostly real short commands, plus a couple of longer
 natural ones — and saves each as its own ECAPA exemplar (exemplars.npy). This beats slicing one long

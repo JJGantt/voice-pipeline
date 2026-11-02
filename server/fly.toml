@@ -11,7 +11,7 @@ primary_region = "iad"
   # host core, which oversubscribes the single core we're scheduled on and makes one ECAPA encode thrash
   # from ~0.2s up to 7-10s — past the 3.5s abort window, so real commands drop before the voiceprint
   # confirms you. These env vars cap the pools at import time; server.py also calls torch.set_num_threads(1).
-  # Jared's wall clock, the same as the Pi's and the Mac's. The worker and its data MCP stamp "now" as
+  # The owner's wall clock, the same as the Pi's and the Mac's. The worker and its data MCP stamp "now" as
   # naive local time (a nutrition entry's occurred_at, the prompt's "said at" line); on UTC they wrote
   # entries four hours late while the other two workers wrote them correctly.
   TZ = "America/New_York"

@@ -134,7 +134,7 @@ def _builtin_mic():
     """The sounddevice index of the Mac's own microphone, or None to fall back to the default input.
 
     Never the default: connected AirPods become it, and holding their mic — which this listener does
-    all day — keeps the whole Bluetooth link in the hands-free profile, so his music and calls are
+    all day — keeps the whole Bluetooth link in the hands-free profile, so the user's music and calls are
     call-quality for as long as they are in, and wake words are heard through a narrowband codec.
     PortAudio does not report a transport, so CoreAudio's own (via system_profiler) names the device."""
     try:
@@ -812,7 +812,7 @@ class RealtimeFeedback:
                 hud("done" if status == "done" else "error")   # brief flash → fades
 
     def _on_presence(self, payload) -> None:
-        """Any mic confirmed Jared (shared voice_presence) → HUD 'Hearing you'. Central, not just this Mac's mic."""
+        """Any mic confirmed the speaker (shared voice_presence) → HUD 'Hearing you'. Central, not just this Mac's mic."""
         try:
             rec = (payload.get("data") or {}).get("record") or {}
         except AttributeError:

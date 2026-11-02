@@ -13,14 +13,14 @@ mic confirms faster than the far ESP one), which change when a capture is first 
 server/assemble.sh copies this file into the jared-voice build context; wakefree.py imports it from here.
 """
 
-# Speaker-gated endpointing: a capture is kept alive on his VERIFIED presence (rolling ECAPA over the
+# Speaker-gated endpointing: a capture is kept alive on the speaker's VERIFIED presence (rolling ECAPA over the
 # trailing window), never a blind energy timeout, so thinking-pauses do not chop a command.
 VAD_WINDOW_S = 2.0            # trailing audio scored per check
 VAD_CHECK_EVERY_S = 0.7       # re-score cadence while capturing
-VAD_NO_JARED_ABORT_S = 3.5    # never confirmed within this much audio: not him, drop
+VAD_NO_JARED_ABORT_S = 3.5    # never confirmed within this much audio: not the speaker, drop
 
 # How many CONSECUTIVE non-confirming checks close a capture: event-based, not a timer that can race the
-# check cadence and cut him off between words. It scales with how long he has been talking. A short
+# check cadence and cut the speaker off between words. It scales with how long the speaker has been talking. A short
 # command is one breath, so the first non-confirm ends it; a long dictated one has real thinking-pauses,
 # and cutting one in half loses the whole command. Each extra miss buys about VAD_CHECK_EVERY_S of pause.
 ABSENT_MISSES_MIN = 1         # short command: close on the first non-confirm (~2s of silence)
@@ -37,10 +37,10 @@ def absent_misses(audio_s: float) -> int:
 # Where a sentence STARTED. PREROLL_S is audio kept from before the energy trigger, so a soft first syllable
 # that crosses the threshold mid-word is not clipped; it is excluded from the VAD timing above.
 PREROLL_S = 1.2
-# Back-fill: a capture that never confirms him inside VAD_NO_JARED_ABORT_S is dropped as noise, and the next
+# Back-fill: a capture that never confirms the speaker inside VAD_NO_JARED_ABORT_S is dropped as noise, and the next
 # opens on the next frame, mid-sentence. So raw audio from before the trigger is kept (HISTORY_S), and an
 # ACCEPTED capture walks backward through it in BACKFILL_STEP_S steps, prepending each VAD_WINDOW_S window
-# that still scores as him (BACKFILL_THR, under the confirm bar on purpose: measured on 1,123 windows of his
+# that still scores as the speaker (BACKFILL_THR, under the confirm bar on purpose: measured on 1,123 windows of the speaker's
 # close-mic speech, 0.9% score under 0.22, while TV-only windows top out around 0.18), until silence, another
 # voice, or BACKFILL_MAX_S.
 HISTORY_S = 8.0

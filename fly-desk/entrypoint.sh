@@ -7,7 +7,7 @@ mkdir -p "$HOME/.claude" "$REPO_ROOT"
 tail -n 20000 /data/desk.log > /data/desk.log.tmp 2>/dev/null && mv /data/desk.log.tmp /data/desk.log
 exec > >(tee -a /data/desk.log) 2>&1
 
-# git over HTTPS through gh's credential helper (GH_TOKEN), committing as Jared, as on the other machines.
+# git over HTTPS through gh's credential helper (GH_TOKEN), committing as the owner, as on the other machines.
 gh auth setup-git
 git config --global user.name "Jared Gantt"
 git config --global user.email "jaredgantt@gmail.com"

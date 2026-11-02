@@ -7,7 +7,7 @@ kill_timeout = "20s"   # time for the worker to announce it is stopping; a turn 
 [build]
 
 [env]
-  # Jared's wall clock, the same as the Pi's and the Mac's: the worker and its data MCP stamp "now" as
+  # The owner's wall clock, the same as the Pi's and the Mac's: the worker and its data MCP stamp "now" as
   # naive local time, and on UTC they wrote entries four hours late.
   TZ = "America/New_York"
   # Codex's login and state, on the volume so a deploy keeps the sign-in.

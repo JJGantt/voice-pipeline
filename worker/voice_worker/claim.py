@@ -1,4 +1,4 @@
-"""Claiming: sweeps, orphan recovery, holding while a mic hears him, and the compare-and-swap claim."""
+"""Claiming: sweeps, orphan recovery, holding while a mic hears the speaker, and the compare-and-swap claim."""
 
 import time
 from datetime import datetime, timezone, timedelta
@@ -144,7 +144,7 @@ def reclaim_stale(db: Supabase) -> None:
 
 
 def _mics_hearing(db: Supabase):
-    """The most recent moment ANY mic reported hearing Jared, or None.
+    """The most recent moment ANY mic reported hearing the speaker, or None.
 
     `voice_presence.heard_jared_at` is already written by every capture source on each confirmed check
     — it drives the HUD and the ESP light. Nothing used it to decide WHEN TO ACT, which is what let a
@@ -282,7 +282,7 @@ def claim_one(db: Supabase) -> dict | None:
         return None
     runstate._standby, runstate._failover_at = False, 0.0   # I'm eligible to claim → run the active cadence
 
-    # HOLD WHILE HE IS STILL TALKING. One utterance reaches the queue as several rows — mics endpoint
+    # HOLD WHILE THE SPEAKER IS STILL TALKING. One utterance reaches the queue as several rows — mics endpoint
     # at different pauses — and acting on the first one to arrive is how half a sentence becomes a
     # command. Measured case: the Mac cut a 65-second dictation into two fragments and enqueued them
     # while the ESP was still recording; the fragments ran, and the ESP's complete 888-character

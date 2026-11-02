@@ -30,9 +30,9 @@ STREAM_RATE  = 24000     # Kokoro's native rate → no resample for speech; Pipe
 STREAM_CHUNK = 600       # frames per pipe write (~25ms) — small so enqueued audio is picked up fast (low lag)
 
 # Toggle cache, mirrored from app_settings (boot fetch + realtime UPDATE). Spoken reply defaults OFF:
-# the TV is not used as a voice speaker (Jared's call), so replies stay silent unless explicitly turned on.
+# the TV is not used as a voice speaker (owner's decision), so replies stay silent unless explicitly turned on.
 _toggles = {"audio_processing_sound": True, "audio_spoken_reply": False}
-_hearing = False             # currently hearing Jared? the cue fires on the FALLING edge (he stopped)
+_hearing = False             # currently hearing the speaker? the cue fires on the FALLING edge (the speaker stopped)
 _hearing_clear = None        # timer that detects the falling edge once presence goes stale
 _kok = None                  # resident Kokoro-ONNX synthesizer
 MODEL_ONNX = os.path.expanduser(os.environ.get("KOKORO_MODEL", "~/voice/pi/kokoro-v1.0.onnx"))
@@ -45,7 +45,7 @@ _speak_event = threading.Event()
 _muted = False                 # push-to-talk / FAB active → cut off + hold replies until you're done
 
 # ---- Floor lamp = the 'Working' indicator (Govee H6072, LAN, ~10ms send) -----------------------------
-# Deliberately NOT a hearing light: blue is Jared's ambient color, and the hearing edge lagged. The lamp
+# Deliberately NOT a hearing light: blue is the user's ambient color, and the hearing edge lagged. The lamp
 # only signals processing — amber the moment a command is claimed, off when it's done. LAN-direct UDP off
 # the cached IP, no cloud. (Hearing still shows on the ESP LED + Mac HUD, just not here.)
 FLOOR_DEV  = os.environ.get("FLOOR_DEV", "")   # the lamp's Govee device id; unset matches by SKU
@@ -53,7 +53,7 @@ FLOOR_SKU  = os.environ.get("FLOOR_SKU", "H6072")
 LAMP_MCAST = ("239.255.255.250", 4001)
 LAMP_RECV_PORT, LAMP_CMD_PORT = 4002, 4003
 LAMP_WORK  = (255, 120, 0)     # amber — a command is processing (Working)
-# DISABLED for now (Jared's call): the working-indicator lamp no longer changes color while a command
+# DISABLED for now (owner's decision): the working-indicator lamp no longer changes color while a command
 # is processing. All the lamp code below is left intact — re-enable by flipping this default back to "1"
 # (or setting LAMP_ENABLED=1 in the env). With this off, _lamp_worker never starts and _lamp_render no-ops.
 LAMP_ENABLED = os.environ.get("LAMP_ENABLED", "0") not in ("0", "false", "off", "no", "")
@@ -264,7 +264,7 @@ def _lamp_apply(working: bool) -> None:
         st = _lamp_load_prior()
         if st is None:
             # Never guess and never go dark: with no known prior state, leaving the amber is the only
-            # honest option (a blind 'off' kills a light he may be using).
+            # honest option (a blind 'off' kills a light the user may be using).
             log("lamp: no saved prior state — leaving as-is")
             return
         # Restore color/brightness FIRST (so the device's remembered state is right even when the
@@ -431,7 +431,7 @@ async def _clear_hearing(delay: float = 1.3):
 
 
 def on_presence(payload):
-    """Track 'hearing Jared' from voice_presence; each fresh confirm restarts the timer that clears _hearing
+    """Track 'hearing the speaker' from voice_presence; each fresh confirm restarts the timer that clears _hearing
     once you stop. _hearing gates 'don't start a reply while you're talking' and drives barge-in. (The
     heard-you cue is NOT here — it's on the 'claimed' event, synced to the screen.)"""
     global _hearing, _hearing_clear

@@ -156,7 +156,7 @@ export function step(st, d, out, live) {
   // is no `user` record at all for one absorbed into a running turn. Two moments, and they are
   // different facts:
   //
-  //   enqueue — he has SENT it; the model has not seen it. `queued`, and a view holds it at the
+  //   enqueue — the user has SENT it; the model has not seen it. `queued`, and a view holds it at the
   //             bottom, because putting it among the steps would claim it was read there.
   //   remove  — `absorbed_mid_turn`, and it carries the same content: THIS is when the model saw
   //             it, so this is where it belongs in the stream.
@@ -197,9 +197,9 @@ export function step(st, d, out, live) {
     if (live && said && typeof d.timestamp === 'string') {
       try { st.onActivity(st.id, d.timestamp); } catch { /* the tick writes it regardless */ }
     }
-    // HIS WORDS, AT THE MOMENT THEY ARRIVE, as their own event in the list.
+    // THE USER'S WORDS, AT THE MOMENT THEY ARRIVE, as their own event in the list.
     // `turnStart` is the same rule readTail uses: tool results, injected context and compact
-    // summaries are not him speaking, and a message stashed to a file resolves to its real text.
+    // summaries are not the user speaking, and a message stashed to a file resolves to its real text.
     // A prompt that started its OWN turn: this record is its ingestion. One that was absorbed
     // mid-turn never reaches here — the `remove` above already reported it.
     // One that waited in the queue for the turn before to end is the same message it was when queued,
@@ -236,13 +236,13 @@ export function step(st, d, out, live) {
     else if (b?.type === 'tool_use') {
       const words = st.said.text.length ? st.said.text : st.said.thought;
       const text = words.join('\n\n');
-      // Not the session reading his own stashed message back to him — see `st.echo` above.
+      // Not the session reading the user's own stashed message back to the user — see `st.echo` above.
       if (words.length && !(st.echo && flatten(text).includes(st.echo))) {
         out({ session: st.id, state: 'text', text });
       }
       st.said = { id: msg.id, text: [], thought: [] };
       // Nor the session opening the stash file itself: a path into ~/.claude-desk-prompts on the wrist
-      // is the workaround showing through, and his words already arrived as `said`.
+      // is the workaround showing through, and the user's words already arrived as `said`.
       if (readsStash(b)) continue;
       out({ session: st.id, state: 'tool', text: toolLine(b) });
     }
@@ -261,7 +261,7 @@ const CODEX_RECORDS = new Set(['session_meta', 'event_msg', 'response_item', 'tu
 /**
  * One Codex rollout record, as the same events `step` makes of a Claude transcript record.
  *
- * A turn is `task_started` .. `task_complete` / `turn_aborted`. His words are the UserMessage item, which
+ * A turn is `task_started` .. `task_complete` / `turn_aborted`. The user's words are the UserMessage item, which
  * Codex writes when a prompt reaches the model — at the turn's start, or mid-turn for words typed while it
  * works (Codex steers the running turn with them rather than queueing them, so there is no `queued`
  * moment to report). What it says between tool calls is an AgentMessage item that is not the final

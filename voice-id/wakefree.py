@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Wake-free voice capture — no wake word, gated on Jared's voice.
+"""Wake-free voice capture — no wake word, gated on the enrolled voice.
 
 Continuously listens. Whenever speech energy is present it scores a rolling window against the
-enrolled voiceprint (ECAPA exemplar matching). While that's Jared, it accumulates the audio into an
-utterance; the utterance closes after ~2s with no Jared-voice (configurable). Each closed utterance is
+enrolled voiceprint (ECAPA exemplar matching). While that's the speaker, it accumulates the audio into an
+utterance; the utterance closes after ~2s with no enrolled-speaker voice (configurable). Each closed utterance is
 transcribed (Groq) and enqueued to voice_requests exactly like a wake-word command (source='mac').
 The worker's __IGNORE__ directive drops anything that isn't a real command, so every chunk can be
 treated as one.
@@ -70,13 +70,13 @@ HEARD_WAV = os.path.expanduser(os.environ.get(
 
 SR = 16000
 FRAME_S = 0.1          # 100ms capture frames — responsive endpointing
-ENERGY_GATE = 0.006    # below this RMS = silence (calibrated under Jared's speech ~0.008+)
-THRESHOLD = float(os.environ.get("VOICEID_THRESHOLD", "0.30"))   # cosine ≥ this = Jared (overridden by hub setting)
+ENERGY_GATE = 0.006    # below this RMS = silence (calibrated under the speaker's speech ~0.008+)
+THRESHOLD = float(os.environ.get("VOICEID_THRESHOLD", "0.30"))   # cosine ≥ this = the speaker (overridden by hub setting)
 TOPK = 3
 MAX_UTTER_S = 600.0   # runaway backstop ONLY (matches the ESP server) — the speaker gate ends a command
                       # when you actually stop; this never touches real speech. Was a stale 30s default.
 MIN_UTTER_S = 0.5
-# Speaker-gated endpointing: keep the utterance alive on Jared's VERIFIED presence (rolling ECAPA), not a
+# Speaker-gated endpointing: keep the utterance alive on the speaker's VERIFIED presence (rolling ECAPA), not a
 # blind energy timeout — so thinking-pauses don't chop a command. Mirrors the Fly ESP server's design.
 VAD_FIRST_CHECK_S = 1.4      # min audio before the first check (the close Mac mic confirms fast)
 KEEPALIVE_MARGIN = 0.16      # hysteresis: once confirmed, stay locked unless match falls to ~not-you/silence
@@ -184,7 +184,7 @@ def _alive_beacon() -> None:
         time.sleep(30)
 
 
-# Governor brake: run as a PASSIVE activity sensor — confirm Jared's voice and stamp the shared
+# Governor brake: run as a PASSIVE activity sensor — confirm the enrolled voice and stamp the shared
 # heard_jared_at (so the worker can re-arm always-on when the room goes quiet), but never capture,
 # transcribe, enqueue, or touch the HUD/TTS. Spawned by the listener with this env while braked.
 SENSOR = os.environ.get("WAKEFREE_SENSOR") == "1"
@@ -233,9 +233,9 @@ def cue() -> None:
 
 
 def publish_presence(jared: bool) -> None:
-    """Upsert the Mac's row in the shared voice_presence — the system-wide 'who is hearing Jared' truth.
+    """Upsert the Mac's row in the shared voice_presence — the system-wide 'who is hearing the speaker' truth.
     Fire-and-forget in a daemon thread so the audio loop never stalls on the network call. Any mic's
-    fresh heard_jared_at makes the whole system 'Hearing Jared' (drives every indicator + send-suppression)."""
+    fresh heard_jared_at makes the whole system 'Hearing the speaker' (drives every indicator + send-suppression)."""
     def _post():
         try:
             now_iso = datetime.now(timezone.utc).isoformat()
@@ -253,7 +253,7 @@ def publish_presence(jared: bool) -> None:
 
 
 def other_heard_jared():
-    """Most recent time a mic OTHER than the Mac confirmed Jared (datetime, or None). At capture close the
+    """Most recent time a mic OTHER than the Mac confirmed the speaker (datetime, or None). At capture close the
     Mac yields ONLY if the ESP clearly heard you more recently (the Mac is the primary mic)."""
     try:
         r = httpx.get(f"{SUPABASE_URL}/rest/v1/voice_presence",
@@ -318,7 +318,7 @@ LED_TOKEN = os.environ.get("LED_TOKEN", "")
 def _esp_working() -> None:
     """Tell the ESP a (Mac-captured) command is now in flight → its LED shows the universal 'working'
     blink immediately. Without this the ESP, which also heard the utterance but dropped its own far-mic
-    copy as 'not Jared', would briefly show idle before the worker's slower blink-ping lands."""
+    copy as 'not the speaker', would briefly show idle before the worker's slower blink-ping lands."""
     try:
         httpx.get(f"{JARED_VOICE_URL}/led-blink",
                   headers={"X-Token": LED_TOKEN} if LED_TOKEN else None, timeout=3)
@@ -443,7 +443,7 @@ def get_setting(key: str, default: float) -> float:
 def trim_voiced(pcm: np.ndarray, gate: float, margin_s: float = 0.15) -> np.ndarray:
     """Keep only the voiced span (first→last 50ms frame above the gate) + a small margin. Trimming
     leading/trailing silence is what makes SHORT commands work — otherwise a 1s command padded with
-    silence dilutes the speaker embedding below threshold and reads as 'not Jared'."""
+    silence dilutes the speaker embedding below threshold and reads as 'not the speaker'."""
     if pcm.size == 0:
         return pcm
     step = int(0.05 * SR)
@@ -541,7 +541,7 @@ def main() -> int:
     vad_future = None          # in-flight speaker check (one at a time)
     last_check = 0.0           # when the last check was launched
     miss = 0                   # consecutive non-confirming checks since the last confirm
-    jared_seen = False         # confirmed Jared at all this utterance?
+    jared_seen = False         # confirmed the speaker at all this utterance?
     pending_span = (0, 0)      # sample span of the window the in-flight check is scoring
     conf_lo = conf_hi = 0      # sample span from the first confirming window to the last — the part that is YOU
     last_confirm = None        # wall-clock of the last confirm (send-suppression vs the other mic)
@@ -616,7 +616,7 @@ def main() -> int:
                                 conf_lo = pending_span[0]
                                 log(f"Jared confirmed (sim={sim:.2f} after {audio_s:.1f}s) — tracking")
                             hud("locked")          # live 'it's you' — you're being heard right now
-                            publish_presence(True)  # shared 'Hearing Jared' truth
+                            publish_presence(True)  # shared 'Hearing the speaker' truth
                             last_confirm = datetime.now(timezone.utc)
                         elif jared_seen:
                             miss += 1
@@ -646,7 +646,7 @@ def main() -> int:
                             # Sensor mode: the confirm loop above already stamped heard_jared_at — that IS
                             # the output. No suppression check, no transcription, no enqueue.
                             log(f"sensor: tracked your voice for {audio_s:.1f}s")
-                        else:                          # tracked as Jared live → no end-of-utterance re-check
+                        else:                          # tracked as the speaker live → no end-of-utterance re-check
                             # Blocking network work (presence check + Groq + enqueue) pauses stream reads —
                             # tell the watchdog frames are legitimately not arriving until we're back.
                             _expect_frames.clear()

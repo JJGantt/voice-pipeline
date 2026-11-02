@@ -20,22 +20,22 @@ export function projectDir(cwd) {
 
 /**
  * A `user` record as the start of a turn: null when it is not one, else `{ prompt }`, whose prompt is
- * null when the turn was started by something he did not say.
+ * null when the turn was started by something the user did not say.
  */
 export function turnStart(d) {
   // Tool results are recorded as user records too. They are the model's own work coming back, not
-  // Jared saying something, so they must not look like the start of a new turn.
+  // the user saying something, so they must not look like the start of a new turn.
   const blocks = d.message?.content;
   if (Array.isArray(blocks) && blocks.length > 0 && blocks.every((b) => b?.type === 'tool_result')) return null;
   // Claude Code's own injected context (`isMeta`) starts a turn without being a prompt. So does the
   // summary it writes when it compacts a conversation mid-turn (`isCompactSummary`): pages of its
-  // own recap, recorded as a user record, which is not something he said.
+  // own recap, recorded as a user record, which is not something the user said.
   if (d.isMeta || d.isCompactSummary) return { prompt: null, meta: true };
   // A shell command run in the terminal (`!ls`) and the terminal's own output for it or for a local
   // slash command (`/chrome`) are recorded as user records. None of them is a turn.
   const raw = typeof blocks === 'string' ? blocks.trimStart() : '';
   if (LOCAL_OUTPUT.some((tag) => raw.startsWith(tag))) return null;
-  // A slash command is recorded as markup around what he typed; what he typed is the prompt.
+  // A slash command is recorded as markup around what the user typed; what the user typed is the prompt.
   const cmd = raw.startsWith('<command-name>') && raw.match(/<command-name>([^<]*)<\/command-name>/);
   if (cmd) {
     const args = (raw.match(/<command-args>([^<]*)<\/command-args>/) || [])[1] || '';
@@ -49,16 +49,16 @@ export function turnStart(d) {
 }
 
 /**
- * Whether text recorded as a user message is something he said. A background task finishing delivers
+ * Whether text recorded as a user message is something the user said. A background task finishing delivers
  * a `<task-notification>` block the same way, as a turn of its own or queued into the one running; it
- * is real, but it is not him, and shown as his words it is a wall of markup in his colour. Both places
- * a user message becomes his words (a turn's prompt here, and a queued message in sessionWatch) ask this.
+ * is real, but it is not the user, and shown as the user's words it is a wall of markup in the user's colour. Both places
+ * a user message becomes the user's words (a turn's prompt here, and a queued message in sessionWatch) ask this.
  */
-// Every synthetic wrapper the harness can inject as a user-turn's text, none of them him: a finished
+// Every synthetic wrapper the harness can inject as a user-turn's text, none of them the user: a finished
 // background task, and a subagent's own final report handed back into the turn that spawned it (the
-// same shape, and the same reason — its content is model output addressed to the session, not to him).
+// same shape, and the same reason — its content is model output addressed to the session, not to the user).
 // Measured leaking through this check with only the first excluded: a subagent hand-back, its own
-// opening line saying plainly it is "NOT a message from the user", displayed on the wrist as his words.
+// opening line saying plainly it is "NOT a message from the user", displayed on the wrist as the user's words.
 const NOT_HIM = ['<task-notification>', '<agent-message'];
 const LOCAL_OUTPUT = ['<local-command-stdout>', '<local-command-stderr>', '<bash-input>', '<bash-stdout>', '<bash-stderr>'];
 export function fromHim(text) {
@@ -70,7 +70,7 @@ export function fromHim(text) {
 //
 // A message too long or too many-lined to type as a message (`typeable` in handoff.js, on both machines)
 // is parked in ~/.claude-desk-prompts and the session is typed a one-line stub naming the file. That stub
-// is what lands in the transcript, so every surface that draws "his last message" would draw the stub:
+// is what lands in the transcript, so every surface that draws "the user's last message" would draw the stub:
 // the session list, the session view, the wall, `desk_turns`.
 //
 // Resolved HERE because this is the single place a user record becomes prompt text, so one
@@ -79,7 +79,7 @@ export function fromHim(text) {
 // Only paths inside the stash directory are read. The path arrives inside transcript text, which is
 // not a place to take a filename from on trust.
 /**
- * What he actually said, from whatever text was recorded.
+ * What the user actually said, from whatever text was recorded.
  *
  * A stub naming a stashed file resolves to the words it stands for; anything else is already them.
  * `stashed` travels with it so a caller can recognise the session's own echo of those words — the stub
@@ -95,13 +95,13 @@ export function resolvePrompt(text) {
 }
 
 // The watch's speak mode appends an instruction for the model (status-hub server.js SPEAK_NOTE) in a
-// <speak-mode> tag. It is not his words, so it is cut wherever the prompt is shown or matched.
+// <speak-mode> tag. It is not the user's words, so it is cut wherever the prompt is shown or matched.
 const SPEAK_NOTE = /\s*<speak-mode>[\s\S]*?<\/speak-mode>/g;
 export function dropSpeakNote(text) {
   return String(text || '').replace(SPEAK_NOTE, '').trim();
 }
 
-// A PASTE IS STILL HIS WORDS, NOT MARKUP.
+// A PASTE IS STILL THE USER'S WORDS, NOT MARKUP.
 //
 // Claude Code wraps pasted input in <pasted_content id="N">…</pasted_content id="N"> — the id is
 // random per block and the closing tag repeats it. That wrapper is an artifact of how the words
@@ -110,7 +110,7 @@ export function dropSpeakNote(text) {
 // desk_turns: a 525-byte prompt stored with the opening tag still on the front of it.
 //
 // The tags are removed and the content kept, rather than the block being extracted, because a
-// message can be part typed and part pasted and both halves are his. An unpaired tag is stripped
+// message can be part typed and part pasted and both halves are the user's. An unpaired tag is stripped
 // too: a prompt can be stored truncated, and half a wrapper is no more readable than a whole one.
 const PASTE_BLOCK = /<pasted_content\b[^>]*>\r?\n?([\s\S]*?)\r?\n?<\/pasted_content\b[^>]*>/g;
 const PASTE_ORPHAN = /<\/?pasted_content\b[^>]*>\r?\n?/g;
@@ -143,7 +143,7 @@ export const flatten = (t) => String(t || '').replace(/\s+/g, ' ').trim();
  * The stub asks the session to reply with the message verbatim first, so the words are visible in the
  * terminal. When the answer needs no tool call after that, the echo lands in the FINAL reply — shown
  * on the wrist under the very words it repeats, and read aloud in full before the answer. The echo is
- * recognised by his first and last lines appearing in order near the front; anything short of that is
+ * recognised by the user's first and last lines appearing in order near the front; anything short of that is
  * left alone, because cutting the wrong text out of an answer is worse than a repeated paragraph.
  */
 export function dropEcho(reply, prompt) {
@@ -158,7 +158,7 @@ export function dropEcho(reply, prompt) {
   return rest || reply;
 }
 // Resolves the file stubs long messages were once sent as (handoff.js). Nothing writes one
-// now; this stays only so turns already recorded that way still show his words until their files are
+// now; this stays only so turns already recorded that way still show the user's words until their files are
 // swept at thirty days.
 function unstash(text) {
   const m = STASH_RE.exec(String(text || ''));
@@ -363,7 +363,7 @@ export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
   // Falling back to mtime when nothing in the window carries a timestamp is deliberate: a compacted
   // or very old transcript is then judged exactly as it was before, rather than reporting 0 and
   // being treated as the least valuable session on the machine.
-  // Two names, kept apart on purpose: `customTitle` is Jared renaming the session by hand, `aiTitle`
+  // Two names, kept apart on purpose: `customTitle` is the user renaming the session by hand, `aiTitle`
   // is Claude Code's guess from the content. A hand-written name outranks anything derived — see the
   // label rule in deskSessions.js.
   //

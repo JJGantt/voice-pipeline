@@ -169,7 +169,7 @@ def should_reset_session(state: dict | None, agent: bool = False) -> bool:
     return False
 
 
-# The hub agent's day: it begins at 4 AM in Jared's own timezone, not at midnight and not in the host's
+# The hub agent's day: it begins at 4 AM in the owner's own timezone, not at midnight and not in the host's
 # zone (the Fly worker runs in UTC). The same boundary the hub uses for every "today" (lib/dates.js).
 DAY_TZ = ZoneInfo(os.environ.get("TZ_DISPLAY", "America/New_York"))
 
@@ -191,7 +191,7 @@ def recent_context() -> str:
     that makes a resumed session drift from what was actually said.
 
     Everything since the day began (4 AM, `day_start`), or since a manual reset from the hub if that is
-    later, oldest first, each line with its time — so he can refer back to anything said earlier today,
+    later, oldest first, each line with its time — so the user can refer back to anything said earlier today,
     from any surface. An idle gap does not cut it: a quiet afternoon is still today. A day is small: a
     heavy one measured ~4.5k tokens of real exchanges plus ~6k of marked room chatter. Tool RESULTS are
     deliberately omitted — a follow-up that needs live data just re-fetches with a tool."""
@@ -204,15 +204,15 @@ def recent_context() -> str:
     rows = sorted((r for r in live["thread"]
                    if r.get("done") and (_parse_ts(r.get("created_at") or "") or since) >= since),
                   key=lambda r: r.get("created_at") or "")
-    # An ignored turn is marked rather than hidden. Unmarked, room chatter would replay as things Jared
-    # said TO the assistant; marked, he can point at one — "do the one you ignored" — and the model can
+    # An ignored turn is marked rather than hidden. Unmarked, room chatter would replay as things the user
+    # said TO the assistant; marked, the user can point at one — "do the one you ignored" — and the model can
     # see both what was said and that nothing was done about it.
     def _line(r):
         ts = _parse_ts(r.get("created_at") or "")
         when = ts.astimezone(DAY_TZ).strftime("%-I:%M %p") if ts else "?"
         who = 'You' if r.get('role') == 'user' else 'Assistant'
         if r.get('role') == 'assistant' and r.get('session_id'):
-            # A session's reply posted into the hub thread. Named, so a reply from him that follows it can
+            # A session's reply posted into the hub thread. Named, so a reply from the user that follows it can
             # be sent back to that session with follow_up rather than answered as if the hub had said it.
             who = f"Session \"{r.get('session_label') or r['session_id']}\" ({r['session_id']})"
         txt = (r.get('text') or '').strip()

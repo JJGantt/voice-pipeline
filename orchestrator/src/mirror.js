@@ -35,7 +35,7 @@ export function localize(text) {
 }
 
 // What Claude Code writes when it is sent C-c mid-turn — which is how pi-desk closes a session it moves
-// for doing heavy work (sessions.js evict). Left in place, these tell the resumed session that JARED
+// for doing heavy work (sessions.js evict). Left in place, these tell the resumed session that THE USER
 // rejected the step and to "STOP and wait", which outweighs any system note and halts the work the move
 // exists to let it finish.
 const REJECTED = "The user doesn't want to proceed with this tool use.";
@@ -47,7 +47,7 @@ const MOVED_INTERRUPT = '[Cut off by the move from the Pi, not by Jared]';
 /**
  * Rewrite the interrupt records the move left at the end of a transcript into what actually happened.
  * Only the trailing run after the last assistant record is touched — that is the turn the move cut off;
- * an interrupt anywhere earlier was Jared's.
+ * an interrupt anywhere earlier was the user's.
  */
 export function unmarkMoveInterrupt(text) {
   const lines = text.split('\n');

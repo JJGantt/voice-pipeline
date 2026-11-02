@@ -330,7 +330,7 @@ async function handResumeToMac(row, prompt, moved = null) {
  */
 // The message that restarts a moved session's turn on the Mac. It shows in the feeds as the prompt
 // that turn answers, so it is a bare label saying what sent it — never a word like "Continue", which a
-// session that had just proposed something would take as Jared approving it.
+// session that had just proposed something would take as the user approving it.
 const MOVED_MARKER = '[Moved from the Pi]';
 const moving = new Set();
 async function onHeavy(name, usage) {
@@ -351,8 +351,8 @@ async function onHeavy(name, usage) {
     }
     // Whether to restart a turn on the Mac is read from the live process BEFORE it is closed. Only a
     // session mid-turn gets one: a background job can outgrow the budget after the turn has ended on a
-    // question for Jared, and any message that then restarted the session would read as his answer.
-    // A session that was waiting on him resumes idle, with the note, and waits for him there.
+    // question for the user, and any message that then restarted the session would read as the user's answer.
+    // A session that was waiting on the user resumes idle, with the note, and waits for the user there.
     const pid = (await liveSessions()).find((l) => l.name === name)?.pid;
     const rec = pid ? sessionOf(pid) : null;
     const midTurn = rec?.busy === true && !rec.waiting;
@@ -525,7 +525,7 @@ async function reconcileSessions() {
           // Carried through explicitly: this is a merge-duplicates upsert, so any column it sends
           // overwrites. Omitting the label would blank it on the very next reconcile tick.
           //
-          // A name Jared typed himself (`/rename`, which writes a `custom-title` record) outranks the
+          // A name typed by hand (`/rename`, which writes a `custom-title` record) outranks the
           // label the router wrote — the same rule the Mac applies. Without this the rename reached
           // the session and nothing ever read it back, so the pane kept showing the old label.
           //
@@ -534,7 +534,7 @@ async function reconcileSessions() {
           // dispatch label that publish just wrote.
           ...(tail.customTitle || row ? {
             label: tail.customTitle ? tail.customTitle.slice(0, 60) : (row?.label || null),
-            // Separately, so a tab can show the repo unless Jared named the session himself.
+            // Separately, so a tab can show the repo unless the session was named by hand.
             custom_title: tail.customTitle ? tail.customTitle.slice(0, 60) : (row?.custom_title || null),
           } : {}),
           last_reply: tail.lastReply ? tail.lastReply.slice(0, 20000) : (rebound ? null : row?.last_reply || null),
@@ -585,7 +585,7 @@ async function reconcileSessions() {
 
   // Rows we publish that tmux no longer has: mark evicted rather than delete, so the transcript stays
   // reachable and the session can be resumed. Only genuinely forgotten sessions are deleted, and only
-  // when Jared says so.
+  // when the user says so.
   try {
     const rows = await sb(`desk_sessions?worker=eq.${WORKER}&status=eq.resident&select=id`);
     const liveNames = new Set(residents.map((r) => r.name));
@@ -799,12 +799,12 @@ async function ensureRepo(name) {
 }
 
 // Appended only when a dispatch ASKED for a write-up (`report` on the command payload, set by the
-// voice tool when Jared says so). Reports are opt-in because most dispatched work just needs
+// voice tool when the user says so). Reports are opt-in because most dispatched work just needs
 // doing, and a page about a one-line change is noise.
 //
 // It rides in the prompt rather than living in CLAUDE.md so it can be per-request at all: a file
-// both machines share applies to every session, including the ones Jared opens by hand at the
-// keyboard, which have no business filing reports at him.
+// both machines share applies to every session, including the ones opened by hand at the
+// keyboard, which have no business filing reports at the user.
 const REPORT_DIRECTIVE =
   '[When you have finished this work, call the publish_report tool with an HTML write-up of what '
   + 'you did — that is how Jared reads the outcome on his phone. Then answer normally here as '
@@ -873,8 +873,8 @@ async function claim(id) {
  * Keep a command that could not run.
  *
  * The prompt inside is usually minutes of dictated speech that cannot be repeated, so it is never
- * simply logged and lost. Not a retry queue — the command is finished, and Jared decides later
- * whether he still wants it.
+ * simply logged and lost. Not a retry queue — the command is finished, and the user decides later
+ * whether the user still wants it.
  */
 async function deadLetter(cmd, reason) {
   try {
@@ -949,7 +949,7 @@ async function startSession({ name, prompt, resumeId = null, commandId = null, r
   const spoken = String(prompt || '').trim();
   // The directive rides along ONLY when this dispatch asked for a write-up. Most work just needs
   // doing, and a report on a one-line change is noise — so it is opt-in, set by the voice tool
-  // when Jared actually asks. A bare session with no prompt has nothing to report on either way.
+  // when the user actually asks. A bare session with no prompt has nothing to report on either way.
   const full = [warning, spoken, (report && spoken) ? REPORT_DIRECTIVE : null].filter(Boolean).join('\n\n');
   const session = launch(dir, name, full, resumeId, reuse, agent);
   // The sender's message id, stamped on the prompt these words become, exactly as a follow-up typed
@@ -962,7 +962,7 @@ async function startSession({ name, prompt, resumeId = null, commandId = null, r
     method: 'POST', headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
     // command_id is what lets a follow-up find this session: the dispatch that created it is the
     // only durable handle the caller had at the time, since the session did not exist yet.
-    // The most recently active session from the moment it exists: it is the work he just asked for.
+    // The most recently active session from the moment it exists: it is the work the user just asked for.
     // `ended: null` for a resume under its own name: the row was parked, and is running again.
     body: JSON.stringify([{ id: session, worker: WORKER, repo: name, status: 'resident', command_id: commandId, agent,
                             label: label || null, active_at: new Date().toISOString(), ended: null,
@@ -1002,7 +1002,7 @@ async function run(cmd) {
     return typeInto(target, prompt, { cmd: (cmd.payload || {}).msg || cmd.id });
   }
 
-  // Name the session itself, with the command Jared would type. Claude Code writes the `custom-title`
+  // Name the session itself, with the command the user would type. Claude Code writes the `custom-title`
   // record, so the name comes back through the transcript rather than living only in our row.
   if (cmd.kind === 'rename_session') {
     const target = String((cmd.payload || {}).session || '').trim();
@@ -1262,8 +1262,8 @@ async function sweepRetention() {
                  `closed over ${KEEP_CLOSED_DAYS} days ago`);
     await forget(await sb(`desk_sessions?status=eq.evicted&last_seen=lt.${ago(KEEP_PARKED_DAYS)}&select=id,claude_session_id`),
                  `parked over ${KEEP_PARKED_DAYS} days ago`);
-    // The command log. Dead letters are NOT swept: an unretried one holds words Jared may still want,
-    // and a retried or dismissed one is a decision he made, which is small and worth keeping.
+    // The command log. Dead letters are NOT swept: an unretried one holds words the user may still want,
+    // and a retried or dismissed one is a decision the user made, which is small and worth keeping.
     await sb(`desk_commands?created=lt.${ago(KEEP_COMMAND_DAYS)}`, { method: 'DELETE', headers: { Prefer: 'return=minimal' } });
     await sb(`voice_requests?created_at=lt.${ago(KEEP_REQUEST_DAYS)}`, { method: 'DELETE', headers: { Prefer: 'return=minimal' } });
     await sweepClips();
@@ -1317,7 +1317,7 @@ function exitIfIdle(residentCount) {
 // session here reads or writes Supabase, so this one touches neither: the responder wakes the machine,
 // posts the incident prompt, and it runs as a plain `claude -p` in the health checkout. Nothing about it
 // appears in the session list, which is itself in Supabase. When it exits the run is reported done, so
-// whatever it left open is handed to Jared.
+// whatever it left open is handed to the user.
 let incidentRuns = 0;
 const OPS_URL = process.env.OPS_URL || 'https://ops-responder.fly.dev';
 async function incidentRun(run, prompt) {

@@ -216,7 +216,7 @@ def main() -> int:
                     # back the instant the primary goes silent (should_defer flips false). Only the ACTIVE
                     # worker tightens to the degraded 2s poll when realtime drops; otherwise healthy backstop.
                     if runstate._holding:
-                        wait_s = HOLD_RETRY_S   # he is still talking; look again shortly
+                        wait_s = HOLD_RETRY_S   # the speaker is still talking; look again shortly
                     elif runstate._standby:
                         wait_s = (max(0.5, runstate._failover_at - time.monotonic()) if runstate._failover_at
                                   else STANDBY_POLL_S)

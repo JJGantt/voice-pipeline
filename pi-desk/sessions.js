@@ -84,7 +84,7 @@ export async function liveSessions() {
  * follow-ups were logged here as "sent" while two sat in the composer and one vanished; nothing reached
  * the conversation. Unconfirmed, it presses Enter once more — the case where the return was taken as a
  * line break — and if that does not submit it either, it throws, so the command is recorded as failed
- * and dead-lettered with his words instead of reported as delivered.
+ * and dead-lettered with the user's words instead of reported as delivered.
  *
  * A session busy mid-turn needs no waiting: Claude Code queues a submitted message and writes it to the
  * transcript at once. A session blocked on a permission prompt is refused, because the keys would go to
@@ -159,7 +159,7 @@ async function exited(pid, ms = 10000) {
  * conversation. That optimised for the wrong thing and cost a live session: a short transcript is
  * usually the conversation just started, and a long one is usually an old finished job, so
  * "cheapest to restore" and "least likely to be wanted" point in opposite directions. A ten-hour-old
- * session that had said its work was deployed was protected, and the one Jared was mid-conversation
+ * session that had said its work was deployed was protected, and the one the user was mid-conversation
  * with was killed, because it was 66KB smaller.
  *
  * Never a working one either — that check remains, but it is weak on its own: `working` means a turn

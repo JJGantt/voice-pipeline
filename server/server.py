@@ -46,7 +46,7 @@ GROQ_MODEL = os.environ.get("GROQ_MODEL", "whisper-large-v3-turbo")
 # docs/ROUTING.md § A command can arrive with two transcripts). The hub does the same for its commands.
 ALT_GROQ_MODEL = "whisper-large-v3" if GROQ_MODEL != "whisper-large-v3" else "whisper-large-v3-turbo"
 # Supabase enqueue target for transcripts. Every write here uses SUPABASE_SERVICE_KEY: anon has no
-# INSERT on voice_requests, because a pending row is run by the worker as Jared with every tool.
+# INSERT on voice_requests, because a pending row is run by the worker as the owner with every tool.
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 # The ESP's token on the ws handshake. Required: main() refuses to start without it, so the audio socket
 # (a stream that becomes commands run with every tool) can never be open to anyone by default.
@@ -54,7 +54,7 @@ VOICE_DEVICE_TOKEN = os.environ.get("VOICE_DEVICE_TOKEN", "")
 # Shared secret for every control route: the worker's /led-*, the Mac listener's /capture-* and
 # /wakefree-*, and /enroll-*. Required — main() refuses to start without it.
 LED_TOKEN = os.environ.get("LED_TOKEN", "")
-# Shared with the hub, which asks /verify whether an uploaded clip sounds like Jared. Required.
+# Shared with the hub, which asks /verify whether an uploaded clip sounds like the speaker. Required.
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "")
 
 
@@ -91,7 +91,7 @@ _inject = False
 _esp_off = False
 # Wake-free (speaker-ID) mode for the ESP, congruent with the Mac: the global wakefree_enabled toggle is
 # bridged here by the Mac listener via /wakefree-on|off. When ON, the ESP captures on speech ENERGY (no
-# wake word) and verifies the utterance is Jared's voice (ECAPA + the shared voiceprint) before
+# wake word) and verifies the utterance is the enrolled voice (ECAPA + the shared voiceprint) before
 # enqueueing. When OFF, wake words. The model + voiceprint load lazily on turn-on (hence the 2 GB box).
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 _wakefree = False
@@ -124,7 +124,7 @@ _last_esp_frame = 0.0
 # the worker's universal pings stomping each other last-writer-wins) cannot happen.
 _led_working = False     # set by the worker's /led-blink, cleared by /led-off (universal, any source)
 _led_capturing = False   # set while this ESP is recording an utterance
-_other_hearing_jared = False  # another mic (Mac) currently hears Jared → keep this ESP's LED solid too
+_other_hearing_jared = False  # another mic (Mac) currently hears the speaker → keep this ESP's LED solid too
 _other_clear_task = None      # timer that clears the above when the other mic goes stale
 _led_safety_task = None       # the ONE working-blink backstop timer (re-armed, never stacked)
 _led_last_sent = None         # last command actually sent to the device — the log records only changes
@@ -150,7 +150,7 @@ LONG_UTTERANCE_WARN_S = 300.0  # warn if a single capture runs this long
 # Wake-free speaker-gated endpointing (replaces energy-vs-noise-floor, which a loud TV corrupts — it
 # both clips you mid-sentence and holds the capture open for ages). Keep the capture alive on YOUR
 # verified presence: re-score the trailing window with ECAPA off the event loop and close only after
-# you've been absent (no confirmed-Jared window) for the hangover. Tune from the logged vad/endpoint lines.
+# you've been absent (no confirmed-speaker window) for the hangover. Tune from the logged vad/endpoint lines.
 SENSE_EVERY_S = 5.0          # brake-sensor cadence: at most one ECAPA check per this much room speech
 VAD_FIRST_CHECK_S = 1.8      # wait for this much audio before the first check
 VAD_KEEPALIVE_MIN = 0.14     # once confirmed, KEEP the capture alive until the match falls to clearly-not-you
@@ -159,7 +159,7 @@ VAD_KEEPALIVE_MIN = 0.14     # once confirmed, KEEP the capture alive until the 
                              # with a margin, lowering voiceid_threshold dragged it UNDER the noise floor and
                              # captures held open forever (0.20 threshold made it 0.04 — a capture ran 78s until
                              # push-to-talk aborted it). Keep this fixed regardless of how low the confirm bar goes.
-# Everything that decides a capture's SPAN (the VAD window and cadence, the absent-miss ramp, the no-Jared
+# Everything that decides a capture's SPAN (the VAD window and cadence, the absent-miss ramp, the no-speaker
 # abort, the pre-roll, the back-fill and the whole-clip accept bar) is shared with the Mac's wake-free
 # capture, because the two mics must endpoint identically: shared/endpointing.py, copied into this build
 # context by assemble.sh. The reasoning and the measurements behind each value are there.
@@ -602,10 +602,10 @@ async def connection(ws):
     check_task = None               # in-flight ECAPA check (one at a time, off the event loop)
     last_check = 0.0                # monotonic time the last check was launched
     miss = 0                        # consecutive non-confirming checks since the last confirm
-    jared_seen = False              # have we confirmed Jared at all this capture?
+    jared_seen = False              # have we confirmed the speaker at all this capture?
     pending_span = (0, 0)           # byte span of the window the in-flight check is scoring
     conf_lo, conf_hi = 0, 0         # byte span from the first confirming window to the last — the part of
-                                    # the capture that is HIM, which is what the whole-clip check scores
+                                    # the capture that is THE SPEAKER, which is what the whole-clip check scores
     mute_flush = False              # mute landed mid-capture on audio worth keeping → close it, don't bin it
     last_confirm = None             # wall-clock of the last confirm (send-suppression vs the other mic)
 
@@ -627,7 +627,7 @@ async def connection(ws):
                 # The boost feeds DETECTION ONLY (energy floors + wake word) — the buffered audio (raw)
                 # stays un-gained. Gaining the stored audio (the old behavior) clipped loud/close speech
                 # to the int16 rail (peak=32767), and a clipped waveform distorts ECAPA embeddings so
-                # badly that Jared scores as a stranger (sim 0.03-0.16 vs thr 0.30). ECAPA and Whisper
+                # badly that the speaker scores as a stranger (sim 0.03-0.16 vs thr 0.30). ECAPA and Whisper
                 # are level-robust — they need fidelity, not volume; each normalizes at point of use.
                 frame = np.clip(frame.astype(np.float32) * GAIN, -32768, 32767).astype(np.int16)
 
@@ -707,13 +707,13 @@ async def connection(ws):
                     elif sense_buf:
                         sense_buf.clear()
                 if woke:
-                    # A wake word is him addressing the assistant on purpose, so that command is NOT
+                    # A wake word is the speaker addressing the assistant on purpose, so that command is NOT
                     # ambient (voice_requests.always_on): the worker treats it like a button press. Only a
                     # wake-free capture, started on speech energy alone, is room audio.
                     by_wake = not _wakefree
                     threshold = speech_level
                     capture_floor = floor     # remember the room floor that set this threshold (diagnostics)
-                    capturing = True          # wake-free: LED stays as-is until ECAPA confirms it's Jared
+                    capturing = True          # wake-free: LED stays as-is until ECAPA confirms it's the enrolled speaker
                                               # (raw energy is not confirmation); wake-word lights below
                     utterance = bytearray(history[-preroll_max:])
                     history_snap = bytes(history[:-preroll_max]) if len(history) > preroll_max else b""
@@ -742,7 +742,7 @@ async def connection(ws):
                 hang = _vpause if _wakefree else SILENCE_HANGOVER_S
 
                 # Speaker-gated endpointing for wake-free (when ECAPA + voiceprint are loaded): keep the
-                # capture alive on Jared's verified presence, not on energy. Falls back to the energy
+                # capture alive on the speaker's verified presence, not on energy. Falls back to the energy
                 # endpoint for wake-word captures (or before the voiceprint loads).
                 speaker_gated = _wakefree and _enc is not None and _bank is not None and _enroll_left == 0
                 close = False
@@ -778,7 +778,7 @@ async def connection(ws):
                                 log.info("wake-free: Jared confirmed (sim=%.2f after %.1fs) — tracking", sim, audio_s)
                                 _led_capturing = True        # LED → solid: confirmed it's YOU
                                 await _render_led(ws, "confirmed Jared")
-                            _spawn(_publish_presence(True))   # shared 'Hearing Jared' truth
+                            _spawn(_publish_presence(True))   # shared 'Hearing the speaker' truth
                             last_confirm = datetime.now(timezone.utc)
                         elif jared_seen:
                             miss += 1
@@ -893,7 +893,7 @@ async def connection(ws):
                 # itself window by window) — NOT the whole capture. The capture also holds the pre-confirm
                 # lead-in and the trailing windows that closed it, and on this far mic those are the TV: on
                 # 2026-09-11 a real 14.9s command whose confirmed windows scored 0.33/0.31/0.27 scored 0.20
-                # as a whole clip because ~5s of TV after he stopped were inside it, and was dropped.
+                # as a whole clip because ~5s of TV after the speaker stopped were inside it, and was dropped.
                 if speaker_gated:
                     if back:
                         span_lo, span_hi = 0, conf_hi + back * 2
@@ -953,7 +953,7 @@ LED_SAFETY_S = 180.0  # clear the 'working' blink after this long if no done eve
 
 def _led_cmd() -> str:
     # Precedence: ENROLLING (armed, waiting for phrases) blinks above all else — unambiguous 'the mic is
-    # in enroll mode' at the device. Then HEARING JARED (this ESP confirmed it's you, OR any other mic)
+    # in enroll mode' at the device. Then HEARING THE SPEAKER (this ESP confirmed it's you, OR any other mic)
     # wins over working — so it stays SOLID blue while you're talking even if a command is processing in
     # the background. You stop → blink (working). Idle → off. Solid is gated on CONFIRMED you.
     if _enroll_left > 0:
@@ -962,7 +962,7 @@ def _led_cmd() -> str:
 
 
 async def _clear_other_hearing_after(delay: float = 1.6) -> None:
-    """Drop the 'other mic hears Jared' flag once that mic stops publishing (it goes stale), then repaint."""
+    """Drop the 'other mic hears the speaker' flag once that mic stops publishing (it goes stale), then repaint."""
     global _other_hearing_jared
     try:
         await asyncio.sleep(delay)
@@ -974,7 +974,7 @@ async def _clear_other_hearing_after(delay: float = 1.6) -> None:
 
 
 def _on_presence(payload) -> None:
-    """Another mic's voice_presence changed → reflect the shared 'Hearing Jared' on this ESP's LED, so it
+    """Another mic's voice_presence changed → reflect the shared 'Hearing the speaker' on this ESP's LED, so it
     stays solid blue while the Mac still has you even when the ESP itself isn't capturing."""
     global _other_hearing_jared, _other_clear_task
     try:
@@ -1068,7 +1068,7 @@ def _load_voiceid():
     import torch
     # On this shared 1-vCPU machine, torch's default thread pool oversubscribes the single core it
     # actually gets scheduled on, so a single ECAPA encode thrashes and balloons from ~0.2s to 7-10s.
-    # That blows past the 3.5s no-Jared abort window, so real commands drop as noise before ECAPA can
+    # That blows past the 3.5s no-speaker abort window, so real commands drop as noise before ECAPA can
     # confirm you. Pin to one thread — a single small inference is FASTER single-threaded here (no
     # coordination overhead), and the latency stays stable inside the confirm window.
     torch.set_num_threads(1)
@@ -1135,9 +1135,9 @@ def _verify_jared(pcm_i16):
 
 def _backfill(history) -> int:
     """How many samples off the END of `history` (the audio right before a capture's trigger) are still
-    Jared talking. Walks back one BACKFILL_STEP_S at a time, scoring the VAD_WINDOW_S window that ends at
+    the speaker talking. Walks back one BACKFILL_STEP_S at a time, scoring the VAD_WINDOW_S window that ends at
     each step, and stops at the first window that is silence (too little voiced audio → _verify_jared
-    returns 0) or not him. One ECAPA encode per step, only at capture-accept. Twin of wakefree.py's
+    returns 0) or not the speaker. One ECAPA encode per step, only at capture-accept. Twin of wakefree.py's
     backfill()."""
     step, win, cap = int(BACKFILL_STEP_S * SAMPLE_RATE), int(VAD_WINDOW_S * SAMPLE_RATE), int(BACKFILL_MAX_S * SAMPLE_RATE)
     n, inc = len(history), 0
@@ -1173,7 +1173,7 @@ def _upload_voiceprint(bank) -> bool:
 
 async def _enroll_sample(pcm_i16, floor_raw: float, ws) -> None:
     """Handle one energy-endpointed utterance while enroll mode is armed: embed it, add it to the bank
-    when the last phrase lands, and flash the LED so Jared gets per-phrase confirmation at the device."""
+    when the last phrase lands, and flash the LED so the speaker gets per-phrase confirmation at the device."""
     global _enroll_left, _enroll_new, _bank
     utt_rms = rms(pcm_i16)
     if utt_rms < max(floor_raw * 2.0, 200.0):
@@ -1217,7 +1217,7 @@ async def _enroll_sample(pcm_i16, floor_raw: float, ws) -> None:
 async def _check_speaker(window_i16, win_end):
     """Run the (blocking) ECAPA verify off the event loop so frame capture keeps flowing while it runs.
     Returns (similarity, win_end); win_end is the capture time the window closed at, so the caller can
-    timestamp 'last confirmed Jared' precisely rather than at result-collection time."""
+    timestamp 'last confirmed the speaker' precisely rather than at result-collection time."""
     sim = await asyncio.to_thread(_verify_jared, window_i16)
     return sim, win_end
 
@@ -1245,9 +1245,9 @@ async def _alive_beacon() -> None:
 
 
 async def _publish_presence(jared: bool) -> None:
-    """Upsert this ESP's row in the shared voice_presence — the system-wide 'who is hearing Jared' truth.
+    """Upsert this ESP's row in the shared voice_presence — the system-wide 'who is hearing the speaker' truth.
     Fire-and-forget on each confirmed check; any mic's fresh heard_jared_at makes the whole system
-    'Hearing Jared' (drives every indicator + lets the other mic suppress a partial capture)."""
+    'Hearing the speaker' (drives every indicator + lets the other mic suppress a partial capture)."""
     key = SUPABASE_SERVICE_KEY
     if not (SUPABASE_URL and key):
         return
@@ -1267,7 +1267,7 @@ async def _publish_presence(jared: bool) -> None:
 
 
 async def _other_heard_jared():
-    """Most recent time a mic OTHER than this ESP confirmed Jared (datetime, or None). Used at capture
+    """Most recent time a mic OTHER than this ESP confirmed the speaker (datetime, or None). Used at capture
     close to suppress a partial: if the Mac still has you, the ESP drops its fragment and the Mac sends
     the whole utterance."""
     key = SUPABASE_SERVICE_KEY

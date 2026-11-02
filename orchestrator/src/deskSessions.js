@@ -1,10 +1,10 @@
 // What the Mac's sessions are doing — published on a tick, the way the Pi publishes its own. Both
-// the ones dispatched to it and the ones Jared opened himself (see `adopt` below).
+// the ones dispatched to it and the ones opened by hand (see `adopt` below).
 //
 // The Mac does NOT get the Pi's residency caps: those exist because a headless 4GB machine has to
 // decide what to close under memory pressure. What it does get is the idle reaper (idle.js), which
 // parks a session the Mac only hosted — dispatched and never typed into at the keyboard — once it
-// has sat idle; a session he used at the Mac stays until he closes it. Beyond that it needs the facts
+// has sat idle; a session the user used at the Mac stays until the user closes it. Beyond that it needs the facts
 // every surface reads:
 //
 //   1. IS IT STILL UP. A row that claims to be running for ever keeps a closed session on the wall and
@@ -78,13 +78,13 @@ function processOf(row, live, byPid, claimed) {
 }
 
 /**
- * A session nothing dispatched — Jared opened it himself. It joins the same table and gets the same
- * treatment, and never touches `desk_focus`: a session appearing is not him choosing to talk to it.
+ * A session nothing dispatched — the user opened it by hand. It joins the same table and gets the same
+ * treatment, and never touches `desk_focus`: a session appearing is not the user choosing to talk to it.
  */
 /**
  * What to call a session nobody has named yet: the terminal it is in and when it opened.
  *
- * Both are things he can act on — the tty is how the window is found and the time is how two on the
+ * Both are things the user can act on — the tty is how the window is found and the time is how two on the
  * same tty are told apart. Deliberately not a guess at what the session is FOR: it has not said
  * anything yet, so any such guess would be invented.
  */
@@ -102,7 +102,7 @@ async function adopt(s, rows) {
   if (existing) {
     // The same conversation running again — `claude --resume` by hand, in a new tab. Revive the row
     // rather than making a second one: its label, its origin and its history are still right.
-    // Resumed at the keyboard, so it is his now whatever opened it first: never parked by idle.js.
+    // Resumed at the keyboard, so it is the user's now whatever opened it first: never parked by idle.js.
     await patchDeskSession(existing.id, { status: 'resident', ended: null, tty: s.tty, pid: s.pid,
                                           started: startedIso, transcript_path: s.transcriptPath,
                                           touched_at: existing.touched_at || startedIso,
@@ -208,15 +208,15 @@ async function reconcile(row, proc) {
       patch.reply_at = tail.replyAt || row.reply_at || null;
     }
     // What a session is CALLED, in order of authority:
-    //   1. a name Jared typed himself (ctrl-R in the session picker, written to the transcript as a
+    //   1. a name typed by hand (ctrl-R in the session picker, written to the transcript as a
     //      `custom-title` record) — an explicit act, so it outranks everything, dispatched or not;
     //   2. the label the router wrote at dispatch, which names the job that was asked for;
     //   3. Claude Code's own generated title, for a session nobody dispatched and nobody named.
     // Refreshed every tick rather than stamped once, because 1 and 3 both change as work goes on.
     const named = tail.customTitle || (row.origin === 'adopted' ? tail.title : null);
     if (named && named.slice(0, 60) !== row.label) patch.label = named.slice(0, 60);
-    // Kept separately from `label` as well: a glanceable surface shows the repo unless he named
-    // the session himself, and `label` cannot answer which of the three sources it came from.
+    // Kept separately from `label` as well: a glanceable surface shows the repo unless the user named
+    // the session by hand, and `label` cannot answer which of the three sources it came from.
     const chosen = tail.customTitle ? tail.customTitle.slice(0, 60) : null;
     if (chosen !== (row.custom_title ?? null)) patch.custom_title = chosen;
   }
@@ -278,7 +278,7 @@ async function reconcile(row, proc) {
     row.status = patch.status;   // stop watching it on this tick, not the next
     console.log(`[desk-sessions] ${row.id} ${patch.status} (its process has exited)`);
     // A dispatched session's window is the session's alone; once it has exited nothing in it is
-    // anyone's. A window he opened himself is left for him.
+    // anyone's. A window opened by hand is left for the user.
     if (row.origin !== 'adopted') {
       closeHuskForTty(row.tty).catch((e) => console.error('[desk-sessions] close husk:', e.message));
     }
@@ -353,7 +353,7 @@ export async function markTtyRead(tty) {
 }
 
 async function tick() {
-  // Messages and pictures handed to a session by file. They are dictated speech and his photos — not
+  // Messages and pictures handed to a session by file. They are dictated speech and the user's photos — not
   // something to leave lying in a home directory for ever (the window is on sweepStashedPrompts).
   sweepStashedPrompts();
 
@@ -364,7 +364,7 @@ async function tick() {
   try { rows = await deskSessionsFor('desk'); }
   catch (e) { return console.error('[desk-sessions] list:', e.message); }
   // Codex sessions (`agent = 'codex'`) too, read from the rollout each holds open (codex.js). Only the
-  // ones a row was written for: a `codex` Jared opens by hand is not adopted.
+  // ones a row was written for: a `codex` opened by hand is not adopted.
   const live = [...(await liveClaudeSessions()).map((p) => ({ ...p, agent: 'claude' })), ...liveCodexSessions()];
   const byPid = new Map(live.map((p) => [p.pid, p]));
   const claimed = new Set();

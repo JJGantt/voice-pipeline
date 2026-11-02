@@ -96,7 +96,7 @@ if [ -n "$PROMPT_FILE" ] && [ -s "$PROMPT_FILE" ]; then
   rm -f "$PROMPT_FILE"
   # A fresh dispatch is told it IS the session the request was for, so words addressed to the
   # dispatcher ("start a session in X and have it...") are not read as an order to dispatch again.
-  # A system prompt, so surfaces still show only his words. The Mac's orchestrator reads the same file.
+  # A system prompt, so surfaces still show only the user's words. The Mac's orchestrator reads the same file.
   [ -z "$RESUME_ID" ] && SYS_TEXT="$(cat "$HERE/../orchestrator/dispatched-session.txt")"$'\n\n'"$SYS_TEXT"
   exec claude --model "$MODEL" "${EXTRA[@]}" "${RESUME[@]}" --append-system-prompt "$SYS_TEXT" "$PROMPT"
 fi

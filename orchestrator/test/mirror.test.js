@@ -7,7 +7,7 @@ const REJECT = "The user doesn't want to proceed with this tool use. The tool us
 
 test('rewrites the interrupt the move left on the cut-off turn', () => {
   const text = [
-    rec({ type: 'user', message: { content: [{ type: 'text', text: '[Request interrupted by user]' }] } }),   // Jared's, earlier
+    rec({ type: 'user', message: { content: [{ type: 'text', text: '[Request interrupted by user]' }] } }),   // the user's, earlier
     rec({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 't1', name: 'Bash' }] } }),
     rec({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: REJECT, is_error: true }] },
           toolUseResult: 'User rejected tool use' }),

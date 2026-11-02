@@ -194,7 +194,7 @@ export async function closeHuskForTty(tty) {
  * Type text into an already-running session, addressed by the tty of its tab.
  *
  * The tty is the only stable handle a Terminal tab has: tab indexes shift as tabs open and close, and
- * "front window" is whatever Jared last clicked — which is exactly the mistake to avoid, since a
+ * "front window" is whatever the user last clicked — which is exactly the mistake to avoid, since a
  * dictated follow-up landing in the wrong terminal is worse than one that fails.
  *
  * What gets typed is `typeable` (handoff.js), shared with the Pi. A running session's tty is raw, so no
@@ -359,7 +359,7 @@ export async function openFreshTab(cwd, name, prompt, sessionId = null, resumeId
   // A fresh session with a prompt is a dispatch, and has to know it IS the session the request was
   // for — otherwise "start a session in X and have it..." left in the words reads as an instruction to
   // it, and it dispatches the same request a second time. A system prompt, not text in the prompt,
-  // so every surface still shows only his words. pi-desk/launch.sh reads the same file.
+  // so every surface still shows only the user's words. pi-desk/launch.sh reads the same file.
   // `note` is anything else the session must know before its first turn — a session moved here from
   // the Pi mid-turn is told why and what was cut off (commands.js resume_mirrored).
   const sysText = [(pf && !resumeId) ? DISPATCHED : '', note || ''].filter(Boolean).join('\n\n');

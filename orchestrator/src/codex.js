@@ -10,9 +10,9 @@
 //     The process launched (`codex`) is a node wrapper that spawns the native binary as its child, so the
 //     search covers the pid and its descendants.
 //   - THE TURN STATE is in the rollout: `event_msg` `task_started` opens a turn, `task_complete` (carrying
-//     `last_agent_message`, the final answer) or `turn_aborted` closes it. His words are the
+//     `last_agent_message`, the final answer) or `turn_aborted` closes it. The user's words are the
 //     `item_completed` UserMessage item (0.16x) or `user_message` event (older rollouts). The developer and
-//     AGENTS.md context Codex injects are `response_item` messages and are never read as his words.
+//     AGENTS.md context Codex injects are `response_item` messages and are never read as the user's words.
 //
 // The thread id is stored in `desk_sessions.claude_session_id`: it is the conversation's identity, the
 // same role the column plays for Claude, and `codex resume <id>` keeps it.
@@ -149,7 +149,7 @@ export async function awaitCodexSession(pid, timeoutMs = 15000) {
 
 // ---- reading a rollout ---------------------------------------------------------------------------
 
-/** His words in a record, or null when the record is not him speaking. */
+/** The user's words in a record, or null when the record is not the user speaking. */
 export function codexPrompt(d) {
   const p = d && d.type === 'event_msg' ? d.payload || {} : null;
   if (!p) return null;

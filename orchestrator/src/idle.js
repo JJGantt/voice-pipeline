@@ -2,7 +2,7 @@
 //
 // A session dispatched from the watch, the phone or the ops responder opens a Terminal tab here and
 // is then driven entirely from elsewhere. Nobody at the Mac closes it, so without this they pile up
-// (27 windows on 2026-10-31). A session Jared typed into at the Mac's own keyboard is his to close,
+// (27 windows on 2026-10-31). A session the user typed into at the Mac's own keyboard is the user's to close,
 // and is never parked by this.
 //
 // TELLING THE TWO APART. The transcript records a prompt typed at the keyboard and one this
@@ -15,7 +15,7 @@
 //
 // Anything else that reaches a session the same way the keyboard does is counted as the keyboard —
 // Remote Control from the Claude app is one. That errs toward keeping a session, never toward
-// closing one he was using.
+// closing one the user was using.
 //
 // Parking is what `end_session` does: the tab goes, the row becomes `evicted`, and the conversation
 // stays resumable — a follow-up to a parked session resumes it (the hub and data-layer both send
@@ -63,7 +63,7 @@ const touchedIds = new Set();
 
 /** The text of a human prompt record, or null when the record is not one. */
 function humanPrompt(r) {
-  // A Codex rollout records his words as a UserMessage item (codex.js), with no mark of where they came
+  // A Codex rollout records the user's words as a UserMessage item (codex.js), with no mark of where they came
   // from; the fingerprints decide that, as for Claude.
   const codex = codexPrompt(r);
   if (codex) return codex;
@@ -137,7 +137,7 @@ async function runningCommand(pid) {
  */
 export async function reapIdle(row, proc, transcriptBytes) {
   if (!proc || row.status !== 'resident') return false;
-  // A session he opened himself at the Mac is his by definition.
+  // A session opened by hand at the Mac is the user's by definition.
   if (row.origin === 'adopted') return false;
   if (row.touched_at || touchedIds.has(row.id)) return false;
 

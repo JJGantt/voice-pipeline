@@ -60,7 +60,7 @@ def run_subscription(run, label: str) -> dict:
 
 
 # The current command's audio-recording START time (voice_requests.capture_start), written here per
-# command. The data MCP's now() reads it so a voice-logged SET lands at when Jared actually spoke — his
+# command. The data MCP's now() reads it so a voice-logged SET lands at when the user actually spoke — the user's
 # rest-clock reference — not ~30s later when the command finishes the pipeline.
 #
 # It is a FILE and not an env value, and that distinction is the whole point. The warm hub client
@@ -398,7 +398,7 @@ class SdkRunner:
     def warm(self) -> None:
         """Connect now rather than on the next turn. Measured cold, the first command after a restart
         took 19.7s on Fly and 9.9s on the Pi where a warm one took 2.8s and 4.5s; every deploy, restart
-        and failed turn (`_recycle`) used to hand that cost to whatever he said next."""
+        and failed turn (`_recycle`) used to hand that cost to whatever the user said next."""
         if claude_unready():
             return
         self._start_loop()
@@ -415,7 +415,7 @@ class SdkRunner:
         turn sent an email in the first test of the send rule. A hook's deny outranks any allow rule."""
         exact = set(self.tools)
         servers = tuple(t + "__" for t in self.tools if t.startswith("mcp__") and t.count("__") == 1)
-        # A session, or a message to another person, only from a turn he pressed for or typed (is_manual).
+        # A session, or a message to another person, only from a turn the user pressed for or typed (is_manual).
         # Fails closed: the client is warm across turns, and the flag is False unless run() was told this
         # turn was pressed. Switching JaredBot OFF stays open: silencing an auto-replier sends nothing.
         sends = name in SEND_TOOLS or (name == JAREDBOT_TOOL and bool((tool_input or {}).get("on")))
@@ -600,7 +600,7 @@ class SdkRunner:
 
 
 # ── Codex: the hub's last resort when Claude itself is down ────────────────────────────────────────
-# Billed to Jared's ChatGPT plan through `codex exec`, which is the only programmatic way in: the plan has
+# Billed to the owner's ChatGPT plan through `codex exec`, which is the only programmatic way in: the plan has
 # no API access. Used for a watch/phone/web hub turn that Claude could not answer at all (the subscription
 # failed for a reason other than its usage limit, or the credits run failed too) and that called no tool
 # first, so nothing is done twice. It gets the same MCP servers, start_session included, and a session it

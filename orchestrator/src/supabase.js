@@ -164,8 +164,8 @@ export async function deskSessionsFor(worker, status) {
  * Keep a command that could not run.
  *
  * The prompt inside is usually minutes of dictated speech that cannot be repeated, so it is never
- * simply logged and lost. Not a retry queue — the command is finished, and Jared decides later
- * whether he still wants it.
+ * simply logged and lost. Not a retry queue — the command is finished, and the user decides later
+ * whether the user still wants it.
  */
 export async function deadLetterCommand(cmd, reason, source = 'desk', machine = 'mac') {
   const res = await fetch(`${base()}/desk_dead_letters`, {

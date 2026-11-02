@@ -24,7 +24,7 @@ _standby = False
 _failover_at = 0.0
 
 
-# Set while a claim is deliberately deferred because a mic is still hearing him. The main loop looks
+# Set while a claim is deliberately deferred because a mic is still hearing the speaker. The main loop looks
 # again in a second rather than waiting out the idle backstop, so the hold costs ~1s, not ~15.
 _holding = False
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live "is that Jared?" detector.
+"""Live "is that the enrolled speaker?" detector.
 
 Streams the mic, scores a rolling ~1.2s window against your enrolled voiceprint (reference.npy)
 every ~0.5s, and prints a live verdict: ● JARED / ○ not you / · silence, with the cosine similarity
@@ -24,7 +24,7 @@ HERE = Path(__file__).parent
 SR = 16000
 WIN_S = 3.0          # scoring window — matches the 3s windows the reference was enrolled from
 HOP_S = 0.5          # score this often
-ENERGY_GATE = 0.005  # RMS below this = silence (calibrated below Jared's quietest speech ~0.008)
+ENERGY_GATE = 0.005  # RMS below this = silence (calibrated below the speaker's quietest speech ~0.008)
 THRESH = float(sys.argv[1]) if len(sys.argv) > 1 else 0.30
 TOPK = 3             # score = mean cosine to the K closest enrollment exemplars (vs a blurred centroid)
 REF = HERE / "reference.npy"
