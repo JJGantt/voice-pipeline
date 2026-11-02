@@ -49,10 +49,11 @@ routed once it gets here is `../docs/ROUTING.md`.
      reason to wait. A standing-by worker sleeps to exactly its deadline.
    - **Desk hosts are not workers.** `desk` and `pi-desk` beat into the same
      `worker_presence` table; every "is another worker up" question counts only
-     `WORKER_PRIORITY` members, and a presence with `info.stopping` or
-     `info.degraded` counts as down.
-   - **Atomic claim:** `PATCH ...&status=eq.pending` → `claimed`. If the returned
-     representation is empty, someone else won the race — skip.
+     `WORKER_PRIORITY` members, and a presence with `info.stopping`,
+     `info.degraded` or `info.stalled` counts as down.
+   - **Atomic claim:** `PATCH ...&status=eq.pending` → `claimed`, with a lease
+     (see *The lease*). If the returned representation is empty, someone else won
+     the race — skip.
    - **Handed-off requests:** a request listing workers in `failed_on` is never
      claimed by them again, and skips affinity: it defers only to a higher-ranked
      worker that has not tried it (see *Handing a failed turn on*).
@@ -60,10 +61,10 @@ routed once it gets here is `../docs/ROUTING.md`.
    - Read the `voice_focus` singleton. `focus == 'hub'` runs here; any other value
      names a live Mac session, and the transcript is injected into that session's
      pty through the orchestrator (`ORCH_URL`) instead of running a fresh turn.
-   - Write the user turn to `voice_messages`.
    - Manage the hub session (resume vs. fresh — see the reset rule below).
    - Run the turn, parse `stream-json`, capture the `session_id` and the final text.
-   - Write the assistant turn to `voice_messages` and mark the request `done`.
+   - Write the user and assistant turns to `voice_messages` and mark the request
+     `done`, in one transaction and only while this worker still holds the claim.
      A failed turn that called no tool is handed to another worker; only when no
      healthy worker is left untried is it marked `error`.
 4. Idle-poll every `IDLE_POLL_S` (60s), tightening to 2s only while realtime is
@@ -92,6 +93,7 @@ routed once it gets here is `../docs/ROUTING.md`.
 | `ORCH_URL` / `ORCH_TOKEN` | `http://localhost:7682` | The Mac orchestrator, for injecting into a focused session. |
 | `HUB_URL` / `HUB_TOKEN` | `https://jared-status-hub.fly.dev` / _(empty)_ | The status hub and its kiosk token, for the live tool-call activity bar. Set in `.env` (Fly: a secret); unset, the worker reports an error at start and pushes nothing. |
 | `CLAUDE_TIMEOUT_S` | `300` | Max seconds for a single hub run. |
+| `LEASE_S` | `120` | How far past the turn's last renewal a claim's lease runs (see *The lease*). |
 | `AGENT_TIMEOUT_S` | `900` | Full-agent (coding) runs get a longer leash. |
 
 ### Where to get the service key
@@ -244,10 +246,32 @@ process's epoch and would orphan a live claim the moment it is made. `reclaim_st
 owner in `failed_on` when it had not acted, closed as an error and investigated when it had (it may be
 half-done) or when it is older than the conversation window.
 
+## The lease: a worker hung mid-turn
+
+The heartbeat runs on its own thread so a long turn never looks dead, which also means a process whose
+turn is wedged keeps heartbeating. So a claim also carries a lease, `voice_requests.lease_until`, which
+only the turn itself renews (`claim.hold`): at claim, at the start of each run attempt by that attempt's
+own deadline (`CLAUDE_TIMEOUT_S` + 30, `AGENT_TIMEOUT_S`, `CODEX_TIMEOUT_S`), and before every tool call,
+each time to at least `LEASE_S` (120s) ahead. A claim whose lease has passed is an orphan whatever its
+owner's heartbeat says, and `reclaim_stale` takes it back with an UPDATE guarded on the lease still being
+past, so a renewal that lands first keeps it. The owner's heartbeat meanwhile reports `info.stalled`, so
+the others stop deferring new commands to it. Noticing a lapsed lease is the orphan sweep's job: nothing
+changes in the database when a lease runs out, so it is a clock arrival caught by that backstop, which
+reads the column in the query it already makes.
+
+Every renewal is a write guarded on `status=claimed`, this `claimed_by` and this `claim_epoch`, so it
+doubles as the check that the claim is still this process's. Once it is not, the process does nothing
+more for the request: the fence (`SdkRunner.gate`) refuses the tool, `run_claude` kills the agent at its
+next tool call, and nothing is written. A renewal that fails on the network refuses that one tool too.
+Every outcome a turn writes (its thread rows and the request's final state) goes through `finish`, the
+`voice_finish` function (data-layer 00159), which writes them in one transaction only while the caller
+still holds the claim. A worker that lost a claim therefore cannot post a reply beside the one that took
+the request over, however late it wakes.
+
 **Acted** means the turn called a tool that changes something: anything but `get_*`, `list_*`,
-`search_*`, `find_*`, web search/fetch and the feeder's status reads (`replay_safe`). The first such call
-stamps `acted_at`. A failure after reads only is still handed on; a crash in `process_request` is handed
-on the same way.
+`search_*`, `find_*`, web search/fetch and the feeder's status reads (`replay_safe`). The lease renewal
+for the first such call stamps `acted_at`, in the same write, before the tool runs. A failure after reads
+only is still handed on; a crash in `process_request` is handed on the same way.
 
 A pending row whose `failed_on` already holds every healthy worker — the one it was handed to died
 before claiming — is **stranded**; the same sweep clears its `failed_on` so everyone may try again.
@@ -285,7 +309,7 @@ What the classes mean:
 ## Tests
 
 `tests/` covers what is costly to break: claiming and failover priority, recording-window dedupe and
-orphan recovery, and the press-provenance gate with the routing it decides. They run the real worker
+orphan and lease recovery, and the press-provenance gate with the routing it decides. They run the real worker
 against an in-memory PostgREST (`tests/fakes.py`) and a stand-in `claude` CLI, so nothing reaches
 Supabase or Claude. From the repo root:
 

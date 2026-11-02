@@ -42,7 +42,7 @@ def test_is_manual_fails_closed(load, source, always_on, manual):
 
 def claimed(h, source, always_on, transcript="start a session to fix the build", **kw):
     row = dict(transcript=transcript, source=source, always_on=always_on, status="claimed",
-               claimed_by=h.w.WORKER_ID, created_at=ago(3), updated_at=ago(3), failed_on=[])
+               claimed_by=h.w.WORKER_ID, claim_epoch=h.w.WORKER_EPOCH, created_at=ago(3), updated_at=ago(3), failed_on=[])
     row.update(kw)
     return dict(h.pg.insert("voice_requests", **row))
 

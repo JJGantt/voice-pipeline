@@ -2,13 +2,14 @@
 
 import time
 from datetime import datetime, timezone, timedelta
+from urllib.parse import quote
 
 from . import runstate
-from .config import BUSY_WAIT_S, DEDUP_TOL_S, DEDUP_WINDOW_S, FAILOVER_S, FALLBACK_WORKER, HEARTBEAT_FRESH_S, MAX_HOLD_S, MIC_QUIET_S, RECLAIM_SWEEP_S, STANDBY_CHECK_S, UNTRANSCRIBED_MAX_S, WORKER_ID
+from .config import BUSY_WAIT_S, DEDUP_TOL_S, DEDUP_WINDOW_S, FAILOVER_S, FALLBACK_WORKER, HEARTBEAT_FRESH_S, LEASE_S, MAX_HOLD_S, MIC_QUIET_S, RECLAIM_SWEEP_S, STANDBY_CHECK_S, UNTRANSCRIBED_MAX_S, WORKER_ID
 from .db import Supabase, degraded
 from .live import session_reset_s
 from .logs import _parse_ts, alert_failure, log, log_error, now_iso
-from .presence import WORKER_EPOCH, claude_unready, defer_target, other_worker_healthy, presence_rows, should_defer, untried_workers
+from .presence import WORKER_EPOCH, claude_unready, defer_target, other_worker_healthy, presence_rows, replay_safe, should_defer, untried_workers
 
 
 _last_transcribing_sweep = 0.0
@@ -63,9 +64,10 @@ def sweep_stuck_transcribing(db: Supabase) -> None:
 def reclaim_stale(db: Supabase) -> None:
     """Release requests no live process is working on, so a worker takes them.
 
-    An ORPHAN is a claimed row whose process is gone: its owner's heartbeat is stale, or the owner is up
-    under a different `claim_epoch` — a worker that died mid-run and came back under the same name, which
-    a heartbeat alone can never show. One that had not acted (`acted_at` empty) goes back to pending with
+    An ORPHAN is a claimed row no process is moving: its owner's heartbeat is stale, the owner is up under
+    a different `claim_epoch` (a worker that died mid-run and came back under the same name, which a
+    heartbeat alone can never show), or its lease has lapsed (a process hung mid-turn, whose heartbeat
+    thread beats on without it; see `hold`). One that had not acted (`acted_at` empty) goes back to pending with
     the owner in `failed_on`, and the realtime UPDATE sends the next worker to it. One that HAD acted may
     be half-done, so it is not replayed: it ends as an error and is investigated. So does an orphan older
     than the conversation window, which would be stale to run.
@@ -84,9 +86,13 @@ def reclaim_stale(db: Supabase) -> None:
     now = datetime.now(timezone.utc)
     presence = {r.get("worker"): r for r in presence_rows(db)}
     for req in db.get("voice_requests", "status=eq.claimed&order=created_at.asc&limit=20"
-                      "&select=id,transcript,claimed_by,claim_epoch,claimed_at,created_at,acted_at,failed_on") or []:
+                      "&select=id,transcript,claimed_by,claim_epoch,claimed_at,created_at,acted_at,failed_on,lease_until") or []:
         owner = req.get("claimed_by") or ""
-        if owner == WORKER_ID:
+        lease = _parse_ts(req.get("lease_until") or "")
+        lapsed = bool(lease) and lease < now
+        if lapsed:
+            alive = False
+        elif owner == WORKER_ID:
             alive = req.get("claim_epoch") == WORKER_EPOCH
         else:
             p = presence.get(owner) or {}
@@ -106,23 +112,27 @@ def reclaim_stale(db: Supabase) -> None:
         if alive:
             continue
         guard = f"id=eq.{req['id']}&status=eq.claimed&claimed_by=eq.{owner}"
+        if lapsed:   # a renewal that lands first keeps the claim: this UPDATE then matches nothing
+            guard += f"&lease_until=lt.{quote(now.isoformat())}"
+        cause = (f"'{owner}' stopped renewing its lease mid-run (its heartbeat was still fresh)" if lapsed
+                 else f"'{owner}' died mid-run")
         created = _parse_ts(req.get("created_at") or "")
         what = f"Request {req['id']} ({(req.get('transcript') or '')[:200]!r}) was orphaned by '{owner}'"
         if req.get("acted_at") or (created and (now - created).total_seconds() > session_reset_s()):
             why = ("it had already acted, so it may be half-done and was not replayed" if req.get("acted_at")
                    else "it is too old to run now")
             if db.patch("voice_requests", guard,
-                        {"status": "error", "error": f"orphaned: '{owner}' died mid-run; {why}", "updated_at": now_iso()},
+                        {"status": "error", "error": f"orphaned: {cause}; {why}", "lease_until": None, "updated_at": now_iso()},
                         extra_headers={"Prefer": "return=representation"}):
                 log(f"closed orphaned request {req['id']} from '{owner}': {why}")
-                alert_failure("orphan", f"'{owner}' died mid-run", f"{what}; {why}. It ended as an error.")
+                alert_failure("orphan", cause, f"{what}; {why}. It ended as an error.")
             continue
         if db.patch("voice_requests", guard,
-                    {"status": "pending", "claimed_by": None, "claimed_at": None, "claim_epoch": None,
+                    {"status": "pending", "claimed_by": None, "claimed_at": None, "claim_epoch": None, "lease_until": None,
                      "failed_on": sorted(set(req.get("failed_on") or []) | {owner}), "updated_at": now_iso()},
                     extra_headers={"Prefer": "return=representation"}):
             log(f"released orphaned request {req['id']} from '{owner}' back to pending")
-            alert_failure("orphan", f"'{owner}' died mid-run",
+            alert_failure("orphan", cause,
                           f"{what} before it acted, and was put back to pending for another worker.")
     for req in db.get("voice_requests", "status=eq.untranscribed&select=id,created_at,transcript") or []:
         created = _parse_ts(req.get("created_at") or "")
@@ -229,9 +239,9 @@ def claim_one(db: Supabase) -> dict | None:
         # nobody else will take it.
         got = db.patch("voice_requests", f"id=eq.{fb['id']}&status=eq.fallback",
                        {"status": "claimed", "claimed_by": WORKER_ID, "claim_epoch": WORKER_EPOCH,
-                        "claimed_at": now_iso(), "assigned_to": WORKER_ID, "updated_at": now_iso()},
+                        "claimed_at": now_iso(), "assigned_to": WORKER_ID, "updated_at": now_iso(), **_new_lease()},
                        extra_headers={"Prefer": "return=representation"})
-        return got[0] if got else None
+        return _leased(got[0]) if got else None
     pending = [r for r in pending or [] if r.get("status") == "pending"]
     # SPOKEN ORDER, not arrival order. A watch that loses the hub holds its clips and sends them together
     # when it gets back, and the uploads land in whatever order they finish: a correction ("I said 11")
@@ -329,6 +339,7 @@ def claim_one(db: Supabase) -> dict | None:
             "claimed_at": now_iso(),
             "assigned_to": WORKER_ID,
             "updated_at": now_iso(),
+            **_new_lease(),
         },
         extra_headers={"Prefer": "return=representation"},
     )
@@ -343,7 +354,76 @@ def claim_one(db: Supabase) -> dict | None:
             continue
         db.patch("voice_requests", f"id=eq.{other['id']}&status=eq.pending",
                  {"status": "done", "result": SUPERSEDED_RESULT, "updated_at": now_iso()})
-    return claimed[0]
+    return _leased(claimed[0])
+
+
+# ---- the lease: holding a claimed request, and giving it up ---------------------------------------------
+
+def _new_lease() -> dict:
+    return {"lease_until": (datetime.now(timezone.utc) + timedelta(seconds=LEASE_S)).isoformat()}
+
+
+def _leased(req: dict) -> dict:
+    """A freshly claimed row, with the lease the claim wrote noted locally for `hold`."""
+    until = _parse_ts(req.get("lease_until") or "")
+    if until:
+        req["_lease_until"] = until
+        runstate._lease_deadline = time.monotonic() + (until - datetime.now(timezone.utc)).total_seconds()
+    return req
+
+
+def _mine(rid: str) -> str:
+    return f"id=eq.{rid}&status=eq.claimed&claimed_by=eq.{WORKER_ID}&claim_epoch=eq.{WORKER_EPOCH}"
+
+
+def hold(db: Supabase, req: dict, for_s: float = 0.0, tool: str | None = None) -> bool:
+    """Renew this process's lease on `req` and confirm it still holds it. Called from the turn's own
+    progress (each run attempt, with that attempt's deadline as `for_s`, and each tool call before it
+    runs, named as `tool`), never from the heartbeat thread, so the lease lapses exactly when the turn
+    stops moving. The lease only grows: it runs to `for_s` + LEASE_S from now or stays where it was.
+
+    True only when the database confirms the claim is still this process's. False means do not act: the
+    claim was taken back (`req["_lost"]`, for good) or could not be confirmed this time. A tool that
+    changes something stamps `acted_at` in the same write, before it runs."""
+    if req.get("_lost"):
+        return False
+    now = datetime.now(timezone.utc)
+    until = max(req.get("_lease_until") or now, now + timedelta(seconds=for_s + LEASE_S))
+    body = {"lease_until": until.isoformat()}
+    short = (tool or "").rsplit("__", 1)[-1]
+    acting = bool(tool) and not req.get("_acted") and not replay_safe(short)
+    if acting:
+        body["acted_at"] = now.isoformat()
+    got = db.patch("voice_requests", _mine(req["id"]), body, extra_headers={"Prefer": "return=representation"})
+    if got == []:
+        req["_lost"] = True
+        log_error(f"request {req['id']}: this worker's claim was taken back mid-turn; it stops acting on it")
+        return False
+    if not got:
+        return False   # unconfirmed (the write failed): fail closed for this step
+    req["_lease_until"] = until
+    runstate._lease_deadline = time.monotonic() + (until - now).total_seconds()
+    if acting:
+        req["_acted"] = True
+    return True
+
+
+def finish(db: Supabase, req: dict, fields: dict, messages: "list | tuple" = ()) -> bool:
+    """Write a request's outcome, its thread rows (`messages`, in order) and final `fields` (status, result
+    or error), in one transaction and only while this process still holds the claim (`voice_finish`,
+    data-layer 00159). False means nothing was written: the claim was taken back, and the worker that took
+    it writes the outcome instead."""
+    body = {"p_id": req["id"], "p_worker": WORKER_ID, "p_epoch": WORKER_EPOCH, "p_fields": fields,
+            "p_messages": list(messages)}
+    got = db.post("rpc/voice_finish", body)
+    if got is None:   # the call failed; once more, since a lost write leaves the row to the lease sweep
+        got = db.post("rpc/voice_finish", body)
+    if got is True:
+        return True
+    if got is False:
+        req["_lost"] = True
+        log_error(f"request {req['id']}: claim taken back before its outcome was written; nothing written")
+    return False
 
 
 # Results that mean the request executed NOTHING. A row like this must never be the surviving half of a

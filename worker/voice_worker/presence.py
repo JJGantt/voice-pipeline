@@ -26,6 +26,8 @@ def heartbeat(db: Supabase) -> None:
         info["degraded"] = True
     if runstate._stopping:
         info["stopping"] = True
+    if runstate._lease_deadline and time.monotonic() > runstate._lease_deadline:
+        info["stalled"] = True   # the turn in flight stopped renewing its lease: hung, though this beats
     db.upsert("worker_presence", {"worker": WORKER_ID, "last_seen": now_iso(), "info": info},
               on_conflict="worker")
 
@@ -48,9 +50,9 @@ def presence_rows(db: Supabase) -> list:
 
 
 def _healthy(row: dict, window_s: float = HEARTBEAT_FRESH_S) -> bool:
-    """A presence row that is fresh AND not reporting a degraded link or a shutdown."""
+    """A presence row that is fresh AND not reporting a degraded link, a shutdown or a stalled turn."""
     info = row.get("info") or {}
-    if info.get("degraded") or info.get("stopping"):
+    if info.get("degraded") or info.get("stopping") or info.get("stalled"):
         return False
     ts = _parse_ts(row.get("last_seen", ""))
     return bool(ts) and (datetime.now(timezone.utc) - ts).total_seconds() <= window_s
@@ -182,9 +184,9 @@ def hand_off(db: Supabase, req: dict, err: str) -> bool:
         return False
     got = db.patch(
         "voice_requests",
-        f"id=eq.{req['id']}&status=eq.claimed&claimed_by=eq.{WORKER_ID}",
-        {"status": "pending", "claimed_by": None, "claimed_at": None, "failed_on": tried,
-         "updated_at": now_iso()},
+        f"id=eq.{req['id']}&status=eq.claimed&claimed_by=eq.{WORKER_ID}&claim_epoch=eq.{WORKER_EPOCH}",
+        {"status": "pending", "claimed_by": None, "claimed_at": None, "claim_epoch": None, "lease_until": None,
+         "failed_on": tried, "updated_at": now_iso()},
         extra_headers={"Prefer": "return=representation"},
     )
     if not got:

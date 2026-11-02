@@ -5,22 +5,21 @@ import os
 import re
 import shutil
 import tempfile
-import threading
 from datetime import datetime, timezone, timedelta
 
 import httpx
 
 from . import runstate
-from .claim import _duplicate_of_recent, claim_one
+from .claim import _duplicate_of_recent, claim_one, finish, hold
 from .config import CREDITS_API_KEY, FALLBACK_OUTAGE_S, HUB_EFFORT, HUB_MODEL, RESET_SENTINEL, SUPABASE_KEY, SUPABASE_URL, WORKER_ID, _NOTHING_SAID
 from .db import Supabase
 from .governor import maybe_auto_disable_wakefree
 from .live import agent_settings, get_focus, read_session, recent_context, session_file, should_reset_session, write_session
 from .logs import _parse_ts, alert_failure, log, log_error, now_iso
 from .outbound import inject_to_terminal, ping_esp_led, push_activity
-from .presence import claude_unready, hand_off, replay_safe
+from .presence import claude_unready, hand_off
 from .prompts import ADDRESSING_DIRECTIVE, AGENT_SYSTEM, ALT_TRANSCRIPT_DIRECTIVE, ATTACH_DIRECTIVE, DELIBERATE_DIRECTIVE, NO_PRESS_DIRECTIVE, NUTRITION_DIRECTIVE, READ_DIRECTIVE, SHARED_STATE_NOTE, SHARE_DIRECTIVE, TOOLS_DIRECTIVE, is_ignore, take_read_marker
-from .runners import SDK, SDK_CREDITS, codex_ready, limit_refused, run_claude, run_codex, run_subscription, set_cmd_ts
+from .runners import CODEX_TIMEOUT_S, SDK, SDK_CREDITS, codex_ready, limit_refused, run_claude, run_codex, run_subscription, set_cmd_ts
 
 
 # PROVENANCE: was this command started by a deliberate act of the user's hand? Only such a command may reach
@@ -120,8 +119,7 @@ def process_request(db: Supabase, req: dict) -> None:
             session_file(reset_agent).unlink(missing_ok=True)
         except Exception as e:
             log_error(f"reset: unlink session failed: {e}")
-        db.patch("voice_requests", f"id=eq.{rid}",
-                 {"status": "done", "result": "(context reset)", "updated_at": now_iso()})
+        finish(db, req, {"status": "done", "result": "(context reset)"})
         log(f"{'agent' if reset_agent else 'hub'} context reset — session dropped")
         return
 
@@ -129,8 +127,7 @@ def process_request(db: Supabase, req: dict) -> None:
     # clip with no speech in it, and typed it asks for nothing. The transcribers already drop it (server.py,
     # mac-listener, status-hub's transcribe.js); this catches every other way a row gets here.
     if _NOTHING_SAID.match(transcript):
-        db.patch("voice_requests", f"id=eq.{rid}",
-                 {"status": "error", "error": "nothing said", "updated_at": now_iso()})
+        finish(db, req, {"status": "error", "error": "nothing said"})
         log(f"ignored {transcript!r}: nothing said")
         return
 
@@ -156,13 +153,8 @@ def process_request(db: Supabase, req: dict) -> None:
         ok, err = inject_to_terminal(transcript)
         if not ok and hand_off(db, req, err or "inject failed"):
             return   # only the Mac runs the orchestrator; another worker may reach it
-        db.patch(
-            "voice_requests",
-            f"id=eq.{rid}",
-            ({"status": "done", "result": "(injected to terminal)", "updated_at": now_iso()}
-             if ok else
-             {"status": "error", "error": err or "inject failed", "updated_at": now_iso()}),
-        )
+        finish(db, req, {"status": "done", "result": "(injected to terminal)"} if ok else
+               {"status": "error", "error": err or "inject failed"})
         return
 
     # Dedup: multiple always-on listeners (ESP + Mac) hear one utterance, so it lands as several requests
@@ -170,8 +162,7 @@ def process_request(db: Supabase, req: dict) -> None:
     # never runs twice. Only an always-on capture can be double-heard: a press, a watch command or a
     # typed message comes from one device on purpose, so it skips the check and the read it costs.
     if req.get("always_on") and _duplicate_of_recent(db, req):
-        db.patch("voice_requests", f"id=eq.{rid}",
-                 {"status": "done", "result": "(duplicate — dropped)", "updated_at": now_iso()})
+        finish(db, req, {"status": "done", "result": "(duplicate — dropped)"})
         log(f"dropped duplicate request {rid}: {transcript[:60]!r}")
         return
 
@@ -200,7 +191,8 @@ def process_request(db: Supabase, req: dict) -> None:
         ctx = recent_context()
         log(f"hub: fresh run + {len(ctx)} chars injected conversation" if ctx else "hub: fresh run (no prior context)")
 
-    _emit = _activity_emitter(db, req)
+    _emit = _activity_emitter()
+    _hold = lambda for_s=0.0, tool=None: hold(db, req, for_s, tool)  # noqa: E731 — the lease, renewed by this turn
 
     # Prompt directives ride only on the prompt handed to Claude, never shown in the thread. None of them
     # shapes how the reply is written: every surface renders the same markdown reply.
@@ -244,7 +236,7 @@ def process_request(db: Supabase, req: dict) -> None:
 
     result = _run_turn(db, req, prompt, ctx, manual=manual, fallback=fallback,
                        use_agent=use_agent, resume_id=resume_id, agent_cwd=ag["cwd"],
-                       read_dir=att_tmp if att_paths else None, on_event=_emit)
+                       read_dir=att_tmp if att_paths else None, on_event=_emit, hold=_hold)
 
     if att_tmp:
         shutil.rmtree(att_tmp, ignore_errors=True)   # staged photos served their turn
@@ -255,20 +247,16 @@ def process_request(db: Supabase, req: dict) -> None:
 
     _record_outcome(db, req, result, prompt, transcript=transcript, attachments=attachments,
                     manual=manual, ambient=ambient, fallback=fallback, session_agent=session_agent,
-                    on_event=_emit)
+                    on_event=_emit, hold=_hold)
 
 
-def _activity_emitter(db: Supabase, req: dict):
-    """The on_event callback for one turn's runner: narration and tool calls go to the hub's activity bar,
-    and the first tool call that CHANGES something marks the request acted (`req["_acted"]`, and
-    `acted_at` on the row). Until then a failed or orphaned turn can run again elsewhere without repeating
-    anything. Transient: none of it is stored in voice_messages."""
-    rid = req["id"]
+def _activity_emitter():
+    """The on_event callback for one turn's runner: narration and tool calls go to the hub's activity bar.
+    Transient: none of it is stored in voice_messages. Marking the request acted is the lease's job
+    (`claim.hold`), done before the tool runs rather than when it is reported."""
 
     # Surface tool calls live by pushing them straight to the hub's activity bar (transient — not
-    # stored in voice_messages, so they never appear in the conversation thread). The first one that
-    # CHANGES something marks the request acted (`req["_acted"]`, and `acted_at` on the row): until then
-    # a failed or orphaned turn can run again elsewhere without repeating anything.
+    # stored in voice_messages, so they never appear in the conversation thread).
 
     def _emit(kind, payload):
         if kind == "text":
@@ -282,10 +270,6 @@ def _activity_emitter(db: Supabase, req: dict):
             return
         name = str(payload.get("name") or "")
         short = name.rsplit("__", 1)[-1] if "__" in name else name
-        if not req.get("_acted") and not replay_safe(short):
-            req["_acted"] = True
-            threading.Thread(target=db.patch, daemon=True,
-                             args=("voice_requests", f"id=eq.{rid}", {"acted_at": now_iso()})).start()
         try:
             args = payload.get("input")
             argstr = json.dumps(args, ensure_ascii=False, separators=(",", ":")) if args else ""
@@ -358,7 +342,7 @@ def build_prompt(req: dict, transcript: str, *, ambient: bool, manual: bool) -> 
 
 
 def _run_turn(db: Supabase, req: dict, prompt: str, ctx: str, *, manual: bool, fallback: bool,
-              use_agent: bool, resume_id, agent_cwd: str, read_dir, on_event) -> dict:
+              use_agent: bool, resume_id, agent_cwd: str, read_dir, on_event, hold) -> dict:
     """Run the turn on the route its provenance and mode allow, and return the runner's result."""
     # Dispatch — one route, the same on every worker (Pi, Mac, and Fly, which holds its own subscription
     # token). Everything runs on the Claude SUBSCRIPTION; there is no paid path. A run that fails
@@ -376,19 +360,19 @@ def _run_turn(db: Supabase, req: dict, prompt: str, ctx: str, *, manual: bool, f
         # it can handle the command and see enough to say what is wrong. Never the --resume agent session.
         fb_prompt = (ctx or recent_context()) + prompt + fallback_directive(db, req["id"])
         result = run_subscription(
-            lambda: run_claude(fb_prompt, None, manual=manual, on_event=on_event,
+            lambda: run_claude(fb_prompt, None, manual=manual, on_event=on_event, hold=hold,
                                system_append=AGENT_SYSTEM + "\n\n" + SHARED_STATE_NOTE,
                                model="opus", cwd=os.path.expanduser("~")),
             "subscription Opus (fallback)")
     elif use_agent:
-        result = run_claude(prompt, resume_id, manual=manual, on_event=on_event,
+        result = run_claude(prompt, resume_id, manual=manual, on_event=on_event, hold=hold,
                             system_append=AGENT_SYSTEM + "\n\n" + SHARED_STATE_NOTE, model="opus",
                             cwd=agent_cwd)
     else:
         # The warm SDK client, not a per-command `claude -p`: that spawn (CLI + four stdio MCP servers)
         # measured 3.6s on the Pi before the model saw a token; the warm client pays it once.
         run_hub = lambda sdk: sdk.run(hub_prompt + NUTRITION_DIRECTIVE + TOOLS_DIRECTIVE, on_event=on_event,  # noqa: E731
-                                      manual=manual, read_dir=read_dir)
+                                      manual=manual, read_dir=read_dir, hold=hold)
         result = run_subscription(lambda: run_hub(SDK), "subscription hub")
         if result.get("ok"):
             SDK_CREDITS.close()   # the subscription answers again; the credits client has no more work
@@ -399,7 +383,7 @@ def _run_turn(db: Supabase, req: dict, prompt: str, ctx: str, *, manual: bool, f
             result = run_hub(SDK_CREDITS)
             result["_limit"] = True
             result["_engine"] = "credits"
-        if not result.get("ok") and not result.get("used_tools") and manual and codex_ready():
+        if not result.get("ok") and not result.get("used_tools") and manual and codex_ready() and hold(CODEX_TIMEOUT_S):
             log_error(f"Claude could not answer ({result.get('raw_error')}) — running the turn on Codex")
             push_activity("On Codex")
             result = {**run_codex(hub_prompt + NUTRITION_DIRECTIVE + TOOLS_DIRECTIVE, manual=manual), "_limit": result.get("_limit"),
@@ -410,9 +394,13 @@ def _run_turn(db: Supabase, req: dict, prompt: str, ctx: str, *, manual: bool, f
 
 
 def _record_outcome(db: Supabase, req: dict, result: dict, prompt: str, *, transcript: str, attachments: list,
-                    manual: bool, ambient: bool, fallback: bool, session_agent: bool, on_event) -> None:
-    """Write the turn back: the thread rows, the request's final state, or a hand-off to another worker."""
+                    manual: bool, ambient: bool, fallback: bool, session_agent: bool, on_event, hold) -> None:
+    """Write the turn back: the thread rows, the request's final state, or a hand-off to another worker.
+    Nothing here is written by a worker whose claim was taken back (`finish`)."""
     rid = req["id"]
+    if req.get("_lost"):
+        log(f"request {rid}: claim was taken back mid-turn; its outcome is the other worker's to write")
+        return
     text = (result.get("text") or "").strip()
 
     # The same net for __IGNORE__ on a turn the user MEANT. Only room-mic turns are taught the sentinel, but a
@@ -421,7 +409,7 @@ def _record_outcome(db: Supabase, req: dict, result: dict, prompt: str, *, trans
     # context to mimic; the prompt already carries DELIBERATE_DIRECTIVE.
     if not ambient and is_ignore(text) and not result.get("used_tools"):
         log("deliberate turn answered __IGNORE__ → clean re-run (no context)")
-        result = SDK.run(prompt + NUTRITION_DIRECTIVE + TOOLS_DIRECTIVE, on_event=on_event, manual=manual)
+        result = SDK.run(prompt + NUTRITION_DIRECTIVE + TOOLS_DIRECTIVE, on_event=on_event, manual=manual, hold=hold)
         text = (result.get("text") or "").strip()
 
     text, needs_read = take_read_marker(text)
@@ -443,51 +431,34 @@ def _record_outcome(db: Supabase, req: dict, result: dict, prompt: str, *, trans
     # say "do the one you ignored", and a following "answer my question" pointed at something that, as
     # far as the model could see, had never been said. Which is precisely what happened on 2026-08-28.
     if ambient and is_ignore(text):
-        push_activity("(ignored — likely noise)", "done")
-        db.post("voice_messages",
-                {"request_id": rid, "focus": "hub", "mode": msg_mode, "role": "user",
-                 "text": transcript, "done": True, "ignored": True, "worker": WORKER_ID})
-        db.patch("voice_requests", f"id=eq.{rid}",
-                 {"status": "done", "result": "(ignored: wake-word false positive)", "updated_at": now_iso()})
-        log(f"ignored likely false-positive (kept in thread): {transcript[:60]!r}")
-        maybe_auto_disable_wakefree()
+        if finish(db, req, {"status": "done", "result": "(ignored: wake-word false positive)"},
+                  [{"focus": "hub", "mode": msg_mode, "role": "user", "text": transcript, "done": True,
+                    "ignored": True, "worker": WORKER_ID}]):
+            push_activity("(ignored — likely noise)", "done")
+            log(f"ignored likely false-positive (kept in thread): {transcript[:60]!r}")
+            maybe_auto_disable_wakefree()
         return
 
-    # Real turn → now write the user bubble (deferred past the noise check), then close the activity bar.
-    db.post("voice_messages",
-            {"request_id": rid, "focus": "hub", "mode": msg_mode, "role": "user", "text": transcript,
-             "done": True, **({"attachments": attachments} if attachments else {})})
-    push_activity(text[:240], "done")  # close out the activity bar w/ the result (room for the full line)
-
+    # Real turn → the user bubble (deferred past the noise check) and the reply, written with the request's
+    # final state in one transaction.
+    user = {"focus": "hub", "mode": msg_mode, "role": "user", "text": transcript, "done": True,
+            **({"attachments": attachments} if attachments else {})}
     if result["ok"]:
-        db.post(
-            "voice_messages",
-            {"request_id": rid, "focus": "hub", "mode": msg_mode, "role": "assistant",
-             "text": text, "done": True, "worker": WORKER_ID, "needs_read": needs_read,
-             # Which engine wrote it, when not the subscription: the surfaces colour the reply by it
-             # (credits amber, Codex blue), so a fallback is visible on the reply itself.
-             **({"engine": result["_engine"]} if result.get("_engine") else {})},
-        )
-        db.patch(
-            "voice_requests",
-            f"id=eq.{rid}",
-            {"status": "done", "result": text, "updated_at": now_iso()},
-        )
-        log(f"done request {rid}: {text[:120]!r}")
-    else:
-        err = result.get("raw_error") or "unknown error"
-        # Still surface whatever assistant text we did get, if any.
-        if result.get("text"):
-            db.post(
-                "voice_messages",
-                {"request_id": rid, "focus": "hub", "mode": msg_mode, "role": "assistant",
-                 "text": take_read_marker(result["text"])[0], "done": True, "worker": WORKER_ID},
-            )
-        db.patch(
-            "voice_requests",
-            f"id=eq.{rid}",
-            {"status": "error", "error": err, "updated_at": now_iso()},
-        )
+        reply = {"focus": "hub", "mode": msg_mode, "role": "assistant", "text": text, "done": True,
+                 "worker": WORKER_ID, "needs_read": needs_read,
+                 # Which engine wrote it, when not the subscription: the surfaces colour the reply by it
+                 # (credits amber, Codex blue), so a fallback is visible on the reply itself.
+                 **({"engine": result["_engine"]} if result.get("_engine") else {})}
+        if finish(db, req, {"status": "done", "result": text}, [user, reply]):
+            push_activity(text[:240], "done")  # close out the activity bar w/ the result
+            log(f"done request {rid}: {text[:120]!r}")
+        return
+    err = result.get("raw_error") or "unknown error"
+    # Still surface whatever assistant text we did get, if any.
+    partial = ([{"focus": "hub", "mode": msg_mode, "role": "assistant", "done": True, "worker": WORKER_ID,
+                 "text": take_read_marker(result["text"])[0]}] if result.get("text") else [])
+    if finish(db, req, {"status": "error", "error": err}, [user, *partial]):
+        push_activity(text[:240], "done")
         log(f"ERROR request {rid}: {err}")
         alert_failure("request", err, f"Request {rid} ({transcript[:200]!r}) ENDED AS AN ERROR here: "
                       + ("it had already acted, so it was not handed on." if req.get("_acted") else
@@ -509,14 +480,11 @@ def one_iteration(db: Supabase) -> bool:
         except Exception:  # noqa: BLE001
             pass
         try:
-            db.patch(
-                "voice_requests",
-                f"id=eq.{req['id']}",
-                {"status": "error", "error": str(e), "updated_at": now_iso()},
-            )
+            finish(db, req, {"status": "error", "error": str(e)})
         except Exception:  # noqa: BLE001
             pass
     finally:
+        runstate._lease_deadline = 0.0   # nothing in flight: the heartbeat cannot call this worker stalled
         # /led-off must fire for EVERY command — the blink (ping_esp_led "blink") is universal, so the
         # off has to be too. Gating this to source=='fly' meant a Mac/web command blinked the ESP and
         # NEVER cleared it (e.g. a wake-word false positive: claimed → blink → dropped as noise →

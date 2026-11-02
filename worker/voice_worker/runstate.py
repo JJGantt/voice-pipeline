@@ -30,3 +30,8 @@ _holding = False
 
 
 _running = True
+
+
+# Monotonic moment the lease on the request in flight lapses; 0 with no request in flight. Past it the turn
+# has stopped renewing, so the heartbeat says `stalled` and the other workers stop deferring to this one.
+_lease_deadline = 0.0

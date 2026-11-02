@@ -185,6 +185,14 @@ STANDBY_CHECK_S = 60.0        # re-evaluate standby while idle this often (it on
 RECLAIM_SWEEP_S = 60.0        # orphan-claim sweep: a backstop for a worker that died mid-command
 
 
+# A claim's lease (`voice_requests.lease_until`): how long it outlives the turn's last sign of progress. The
+# turn extends it at claim, at the start of each run attempt by that attempt's own deadline, and on every
+# tool call, so it lapses only when the turn has stopped moving; the orphan sweep then takes it back even
+# though the owner's heartbeat thread is still beating. It must cover the longest stretch BETWEEN those
+# points (prompt building, photo downloads, the retry pauses), not a whole turn.
+LEASE_S = float(os.environ.get("LEASE_S", "120"))
+
+
 IDLE_POLL_DEGRADED_S = 2.0    # realtime down — polling is the only pickup path, stay snappy
 
 

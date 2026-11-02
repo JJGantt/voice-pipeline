@@ -128,6 +128,15 @@ def write_mcp_config(codex_sessions: bool = False) -> str:
     return path
 
 
+# What a turn does once its claim on the request has been taken back by another worker (claim.hold). Read
+# by the model as a tool's refusal, never by a person.
+LEASE_LOST_REASON = "This worker no longer holds this request; another worker has taken it over. Stop."
+
+
+LEASE_LOST_RESULT = {"session_id": None, "text": "", "result": "", "ok": False, "used_tools": False,
+                     "raw_error": "could not confirm this worker still holds the request", "_unheld": True}
+
+
 def _kill_group(proc) -> None:
     """Kill a run and everything it started. A grandchild holding stdout open would otherwise keep the
     stream reader from ever reaching EOF, and the claim with it."""
@@ -140,7 +149,7 @@ def _kill_group(proc) -> None:
             pass
 
 
-def run_claude(transcript: str, resume_session_id: str | None, *, manual: bool, on_event=None,
+def run_claude(transcript: str, resume_session_id: str | None, *, manual: bool, on_event=None, hold=None,
                system_append: str = "", model: str = "opus", cwd: str | None = None) -> dict:
     """Run the UNRESTRICTED Claude Code agent headless (`claude -p --dangerously-skip-permissions`) and
     STREAM its stream-json output, parsing events as they arrive. Full-agent mode and the watch's
@@ -152,6 +161,9 @@ def run_claude(transcript: str, resume_session_id: str | None, *, manual: bool, 
 
     on_event(kind, payload) fires live during the run so progress can be surfaced — on_event("tool",
     {"name", "input"}) for each tool call, on_event("text", ...) for narration a tool call followed.
+    `hold` is the request's lease: renewed for the whole run before it starts, and at every tool call,
+    where a claim taken back kills the run (this path has no fence to refuse the tool).
+
     Returns {"session_id", "text", "result", "ok", "raw_error"}.
     """
     if manual is not True:
@@ -175,6 +187,8 @@ def run_claude(transcript: str, resume_session_id: str | None, *, manual: bool, 
     if system_append:
         cmd += ["--append-system-prompt", system_append]
     timeout_s = AGENT_TIMEOUT_S
+    if hold and not hold(timeout_s):
+        return dict(LEASE_LOST_RESULT)
     if cwd and not os.path.isdir(cwd):   # a published path may not exist on the worker that runs it
         log(f"agent cwd {cwd!r} not present here; falling back to $HOME")
         cwd = os.path.expanduser("~")
@@ -185,6 +199,7 @@ def run_claude(transcript: str, resume_session_id: str | None, *, manual: bool, 
     raw_error = None
     proc = None
     timed_out = {"v": False}
+    lost = {"v": False}   # the claim was taken back mid-run
     t_spawn = t_init = t_first = None   # timing seams: spawn → MCP-ready (system init) → first model token
     n_tools = 0
 
@@ -256,6 +271,10 @@ def run_claude(transcript: str, resume_session_id: str | None, *, manual: bool, 
                     elif block.get("type") == "tool_use":
                         n_tools += 1
                         tname = block.get("name", "")
+                        if hold and not hold(0.0, tname):
+                            lost["v"] = True
+                            _kill_group(proc)
+                            break
                         if on_event:
                             try:
                                 if "".join(said).strip():
@@ -290,6 +309,8 @@ def run_claude(transcript: str, resume_session_id: str | None, *, manual: bool, 
                 f"gen+{n_tools}tools {gen} | total {t_end - t_spawn:.1f}s | "
                 f"model={model} resume={'y' if resume_session_id else 'n'} agent=y")
 
+        if lost["v"]:
+            return {**LEASE_LOST_RESULT, "session_id": session_id, "used_tools": True, "_unheld": False}
         if timed_out["v"]:
             return {"session_id": session_id, "text": "", "result": "",
                     "ok": False, "raw_error": f"claude timed out after {timeout_s}s"}
@@ -377,6 +398,7 @@ class SdkRunner:
         self._loop = None
         self._client = None
         self._manual = False   # the turn in flight was started by a press (is_manual); set by run()
+        self._hold = None      # the turn in flight's lease (claim.hold, bound to its request); set by run()
         self._used = False     # the warm client has run a turn since it connected, so needs a /clear
         self._lock = None      # serialises connects; created on the SDK loop
 
@@ -408,6 +430,15 @@ class SdkRunner:
             log(f"sdk runner: warm-up failed ({e}); the next turn connects")
 
     def gate(self, name: str, tool_input: dict) -> tuple[str, "str | None"]:
+        """The fence's decision (`_gate`), and for a tool it lets through, the lease: a worker whose claim
+        on the request was taken back runs nothing more for it. Checked last, because renewing for a tool
+        stamps `acted_at` and a denied tool acts on nothing."""
+        decision, reason = self._gate(name, tool_input)
+        if decision != "deny" and self._hold and not self._hold(0.0, name):
+            return "deny", LEASE_LOST_REASON
+        return decision, reason
+
+    def _gate(self, name: str, tool_input: dict) -> tuple[str, "str | None"]:
         """The fence's decision for one tool call on the turn in flight: ("allow" | "deny", reason) or
         ("pass", None) to leave it to the allow list. Enforced as a PreToolUse hook BEFORE any permission
         rule: this client is Claude Code, which also applies the host user's own settings, and the Mac's
@@ -560,6 +591,12 @@ class SdkRunner:
             pass
         threading.Thread(target=self.warm, name="sdk-warm", daemon=True).start()
 
+    def _held_attempt(self, transcript, on_event) -> dict:
+        """An attempt, started only once the lease is renewed to cover all of it."""
+        if self._hold and not self._hold(CLAUDE_TIMEOUT_S + 30):
+            return dict(LEASE_LOST_RESULT)
+        return self._attempt(transcript, on_event)
+
     def _attempt(self, transcript, on_event) -> dict:
         """One turn on the warm client. `used_tools` reports whether it acted before failing; a crash
         hides that, so it reports True — the conservative answer, since it only suppresses a retry."""
@@ -570,15 +607,16 @@ class SdkRunner:
             return {"session_id": None, "text": "", "result": "", "ok": False, "used_tools": True,
                     "raw_error": f"sdk run failed: {e}"}
 
-    def run(self, transcript, on_event=None, manual=False, read_dir=None) -> dict:
+    def run(self, transcript, on_event=None, manual=False, read_dir=None, hold=None) -> dict:
         """`manual` says the turn was started by a press (is_manual), which is what the fence reads for the
-        session and send tools; `read_dir` is where this turn's photos are. `manual` defaults to the
-        restrictive answer. Turns run one at a time, so a flag on the runner is exactly one turn's."""
+        session and send tools; `read_dir` is where this turn's photos are; `hold` is the request's lease,
+        renewed before each attempt and each tool. `manual` defaults to the restrictive answer. Turns run
+        one at a time, so a flag on the runner is exactly one turn's."""
         self._start_loop()
-        self._manual, self._read_dir = manual, read_dir
-        result = self._attempt(transcript, on_event)
-        if result.get("ok"):
-            return result
+        self._manual, self._read_dir, self._hold = manual, read_dir, hold
+        result = self._held_attempt(transcript, on_event)
+        if result.get("ok") or result.get("_unheld"):
+            return result   # an attempt never started leaves the warm client as it was
         # ANY failure leaves the warm process in an unknown state, so recycle it. Refusals are why the
         # recycle cannot be limited to timeouts and transport errors: the CLI answers "Sonnet 5 can't
         # help with this. Start a new session to continue." through the ORDINARY result path, and then
@@ -593,7 +631,7 @@ class SdkRunner:
         # Nothing was called, so re-running is side-effect free and keeps the turn on the subscription
         # instead of spending the caller's fallback. A genuinely refusable turn just fails twice, fast.
         log(f"sdk turn failed ({result.get('raw_error')}) — recycled warm client, retrying once")
-        retry = self._attempt(transcript, on_event)
+        retry = self._held_attempt(transcript, on_event)
         if not retry.get("ok"):
             self._recycle()   # the cold client failed too; don't hand the next turn a used one
         return retry

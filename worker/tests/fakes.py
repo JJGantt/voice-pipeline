@@ -126,6 +126,19 @@ class FakePostgrest:
         rows = rows[off:off + int(lim)] if lim else rows[off:]
         return rows
 
+    def _voice_finish(self, a: dict) -> bool:
+        """data-layer 00159's voice_finish: the thread rows and final state, only while the caller holds it."""
+        req = next((r for r in self.rows("voice_requests") if r.get("id") == a["p_id"]), None)
+        if not req or req.get("status") != "claimed" or req.get("claimed_by") != a["p_worker"] \
+                or req.get("claim_epoch") != a["p_epoch"]:
+            return False
+        for m in a.get("p_messages") or []:
+            self.insert("voice_messages", **{"request_id": a["p_id"], **m})
+        f = a["p_fields"]
+        req.update(status=f["status"], result=f.get("result", req.get("result")),
+                   error=f.get("error", req.get("error")), lease_until=None, updated_at=iso(datetime.now(timezone.utc)))
+        return True
+
     def handle(self, request: httpx.Request) -> httpx.Response:
         u = urlsplit(str(request.url))
         if u.hostname != SUPABASE_HOST:
@@ -144,6 +157,8 @@ class FakePostgrest:
         if request.method == "GET":
             return httpx.Response(200, json=self._select(table, params))
         body = json.loads(request.content or b"null")
+        if table == "rpc/voice_finish":
+            return httpx.Response(200, json=self._voice_finish(body))
         if request.method == "PATCH":
             hit = self._select(table, [p for p in params if p[0] not in ("order", "limit")])
             for r in hit:
