@@ -247,7 +247,7 @@ in `server.py`): `wakefree_enabled` (→ load ECAPA + capture mode), `voice_mute
 `voice_inject_mode`, `voiceid_threshold`/`wakefree_pause_s`/`voiceprint`. A server restart or a
 sleeping Mac cannot strand the ESP in the wrong mode — it restores itself from the DB.
 - The Mac listener still mirrors these to the ESP over HTTP (`/wakefree-on|off`, `/capture-off|on`,
-  each with `?token=<LED_TOKEN>`) as a **redundant fast-path**, and still does the Mac-local work (mic handoff,
+  each with `LED_TOKEN` in an `X-Token` header) as a **redundant fast-path**, and still does the Mac-local work (mic handoff,
   start/stop `wakefree.py`). But that bridge is no longer load-bearing — if the Mac is off, Fly already
   has the state. (The LED is likewise host-independent: the worker that drives it fails over Fly→Pi→Mac.)
 

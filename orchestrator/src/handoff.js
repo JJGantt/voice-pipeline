@@ -57,10 +57,9 @@ export function sweepStashedPrompts(maxAgeMs = 30 * 86400000) {
 async function fetchAttachment(name) {
   if (!/^[\w.-]+$/.test(String(name || ''))) throw new Error(`unusable attachment name: ${name}`);
   fs.mkdirSync(PROMPT_DIR, { recursive: true, mode: 0o700 });
-  // `?token=` — the same way everything else here reaches the hub (see sessionWatch). The X-Hub-Token
-  // header is the derived one the iOS app carries, and this token is not that.
-  const r = await fetch(`${config.HUB_URL}/api/attachment?path=${encodeURIComponent(name)}`
-                        + `&token=${encodeURIComponent(config.HUB_TOKEN)}`);
+  // The kiosk token in the X-Hub-Token header, never the URL (status-hub accepts it there).
+  const r = await fetch(`${config.HUB_URL}/api/attachment?path=${encodeURIComponent(name)}`,
+                        { headers: { 'X-Hub-Token': config.HUB_TOKEN } });
   if (!r.ok) throw new Error(`attachment ${name}: ${r.status}`);
   const file = path.join(PROMPT_DIR, name);
   fs.writeFileSync(file, Buffer.from(await r.arrayBuffer()), { mode: 0o600 });

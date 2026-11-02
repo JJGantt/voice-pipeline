@@ -2,7 +2,7 @@
 // Voice orchestrator daemon.
 //
 // HTTP + WS server (bound 0.0.0.0:PORT so the Pi can reach it over LAN/Tailscale).
-// Every request is token-gated (?token= or X-Token). Endpoints:
+// Every request is token-gated (X-Token header, src/auth.js). Endpoints:
 //   GET  /term     (websocket)  pipe the active pty <-> client bytes
 //   POST /inject   ({text,submit?}) write text (and optional Enter) to active pty
 //   GET  /health   ok
@@ -14,6 +14,7 @@ import http from 'node:http';
 import { createRequire } from 'node:module';
 import { WebSocketServer } from 'ws';
 import { config } from './config.js';
+import { authed } from './auth.js';
 import { attachClient, handleClientMessage, inject, hasActive } from './pty.js';
 import { startFocusWatcher } from './focus.js';
 import { startRegistry } from './registry.js';
@@ -30,24 +31,12 @@ ops.install({ machine: 'mac', service: 'orchestrator' });
 setInterval(() => ops.beat(60), 60e3);
 ops.beat(60);
 
-// ---- auth -----------------------------------------------------------------
-
-function tokenOf(req, url) {
-  const header = req.headers['x-token'];
-  if (header) return header;
-  return url.searchParams.get('token');
-}
-
-function authed(req, url) {
-  return tokenOf(req, url) === config.ORCH_TOKEN;
-}
-
 // ---- HTTP -----------------------------------------------------------------
 
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
 
-  if (!authed(req, url)) {
+  if (!authed(req, config.ORCH_TOKEN)) {
     res.writeHead(401, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'unauthorized' }));
     return;
@@ -121,7 +110,7 @@ const wss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  if (url.pathname !== '/term' || !authed(req, url)) {
+  if (url.pathname !== '/term' || !authed(req, config.ORCH_TOKEN)) {
     socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
     socket.destroy();
     return;

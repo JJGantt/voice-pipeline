@@ -64,8 +64,9 @@ export const config = {
   COMMAND_TTL_S: parseInt(process.env.COMMAND_TTL_S || '120', 10),
 };
 
-// terminal_url advertised to the TV/Pi when a real session is active. wss via Tailscale Serve
-// (TLS-terminated at the tailnet FQDN) so the HTTPS /tv page can open it without mixed-content.
+// terminal_url advertised in voice_focus when a real session is active: wss via Tailscale Serve
+// (TLS-terminated at the tailnet FQDN). Without the token, which a client sends as X-Token (src/auth.js):
+// voice_focus is a shared row in a realtime publication, not a place for a secret.
 export function terminalUrl() {
-  return `${config.TERM_BASE}/term?token=${config.ORCH_TOKEN}`;
+  return `${config.TERM_BASE}/term`;
 }

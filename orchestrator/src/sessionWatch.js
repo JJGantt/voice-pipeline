@@ -73,9 +73,9 @@ function takeExpect(sessionId, prompt) {
 async function push(body) {
   if (!config.HUB_URL || !config.HUB_TOKEN) return null;
   try {
-    const r = await fetch(`${config.HUB_URL}/api/session-activity?token=${encodeURIComponent(config.HUB_TOKEN)}`, {
+    const r = await fetch(`${config.HUB_URL}/api/session-activity`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Hub-Token': config.HUB_TOKEN },
       body: JSON.stringify(body),
       // Bounded: one session's pushes go one after another (send), so a request that never returned
       // would hold back every step and reply after it for as long as the process lived.

@@ -9,10 +9,10 @@ publishes the list of focusable sessions.
 voice_focus(id=1).focus ──realtime──▶ orchestrator   (60s poll = backstop; 10s while the socket is down)
    = 'hub'        → kill pty, re-open the desk Terminal tab, terminal_url = null
    = <session id> → close that desk tab, spawn `claude --resume <id>` in a pty,
-                    terminal_url = ws://MAC_HOST:PORT/term?token=ORCH_TOKEN
+                    terminal_url = wss://TERM_BASE/term
 
-xterm.js on Pi ──ws /term?token=──▶ active pty (bytes both ways, resizable)
-caller         ──POST /inject?token=── inject text (+optional Enter) into pty
+ws client      ──ws /term  (X-Token)──▶ active pty (bytes both ways, resizable)
+caller         ──POST /inject (X-Token)── inject text (+optional Enter) into pty
 ```
 
 ## Run
@@ -57,8 +57,9 @@ launchctl load ~/Library/LaunchAgents/com.jaredgantt.voice-orchestrator.plist
 ## HTTP / WS contract
 
 Server binds `0.0.0.0:PORT` so the Pi can reach it over LAN/Tailscale.
-**Every request requires the token** — `?token=<ORCH_TOKEN>` or `X-Token` header.
-Missing/wrong token → `401`.
+**Every request requires the token in an `X-Token` header** (`src/auth.js`). A token in the query string
+is not read: URLs end up in logs and in the `voice_focus` row. Missing/wrong token → `401`. A browser
+WebSocket cannot set that header, so `/term` is for header-capable clients only (Node `ws`, `websocat`).
 
 - `GET /term` (websocket) — pipes the **current active pty** ↔ client bytes.
   If there's no active pty the socket stays open and gets a one-line notice.
@@ -81,7 +82,7 @@ Missing/wrong token → `401`.
    `voice_focus.session_cwd` (fallback: the `cwd` recorded inside the session
    file). It replaces/kills any previous active pty and streams to `/term`
    clients (default 200×50, resizable).
-3. PATCH `voice_focus` id=1: `terminal_url = ws://MAC_HOST:PORT/term?token=...`.
+3. PATCH `voice_focus` id=1: `terminal_url = <TERM_BASE>/term` (no token in it).
 
 **focus = 'hub'**
 1. Kill the active pty.
