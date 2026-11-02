@@ -19,18 +19,12 @@ everywhere.
 | deploy | `fly-worker/deploy.sh` | `pull-repos` + service restart | `pull-repos` + launchd restart |
 
 The worker has a Fly app of its own because inside `jared-voice` every deploy of either the worker or
-the transcriber restarted both, and they shared one CPU.
+the transcriber restarts both, and they share one CPU.
 
-Turns claimed 2026-09-15 → 10-16, when the order was Pi first: Pi 191 (188 done, 3 error), Mac 1,
-Fly 20. Fly took its 20 turns in two incidents, never otherwise:
-
-- **2026-10-14 22:39Z → 10-15 01:28Z.** The Pi's worker was running but could not reach Supabase:
-  its journal shows `UPSERT worker_presence failed` with DNS failures (`Temporary failure in name
-  resolution`), TLS EOFs and read timeouts from 22:55Z on. Its heartbeat went stale and Fly claimed.
-- **2026-10-16 ~02:02Z → 02:51Z.** The Pi's CLI was gone: from 01:55Z every Opus escalation failed
-  with `No such file or directory: '/usr/local/bin/claude'` (the `~/.npm-global/bin/claude` link the
-  wrapper points at was re-created at 02:03:19Z, consistent with a self-update replacing it). Those
-  turns fell through to Fly. Part of this window was also failover testing by another session.
+In the month measured with the Pi first (Pi 191 turns, Mac 1, Fly 20), Fly claimed only during two
+Pi-side outages: the Pi's worker running but unable to reach Supabase (DNS failures, TLS EOFs, read
+timeouts, so its heartbeat went stale), and the Pi's `/usr/local/bin/claude` link missing while a CLI
+self-update replaced it, so its turns fell through.
 
 ## How Claude runs on each host
 
@@ -49,8 +43,8 @@ The code is the same everywhere; only the environment differs.
 - **Worker logs:** the Pi's are in `journalctl -u voice-worker` (retained back to 2026-10-02 when
   measured); the Mac's in `worker/worker.out.log` (back to June). Fly's are in `/data/worker.log`
   (everything the machine prints, trimmed daily to its last 50,000 lines); `fly logs -a
-  jared-voice-worker` holds only the last 100. Before the volume, a Fly restart erased its history,
-  which is why the Fly numbers below come from `voice_requests` rather than worker logs.
+  jared-voice-worker` holds only the last 100. The Fly numbers below come from `voice_requests`
+  rather than worker logs.
 - **No session host on Fly.** The machine runs `entrypoint.sh` and `worker.py` — no orchestrator, no
   desk host, and `worker_presence` has no Fly desk row. Its failures go to the ops responder like every
   worker's, which runs the investigation elsewhere. `start_session` still works from Fly because it is a database write that the Pi's or
@@ -143,40 +137,26 @@ What these say, and how far:
   was 3.9–4.0s on Fly against 2.9–6.8s on the Pi; what varies most is Anthropic's time to first
   token (2.0s and 10.5s on two otherwise identical Fly runs).
 - **Region does not favour any host.** Supabase is `West US (North California)`; Fly is `iad`, the
-  home machines are in Florida, and all three pay about 0.2s per new connection to it.
+  home machines are on the US east coast, and all three pay about 0.2s per new connection to it.
 - **These Fly numbers were taken on a vCPU shared with transcription**: `server.py` held ~225MB and ran
   Whisper / ECAPA on the same core (idle load average 0.2–0.3, ~1.5GB of the 2GB available). The worker
   now has its own machine; it has not been re-measured there.
 
-## The missing tools on 2026-10-14/15
+## Two constraints that keep MCP tools present on Fly
 
-Two turns claimed by Fly answered that a tool did not exist:
+A turn whose MCP server is missing answers that the tool does not exist. Two things prevent it
+(commit `3d881b2`):
 
-- 23:49:55Z, "Make the light, the floor lamp white and 30% brightness" → "I checked my available tools
-  and I don't actually have a working lighting-control function…"
-- 00:44:35Z, "114 grams of Honey Nut Cheerios…" → "I don't have a working nutrition-logging tool…"
-
-They had two separate causes. Both are recorded in commit `3d881b2` (2026-10-15 01:15Z), the fix the
-investigation session made:
-
-1. **No lights:** the image installed the `mcp` Python package unpinned, the rebuild for release v112
-   (2026-10-14 22:37Z) pulled 2.x, and 2.x removed `mcp.server.fastmcp`, so `govee_mcp.py` died on
-   import. The fix pins `mcp<2` in the Dockerfile. Fly has `mcp 1.30.0` now, and govee starts there
-   (table above).
-2. **No nutrition tool:** Claude Code under `-p` connects `--mcp-config` servers in the background, so
-   the model's first request carried only the servers that had finished starting. log_nutrition is
-   gated, so the turn ran on a fresh Opus spawn, and on Fly the data server (2.2s cold, measured above)
-   lost that race while the set-logging turns earlier that evening, on the warm client, had it. The
-   fix sets `alwaysLoad: true` on every server in `write_mcp_config()`, which makes the CLI connect
-   them before the first turn. Fly's 2.1.197 binary contains `alwaysLoad`.
-
-Both shipped to Fly as releases v113/v114 (2026-10-15 01:17Z / 01:21Z), after both failures. Since
-then Fly has run stage_meal, edit_staged and log_nutrition on escalated spawns (2026-10-16 02:02Z →
-02:24Z) without a missing tool. That is the evidence it is fixed; it is a handful of turns.
+1. **`mcp<2` is pinned in the Dockerfile.** `mcp` 2.x removed `mcp.server.fastmcp`, so `govee_mcp.py`
+   dies on import under it.
+2. **`alwaysLoad: true` on every server in `write_mcp_config()`.** Claude Code under `-p` connects
+   `--mcp-config` servers in the background, so the model's first request carries only the servers that
+   have finished starting; a slow one (the data server is 2.2s cold on Fly) loses that race. `alwaysLoad`
+   makes the CLI connect them before the first turn.
 
 **Still latent, not fixed:**
 
-- Nothing runs a tool check on Fly, so the next server that breaks there will again be found by Jared
+- Nothing runs a tool check on Fly, so the next server that breaks there will again be found by a user
   asking for something. `worker/tool-check.py` calls one read-only tool on every server
   `write_mcp_config()` registers, but it is not in the Fly image; shipping it and running it at worker
   start, with an alert on a failure, would catch this class.
@@ -185,8 +165,8 @@ then Fly has run stage_meal, edit_staged and log_nutrition on escalated spawns (
 
 ## Why Fly is primary
 
-Jared's weighting (2026-10-16): iMessage, Gmail and the feeder are rare enough that they do not count
-in this decision, so Fly lacking them does not count against it.
+Decision: iMessage, Gmail and the feeder are rare enough that they do not count in this decision, so
+Fly lacking them does not count against it.
 
 - **It answers the common turn faster**: 2.8s against the Pi's 4.4s on the same command, and Opus
   turns cost the same on both.
