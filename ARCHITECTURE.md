@@ -203,7 +203,7 @@ word, every source (Mac *and* ESP) gates on the enrolled voice; OFF → the wake
   other people are filtered for free (never transcribed); the worker's `__IGNORE__` directive drops any
   of the enrolled speaker's speech that isn't a command.
   - **N rises with how long the speaker has been talking** (`absent_misses()` in `wakefree.py`,
-    `_absent_misses()` in `server.py`): 1 miss (~2s of pause tolerated) for a short command, up to 5
+    `session.py` in the server, from `shared/endpointing.py`): 1 miss (~2s of pause tolerated) for a short command, up to 5
     (~4.8s) past ~32s of speech. A one-breath command should end the instant the speaker stops rather than
     record the room afterwards; a long dictated one is full of thinking-pauses, and cutting one in half
     loses the entire command — which costs far more than a few seconds of trailing silence.
@@ -215,7 +215,7 @@ word, every source (Mac *and* ESP) gates on the enrolled voice; OFF → the wake
     clean windows pass it, TV tops out ~0.18), stopping at silence, another voice, or 5s.
     `capture_start` moves back with it, so the worker's grouping and the data MCP's "when was it said"
     see the true start. `PREROLL_S`/`HISTORY_S`/`BACKFILL_*` are one setting written twice —
-    `server.py` and `wakefree.py`.
+    `server/voice_server/` and `wakefree.py`.
   - **The confirmed span is verified once more before anything is transcribed.** The live gate only
     ever scores 2s slices, and one slice over the confirm bar commits the capture, so a TV voice fluking a
     single slice past 0.30 would be transcribed and run a model turn that answers `__IGNORE__`. A longer
@@ -236,8 +236,8 @@ word, every source (Mac *and* ESP) gates on the enrolled voice; OFF → the wake
 ### State lives in the DB — every host reads it itself (the Mac is NOT the source of truth)
 `app_settings` (written by the hub) is the single source of truth. **Fly is the always-on host that
 runs the ESP precisely because the Mac is intermittent**, so the Fly server reads its own state
-straight from `app_settings` — on boot AND live via its own realtime subscription (`_settings_listener`
-in `server.py`): `wakefree_enabled` (→ load ECAPA + capture mode), `voice_muted` (→ global mute),
+straight from `app_settings` — on boot AND live via its own realtime subscription (`settings_sync.py`
+in `server/voice_server/`): `wakefree_enabled` (→ load ECAPA + capture mode), `voice_muted` (→ global mute),
 `voice_inject_mode`, `voiceid_threshold`/`wakefree_pause_s`/`voiceprint`. A server restart or a
 sleeping Mac cannot strand the ESP in the wrong mode — it restores itself from the DB.
 - The Mac listener still mirrors these to the ESP over HTTP (`/wakefree-on|off`, `/capture-off|on`,

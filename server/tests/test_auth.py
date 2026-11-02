@@ -19,6 +19,7 @@ os.environ.update({"GROQ_API_KEY": "x", "LED_TOKEN": "led-secret", "VERIFY_TOKEN
                    "VOICE_DEVICE_TOKEN": "device-secret", "SUPABASE_SERVICE_KEY": "k",
                    "SUPABASE_URL": "http://supabase.test", "OPS_TOKEN": "", "OPS_URLS": "http://127.0.0.1:9"})
 import server  # noqa: E402
+from voice_server import auth, config, routes, session  # noqa: E402
 
 
 class Req:
@@ -32,7 +33,7 @@ class Conn:
 
 
 def call(path, headers=None):
-    return asyncio.run(server.process_request(Conn(), Req(path, headers)))
+    return asyncio.run(routes.process_request(Conn(), Req(path, headers)))
 
 
 @pytest.mark.parametrize("path", ["/led-off", "/capture-on", "/wakefree-off", "/enroll-status"])
@@ -69,18 +70,18 @@ class WS:
 
 @pytest.mark.parametrize("ws", [WS(), WS("/ws/audio?token=device-secret"), WS(headers={"X-Device-Token": "nope"})])
 def test_device_socket_without_its_token_in_a_header_is_closed(ws):
-    asyncio.run(server.connection(ws))
+    asyncio.run(session.connection(ws))
     assert ws.closed == 1008
 
 
 def test_device_token_header_is_accepted():
-    assert server._client_token(WS(headers={"X-Device-Token": "device-secret"})) == "device-secret"
-    assert server._client_token(WS(headers={"Authorization": "Bearer device-secret"})) == "device-secret"
-    assert server._client_token(WS("/ws/audio?token=device-secret")) is None
+    assert auth.client_token(WS(headers={"X-Device-Token": "device-secret"})) == "device-secret"
+    assert auth.client_token(WS(headers={"Authorization": "Bearer device-secret"})) == "device-secret"
+    assert auth.client_token(WS("/ws/audio?token=device-secret")) is None
 
 
 @pytest.mark.parametrize("name", ["LED_TOKEN", "VERIFY_TOKEN", "VOICE_DEVICE_TOKEN"])
 def test_server_refuses_to_start_without_each_token(monkeypatch, name):
-    monkeypatch.setattr(server, name, "")
+    monkeypatch.setattr(config, name, "")
     with pytest.raises(SystemExit):
         asyncio.run(server.main())

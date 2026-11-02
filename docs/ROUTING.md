@@ -108,7 +108,7 @@ request becomes a `start_session`, where a browser exists. The reads (`get_shopp
 ## A command can arrive with two transcripts
 
 Both transcribers that feed the queue — the hub for the watch, phone and web (status-hub
-`/api/voice-command`) and `server/server.py` for the ESP (`transcribe_alt`) — run both Groq Whisper
+`/api/voice-command`) and `server/voice_server/transcribe.py` for the ESP (`transcribe_alt`) — run both Groq Whisper
 models on every command in parallel and store the second reading as `voice_requests.alt_transcript` when
 its words differ. The Mac's own listeners (`wakefree.py`, `mac-listener`) do not; they are disabled. The worker appends it to the
 prompt (`ALT_TRANSCRIPT_DIRECTIVE`), telling the model to act on whichever reading makes sense word by

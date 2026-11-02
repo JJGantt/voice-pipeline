@@ -70,7 +70,7 @@ time. Editing a copy is lost work; edit the source.
 
 - **`server/` → `jared-voice`**: the ESP wake-word/transcription server and the Govee inventory sync.
   `assemble.sh` copies `sync_devices.py` in from the govee-mcp checkout and `endpointing.py` from
-  `shared/`. `server/server.py` is the one file there that is genuinely source. Deploy with:
+  `shared/`. `server.py`, `voice_server/`, `tests/` and the deploy files are genuinely source. Deploy with:
 
       cd server && ./assemble.sh && flyctl deploy --now -a jared-voice
 

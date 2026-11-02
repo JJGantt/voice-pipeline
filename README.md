@@ -2,7 +2,7 @@
 
 ESP32 mic → Fly backend → wake word → Groq transcription. The pipeline ends at a
 **transcript string**; wiring that transcript into the rest of the system happens at
-the handoff seam (`handle_transcript()` in `server/server.py`).
+the handoff seam (`handle_transcript()` in `server/voice_server/lifecycle.py`).
 
 ```
 ESP32 (I2S mic) ──wss://jared-voice.fly.dev/ws/audio──▶  Fly: jared-voice
@@ -23,6 +23,30 @@ ESP32 (I2S mic) ──wss://jared-voice.fly.dev/ws/audio──▶  Fly: jared-vo
 - The same image also runs the Govee inventory sync (`entrypoint.sh`). The voice worker is not here;
   it is its own app, below.
 
+### Layout
+`server.py` is the entry point (logging, the ops reporter, `main()`); the rest is the `voice_server`
+package. Mutable state lives in one object per module that owns it (`esp.link`, `led.state`,
+`modes.state`, `voiceid.state`, `enroll.state`); per-capture state is local to `session.connection()`.
+
+| module | owns |
+|---|---|
+| `config` | environment configuration, read once |
+| `auth` | header token checks for the routes and the device socket |
+| `db` | Supabase REST URLs, service-key headers, the `app_settings` read |
+| `session` | one ESP socket: the frame loop and the capture state machine |
+| `wake` | the per-connection openWakeWord model |
+| `voiceid` | ECAPA, the shared voiceprint, verify and back-fill |
+| `enroll` | voiceprint enrollment from the ESP mic |
+| `transcribe` | Groq Whisper (with retry and OpenAI fallback) and the second reading |
+| `lifecycle` | the command's `voice_requests` row and the handoff seam |
+| `led` | the LED's precedence state machine and its realtime inputs |
+| `modes` | mute, inject, ESP off, wake-free, the governor brake |
+| `settings_sync` | the realtime subscription and its backstop poll |
+| `presence` | this ESP's `voice_presence` row: liveness beacon and "heard the speaker" |
+| `esp` | the live device socket, its drop and offline reporting |
+| `routes` | the HTTP control routes and `/verify` |
+| `audio`, `tasks` | PCM helpers; held fire-and-forget tasks |
+
 ## fly-worker/ (Fly app `jared-voice-worker`)
 - The voice worker (`worker/worker.py`, `WORKER_ID=fly`) alone on a `shared-cpu-1x` 2GB machine in
   `iad`. It claims first (`WORKER_PRIORITY=fly,pi,mac`); the Pi, then the Mac, are fallbacks
@@ -41,7 +65,7 @@ ESP32 (I2S mic) ──wss://jared-voice.fly.dev/ws/audio──▶  Fly: jared-vo
   the worker shares a CPU with transcription.
 
 ### The handoff seam
-`handle_transcript(text)` logs the transcript and, if `SUPABASE_URL` and
+`lifecycle.handle_transcript(text)` logs the transcript and, if `SUPABASE_URL` and
 `SUPABASE_SERVICE_KEY` are set, enqueues it into the Supabase `voice_requests` table
 (normally by PATCHing the row opened at capture-accept to `pending`, else an `INSERT`).
 Anon has no INSERT on `voice_requests`: a pending row is run by the worker as the owner with
