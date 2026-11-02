@@ -1,6 +1,6 @@
 # voice-id — speaker identification + wake-free voice
 
-Local speaker verification (is this Jared's voice?) and the **wake-free** capture mode it gates.
+Local speaker verification (is this the enrolled speaker?) and the **wake-free** capture mode it gates.
 Everything runs on-device; no audio leaves the machine. Model: **ECAPA-TDNN**
 (`speechbrain/spkrec-ecapa-voxceleb`), CPU, ~20 MB.
 
@@ -40,7 +40,7 @@ macOS mic input volume first; quiet audio scores lower.
 ## How verification works
 
 A captured utterance is trimmed to its voiced span, embedded, and scored as the **mean cosine to the
-top-3 closest exemplars**. `≥ voiceid_threshold` (hub setting, default 0.30) → Jared. Short/distant
+top-3 closest exemplars**. `≥ voiceid_threshold` (hub setting, default 0.30) → the enrolled speaker. Short/distant
 utterances carry less speaker signal, so they score lower — the fix is bank coverage (short + far
 exemplars) and a permissive threshold (the TV tops out ~0.20, so 0.30 still clears it; the worker's
 `__IGNORE__` filter is the backstop for anything ambient that slips through).
@@ -49,9 +49,9 @@ exemplars) and a permissive threshold (the TV tops out ~0.20, so 0.30 still clea
 
 `wakefree.py`: speech energy opens a capture (1.2s pre-roll) → ECAPA re-scores the trailing 2s every
 0.7s → confirmed = tracking, and the capture closes after consecutive non-confirms (more are tolerated
-the longer you have talked) → at accept it **back-fills** up to 5s of your voice from before the trigger
-(a noise-dropped capture that was really the start of your sentence) → the **whole clip is scored once
-more** and dropped under `voiceid_accept_threshold` (a TV voice that fluked one 2s slice) → Groq
+the longer the speaker has talked) → at accept it **back-fills** up to 5s of the speaker's voice from
+before the trigger (a noise-dropped capture that was really the start of the sentence) → the
+**confirmed span is scored once more** and dropped under `voiceid_accept_threshold` (a TV voice that fluked one 2s slice) → Groq
 transcribe → enqueue `voice_requests {source: mac}`. Never confirmed within 3.5s = dropped as the TV,
 before transcription. Toggled by `app_settings.wakefree_enabled`; the Mac listener owns the mic handoff
 (push-to-talk > wake-free > wake-word). See `../ARCHITECTURE.md` → "Wake-free mode".
@@ -60,7 +60,7 @@ before transcription. Toggled by `app_settings.wakefree_enabled`; the Mac listen
 
 - `wakefree_enabled` — on/off (the listener reacts live via realtime).
 - `voiceid_threshold` — the live 2s-slice match threshold (lower = more permissive).
-- `voiceid_accept_threshold` — the whole-clip bar at accept (default 0.22).
+- `voiceid_accept_threshold` — the confirmed-span bar at accept (default 0.22).
 - `wakefree_pause_s` — ESP server only (its energy fallback before the voiceprint loads); not read here.
 
 `wakefree.py` reads both thresholds at startup (a toggle off→on re-reads them).

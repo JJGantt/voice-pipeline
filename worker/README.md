@@ -36,8 +36,8 @@ routed once it gets here is `../docs/ROUTING.md`.
      against priority, until the window resets, the owner goes silent past
      `OWNER_GRACE_S`, or the owner reports itself degraded — a full-agent CLI session
      lives on one machine. A hub turn follows priority alone: it is a fresh run handed
-     the day's thread from the live state every worker holds, so pinning it bought
-     nothing and held commands on a slower worker for up to `session_reset_s`.
+     the day's thread from the live state every worker holds, so pinning it buys
+     nothing and would hold commands on a slower worker for up to `session_reset_s`.
    - **Degraded stands down:** a degraded worker does not claim while any other
      worker is healthy.
    - **Failover deadline (`failover_wait`):** a request still pending `FAILOVER_S`
@@ -97,8 +97,8 @@ routed once it gets here is `../docs/ROUTING.md`.
 ### Where to get the service key
 
 It's in the `data` MCP server's `env` block in `~/.claude.json`
-(`mcpServers.data.env.SUPABASE_KEY`), and hardcoded in
-`/Users/jaredgantt/repos/data-layer/src/client.ts`. The worker takes it **from
+(`mcpServers.data.env.SUPABASE_KEY`), and in data-layer's gitignored `.env`
+(which `data-layer/src/client.ts` loads). The worker takes it **from
 the `SUPABASE_KEY` env var only** — it does not read those files at runtime.
 `run.sh` requires you to export it.
 
@@ -183,7 +183,7 @@ cost ~0.7s before a turn could start; from memory they are microseconds.
 **Only an always-on capture is checked for a duplicate.** Two room mics can hear one utterance; a
 press, a watch command or a typed message comes from one device on purpose, so it skips
 `_duplicate_of_recent` and the read of the last 12 requests it costs. `session_reset_s` still bounds which
-worker owns the conversation in full-agent mode (affinity); it no longer bounds what the agent
+worker owns the conversation in full-agent mode (affinity); it does not bound what the agent
 remembers.
 
 The agent session resets only on a manual reset.
@@ -262,7 +262,7 @@ When a command fails on a worker (handed on, passed on unclaimed, or ended as an
 reports `<stage> · <class> · <error>` to the ops responder (`alert_failure`; health/responder/README.md),
 with the request and what became of it as the context the investigating agent is given. Class is one
 of `auth`/`billing`/`rate-limit`/`error`. The responder groups repeats into one incident, starts one
-agent for it and tells Jared; nothing in the worker throttles or dispatches. Overloaded, 5xx,
+agent for it and notifies the owner; nothing in the worker throttles or dispatches. Overloaded, 5xx,
 rate-limit and network errors are retried a few times before any of this; auth and billing are not.
 
 Every other failure the worker logs goes the same way: `log_error` prints the line and reports it.
