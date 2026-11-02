@@ -47,6 +47,9 @@ package. Mutable state lives in one object per module that owns it (`esp.link`, 
 | `routes` | the HTTP control routes and `/verify` |
 | `audio`, `tasks` | PCM helpers; held fire-and-forget tasks |
 
+Nothing blocking runs on the event loop: it carries the ESP's audio, so a synchronous HTTP call, model
+load or ECAPA encode there stalls the stream. Those go through `asyncio.to_thread` (or an async client).
+
 ## fly-worker/ (Fly app `jared-voice-worker`)
 - The voice worker (`worker/worker.py`, `WORKER_ID=fly`) alone on a `shared-cpu-1x` 2GB machine in
   `iad`. It claims first (`WORKER_PRIORITY=fly,pi,mac`); the Pi, then the Mac, are fallbacks

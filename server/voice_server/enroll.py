@@ -85,7 +85,7 @@ async def sample(pcm_i16, floor_raw: float, ws) -> None:
     prev_shape = None if bank is None else bank.shape
     merged = new if bank is None else np.vstack([bank, new]).astype(np.float32)
     voiceid.state.bank = merged
-    if _upload_voiceprint(merged):
+    if await asyncio.to_thread(_upload_voiceprint, merged):
         log.info("enroll: DONE — bank now %s (was %s; +%d from this mic), uploaded to app_settings",
                  merged.shape, prev_shape, new.shape[0])
     else:

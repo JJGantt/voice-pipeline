@@ -50,7 +50,8 @@ async def listen() -> None:
     if not db.configured():
         log.warning("settings listener: no supabase creds; ESP state will rely on the Mac bridge only")
         return
-    s = db.get_settings(_MODE_KEYS)
+    # The settings read is a blocking HTTP call: off the event loop, so it never stalls the audio socket.
+    s = await asyncio.to_thread(db.get_settings, _MODE_KEYS)
     for k in ("voice_muted", "wakefree_enabled", "voice_inject_mode", "wakefree_autooff_at", "esp_mic_enabled"):
         if k in s:
             modes.apply_setting(k, s[k])
@@ -74,7 +75,7 @@ async def listen() -> None:
             while sock.is_connected and (time.monotonic() - started) < SETTINGS_SOCKET_MAX_S:
                 await asyncio.sleep(SETTINGS_POLL_S)
                 try:
-                    _reconcile(db.get_settings(_MODE_KEYS))
+                    _reconcile(await asyncio.to_thread(db.get_settings, _MODE_KEYS))
                 except Exception as e:  # noqa: BLE001
                     log.warning("settings backstop poll failed: %s", e)
             log.info("settings listener recycling realtime socket (connected=%s)", sock.is_connected)

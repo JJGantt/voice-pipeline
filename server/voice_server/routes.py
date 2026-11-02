@@ -60,7 +60,7 @@ async def process_request(connection, request):
         if not obj or ".." in obj:
             return connection.respond(HTTPStatus.BAD_REQUEST, "p required\n")
         if not voiceid.ready():
-            voiceid.load()
+            await asyncio.to_thread(voiceid.load)   # model load + settings read: never on the event loop
         try:
             async with httpx.AsyncClient(timeout=20) as c:
                 r = await c.get(db.url(f"/storage/v1/object/{obj}"), headers=db.headers())
@@ -90,7 +90,7 @@ async def process_request(connection, request):
     if path.startswith("/wakefree-o"):    # /wakefree-on | /wakefree-off — global mode, bridged by the Mac listener
         on = path.startswith("/wakefree-on")
         if on and not modes.state.wakefree:
-            voiceid.load()
+            await asyncio.to_thread(voiceid.load)   # loaded before the mode flips, as before, without blocking the loop
             modes.state.wakefree = True
             log.info("wake-free ON (speaker-ID capture)")
         elif not on and modes.state.wakefree:

@@ -363,7 +363,8 @@ async def connection(ws):
                             utterance = bytearray()
                             continue
                 elif md.wakefree:
-                    sim = voiceid.verify(_arr)
+                    # One ECAPA encode of the whole utterance: off the event loop, like every other encode.
+                    sim = await asyncio.to_thread(voiceid.verify, _arr)
                     if sim < vid.thresh:
                         log.info("wake-free: not Jared (sim=%.2f) — dropped", sim)
                         led.state.capturing = False
