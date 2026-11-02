@@ -28,3 +28,4 @@ orchestrator/node_modules/
 
 # test venv (pytest + the worker/server deps), built by the README recipe
 .venv-test/
+.DS_Store
