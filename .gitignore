@@ -25,3 +25,6 @@ voice-id/wakefree.err.log
 
 # orchestrator dependencies: installed with `npm install` in orchestrator/, never committed
 orchestrator/node_modules/
+
+# test venv (pytest + the worker/server deps), built by the README recipe
+.venv-test/

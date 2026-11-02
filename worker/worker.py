@@ -158,10 +158,12 @@ HAS_MESSAGES = bool(MESSAGES_MCP_URL and MESSAGES_MCP_TOKEN)
 # Low-latency activity push to the status-hub server: transient "what the assistant is doing" events go
 # straight to the SSE clients (bypassing Supabase realtime) so the on-screen activity bar tracks
 # tool calls in real time. Authenticated by the hub's kiosk token, HUB_TOKEN, which comes from the
-# environment (worker/.env, a Fly secret on jared-voice-worker) and is never written in code.
+# environment (worker/.env, a Fly secret on jared-voice-worker) and is never written in code. It rides
+# the X-Hub-Token header, never the URL, where it would land in proxy logs.
 HUB_URL = os.environ.get("HUB_URL", "https://jared-status-hub.fly.dev").rstrip("/")
 HUB_TOKEN = os.environ.get("HUB_TOKEN", "")
-HUB_PUSH_URL = f"{HUB_URL}/api/voice-activity?token={HUB_TOKEN}" if HUB_TOKEN else ""
+HUB_PUSH_URL = f"{HUB_URL}/api/voice-activity" if HUB_TOKEN else ""
+HUB_HEADERS = {"X-Hub-Token": HUB_TOKEN}
 
 
 # Set for the duration of a FALLBACK command (`process_request`): the hub is the thing that did not answer,
@@ -174,7 +176,8 @@ def push_activity(text: str, state: str = "tool") -> None:
     if not HUB_PUSH_URL or _hub_unreachable:
         return
     try:
-        httpx.post(HUB_PUSH_URL, json={"text": text, "state": state, "focus": "hub"}, timeout=2.0)
+        httpx.post(HUB_PUSH_URL, json={"text": text, "state": state, "focus": "hub"}, headers=HUB_HEADERS,
+                   timeout=2.0)
     except Exception:  # noqa: BLE001
         pass
 
@@ -256,7 +259,7 @@ def ping_esp_led(state: str) -> None:
     def _go():
         try:
             httpx.get(f"{LED_BASE_URL}/led-{state}",
-                      params={"token": LED_TOKEN} if LED_TOKEN else None, timeout=3.0)
+                      headers={"X-Token": LED_TOKEN} if LED_TOKEN else None, timeout=3.0)
         except Exception:  # noqa: BLE001
             pass
     threading.Thread(target=_go, daemon=True).start()
@@ -1695,6 +1698,9 @@ def report_usage(info: dict) -> None:
     threading.Thread(target=_go, name="usage-report", daemon=True).start()
 
 
+GATED_REASON = "That tool is not available to this assistant."
+
+
 class SdkRunner:
     """Warm Claude Agent SDK client — every hub turn runs here, billed to the subscription.
 
@@ -1748,12 +1754,38 @@ class SdkRunner:
         except Exception as e:  # noqa: BLE001
             log(f"sdk runner: warm-up failed ({e}); the next turn connects")
 
+    def gate(self, name: str, tool_input: dict) -> tuple[str, "str | None"]:
+        """The fence's decision for one tool call on the turn in flight: ("allow" | "deny", reason) or
+        ("pass", None) to leave it to the allow list. Enforced as a PreToolUse hook BEFORE any permission
+        rule: this client is Claude Code, which also applies the host user's own settings, and the Mac's
+        pre-approve every data, gmail and messages tool in auto mode; with allowed_tools alone a room-mic
+        turn sent an email in the first test of the send rule. A hook's deny outranks any allow rule."""
+        exact = set(self.tools)
+        servers = tuple(t + "__" for t in self.tools if t.startswith("mcp__") and t.count("__") == 1)
+        if name in SESSION_START_TOOLS and not self._manual:
+            # No session from a turn a microphone started by itself (is_manual). Fails closed: the flag is
+            # False unless run() was told this turn was pressed.
+            return "deny", ("Starting or messaging a Claude session is off for commands a microphone heard "
+                            "by itself. It has to come from the button on his phone or watch, or be typed.")
+        if name in SEND_TOOLS and name in exact:
+            # The client is warm across turns, so only the flag run() sets can say which mic this was.
+            if self._ambient:
+                return "deny", ("Sending texts and email is off for the always-on room mics. "
+                                "He can send it with the button on his phone or watch, or by typing it.")
+            return "allow", None
+        if name == "Read":   # photo turns only: the CLI views an image by reading its file
+            path = os.path.realpath(str((tool_input or {}).get("file_path") or ""))
+            if self._read_dir and path.startswith(os.path.realpath(self._read_dir) + os.sep):
+                return "allow", None
+            return "deny", "Read is only for the photos attached to this message."
+        if name in exact or name.startswith(servers):
+            return "pass", None
+        return "deny", GATED_REASON
+
     async def _connect(self):
         from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions, HookMatcher, PermissionResultDeny
 
-        gated = "That tool is not available to this assistant."
-        exact = set(self.tools)
-        servers = tuple(t + "__" for t in self.tools if t.startswith("mcp__") and t.count("__") == 1)
+        gated = GATED_REASON
 
         def _decide(decision, reason=None):
             out = {"hookEventName": "PreToolUse", "permissionDecision": decision}
@@ -1762,32 +1794,8 @@ class SdkRunner:
             return {"hookSpecificOutput": out}
 
         async def _fence(input_data, tool_use_id, context):  # noqa: ARG001
-            # The allow list, enforced BEFORE any permission rule. This client is Claude Code, which also
-            # applies the host user's own settings — and the Mac's pre-approve every data, gmail and
-            # messages tool in auto mode; with allowed_tools alone a room-mic turn sent an email in the
-            # first test of the send rule. A hook's deny outranks any allow rule, so the list holds here.
-            name = input_data.get("tool_name") or ""
-            if name in SESSION_START_TOOLS and not self._manual:
-                # No session from a turn a microphone started by itself (is_manual). Fails closed: the
-                # flag is False unless run() was told this turn was pressed.
-                return _decide("deny", "Starting or messaging a Claude session is off for commands a "
-                                       "microphone heard by itself. It has to come from the button on his "
-                                       "phone or watch, or be typed.")
-            if name in SEND_TOOLS and name in exact:
-                # The one per-turn decision: the client is warm across turns, so only the flag run()
-                # sets can say which mic this turn came from.
-                if self._ambient:
-                    return _decide("deny", "Sending texts and email is off for the always-on room mics. "
-                                           "He can send it with the button on his phone or watch, or by typing it.")
-                return _decide("allow")
-            if name == "Read":   # photo turns only: the CLI views an image by reading its file
-                path = os.path.realpath(str((input_data.get("tool_input") or {}).get("file_path") or ""))
-                if self._read_dir and path.startswith(os.path.realpath(self._read_dir) + os.sep):
-                    return _decide("allow")
-                return _decide("deny", "Read is only for the photos attached to this message.")
-            if name in exact or name.startswith(servers):
-                return {}
-            return _decide("deny", gated)
+            decision, reason = self.gate(input_data.get("tool_name") or "", input_data.get("tool_input") or {})
+            return {} if decision == "pass" else _decide(decision, reason)
 
         async def _deny(tool_name, tool_input, context):  # noqa: ARG001
             # Reached only by a tool the fence let through without pre-approval; there is none today.
@@ -2033,7 +2041,7 @@ def inject_to_terminal(text: str) -> tuple[bool, str | None]:
     try:
         r = httpx.post(
             f"{ORCH_URL}/inject",
-            params={"token": ORCH_TOKEN},
+            headers={"X-Token": ORCH_TOKEN},
             json={"text": text, "submit": True},
             timeout=10.0,
         )
