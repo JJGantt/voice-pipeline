@@ -98,7 +98,13 @@ async function deliver(row, text, { expect = null, cmd = null } = {}) {
   if (!row) throw new Error('no such session');
   if (!row.tty) throw new Error(`no terminal recorded for ${row.id}`);
   const s = sessionFor(row);
-  if (s?.waiting) throw new Error(`${row.id} is waiting on a ${s.waiting} — not typing into it`);
+  if (s?.waiting) {
+    // Expected, not a fault: the sender is told and the words are dead-lettered for a retry, so drain()
+    // logs this as a warning rather than opening an incident.
+    const e = new Error(`${row.id} is waiting on a ${s.waiting} — not typing into it`);
+    e.expected = true;
+    throw e;
+  }
   const tpath = s?.transcriptPath || row.transcript_path || null;
   const from = tpath ? transcriptSize(tpath) : 0;
   if (cmd) expectPrompt(row.id, text, cmd);
@@ -367,7 +373,7 @@ async function drain() {
       try {
         await finishCommand(cmd.id, 'done', await run(cmd));
       } catch (e) {
-        console.error('[commands] failed:', e.message);
+        (e.expected ? console.warn : console.error)('[commands] failed:', e.message);
         await finishCommand(cmd.id, 'error', e.message);
         await deadLetterCommand(cmd, e.message).catch((err) => console.error('[commands] dead letter:', err.message));
       }

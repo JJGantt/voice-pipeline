@@ -331,7 +331,9 @@ they confirm it is one contract, in `orchestrator/src/handoff.js`:
   unconfirmed command fails and is dead-lettered with his words. Typing reports nothing on its own —
   text can sit unsent in the composer, or vanish, while the call that typed it succeeds.
 - **A session waiting on a permission prompt is refused.** The keys would go to the dialog and the Enter
-  would answer it. The state comes from the session's record (`waiting` in `discover.js`).
+  would answer it. The state comes from the session's record (`waiting` in `discover.js`). The refusal
+  is logged as a warning, not an error: the sender is told and the words are dead-lettered for a retry,
+  so it must not open an ops incident.
 - **Pictures** in a command's `payload.attachments` are fetched from the hub on the machine that owns
   the session and named in the prompt (`withAttachments`), for `follow_up`, `resume_session` and
   `open_session` alike, on both machines.
