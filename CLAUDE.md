@@ -3,8 +3,8 @@
 ## There is one route
 
 Every hub turn, photos included, runs on **Opus at its default effort** (`HUB_MODEL` / `HUB_EFFORT`)
-with the full toolset, on the warm SDK client. There is no fast first responder and no escalation —
-Jared's call for quality over speed. Read `docs/ROUTING.md` before touching the worker's routing (`worker/voice_worker/process.py`): it
+with the full toolset, on the warm SDK client. There is no fast first responder and no escalation:
+quality is chosen over latency. Read `docs/ROUTING.md` before touching the worker's routing (`worker/voice_worker/process.py`): it
 covers what every turn is told, how sends are fenced per mic, and what to get right if a faster split
 is ever rebuilt (gate by omission from an allow list, never `--disallowedTools`).
 
@@ -36,8 +36,8 @@ usage limit (`limit_refused`: the turn's `rate_limit_event` said `rejected`, or 
 your 5-hour limit"). It re-runs on `SDK_CREDITS`, a second warm client billed to `ANTHROPIC_API_KEY`,
 which the Max plan's monthly Console credits pay for. It is not handed to another worker, since every
 worker shares the account. Nothing a microphone heard by itself is re-run there, wake-word captures and
-the watch's and phone's listeners included: judging room noise on the key is what drained the Console
-balance once. `SDK_CREDITS` connects on first use and closes on the next turn
+the watch's and phone's listeners included: judging room noise on the key drains the Console
+balance. `SDK_CREDITS` connects on first use and closes on the next turn
 the subscription answers.
 
 The CLI and the Agent SDK silently prefer the key over the subscription login, so the worker (`voice_worker/config.py`) pops it
@@ -47,7 +47,7 @@ strips it separately (it sources the worker's `.env` itself). Fly holds it as a 
 
 When Claude cannot answer at all (the subscription failed for any other reason, or the credits run
 failed too), a manual hub turn that called no tool is re-run on Codex (`run_codex`: `codex exec`
-on Jared's ChatGPT plan, the same MCP servers, read-only sandbox, prompt on stdin),
+on the owner's ChatGPT plan, the same MCP servers, read-only sandbox, prompt on stdin),
 on any worker where `codex_ready()` (the binary plus a login in `CODEX_HOME`). Each machine needs its own
 `codex login --device-auth`: one ChatGPT login copied to two machines breaks when either rotates its
 refresh token.
@@ -80,8 +80,8 @@ time. Editing a copy is lost work; edit the source.
 
       fly-worker/deploy.sh
 
-  The worker is in an app of its own because, sharing `jared-voice`, a deploy of either restarted
-  both and the worker shared one CPU with transcription.
+  The worker is in an app of its own because, sharing `jared-voice`, a deploy of either restarts
+  both and the worker shares one CPU with transcription.
 
 Both scripts take the checkouts from `~/repos/...` on the Mac and `~/data-layer` / `~/mcp-govee` on the
 Pi. Over SSH the Mac's flyctl has no token (its login is not reachable from a non-interactive shell), so
@@ -93,7 +93,7 @@ a deploy started from the Pi runs on the Pi, with `FLY_API_TOKEN=$(cat ~/.fly/to
 The ESP and the Mac hear the same sentence, and the worker collapses the pair by *recording-window
 overlap* (`_duplicate_of_recent`), keeping whichever arrived first. That only holds while the two agree
 on where the sentence started and ended, so every value that decides a capture's span (the VAD window
-and cadence, the absent-miss ramp, the no-Jared abort, `PREROLL_S`, `HISTORY_S`, the `BACKFILL_*`
+and cadence, the absent-miss ramp, the no-owner abort (`VAD_NO_JARED_ABORT_S`), `PREROLL_S`, `HISTORY_S`, the `BACKFILL_*`
 constants and the whole-clip accept defaults) lives once, in `shared/endpointing.py`, which
 `voice-id/wakefree.py` imports and `server/assemble.sh` copies into the Fly build context. Change it
 there; a value redefined locally in either file reopens the failure below. `VAD_FIRST_CHECK_S` is
@@ -116,8 +116,8 @@ Realtime is the pickup path everywhere here; every poll cadence is a backstop an
 `isHealthy()` says realtime is down. At 1s the three workers cost ~280k empty reads a day against the
 free-plan quota. If pickup feels slow, fix the subscription — do not shorten the poll.
 
-**An idle cycle asks ONE question: is anything pending?** `IDLE_POLL_S` is 60s. The two other reads it
-used to make — "does a live context window belong to someone else?" (`should_defer` → `context_owner`)
+**An idle cycle asks ONE question: is anything pending?** `IDLE_POLL_S` is 60s. Two other reads —
+"does a live context window belong to someone else?" (`should_defer` → `context_owner`)
 and "are there orphaned claims?" (`reclaim_stale`) — answer nothing while there is nothing to claim, so
 `claim_one` reads `pending` FIRST and those two run on their own 60s clocks. Deferring is still decided
 fresh, before any claim, the instant something IS pending. Putting either back on the cycle costs
@@ -171,15 +171,14 @@ only spend its timeout. Status-hub `docs/WATCH.md` § When the hub does not answ
 ## Reading a session: two handles, two columns
 
 `desk_sessions.tty` reaches a Mac session (its Terminal tab); `transcript_path` reads what any session
-said. They were one column once, and a Mac row's "transcript path" was really a tty — which is why
-nothing could read a Mac session's replies.
+said. A tty is not a transcript path; keep the two apart.
 
 ## A process's conversation is read from Claude Code's own record — never matched or guessed
 
 (For a Codex session it is read from the rollout file its process holds open — `orchestrator/src/codex.js`.
 The same rule holds: read, never inferred from which rollout is newest.)
 
-The Mac recognises `claude` processes it did not start — a terminal Jared opened himself — and
+The Mac recognises `claude` processes it did not start — a terminal opened by hand — and
 publishes them into `desk_sessions` with `origin='adopted'`, so liveness and the last reply work the
 same for everything running. Adoption writes only `desk_sessions`, never `desk_focus`: unpinned, focus
 is computed from activity (`active_at`), not stored.
@@ -189,9 +188,9 @@ for every live process: the conversation id (the transcript's filename) and the 
 rewrites the id on `/clear`, deletes the file when the process exits, and says whether a turn is in flight
 and since when — the source of `working` and `active_at`. `orchestrator/src/discover.js`
 reads it on both machines; on the Pi the tmux pane's pid is claude's because `launch.sh` `exec`s it.
-Do not go back to matching transcripts by birth time or recency: every session in the home directory
-shares one project directory, so each new session there looked like a `/clear` of every older one —
-336 rebinds against 42 adoptions, and rows reported saying each other's words.
+Do not match transcripts by birth time or recency: every session in the home directory shares one
+project directory, so each new session there looks like a `/clear` of every older one, and rows end up
+reporting each other's words.
 
 A row belongs to a PROCESS (`pid`), not a Terminal tab: a later `claude` in the same tab is a new row,
 and a row whose process has exited is closed. A process whose conversation already belongs to a row
@@ -205,28 +204,27 @@ Each tick reads the process's record again and rebinds the row to whatever conve
 resetting `mirror_offset` because the mirror is keyed by session id — and clearing the ABANDONED
 conversation's mirror (`mirrorReset`) as it goes. Nothing will ever point at those parts again: the row
 names a different conversation from that moment, so retention cannot reach them either. Without that
-they stay in the bucket for ever; 65 conversations and 104MB had accumulated by 2026-09-16. A session's NAME is refreshed
-every tick too, in order of authority: a name Jared chose himself beats the label the router wrote
-at dispatch, which beats Claude Code's own generated title.
+they stay in the bucket for ever. A session's NAME is refreshed every tick too, in order of authority:
+a name the user chose beats the label the router wrote at dispatch, which beats Claude Code's own
+generated title.
 
-He can choose it two ways, and they are the same act: `/rename <name>` typed into the session, or
+A user name is set two ways, and they are the same act: `/rename <name>` typed into the session, or
 ctrl-R in the session picker. Both make Claude Code write a `custom-title` record into the transcript,
 which is what gets read back here.
 
 **Renaming from the hub or by voice sends `/rename` into the live session** rather than writing that
-record ourselves. Tested both: appending the record directly works for everything that READS the
+record ourselves. Appending the record directly works for everything that READS the
 transcript, but the running session never re-reads its own file, so its terminal tab keeps the old
 title. `/rename` renames the session itself — tab included — and it writes the record for us.
 
 That order is the point. A generated title describes the content, so **two different sessions about
-the same subject get the same name** — 'Pull day workout log' is the title of nineteen transcripts
-here. The only reliable way to tell two apart is to name one.
+the same subject get the same name**. The only reliable way to tell two apart is to name one.
 
 **This is Mac-only on purpose.** A transcript only rolls when someone types `/clear`; COMPACTION does
 not roll it — it writes `compactMetadata` and `isCompactSummary` records into the same file (verified
 across the transcripts on disk). Pi sessions are headless in tmux with nobody typing in them, so
 there is nothing there to follow. Adding the same rebinding to `pi-desk` would be code for a case
-that cannot happen unless Jared attaches to the tmux session himself and clears it.
+that cannot happen unless someone attaches to the tmux session and clears it.
 
 ## Nothing in here is kept for ever
 
@@ -250,7 +248,7 @@ their conversation stops running (`pi-desk/scratch.js`): on the Pi `/tmp` is RAM
 lands in zram swap, and swap over `MAX_SWAP_PCT` holds every queued launch. A parked session resumes
 with an empty scratch directory.
 
-Dead letters are deliberately exempt: an unretried one holds words Jared may still want, and a
+Dead letters are deliberately exempt: an unretried one holds words the user may still want, and a
 retried or dismissed one is a decision worth keeping.
 
 ## Moving a session between machines
@@ -266,7 +264,7 @@ A session the Pi moves mid-turn is closed with C-c — for memory (`pi-desk` `on
 ITSELF because its work needs the Mac (the call is the step in flight). Both send `[Moved from the
 Pi]` as the prompt that restarts the turn, plus the moved note; without them the session resumes
 idle and the task stops. Claude Code
-records that as Jared rejecting the step it was on, with an instruction to stop and wait. On the way
+records that as the user rejecting the step it was on, with an instruction to stop and wait. On the way
 down `mirrorDown` rewrites those trailing records (`unmarkMoveInterrupt`) when the command says
 `moved` + `mid_turn`; without it the resumed session obeys the fake rejection and the work stops.
 
@@ -275,8 +273,7 @@ Mac, `/home/jaredgantt` on the Pi. `localize()` does it on the way down. Without
 session points at a directory that does not exist.
 
 **ONE WRITER, ALWAYS.** `claude --resume` on a transcript that is live elsewhere does not reattach —
-it starts a second process replaying the same file, and the two diverge with one id between them
-(measured: 11 records became 27 on the Pi while the Mac's copy stayed at 11). So a transfer is
+it starts a second process replaying the same file, and the two diverge with one id between them. So a transfer is
 claimed by the machine GIVING THE SESSION UP: it closes the session, flushes the last of the mirror,
 and only then enqueues `resume_mirrored` for the destination.
 
@@ -291,8 +288,8 @@ both machines) parks it once that turn's reply has been reported and the transcr
 status-hub `docs/SESSIONS.md` has the details.
 
 Closing a session on the Mac is `/exit` typed into the tab, then SIGTERM if it is ignored. A Terminal
-TAB does not understand AppleScript's `close` (it answers -1708), which is why `closeTabForTty` used
-to report failure and close nothing; the window is closed only when that tab is the last one in it.
+TAB does not understand AppleScript's `close` (it answers -1708), so `closeTabForTty` closes the
+window only when that tab is the last one in it.
 A dispatched session's launch command ends in `exit 0`, so when the session ends by any route its
 shell goes too: with the Terminal profile's "When the shell exits: Close if the shell exited cleanly"
 (set on the Mac) the tab closes itself, and `closeHuskForTty` is the net when it does not.
@@ -313,10 +310,10 @@ Both machines put a follow-up into a live session by typing it — the Mac into 
 they confirm it is one contract, in `orchestrator/src/handoff.js`:
 
 - **A message of any length is pasted as it is.** Past about 800 characters or 4 lines Claude Code wraps
-  input as `<pasted_content>`, and a session still answers it as his request — every long dictation he
-  pastes at the keyboard arrives that way. `transcripts.js` strips the tags so every surface shows only
-  his words. A running session's tty is raw, so nothing is cut (20,000 characters arrived intact on the
-  Mac), and tmux has no limit. Messages sent before this were stashed in `~/.claude-desk-prompts/` behind
+  input as `<pasted_content>`, and a session still answers it as the user's request (a long dictation
+  pasted at the keyboard arrives that way). `transcripts.js` strips the tags so every surface shows only
+  the user's words. A running session's tty is raw, so nothing is cut (20,000 characters arrived intact on the
+  Mac), and tmux has no limit. Older messages were stashed in `~/.claude-desk-prompts/` behind
   a read-this stub; `unstash`, `readsStash` and `dropEcho` remain only to render those turns, and go
   inert as the files are swept at thirty days.
 - **Whatever is typed goes inside bracketed-paste markers, and Enter follows as a keypress.** Without a
@@ -328,7 +325,7 @@ they confirm it is one contract, in `orchestrator/src/handoff.js`:
   `user` record at once when idle, and a `queue-operation` enqueue carrying the text at once when a turn
   is running — a busy session queues a typed message just as it does one from Remote Control, so there is
   nothing to wait for. Unconfirmed after 8s, the Pi presses Enter once more (the Mac does not); an
-  unconfirmed command fails and is dead-lettered with his words. Typing reports nothing on its own —
+  unconfirmed command fails and is dead-lettered with the user's words. Typing reports nothing on its own —
   text can sit unsent in the composer, or vanish, while the call that typed it succeeds.
 - **A follow-up to a session on a permission prompt is held, not typed.** The keys would go to the
   dialog and the Enter would answer it. The state comes from the session's record (`waiting` in
@@ -353,7 +350,7 @@ conversation forks into two copies with one id).
 a turn, identified by the transcript record whose `stop_reason` is `end_turn` — not "the last
 assistant text", which mid-turn is a half-written thought. And only the text after the turn's last tool
 call: text before one is narration, which `sessionWatch.js` streams as progress, and joined onto the
-reply it opened every answer and reply notification with "Checking X first...". `working` is what separates them: a reply
+reply it would open every answer and reply notification with "Checking X first...". `working` is what separates them: a reply
 is final only when `working` is false.
 
 It reads only the last 512KB. These files reach tens of megabytes — one project directory here holds
@@ -365,7 +362,7 @@ there is nothing to bring back.
 
 The Pi resumes one of its own sessions **under the name it had**: same tmux name, same Remote Control
 name, same row, flipped back to `resident`. The Remote Control name is the session's identity in the
-Claude app, and a fresh one made a reaped-and-resumed conversation show up there as a different
+Claude app, and a fresh one makes a reaped-and-resumed conversation show up there as a different
 session. The Mac still opens a resume as a new row with a new name.
 
 The Mac's `deskSessions.js` tick is still smaller than the Pi's: no memory admission. What it does do
@@ -375,15 +372,15 @@ and the last turn boundary (`active_at`), mirror the tail, and run the idle reap
 
 **The idle reaper (`idle.js`) parks a session the Mac only HOSTED** — dispatched (from the watch, the
 phone, the responder) and never typed into at the keyboard — once it has been idle 30 minutes
-(`IDLE_PARK_MS`), with its mirror complete and no Bash tool still running under it. A session he typed
-into at the Mac, or opened there himself (`origin = adopted`), is never parked; he closes it. The
+(`IDLE_PARK_MS`), with its mirror complete and no Bash tool still running under it. A session typed
+into at the Mac, or opened there by hand (`origin = adopted`), is never parked; the user closes it. The
 transcript records a keyboard prompt and a pasted-in one identically, so the orchestrator
 fingerprints every prompt it sends (`remote_inputs`, written BEFORE sending) and a human prompt
 matching none of them stamps `touched_at`, which is never cleared and survives a resume. Remote
 Control input from the Claude app is indistinguishable from the keyboard and counts as it, which
 errs toward keeping a session. Ticks never overlap: parking takes seconds per session, and an
-overlapping tick acting on rows read before the first wrote anything parked a session the first had
-just found typed into.
+overlapping tick acting on rows read before the first wrote anything would park a session the first
+had just found typed into.
 
 ## Tests
 

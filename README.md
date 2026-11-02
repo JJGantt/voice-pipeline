@@ -37,14 +37,14 @@ ESP32 (I2S mic) ──wss://jared-voice.fly.dev/ws/audio──▶  Fly: jared-vo
   claimed by `fly` before swapping the machine, because a turn running at the swap is orphaned and
   never answered. Secrets: `SUPABASE_URL`, `SUPABASE_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`,
   `GOVEE_API_KEY`, `LED_TOKEN`.
-- It is a separate app from `jared-voice` because, sharing one, a deploy of either restarted both and
-  the worker shared a CPU with transcription.
+- It is a separate app from `jared-voice` because, sharing one, a deploy of either restarts both and
+  the worker shares a CPU with transcription.
 
 ### The handoff seam
 `handle_transcript(text)` logs the transcript and, if `SUPABASE_URL` and
 `SUPABASE_SERVICE_KEY` are set, enqueues it into the Supabase `voice_requests` table
 (normally by PATCHing the row opened at capture-accept to `pending`, else an `INSERT`).
-Anon has no INSERT on `voice_requests`: a pending row is run by the worker as Jared with
+Anon has no INSERT on `voice_requests`: a pending row is run by the worker as the owner with
 every tool, so only server-side holders of the service key may write one. Downstream consumers read off that
 queue. It's best-effort and never raises.
 
