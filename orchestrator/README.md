@@ -96,7 +96,11 @@ WebSocket cannot set that header, so `/term` is for header-capable clients only 
    unsent paste; any check failing takes the new-window path. If Terminal has
    no window/isn't running, launch it and run there. The launchd daemon has no
    Accessibility grant, so the keystroke fails and this falls back to a new
-   window (`applescript.js` `runInNewTerminal`).
+   window (`applescript.js` `runInNewTerminal`). Every launch (this, a dispatch,
+   a resume, a move from the Pi, Codex) is checked once 30s later: the tty it was
+   typed into must be running a process carrying that launch's marker (its Remote
+   Control name, else its resume id), and `[launch] … did not start` goes to the
+   ops responder as an error when it is not (`checkLaunch`).
 3. PATCH `voice_focus` id=1: `terminal_url = null`.
 
 ## Session registry

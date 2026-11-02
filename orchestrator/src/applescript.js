@@ -300,9 +300,32 @@ async function runInNewTerminal(shellCmd) {
   }
 }
 
+// A launch is "done" the moment its command has been typed, which says nothing about whether anything
+// started: a launch line typed into a live session's input sat there unsent for 26 minutes while the
+// command reported success. So, once per launch, LAUNCH_CHECK_MS later, the tty it was typed into must
+// be running a process whose command line carries `marker` — something unique to this launch where
+// there is one — and an error goes to the ops responder when it is not.
+const LAUNCH_CHECK_MS = 30_000;
+function checkLaunch(raw, marker, what) {
+  const tty = String(raw).split('\t')[1] || '';
+  if (!tty) {
+    console.error(`[launch] ${what}: Terminal reported no tty, so whether it started cannot be checked`);
+    return raw;
+  }
+  setTimeout(() => {
+    // `ps -t` exits 1 when nothing is on the tty at all, which is the same answer as no match.
+    execFile('ps', ['-t', tty.replace(/^\/dev\//, ''), '-o', 'command='], (_err, out) => {
+      if (String(out || '').includes(marker)) return;
+      console.error(`[launch] ${what} did not start: ${LAUNCH_CHECK_MS / 1000}s after its command was typed into ${tty}, nothing there is running ${marker}`);
+    });
+  }, LAUNCH_CHECK_MS).unref();
+  return raw;
+}
+
 // Re-open a desk tab and resume the session "right where it was".
 export async function reopenDeskTab(cwd, id) {
-  return runInNewTerminal(`cd ${shQuote(cwd)}; ${shQuote(config.CLAUDE_BIN)} --model ${shQuote(config.DESK_MODEL)} --resume ${shQuote(id)}`);
+  const raw = await runInNewTerminal(`cd ${shQuote(cwd)}; ${shQuote(config.CLAUDE_BIN)} --model ${shQuote(config.DESK_MODEL)} --resume ${shQuote(id)}`);
+  return checkLaunch(raw, id, `resume of ${id}`);
 }
 
 // Start a FRESH session in `cwd` with Remote Control on, named after the repo (plus a unique
@@ -345,7 +368,9 @@ export async function openFreshTab(cwd, name, prompt, sessionId = null, resumeId
   // ends, however it ends, the shell goes too. With the profile's "When the shell exits: Close if the
   // shell exited cleanly" the tab then closes itself. Without that setting it is left as "[Process
   // completed]", which closeHuskForTty clears.
-  return runInNewTerminal(`cd ${shQuote(cwd)}; ${env}${shQuote(config.CLAUDE_BIN)}${model}${resume}${rc}${sys}${first}; exit 0`);
+  const raw = await runInNewTerminal(`cd ${shQuote(cwd)}; ${env}${shQuote(config.CLAUDE_BIN)}${model}${resume}${rc}${sys}${first}; exit 0`);
+  // The Remote Control name is unique to this launch; without one, the resumed id; failing both, claude.
+  return checkLaunch(raw, rcName || resumeId || config.CLAUDE_BIN, `session ${sessionId || rcName || cwd}`);
 }
 
 // A Codex session is started by the same launcher the Pi uses (pi-desk/launch-codex.sh): the flags that
@@ -356,8 +381,9 @@ const CODEX_LAUNCHER = new URL('../../pi-desk/launch-codex.sh', import.meta.url)
 export async function openCodexTab(cwd, name, prompt, sessionId, resumeId = null) {
   const pf = prompt ? promptFile(prompt) : '';
   // `exit 0` after it, for the reason given in openFreshTab.
-  return runInNewTerminal(`cd ${shQuote(cwd)}; DESK_MACHINE=mac ${shQuote(CODEX_LAUNCHER)} ${shQuote(cwd)} `
+  const raw = await runInNewTerminal(`cd ${shQuote(cwd)}; DESK_MACHINE=mac ${shQuote(CODEX_LAUNCHER)} ${shQuote(cwd)} `
     + `${shQuote(name || 'root')} ${shQuote(pf)} ${shQuote(resumeId || '')} ${shQuote(sessionId || '')}; exit 0`);
+  return checkLaunch(raw, 'codex', `Codex session ${sessionId || cwd}`);
 }
 
 /**
