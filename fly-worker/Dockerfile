@@ -21,10 +21,9 @@ RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 # (CODEX_HOME in fly.toml), signed in once on this machine with `codex login --device-auth`.
 RUN npm install -g @openai/codex@latest
 
-# `mcp<2`: govee_mcp.py imports mcp.server.fastmcp, which 2.x removed — an unpinned rebuild leaves the
-# worker with no lights tool and no error anywhere but the server's stderr.
-RUN pip3 install --no-cache-dir --break-system-packages \
-      httpx==0.27.2 realtime==2.31.0 claude-agent-sdk 'mcp<2' python-dotenv
+# worker/requirements.txt, assembled in by deploy.sh.
+COPY requirements.txt /app/requirements.txt
+RUN pip3 install --no-cache-dir --break-system-packages -r /app/requirements.txt
 
 # data MCP — build the TypeScript to dist/mcp.js
 WORKDIR /app/data-layer
@@ -49,7 +48,7 @@ RUN python3 -m venv /opt/gmail-venv && /opt/gmail-venv/bin/pip install --no-cach
 COPY gmail-mcp /app/gmail-mcp
 
 WORKDIR /app
-COPY worker.py ops_report.py entrypoint.sh ./
+COPY worker.py entrypoint.sh ./
 COPY voice_worker ./voice_worker
 
 # /data is the volume: transcripts (CLAUDE_CONFIG_DIR), the worker's log and its state survive restarts.

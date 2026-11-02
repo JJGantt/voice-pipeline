@@ -15,10 +15,12 @@ route, and `app_settings.wakefree_route` is likewise an inert leftover row.
 ## Errors are reported, not just printed
 
 The worker, the Fly voice server, `pi-desk` and the orchestrator send their failures and heartbeats to
-the ops responder (health/responder/README.md), where a new incident starts an agent. The reporters
-are copies of that repo's: `worker/ops_report.py`, `server/ops_report.py` and
-`orchestrator/src/ops_report.cjs` (which `pi-desk` also loads). Edit
-them there and copy them out. In the worker a failure is `log_error`, in the server `log.error`, in the
+the ops responder (health/responder/README.md), where a new incident starts an agent. The Python
+reporter is the `ops-report` package (github.com/JJGantt/ops-report), pinned to a tag in
+`worker/requirements.txt` and `server/requirements.txt`; moving to a new version is bumping both pins,
+reinstalling the Pi's `.venv-worker` and the Mac's `server/.venv`, and redeploying both Fly apps. The Node
+reporter is `orchestrator/src/ops_report.cjs` (which `pi-desk` also loads), a copy of that repo's
+`report/report.js`: edit it there and copy it out. In the worker a failure is `log_error`, in the server `log.error`, in the
 Node hosts `console.error`; `log` / `console.log` / `.catch(() => {})` are invisible to the responder and are only
 for a retry or fallback that is already handling it. The Fly session host reports errors but sends no
 heartbeat, because it sleeps whenever nothing runs.

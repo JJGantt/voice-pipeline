@@ -287,9 +287,9 @@ agent for it and notifies the owner; nothing in the worker throttles or dispatch
 rate-limit and network errors are retried a few times before any of this; auth and billing are not.
 
 Every other failure the worker logs goes the same way: `log_error` prints the line and reports it.
-`log` is for lines that only announce a retry or a fallback. realtime-py's own per-attempt `Connection attempt failed:` and socket-close records are re-levelled to WARNING (`_demote_realtime_retry`), since the library reconnects by itself; its `Connection failed permanently` still reports. The reporter is `ops_report.py`, a copy of
-health/responder's `report/report.py` (edit it there and copy it out); it reads `OPS_TOKEN` from the
-environment or `~/.config/ops/env`.
+`log` is for lines that only announce a retry or a fallback. realtime-py's own per-attempt `Connection attempt failed:` and socket-close records are re-levelled to WARNING (`_demote_realtime_retry`), since the library reconnects by itself; its `Connection failed permanently` still reports. The reporter is the `ops-report` package
+(github.com/JJGantt/ops-report), pinned in `requirements.txt`; it reads `OPS_TOKEN` and `OPS_URLS` from
+the environment or `~/.config/ops/env` (on Fly, both are app secrets).
 
 The worker's heartbeat to the responder rides the heartbeat thread but is sent only while the main loop
 has come round within `LOOP_STALL_S` (default 30 minutes, longer than any turn), so a wedged loop goes

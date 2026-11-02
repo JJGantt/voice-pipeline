@@ -3,5 +3,5 @@ mcp-voice/
 govee-mcp/
 worker.py
 gmail-mcp/
-ops_report.py
+requirements.txt
 voice_worker/

@@ -1,0 +1,10 @@
+# The worker's packages as the Fly image (fly-worker/Dockerfile) installs them. The Pi's .venv-worker and
+# the Mac's server/.venv hold the same packages at versions of their own; they take the ops-report line.
+httpx==0.27.2
+realtime==2.31.0
+claude-agent-sdk
+# govee_mcp.py imports mcp.server.fastmcp, which 2.x removed: an unpinned rebuild leaves the worker with
+# no lights tool and no error anywhere but the server's stderr.
+mcp<2
+python-dotenv
+ops-report @ https://github.com/JJGantt/ops-report/archive/refs/tags/v1.0.0.tar.gz

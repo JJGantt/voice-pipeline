@@ -24,7 +24,7 @@ COPY govee-mcp/sync_devices.py /app/govee-mcp/sync_devices.py
 
 # app code
 WORKDIR /app
-COPY server.py endpointing.py ops_report.py entrypoint.sh ./
+COPY server.py endpointing.py entrypoint.sh ./
 COPY voice_server ./voice_server
 
 EXPOSE 8080
