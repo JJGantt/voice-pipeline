@@ -33,6 +33,8 @@ let MACHINE = process.env.OPS_MACHINE || os.hostname();
 let SERVICE = process.env.OPS_SERVICE || path.basename(process.argv[1] || 'node');
 let SPOOL = process.env.OPS_SPOOL || '';
 const origError = console.error.bind(console);
+// Set by install() when this process is not the service it names; see there.
+let off = false;
 
 // The same message repeated inside a short window is sent once, with its count. A service failing
 // every few seconds is one problem; the responder counts it either way, this only spares the network.
@@ -46,6 +48,7 @@ function spoolAppend(kind, item) {
 }
 
 async function post(kind, items) {
+  if (off) return true;
   if (!TOKEN) return false;
   for (const u of URLS) {
     try {
@@ -111,6 +114,13 @@ function install(opts = {}) {
   MACHINE = opts.machine || MACHINE;
   SERVICE = opts.service || SERVICE;
   SPOOL = opts.spool || SPOOL;
+  // 'fly' names the live service, and Fly sets FLY_APP_NAME on every machine. Without it this is the
+  // same code loaded somewhere else (a script on the Mac requiring server.js), and it would file its
+  // failures, and its beats, as the live service's. So it sends nothing.
+  if (MACHINE === 'fly' && !process.env.FLY_APP_NAME) {
+    off = true;
+    origError(`[ops] ${SERVICE} names machine 'fly' but FLY_APP_NAME is unset: not reporting`);
+  }
   process.on('uncaughtException', fatal);
   process.on('unhandledRejection', (e) => fatal(e instanceof Error ? e : new Error(String(e))));
   console.error = (...args) => {
