@@ -19,7 +19,7 @@ from .live import agent_settings, get_focus, read_session, recent_context, sessi
 from .logs import _parse_ts, alert_failure, log, log_error, now_iso
 from .outbound import inject_to_terminal, ping_esp_led, push_activity
 from .presence import claude_unready, hand_off, replay_safe
-from .prompts import ADDRESSING_DIRECTIVE, AGENT_SYSTEM, ALT_TRANSCRIPT_DIRECTIVE, ATTACH_DIRECTIVE, DELIBERATE_DIRECTIVE, NO_SESSION_DIRECTIVE, NUTRITION_DIRECTIVE, READ_DIRECTIVE, ROOM_SEND_DIRECTIVE, SHARED_STATE_NOTE, SHARE_DIRECTIVE, TOOLS_DIRECTIVE, is_ignore, take_read_marker
+from .prompts import ADDRESSING_DIRECTIVE, AGENT_SYSTEM, ALT_TRANSCRIPT_DIRECTIVE, ATTACH_DIRECTIVE, DELIBERATE_DIRECTIVE, NO_PRESS_DIRECTIVE, NUTRITION_DIRECTIVE, READ_DIRECTIVE, SHARED_STATE_NOTE, SHARE_DIRECTIVE, TOOLS_DIRECTIVE, is_ignore, take_read_marker
 from .runners import SDK, SDK_CREDITS, codex_ready, limit_refused, run_claude, run_codex, run_subscription, set_cmd_ts
 
 
@@ -242,7 +242,7 @@ def process_request(db: Supabase, req: dict) -> None:
             prompt += ("\n\n[The user attached photo(s), but they could not be retrieved — tell them "
                        "that briefly instead of guessing at the contents.]")
 
-    result = _run_turn(db, req, prompt, ctx, manual=manual, ambient=ambient, fallback=fallback,
+    result = _run_turn(db, req, prompt, ctx, manual=manual, fallback=fallback,
                        use_agent=use_agent, resume_id=resume_id, agent_cwd=ag["cwd"],
                        read_dir=att_tmp if att_paths else None, on_event=_emit)
 
@@ -345,11 +345,11 @@ def build_prompt(req: dict, transcript: str, *, ambient: bool, manual: bool) -> 
                + ", seconds included — to the logging tool explicitly rather than omitting it — the tool's own clock may not be wherever "
                "this was actually said/typed.]")
     if ambient:
-        prompt += ADDRESSING_DIRECTIVE + ROOM_SEND_DIRECTIVE
+        prompt += ADDRESSING_DIRECTIVE
     else:
         prompt += DELIBERATE_DIRECTIVE
     if not manual:
-        prompt += NO_SESSION_DIRECTIVE
+        prompt += NO_PRESS_DIRECTIVE
     prompt += READ_DIRECTIVE
     alt = (req.get("alt_transcript") or "").strip()
     if alt:
@@ -357,7 +357,7 @@ def build_prompt(req: dict, transcript: str, *, ambient: bool, manual: bool) -> 
     return prompt
 
 
-def _run_turn(db: Supabase, req: dict, prompt: str, ctx: str, *, manual: bool, ambient: bool, fallback: bool,
+def _run_turn(db: Supabase, req: dict, prompt: str, ctx: str, *, manual: bool, fallback: bool,
               use_agent: bool, resume_id, agent_cwd: str, read_dir, on_event) -> dict:
     """Run the turn on the route its provenance and mode allow, and return the runner's result."""
     # Dispatch — one route, the same on every worker (Pi, Mac, and Fly, which holds its own subscription
@@ -388,7 +388,7 @@ def _run_turn(db: Supabase, req: dict, prompt: str, ctx: str, *, manual: bool, a
         # The warm SDK client, not a per-command `claude -p`: that spawn (CLI + four stdio MCP servers)
         # measured 3.6s on the Pi before the model saw a token; the warm client pays it once.
         run_hub = lambda sdk: sdk.run(hub_prompt + NUTRITION_DIRECTIVE + TOOLS_DIRECTIVE, on_event=on_event,  # noqa: E731
-                                      ambient=ambient, manual=manual, read_dir=read_dir)
+                                      manual=manual, read_dir=read_dir)
         result = run_subscription(lambda: run_hub(SDK), "subscription hub")
         if result.get("ok"):
             SDK_CREDITS.close()   # the subscription answers again; the credits client has no more work
@@ -421,8 +421,7 @@ def _record_outcome(db: Supabase, req: dict, result: dict, prompt: str, *, trans
     # context to mimic; the prompt already carries DELIBERATE_DIRECTIVE.
     if not ambient and is_ignore(text) and not result.get("used_tools"):
         log("deliberate turn answered __IGNORE__ → clean re-run (no context)")
-        result = SDK.run(prompt + NUTRITION_DIRECTIVE + TOOLS_DIRECTIVE, on_event=on_event, ambient=ambient,
-                         manual=manual)
+        result = SDK.run(prompt + NUTRITION_DIRECTIVE + TOOLS_DIRECTIVE, on_event=on_event, manual=manual)
         text = (result.get("text") or "").strip()
 
     text, needs_read = take_read_marker(text)

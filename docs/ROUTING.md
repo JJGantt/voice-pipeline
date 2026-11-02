@@ -55,28 +55,28 @@ Three blocks ride on every hub prompt beside the replayed conversation and the t
   names, never for "same as yesterday" (that copies the logged entry); read the workout catalog and pass
   the exercise id, with `upsert_catalog_exercise` only for a genuinely new movement; look things up with
   WebSearch/WebFetch in the turn, and `start_session` only for what needs his signed-in browser.
-- `DELIBERATE_DIRECTIVE` on a pushed or typed command, or `ADDRESSING_DIRECTIVE` + `ROOM_SEND_DIRECTIVE`
+- `DELIBERATE_DIRECTIVE` on a pushed or typed command, or `ADDRESSING_DIRECTIVE`
   on a room-mic turn (below).
 
 `logSets()` backs the catalog rule mechanically: it throws on an unknown exercise unless a `muscles` map
 comes with the call. `log_recipe` has no field through which a macro could be invented — it takes a
 saved recipe's name and a serving count.
 
-## Sends are decided per turn, by which mic heard it
+## Sends need a press
 
-A pushed command — typed, the phone's button, the watch's — may send a text or an email (`SEND_TOOLS`);
-one from an always-on mic (`voice_requests.always_on`) may not, because those hear the whole room and a
-sentence meant for someone else would reach a real person. The warm client's `_fence` PreToolUse hook
-allows the sends only when `SdkRunner.run(..., ambient=False)`. The unrestricted agent (`run_claude`)
-has no fence and keeps them, which is safe only because it runs nothing but manual commands (below).
+A text or an email reaches a real person, so it may be sent only on a command he pressed for or typed
+(`is_manual`, next section). Anything a microphone heard by itself, a wake-word capture included, gets
+no send on any path: the warm client's fence (`SdkRunner.gate`, run as a PreToolUse hook) refuses
+`SEND_TOOLS` and switching JaredBot on (`JAREDBOT_TOOL` with `on: true`, an auto-replier that texts for
+him) unless `SdkRunner.run(..., manual=True)`; `manual` defaults to False, so a caller that forgets it
+fails closed. Switching JaredBot off stays open to any mic. The unrestricted agent and Codex have no fence
+and keep every tool, which is safe only because they refuse any command that is not manual (below), and
+the credits runner is reached only by manual commands.
 
 The fence, not `allowed_tools`, is what holds the list. The warm client is Claude Code, which also
 applies the host user's settings, and the Mac's pre-approve every data, gmail and messages tool in auto
 mode — with `allowed_tools` alone a room-mic turn sent email. A hook's deny outranks any allow rule.
 The fence also allows `Read` only inside the current turn's photo directory.
-
-Room-mic turns carry `ROOM_SEND_DIRECTIVE`, which tells the model a send has to come from a press. The
-other way round a send, starting a session whose own tools could send it, is closed by the next rule.
 
 ## Sessions and the unrestricted agent need a press
 
@@ -95,10 +95,10 @@ client invents, or an unstamped row. The hub lets an uploading client name its o
 device is not manual until its label is added here, after checking that every writer of it is a button.
 
 Enforced at each point, not once: `process_request` routes a non-manual command to the fenced warm client
-even with agent mode on or a session focused; the fence refuses `SESSION_START_TOOLS` unless
+even with agent mode on or a session focused; the fence refuses `SESSION_START_TOOLS` and the sends unless
 `SdkRunner.run(..., manual=True)`; `run_claude` and `run_codex` refuse outright unless called with
-`manual=True`. A non-manual turn also carries `NO_SESSION_DIRECTIVE`, so the model says it needs the
-button rather than trying. Sends stay on the `always_on` rule above, so a wake-word turn can still send.
+`manual=True`. A non-manual turn also carries `NO_PRESS_DIRECTIVE`, so the model says it needs the
+button rather than trying, for a session or a send alike.
 
 ## Browser-only tools are removed from the schema
 
@@ -202,7 +202,7 @@ question usually goes unseen. For that, `_line` names a session's reply in the
 replayed thread as `Session "<label>" (<id>)` (from `voice_messages.session_id` / `session_label`)
 rather than `Assistant`, so the model can tell which session said what and pass its id. None of this
 applies on a turn that is not manual (a wake-word capture is deliberate but not manual): the session
-tools are refused there, and `NO_SESSION_DIRECTIVE` tells the model to say it needs the button.
+tools and the sends are refused there, and `NO_PRESS_DIRECTIVE` tells the model to say it needs the button.
 
 Every turn also gets `READ_DIRECTIVE`: a reply to a QUESTION ends with the `[[read]]` marker, and a
 reply to a request to DO something does not. The directive is worded around what he asked for, not

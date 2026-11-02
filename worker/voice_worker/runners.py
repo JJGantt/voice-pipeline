@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 
 import httpx
 
-from .config import AGENT_TIMEOUT_S, ALL_TOOLS, CLAUDE_BIN, CLAUDE_TIMEOUT_S, CREDITS_API_KEY, DATA_MCP_JS, GMAIL_MCP_PY, GMAIL_PY, GOVEE_MCP_PY, GOVEE_PY, HAS_MESSAGES, HTTP_TIMEOUT_S, HUB_EFFORT, HUB_MODEL, MESSAGES_HEADERS, MESSAGES_MCP_URL, PETLIBRO_MCP_PY, PETLIBRO_PY, SEND_TOOLS, SESSION_START_TOOLS, SESSION_TOOLS, STATE_DIR, SUPABASE_KEY, SUPABASE_URL, VOICE_MCP_JS, WORKER_ID
+from .config import AGENT_TIMEOUT_S, ALL_TOOLS, JAREDBOT_TOOL, CLAUDE_BIN, CLAUDE_TIMEOUT_S, CREDITS_API_KEY, DATA_MCP_JS, GMAIL_MCP_PY, GMAIL_PY, GOVEE_MCP_PY, GOVEE_PY, HAS_MESSAGES, HTTP_TIMEOUT_S, HUB_EFFORT, HUB_MODEL, MESSAGES_HEADERS, MESSAGES_MCP_URL, PETLIBRO_MCP_PY, PETLIBRO_PY, SEND_TOOLS, SESSION_START_TOOLS, SESSION_TOOLS, STATE_DIR, SUPABASE_KEY, SUPABASE_URL, VOICE_MCP_JS, WORKER_ID
 from .db import headers
 from .logs import classify_failure, log, log_error
 from .outbound import push_activity
@@ -376,7 +376,6 @@ class SdkRunner:
         self._read_dir = None  # this turn's attachment directory, the only place Read may look
         self._loop = None
         self._client = None
-        self._ambient = True   # the turn in flight came from a room mic; set by run() before each turn
         self._manual = False   # the turn in flight was started by a press (is_manual); set by run()
         self._used = False     # the warm client has run a turn since it connected, so needs a /clear
         self._lock = None      # serialises connects; created on the SDK loop
@@ -416,16 +415,15 @@ class SdkRunner:
         turn sent an email in the first test of the send rule. A hook's deny outranks any allow rule."""
         exact = set(self.tools)
         servers = tuple(t + "__" for t in self.tools if t.startswith("mcp__") and t.count("__") == 1)
-        if name in SESSION_START_TOOLS and not self._manual:
-            # No session from a turn a microphone started by itself (is_manual). Fails closed: the flag is
-            # False unless run() was told this turn was pressed.
-            return "deny", ("Starting or messaging a Claude session is off for commands a microphone heard "
-                            "by itself. It has to come from the button on his phone or watch, or be typed.")
+        # A session, or a message to another person, only from a turn he pressed for or typed (is_manual).
+        # Fails closed: the client is warm across turns, and the flag is False unless run() was told this
+        # turn was pressed. Switching JaredBot OFF stays open: silencing an auto-replier sends nothing.
+        sends = name in SEND_TOOLS or (name == JAREDBOT_TOOL and bool((tool_input or {}).get("on")))
+        if (name in SESSION_START_TOOLS or sends) and not self._manual:
+            return "deny", ("Starting or messaging a Claude session, and sending a text or an email, are off "
+                            "for commands a microphone heard by itself. It has to come from the button on his "
+                            "phone or watch, or be typed.")
         if name in SEND_TOOLS and name in exact:
-            # The client is warm across turns, so only the flag run() sets can say which mic this was.
-            if self._ambient:
-                return "deny", ("Sending texts and email is off for the always-on room mics. "
-                                "He can send it with the button on his phone or watch, or by typing it.")
             return "allow", None
         if name == "Read":   # photo turns only: the CLI views an image by reading its file
             path = os.path.realpath(str((tool_input or {}).get("file_path") or ""))
@@ -572,13 +570,12 @@ class SdkRunner:
             return {"session_id": None, "text": "", "result": "", "ok": False, "used_tools": True,
                     "raw_error": f"sdk run failed: {e}"}
 
-    def run(self, transcript, on_event=None, ambient=True, manual=False, read_dir=None) -> dict:
-        """`ambient` says the turn came from a room mic, which is what the fence reads for the sends;
-        `manual` says it was started by a press (is_manual), which is what it reads for the session tools;
-        `read_dir` is where this turn's photos are. Both flags default to the restrictive answer. Turns run
-        one at a time, so a flag on the runner is exactly one turn's."""
+    def run(self, transcript, on_event=None, manual=False, read_dir=None) -> dict:
+        """`manual` says the turn was started by a press (is_manual), which is what the fence reads for the
+        session and send tools; `read_dir` is where this turn's photos are. `manual` defaults to the
+        restrictive answer. Turns run one at a time, so a flag on the runner is exactly one turn's."""
         self._start_loop()
-        self._ambient, self._manual, self._read_dir = ambient, manual, read_dir
+        self._manual, self._read_dir = manual, read_dir
         result = self._attempt(transcript, on_event)
         if result.get("ok"):
             return result

@@ -1,7 +1,8 @@
 """The press-provenance gate and the routing it decides.
 
 Rule: anything that reaches the worker without a manual press cannot start or message a Claude session,
-and never reaches the unrestricted agent (--dangerously-skip-permissions), Codex or the credits runner.
+cannot send a text or an email (or switch the JaredBot auto-replier on), and never reaches the
+unrestricted agent (--dangerously-skip-permissions), Codex or the credits runner.
 Manual = a source only a press or a keyboard writes, AND not always_on. Everything else fails closed.
 """
 
@@ -63,41 +64,38 @@ def test_agent_mode_reaches_the_unrestricted_agent_only_on_a_press(load, source,
     else:
         assert argvs == []
         assert len(sdk.calls) == 1 and sdk.calls[0]["manual"] is False
-        assert h.w.NO_SESSION_DIRECTIVE in sdk.calls[0]["prompt"]
+        assert h.w.NO_PRESS_DIRECTIVE in sdk.calls[0]["prompt"]
 
 
 SESSION_CALLS = [("mcp__data__start_session", {"prompt": "x"}), ("mcp__data__follow_up", {"prompt": "x"}),
                  ("mcp__data__resume_session", {"session": "s-1"}), ("mcp__data__transfer_session", {"session": "s-1"})]
+SEND_CALLS = [("mcp__messages__send_message", {"to": "Mom", "text": "x"}),
+              ("mcp__gmail__send_email", {"to": "a@b.c", "body": "x"}),
+              ("mcp__voice__set_jaredbot", {"on": True})]
 
 
-@pytest.mark.parametrize("source,always_on,manual", [c for c in CASES if c[0]])
-def test_the_fence_refuses_session_tools_unless_pressed(load, source, always_on, manual):
+@pytest.mark.parametrize("source,always_on,manual", [c for c in CASES if c[0] and c[0] != "watch-fallback"])
+def test_the_fence_refuses_sessions_and_sends_unless_pressed(load, source, always_on, manual):
     h = load(WORKER_ID="fly")
-    sdk = h.install_runners(h.runner(tools=SESSION_CALLS + [("mcp__data__get_lists", {})]))
+    sdk = h.install_runners(h.runner(tools=SESSION_CALLS + SEND_CALLS + [("mcp__data__get_lists", {})]))
     h.w.process_request(h.db, claimed(h, source, always_on))
-    if source == "watch-fallback":
-        return   # runs on the agent path (covered above), never on this client
     decisions = sdk.calls[0]["decisions"]
-    for name, _ in SESSION_CALLS:
-        assert decisions[name] == ("pass" if manual else "deny"), name
+    for name, _ in SESSION_CALLS + SEND_CALLS:
+        assert (decisions[name] != "deny") is manual, name
     assert decisions["mcp__data__get_lists"] == "pass"   # ordinary tools are untouched
 
 
 def test_runner_defaults_are_the_restrictive_ones(load):
     h = load()
     r = h.w.SdkRunner()
-    assert r.gate("mcp__data__start_session", {})[0] == "deny"
-    assert r.gate("mcp__gmail__send_email", {})[0] == "deny"
+    for name, args in SESSION_CALLS + SEND_CALLS:
+        assert r.gate(name, args)[0] == "deny", name
 
 
-def test_sends_follow_the_always_on_flag(load):
-    h = load()
-    r = h.w.SdkRunner()
-    r._ambient, r._manual = False, False     # a wake-word capture: deliberate, but not a press
-    assert r.gate("mcp__messages__send_message", {})[0] == "allow"
-    assert r.gate("mcp__data__start_session", {})[0] == "deny"
-    r._ambient = True
-    assert r.gate("mcp__messages__send_message", {})[0] == "deny"
+def test_silencing_jaredbot_stays_open_to_any_mic(load):
+    r = load().w.SdkRunner()
+    assert r.gate("mcp__voice__set_jaredbot", {"on": False})[0] == "pass"
+    assert r.gate("mcp__voice__set_jaredbot", {"on": True})[0] == "deny"
 
 
 def test_unrestricted_runners_refuse_without_a_press_even_if_called_directly(load):

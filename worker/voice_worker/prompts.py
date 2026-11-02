@@ -171,23 +171,13 @@ ADDRESSING_DIRECTIVE = (
 )
 
 
-# The room mics can never send a text or an email. The send tools are denied on those turns by every
-# runner (SdkRunner._fence, --disallowedTools); this closes the way around that the model could still
-# reach for — starting a session whose own tools would send it.
-ROOM_SEND_DIRECTIVE = (
-    "\n\n[This came from an always-on room mic, which cannot send texts or email. If it asks you to "
-    "send, reply to or forward a text or an email, do not do it, and say it has to come from the button "
-    "on his phone or watch.]"
-)
-
-
-# Every turn that is not manual (`is_manual`): a microphone heard it, so it cannot reach a session. The
-# session tools are refused by the fence regardless; this keeps the model from promising or attempting it.
-NO_SESSION_DIRECTIVE = (
-    "\n\n[This came from a microphone that was not started by his press, so it cannot start a Claude "
-    "session or send anything into one: start_session, follow_up, resume_session and transfer_session are "
-    "refused on this turn. If what he said needs a session, do not try another route; say it has to come "
-    "from the button on his phone or watch, or typed.]"
+# Every turn that is not manual (`is_manual`): a microphone heard it, so it cannot reach a session or send a
+# message. Those tools are refused by the fence regardless; this keeps the model from promising or trying.
+NO_PRESS_DIRECTIVE = (
+    "\n\n[This came from a microphone that was not started by his press, so on this turn you cannot start "
+    "a Claude session or send anything into one, and you cannot send, reply to or forward a text or an "
+    "email (or turn JaredBot on): those tools are refused. If what he said needs one of them, do not try "
+    "another route; say it has to come from the button on his phone or watch, or typed.]"
 )
 
 

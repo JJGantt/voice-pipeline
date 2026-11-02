@@ -286,9 +286,11 @@ MAIL_TOOLS = [
 
 
 # Sending a text or an email reaches another person, so it is decided per TURN, not per list: allowed
-# when he pushed a button or typed, never from the always-on room mics, which hear the whole room and
-# would send a sentence that was never meant for the assistant. See SdkRunner._fence.
+# only on a command he pressed for or typed (is_manual), never on one a microphone heard by itself, wake
+# word included, which could send a sentence that was never meant for the assistant. See SdkRunner.gate,
+# which also holds back switching JaredBot (the group-chat auto-replier) ON, since that sends texts too.
 SEND_TOOLS = ["mcp__messages__send_message", "mcp__gmail__send_email"]
+JAREDBOT_TOOL = "mcp__voice__set_jaredbot"
 
 
 # Tools that only mean something next to his signed-in browser, which this worker does not have: a cart

@@ -179,7 +179,7 @@ def scripted_runner_class(SdkRunner):
             return None
 
         def _attempt(self, transcript, on_event):
-            turn = {"prompt": transcript, "manual": self._manual, "ambient": self._ambient, "decisions": {}}
+            turn = {"prompt": transcript, "manual": self._manual, "decisions": {}}
             self.calls.append(turn)
             for name, args in self.script:
                 decision, _ = self.gate(name, args)
