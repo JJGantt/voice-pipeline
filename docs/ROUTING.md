@@ -12,10 +12,10 @@ mic → transcript → voice_requests (Supabase)
 
 **One path, one model.** Every hub turn — photos included — runs on the warm `SdkRunner`: `HUB_MODEL`
 (`opus`) at `HUB_EFFORT` (unset = the model's default, which is adaptive: it thinks as hard as the turn
-needs), with `ALL_TOOLS` plus `Read`. There is no fast first responder and no escalation. Jared chose
-quality over speed on 2026-10-29: he does not need anything instantly, and a low-effort first responder
-judges worse exactly where it matters — macro estimates, and what to make of web results. If latency
-becomes a problem he decides the optimisation; see "Splitting it again" below before building one.
+needs), with `ALL_TOOLS` plus `Read`. There is no fast first responder and no escalation. Decision:
+quality over speed. A low-effort first responder judges worse exactly where it matters (macro
+estimates, and what to make of web results). A latency optimisation is the owner's decision; see
+"Splitting it again" below before building one.
 Full-agent mode is separate: the unrestricted coding agent on its own `--resume` session.
 
 The bottom activity bar shows the prompt, tool calls, and what the model says between them. Every
@@ -24,7 +24,7 @@ since text after the last tool call is the reply.
 
 ## Effort
 
-Measured 2026-10-16 on four meals (a Chipotle burrito, cereal with milk and a banana, two thirds of a
+Measured on four meals (a Chipotle burrito, cereal with milk and a banana, two thirds of a
 restaurant pad thai, tofu with oil and cornstarch), asking Opus for calories and macros at each level:
 
 | effort | seconds per answer | macros |
@@ -44,17 +44,14 @@ Three blocks ride on every hub prompt beside the replayed conversation and the t
 - `NUTRITION_DIRECTIVE` — decompose an unspecified dish into ingredients with realistic portions, use
   the per-ingredient breakdown, and **web-search a specific restaurant item or branded product whose
   published nutrition it can't quote with certainty**, preferring the brand's own page; never search
-  generic foods, saved recipes or repeats of logged meals. Measured 2026-10-29, Opus at default effort,
-  two runs each with and without web: famous chains (Big Mac, Chick-fil-A sandwich, grande latte,
-  Chipotle burrito, Crunchwrap) came out at the published figures from memory, and searching only added
-  5–25s. Less-common items were off 20–40% from memory and searching fixed most of them: Jinya Spicy
-  Creamy Vegan Ramen 960 → 790 (published ~790), La Colombe Vanilla Draft Latte 130–150 → 110 (label
-  ~110). A search can land on a stale third-party listing (a Panera melt came back 990 against ~890),
-  which is why the directive points at the brand's own page.
-- `TOOLS_DIRECTIVE` — picks between tools that look interchangeable: `log_recipe` only for a recipe he
-  names, never for "same as yesterday" (that copies the logged entry); read the workout catalog and pass
+  generic foods, saved recipes or repeats of logged meals. Measured with Opus at default effort, with
+  and without web: famous chain items come out at the published figures from memory, and searching only
+  adds 5–25s; less-common items are off 20–40% from memory and searching fixes most of them. A search
+  can land on a stale third-party listing, which is why the directive points at the brand's own page.
+- `TOOLS_DIRECTIVE` — picks between tools that look interchangeable: `log_recipe` only for a recipe the
+  user names, never for "same as yesterday" (that copies the logged entry); read the workout catalog and pass
   the exercise id, with `upsert_catalog_exercise` only for a genuinely new movement; look things up with
-  WebSearch/WebFetch in the turn, and `start_session` only for what needs his signed-in browser.
+  WebSearch/WebFetch in the turn, and `start_session` only for what needs the signed-in browser.
 - `DELIBERATE_DIRECTIVE` on a pushed or typed command, or `ADDRESSING_DIRECTIVE`
   on a room-mic turn (below).
 
@@ -64,18 +61,18 @@ saved recipe's name and a serving count.
 
 ## Sends need a press
 
-A text or an email reaches a real person, so it may be sent only on a command he pressed for or typed
+A text or an email reaches a real person, so it may be sent only on a command that was pressed for or typed
 (`is_manual`, next section). Anything a microphone heard by itself, a wake-word capture included, gets
 no send on any path: the warm client's fence (`SdkRunner.gate`, run as a PreToolUse hook) refuses
-`SEND_TOOLS` and switching JaredBot on (`JAREDBOT_TOOL` with `on: true`, an auto-replier that texts for
-him) unless `SdkRunner.run(..., manual=True)`; `manual` defaults to False, so a caller that forgets it
+`SEND_TOOLS` and switching JaredBot on (`JAREDBOT_TOOL` with `on: true`, an auto-replier that texts on the
+owner's behalf) unless `SdkRunner.run(..., manual=True)`; `manual` defaults to False, so a caller that forgets it
 fails closed. Switching JaredBot off stays open to any mic. The unrestricted agent and Codex have no fence
 and keep every tool, which is safe only because they refuse any command that is not manual (below), and
 the credits runner is reached only by manual commands.
 
 The fence, not `allowed_tools`, is what holds the list. The warm client is Claude Code, which also
 applies the host user's settings, and the Mac's pre-approve every data, gmail and messages tool in auto
-mode — with `allowed_tools` alone a room-mic turn sent email. A hook's deny outranks any allow rule.
+mode — with `allowed_tools` alone a room-mic turn can send email. A hook's deny outranks any allow rule.
 The fence also allows `Read` only inside the current turn's photo directory.
 
 ## Sessions and the unrestricted agent need a press
@@ -160,8 +157,7 @@ reconnected. Passing a fresh `session_id` to `query()` does not clear it: that a
 and starts no new conversation.
 
 The mic is always on, so the input that trips a refusal is usually room audio nobody addressed to the
-assistant — and the commands that die behind it are unrelated. On 2026-09-02 one false-triggered
-ambient capture wedged the client for 85 minutes and roughly fifteen commands failed.
+assistant — and the commands that die behind it are unrelated.
 
 So `SdkRunner.run()` recycles the client after **any** failed turn, not just a timeout or transport
 error — a refusal arrives through the ordinary `ResultMessage` path with `is_error` set, so an
@@ -180,8 +176,8 @@ Which is which is `voice_requests.always_on`, stamped by whoever captured the cl
 (only for a wake-free capture, started on speech energy; a wake-word capture is a press), the Mac's
 listener and wake-free capture, and the hub for an uploaded clip from a listener label
 (`GATED_SOURCES` in status-hub). The worker never decides it from `source`: one device can be both a
-listener and a button, and a second list of labels here is how the phone's listener ended up counted
-as a press. An unstamped row is a press for this, so a new capture path that forgets the flag gets
+listener and a button, and a second list of labels here drifts from the capturer's (a listener ends up
+counted as a press). An unstamped row is a press for this, so a new capture path that forgets the flag gets
 answered, never silently dropped. What a command may DO is the stricter `is_manual` above, which reads
 `source` too and fails the other way: a wake-word capture is deliberate here but not manual there.
 
@@ -189,31 +185,31 @@ Only a room-mic turn can be ignored: the `__IGNORE__` sentinel is taught in `ADD
 alone. That alone does not keep it from a deliberate turn, because every turn replays the day's thread
 and a model copies a reply it sees there — so a bare sentinel reply is never replayed (`is_ignore` in
 `_line`'s filter), and a deliberate turn that answers `__IGNORE__` anyway is re-run clean, with no
-context. Deliberate turns get `DELIBERATE_DIRECTIVE` instead: work out the implied question when he
-describes something without asking one, and if he truly cannot be understood say so in the model's own
+context. Deliberate turns get `DELIBERATE_DIRECTIVE` instead: work out the implied question when the
+user describes something without asking one, and if the user truly cannot be understood say so in the model's own
 words. There is no canned "didn't understand" line; offered one, the model used it on clear speech.
 
-`DELIBERATE_DIRECTIVE` also makes the model his **orchestrator**: work he describes that needs a real
-machine (code, debugging, deploys, a project, his signed-in browser) becomes a `start_session` whether
-or not he says "session", and a reply from him that plainly answers a session's message in the thread
-goes back to that session through `follow_up`. When it is unclear which of the two he means, the
-model starts a new session rather than asking: he gives a command and looks away, so a clarifying
-question usually goes unseen. For that, `_line` names a session's reply in the
+`DELIBERATE_DIRECTIVE` also makes the model the user's **orchestrator**: described work that needs a
+real machine (code, debugging, deploys, a project, the signed-in browser) becomes a `start_session`
+whether or not the word "session" is said, and a reply that plainly answers a session's message in the
+thread goes back to that session through `follow_up`. When it is unclear which of the two is meant, the
+model starts a new session rather than asking: the user gives a command and looks away, so a
+clarifying question usually goes unseen. For that, `_line` names a session's reply in the
 replayed thread as `Session "<label>" (<id>)` (from `voice_messages.session_id` / `session_label`)
 rather than `Assistant`, so the model can tell which session said what and pass its id. None of this
 applies on a turn that is not manual (a wake-word capture is deliberate but not manual): the session
 tools and the sends are refused there, and `NO_PRESS_DIRECTIVE` tells the model to say it needs the button.
 
 Every turn also gets `READ_DIRECTIVE`: a reply to a QUESTION ends with the `[[read]]` marker, and a
-reply to a request to DO something does not. The directive is worded around what he asked for, not
+reply to a request to DO something does not. The directive is worded around what was asked for, not
 what the reply contains, because a confirmation routinely carries information — the video picked
 for the TV and what it is about, the past entry a staged meal was copied from — and judged by its
 content the model flags those, and the room-noise "that wasn't meant for me" replies with them. A
-request that FAILED, or only partly worked, is flagged regardless: he gives a command and looks away
-assuming it worked, so a failure is exactly the reply he must not miss.
+request that FAILED, or only partly worked, is flagged regardless: the user gives a command and looks
+away assuming it worked, so a failure is exactly the reply that must not be missed.
 
 A failure caused by a BROKEN or MISSING tool also starts a session to fix it (`DELIBERATE_DIRECTIVE`),
-with his request, the tool and its exact error as the prompt; a failure that is the state of the world
+with the user's request, the tool and its exact error as the prompt; a failure that is the state of the world
 (the TV is off) starts nothing, since there is no code to change. `take_read_marker` strips it
 before the reply is stored or spoken and sets `voice_messages.needs_read`, which the watch uses to
 keep the answer reachable until it has been on screen (status-hub `docs/WATCH.md`, "Unread answers").
@@ -226,11 +222,11 @@ It carries only what the model cannot work out from the text itself:
 1. the audio is room-wide, so most of what arrives was not said to the assistant;
 2. an ignore must be the bare `__IGNORE__` sentinel and nothing else, since the exact sentinel is what drops the turn;
 3. a machine named in a dispatch ("the Mac agent", "the Pi") is a **destination**, not a third party.
-4. development talk naming no destination is him speaking to a session already open elsewhere —
-   which has heard him already, through its own channel.
+4. development talk naming no destination is the user speaking to a session already open elsewhere —
+   which has heard it already, through its own channel.
 
 Point 4 is STRUCTURAL — it is not about what the words mean. Any sentence can be a dispatch or not,
-depending only on whether Jared handed it over. Listing example sentences that are "not for you" is the
+depending only on whether the user handed it over. Listing example sentences that are "not for you" is the
 wrong shape of instruction: it teaches that certain CONTENT is never a dispatch, when the same words
 forwarded deliberately are exactly that. A room-mic turn cannot dispatch at all now (it is not manual),
 so points 3 and 4 decide only whether the model answers or ignores; point 3 is what makes it answer
