@@ -311,3 +311,16 @@ ALL_TOOLS = ["mcp__data", "mcp__voice", "mcp__govee-lights", "mcp__petlibro-feed
 
 
 UNTRANSCRIBED_MAX_S = 75.0    # older than this a queued clip is closed, not transcribed late; under the 90s stuck-transcribing sweep
+
+
+# Invariants between the timings above. Each one, broken, fails silently (two fallbacks claiming at once,
+# a context-losing switch on a heartbeat hiccup, a queued clip closed while it is still being transcribed),
+# so a host with a bad override refuses to start instead.
+for _ok, _why in (
+    (STANDBY_HEARTBEAT_S < HEARTBEAT_FRESH_S, "STANDBY_HEARTBEAT_S must stay under HEARTBEAT_FRESH_S, or a "
+                                              "standing-by worker looks dead to the workers below it"),
+    (HEARTBEAT_INTERVAL_S < HEARTBEAT_FRESH_S, "HEARTBEAT_INTERVAL_S must stay under HEARTBEAT_FRESH_S"),
+    (OWNER_GRACE_S > HEARTBEAT_FRESH_S, "OWNER_GRACE_S must exceed HEARTBEAT_FRESH_S"),
+):
+    if not _ok:
+        raise SystemExit(f"voice worker config: {_why}")

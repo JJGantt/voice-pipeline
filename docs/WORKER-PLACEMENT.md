@@ -8,9 +8,9 @@ Sonnet first responder and an Opus escalation; re-run them before acting on the 
 
 ## Placement
 
-**Fly is primary, the Pi second, the Mac last.** `WORKER_PRIORITY=fly,pi,mac` is `worker/run.sh`'s
-default (the Pi and the Mac launch through it), the Pi's `worker/.env` value, `voice_worker/config.py`'s in-file
-default, and the `fly-worker/Dockerfile` env. Change all four together.
+**Fly is primary, the Pi second, the Mac last.** `WORKER_PRIORITY=fly,pi,mac` is set in one place,
+the default in `worker/voice_worker/config.py`; no host overrides it, so changing it there changes it
+everywhere.
 
 | | Fly (`jared-voice-worker`) | Pi | Mac |
 |---|---|---|---|

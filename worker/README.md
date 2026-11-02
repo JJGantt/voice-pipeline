@@ -79,7 +79,7 @@ routed once it gets here is `../docs/ROUTING.md`.
 | `SUPABASE_URL` | `https://felyggqjjhltwokdfhop.supabase.co` | |
 | `SUPABASE_KEY` | *(required, no default)* | **Must be the service_role key** — it bypasses RLS and needs full read/write on `voice_requests`, `voice_messages`, `worker_presence`, `voice_focus`. The anon key will NOT work. |
 | `WORKER_ID` | `mac` | Also `pi`, `fly`. Identifies this worker in the queue + presence. |
-| `WORKER_PRIORITY` | `fly,pi,mac` | Ordered, highest first. A worker only claims if no higher-priority worker has a fresh heartbeat. The same value is `run.sh`'s default, `worker.py`'s, the Pi's `.env` and the Fly image's; change all four together. |
+| `WORKER_PRIORITY` | `fly,pi,mac` | Ordered, highest first. A worker only claims if no higher-priority worker has a fresh heartbeat. Set only as the default in `voice_worker/config.py`; no host overrides it. |
 | `STATE_DIR` | `~/.voice-worker` | Stores `hub_session.json` and `agent_session.json` (session id + last activity). `/data/voice-worker` on Fly, on the volume. |
 | `HUB_MODEL` / `HUB_EFFORT` | `opus` / *(unset)* | The hub turn's model and effort; unset is the model's default (`docs/ROUTING.md`). |
 | `CLAUDE_BIN` | `claude` | Path to the Claude Code CLI. |

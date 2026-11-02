@@ -65,8 +65,8 @@ holds its own `CLAUDE_CODE_OAUTH_TOKEN`). A run that fails transiently is retrie
 
 Which host should run the agent, what each one can and cannot do, and measured speeds: `docs/WORKER-PLACEMENT.md`.
 
-- **Worker claim priority** is `WORKER_PRIORITY`, **`fly,pi,mac`** everywhere: `worker/run.sh`'s
-  default, the Pi's `worker/.env`, and the `jared-voice-worker` image. The highest-priority worker with
+- **Worker claim priority** is `WORKER_PRIORITY`, **`fly,pi,mac`**, set in one place: the default in
+  `worker/voice_worker/config.py` (no host overrides it). The highest-priority worker with
   a fresh heartbeat claims and the others defer, so **Fly takes a command whenever it is up**, then the
   Pi, then the Mac. Fly is first because it answers the common turn faster (2.8s median against
   the Pi's 4.4s on identical commands, measured on the warm client) and is independent of the house; Opus turns cost about the same

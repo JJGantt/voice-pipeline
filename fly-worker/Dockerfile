@@ -61,7 +61,6 @@ ENV DATA_MCP_JS=/app/data-layer/dist/mcp.js \
     GMAIL_MCP_PY=/app/gmail-mcp/gmail_mcp.py \
     CLAUDE_CONFIG_DIR=/data/claude \
     STATE_DIR=/data/voice-worker \
-    WORKER_ID=fly \
-    WORKER_PRIORITY=fly,pi,mac
+    WORKER_ID=fly
 
 CMD ["./entrypoint.sh"]

@@ -134,6 +134,9 @@ def test_a_focused_session_receives_only_pressed_commands(load, source, always_o
                                                       ("watch", True, False)])
 def test_usage_limit_moves_only_pressed_commands_onto_credits(load, source, always_on, credits):
     h = load(WORKER_ID="fly", ANTHROPIC_API_KEY="console-key")
+    # The key is taken out of the environment at import: the CLI and the SDK prefer it over the
+    # subscription, so anything spawned that inherited it would bill the API silently.
+    assert "ANTHROPIC_API_KEY" not in __import__("os").environ and h.w.CREDITS_API_KEY == "console-key"
     sdk = h.runner(ok=False)
     sdk.limit_hit = True
     h.install_runners(sdk)

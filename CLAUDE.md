@@ -164,7 +164,7 @@ A `voice_requests` row with status `fallback` came from the watch through Supaba
 edge function (data-layer), because the hub on Fly did not answer. Only `FALLBACK_WORKER` (the Pi)
 claims it, in the same read as its `pending` rows, with no deferring or holding. Every other worker's
 claim filter must stay `status=eq.pending`: a Fly worker can be up while the hub is down, and a widened
-filter there would put the fallback back on Fly. The run is the unrestricted Opus agent with
+filter there would put the fallback back on Fly. (`worker/tests/test_claiming.py` holds this.) The run is the unrestricted Opus agent with
 `fallback_directive`; `_hub_unreachable` skips the pushes to the hub for its duration, since each would
 only spend its timeout. Status-hub `docs/WATCH.md` § When the hub does not answer has the watch's half.
 
