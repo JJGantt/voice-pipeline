@@ -28,9 +28,8 @@ import path from 'node:path';
 const STARTING_S = 90;
 
 const here = path.dirname(new URL(import.meta.url).pathname);
-// The service key: from the environment, else the files the services themselves load it from — the
-// voice worker's .env (the Pi's pi-desk borrows it from there), then data-layer's, which is where it
-// lives on the Mac (the orchestrator gets its own copy from its launchd plist).
+// The service key: from the environment, else the gitignored .env files the services themselves load
+// it from (the voice worker's, which pi-desk also reads, then data-layer's).
 function key() {
   if (process.env.SUPABASE_KEY) return process.env.SUPABASE_KEY;
   const candidates = [

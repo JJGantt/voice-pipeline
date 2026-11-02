@@ -96,13 +96,10 @@ routed once it gets here is `../docs/ROUTING.md`.
 | `LEASE_S` | `120` | How far past the turn's last renewal a claim's lease runs (see *The lease*). |
 | `AGENT_TIMEOUT_S` | `900` | Full-agent (coding) runs get a longer leash. |
 
-### Where to get the service key
+### The service key
 
-It's in the `data` MCP server's `env` block in `~/.claude.json`
-(`mcpServers.data.env.SUPABASE_KEY`), and in data-layer's gitignored `.env`
-(which `data-layer/src/client.ts` loads). The worker takes it **from
-the `SUPABASE_KEY` env var only** — it does not read those files at runtime.
-`run.sh` requires you to export it.
+The worker takes it **from the `SUPABASE_KEY` env var only**. `run.sh` loads the gitignored
+`worker/.env` into the environment first and refuses to start without it.
 
 ## Running
 

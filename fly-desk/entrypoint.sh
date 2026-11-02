@@ -7,10 +7,15 @@ mkdir -p "$HOME/.claude" "$REPO_ROOT"
 tail -n 20000 /data/desk.log > /data/desk.log.tmp 2>/dev/null && mv /data/desk.log.tmp /data/desk.log
 exec > >(tee -a /data/desk.log) 2>&1
 
-# git over HTTPS through gh's credential helper (GH_TOKEN), committing as the owner, as on the other machines.
+# git over HTTPS through gh's credential helper (GH_TOKEN), committing as the owner (GIT_USER_NAME /
+# GIT_USER_EMAIL), as on the other machines.
 gh auth setup-git
-git config --global user.name "Jared Gantt"
-git config --global user.email "jaredgantt@gmail.com"
+if [ -n "${GIT_USER_NAME:-}" ] && [ -n "${GIT_USER_EMAIL:-}" ]; then
+  git config --global user.name "$GIT_USER_NAME"
+  git config --global user.email "$GIT_USER_EMAIL"
+else
+  echo "ERROR: GIT_USER_NAME / GIT_USER_EMAIL unset; sessions here cannot commit" >&2
+fi
 git config --global pull.ff only
 
 # The shared CLAUDE.md, this machine's own, its settings and the skills — linked by the repo's installer.
