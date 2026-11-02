@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Flash the ESP with src/config.h's DEVICE_TOKEN, then make jared-voice require it.
+# Flash the ESP with src/config.h's DEVICE_TOKEN and wait for jared-voice to accept it.
 #
-# Order is the whole point: VOICE_DEVICE_TOKEN on Fly locks out any ESP that does not send it, so the
-# secret is set only after the server has logged a connection that presented a token, and removed
-# again if the ESP is rejected afterwards. Run with the ESP plugged into this Mac over USB.
+# jared-voice always requires VOICE_DEVICE_TOKEN (it will not start without it), so an ESP running
+# firmware without the token cannot connect at all until this has been run. The Fly secret must equal
+# config.h's DEVICE_TOKEN; this script sets it to that before flashing. Run with the ESP plugged into
+# this Mac over USB.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 APP=jared-voice
@@ -15,29 +16,18 @@ tok=$(sed -n 's/^#define DEVICE_TOKEN "\([0-9a-f]*\)".*/\1/p' src/config.h)
 # Log lines since a moment, ANSI colour stripped (each line starts with its UTC timestamp).
 since() { fly logs -a "$APP" --no-tail 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | awk -v t="$1" '$1 >= t'; }
 
+printf 'VOICE_DEVICE_TOKEN=%s\n' "$tok" | fly secrets import -a "$APP" >/dev/null   # restarts the server if it changed
+
 t_flash=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 ~/.platformio/penv/bin/pio run -t upload
 
-# Wait for the server to see the flashed ESP present its token.
 echo "waiting for the ESP to reconnect with its token..."
 for _ in $(seq 1 40); do
-  if since "$t_flash" | grep -q "device token presented"; then found=1; break; fi
+  recent=$(since "$t_flash")
+  if grep -q "device token presented" <<<"$recent"; then echo "OK: the ESP is connected with its token"; exit 0; fi
   sleep 3
 done
-[ "${found:-}" = 1 ] || { echo "FAILED: no connection presenting a token; VOICE_DEVICE_TOKEN left unset"; exit 1; }
-
-t0=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-printf 'VOICE_DEVICE_TOKEN=%s\n' "$tok" | fly secrets import -a "$APP" >/dev/null
-echo "VOICE_DEVICE_TOKEN set; waiting for the restarted server to accept the ESP..."
-for _ in $(seq 1 40); do
-  recent=$(since "$t0")
-  if grep -q "rejected unauthenticated" <<<"$recent"; then
-    fly secrets unset VOICE_DEVICE_TOKEN -a "$APP" >/dev/null
-    echo "FAILED: the server rejected the ESP; VOICE_DEVICE_TOKEN removed again"; exit 1
-  fi
-  if grep -q "voice backend up" <<<"$recent" && grep -q "device token presented" <<<"$recent"; then
-    echo "OK: the ESP is connected and the server now requires its token"; exit 0
-  fi
-  sleep 3
-done
-echo "UNKNOWN: no connection seen after the restart; check: fly logs -a $APP"; exit 1
+if grep -q "rejected unauthenticated" <<<"$(since "$t_flash")"; then
+  echo "FAILED: the server rejected the ESP's token (config.h and the Fly secret disagree?)"; exit 1
+fi
+echo "UNKNOWN: no connection seen; check: fly logs -a $APP"; exit 1

@@ -381,6 +381,11 @@ errs toward keeping a session. Ticks never overlap: parking takes seconds per se
 overlapping tick acting on rows read before the first wrote anything parked a session the first had
 just found typed into.
 
+## Tests
+
+Run the suites before pushing (README § Tests says how; CI runs them on push). A change that alters
+behaviour on purpose updates its tests in the same commit.
+
 ## Docs
 
 `docs/ROUTING.md` is the routing contract. `ARCHITECTURE.md` covers the always-on machinery —

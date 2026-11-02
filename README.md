@@ -56,12 +56,11 @@ holds it). The server refuses to start without both, or without
 `SUPABASE_SERVICE_KEY`.
 
 The ws handshake must present `VOICE_DEVICE_TOKEN` in an `X-Device-Token` header (or
-`Authorization: Bearer ...`), or it is closed (1008). While that secret is
-unset every connection is accepted, and the connect log line says `(device token presented)` when the
-ESP sent one. The firmware sends `DEVICE_TOKEN` from its gitignored `config.h`; set the secret only
-with `firmware/bin/enable-device-token.sh`, which flashes the ESP, waits for it to present the token,
-sets the secret, and removes it again if the ESP is then rejected. Setting it any other way before
-the ESP sends the token locks the ESP out.
+`Authorization: Bearer ...`), or it is closed (1008); the server refuses to start without the secret
+set, so the socket is never open by default. The ESP is the only client of the socket. Its firmware
+sends `DEVICE_TOKEN` from the gitignored `config.h`, which must equal the Fly secret: flash it with
+`firmware/bin/enable-device-token.sh`, which sets the secret from `config.h`, flashes, and waits for
+the server to accept the ESP. Firmware flashed before the token existed cannot connect at all.
 
 ## firmware/ (ESP32, PlatformIO)
 - Copy `src/config.h.example` → `src/config.h`, fill WiFi + server + I2S mic pins and `DEVICE_TOKEN`
@@ -78,3 +77,17 @@ the ESP sends the token locks the ESP out.
 - `ARCHITECTURE.md` — the always-on machinery: workers and failover, wake-free capture, speaker ID,
   the feedback channels, and the `app_settings` catalog.
 - Per-directory READMEs in `worker/`, `orchestrator/`, `mcp-voice/`, `voice-id/`.
+
+## Tests
+
+Three suites, each covering what is costly to break and nothing else: the worker's claiming,
+failover, dedupe and press-provenance gate (`worker/tests`), the voice server's token auth
+(`server/tests`), and the orchestrator's auth and transcript handling (`orchestrator/test`). They
+stub only outside services (Supabase, Claude, Groq). From the repo root:
+
+    python3.11 -m venv .venv-test
+    .venv-test/bin/pip install -r worker/requirements-test.txt -r server/requirements.txt
+    .venv-test/bin/python -m pytest worker/tests server/tests
+    (cd orchestrator && npm test)
+
+Run them before pushing; `.github/workflows/tests.yml` runs them again on every push to main.

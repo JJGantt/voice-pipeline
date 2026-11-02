@@ -10,8 +10,8 @@ service key for downstream consumers to pick up. Wire the rest of the system off
 
 Every HTTP control route (/led-*, /enroll-*, /capture-*, /wakefree-*) requires LED_TOKEN and /verify
 requires VERIFY_TOKEN, in an X-Token (or Authorization: Bearer) header; the server refuses to start
-without both. The WebSocket requires a device token in an X-Device-Token / Authorization header when
-VOICE_DEVICE_TOKEN is set; it stays optional only until the ESP firmware sends one.
+without both. The WebSocket requires VOICE_DEVICE_TOKEN in an X-Device-Token / Authorization header;
+the server refuses to start without it set.
 """
 
 import asyncio
@@ -48,8 +48,9 @@ ALT_GROQ_MODEL = "whisper-large-v3" if GROQ_MODEL != "whisper-large-v3" else "wh
 # Supabase enqueue target for transcripts. Every write here uses SUPABASE_SERVICE_KEY: anon has no
 # INSERT on voice_requests, because a pending row is run by the worker as Jared with every tool.
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
-# Optional device-token auth on the ws handshake; enforced only when set.
-VOICE_DEVICE_TOKEN = os.environ.get("VOICE_DEVICE_TOKEN")
+# The ESP's token on the ws handshake. Required: main() refuses to start without it, so the audio socket
+# (a stream that becomes commands run with every tool) can never be open to anyone by default.
+VOICE_DEVICE_TOKEN = os.environ.get("VOICE_DEVICE_TOKEN", "")
 # Shared secret for every control route: the worker's /led-*, the Mac listener's /capture-* and
 # /wakefree-*, and /enroll-*. Required — main() refuses to start without it.
 LED_TOKEN = os.environ.get("LED_TOKEN", "")
@@ -64,8 +65,7 @@ def _token_ok(given, want: str) -> bool:
 
 def _http_token(request) -> str | None:
     """The token on a control request: `X-Token: <token>` or `Authorization: Bearer <token>`. Never the
-    query string, which ends up in proxy logs and shell history. TRANSITION: `?token=` is still read
-    until every caller sends the header (worker, wakefree, mac-listener, the hub's /verify)."""
+    query string, which ends up in proxy logs and shell history."""
     headers = getattr(request, "headers", None)
     if headers is not None:
         tok = headers.get("X-Token")
@@ -74,8 +74,7 @@ def _http_token(request) -> str | None:
         auth = headers.get("Authorization") or ""
         if auth.startswith("Bearer "):
             return auth[len("Bearer "):]
-    from urllib.parse import urlparse, parse_qs
-    return parse_qs(urlparse(getattr(request, "path", "") or "").query).get("token", [None])[0]
+    return None
 # The currently-connected ESP, so the /led-off HTTP handler can reach it. One device → one global ref.
 _active_esp = None
 # Push-to-talk active anywhere (Hammerspoon dictation) → the ESP ignores ALL audio: the mute is global,
@@ -564,14 +563,12 @@ async def _device_frames(ws, peer):
 async def connection(ws):
     global _active_esp, _led_working, _led_capturing, _last_esp_frame, _led_last_sent
     peer = getattr(ws, "remote_address", "?")
-    # Device-token gate: enforced only when VOICE_DEVICE_TOKEN is set, so existing
-    # firmware that doesn't send a token keeps working until it's updated.
-    if VOICE_DEVICE_TOKEN:
-        if not _token_ok(_client_token(ws), VOICE_DEVICE_TOKEN):
-            log.warning("rejected unauthenticated/invalid connection: %s", peer)
-            await ws.close(code=1008, reason="invalid device token")
-            return
-    log.info("ESP32 connected: %s%s", peer, " (device token presented)" if _client_token(ws) else "")
+    # Device-token gate, always on (an unset VOICE_DEVICE_TOKEN never matches, and main() refuses it).
+    if not _token_ok(_client_token(ws), VOICE_DEVICE_TOKEN):
+        log.warning("rejected unauthenticated/invalid connection: %s", peer)
+        await ws.close(code=1008, reason="invalid device token")
+        return
+    log.info("ESP32 connected: %s (device token presented)", peer)
     _active_esp = ws
     _esp_back()
     _led_working = False
@@ -1571,6 +1568,7 @@ async def _ops_beat():
 
 async def main():
     missing = [n for n, v in (("LED_TOKEN", LED_TOKEN), ("VERIFY_TOKEN", VERIFY_TOKEN),
+                              ("VOICE_DEVICE_TOKEN", VOICE_DEVICE_TOKEN),
                               ("SUPABASE_SERVICE_KEY", SUPABASE_SERVICE_KEY)) if not v]
     if missing:
         log.error("refusing to start: %s not set", ", ".join(missing))
