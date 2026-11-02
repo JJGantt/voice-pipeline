@@ -289,6 +289,8 @@ def _write_wav(pcm_f32: np.ndarray) -> str:
     return path
 
 
+# Its own copy by necessity: a Mac process (float32 input, sync, Groq only); mac-listener's adds a local whisper.cpp
+# fallback and the Fly server's (server/voice_server/transcribe.py) is async with OpenAI behind it.
 def transcribe(pcm_f32: np.ndarray) -> str:
     if pcm_f32.size < int(SR * MIN_UTTER_S) or not GROQ_API_KEY:
         return ""

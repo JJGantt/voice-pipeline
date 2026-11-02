@@ -874,7 +874,8 @@ def _groq_transcribe(path: str):
 
 # WHISPER WRITES "Thank you." FOR A CLIP WITH NO SPEECH IN IT: silence, breath, a room. A transcript
 # that is that phrase and nothing else is treated as nothing heard, so it never becomes a command. The
-# cost is that saying only "thank you" is dropped too. The same rule is in server/server.py and status-hub's server/lib/transcribe.js.
+# cost is that saying only "thank you" is dropped too. The same rule is in server/voice_server/transcribe.py,
+# worker/voice_worker/config.py and status-hub's server/lib/transcribe.js.
 _NOTHING_SAID = re.compile(r"^\W*thank\s+you\W*$", re.IGNORECASE)
 
 
@@ -882,6 +883,8 @@ def _heard(text: str) -> str:
     return "" if _NOTHING_SAID.match(text) else text
 
 
+# Its own copy by necessity: a Mac process run from this checkout, sync, falling back to local whisper.cpp; the
+# Fly server's async Groq/OpenAI transcriber (server/voice_server/transcribe.py) ships only in that image.
 def transcribe(pcm: np.ndarray) -> str:
     """Groq (fast + accurate) when GROQ_API_KEY is set; else local whisper.cpp. '' if too short/failed."""
     if pcm.size < int(SAMPLE_RATE * MIN_UTTER_S):

@@ -1,4 +1,5 @@
-"""The last transcriber: the Mac's local Whisper for clips every cloud provider failed on."""
+"""The last transcriber: the Mac's local Whisper for clips every cloud provider failed on. Not a copy of the
+capturers' transcribers: it re-runs a stored clip from the voice-clips bucket after they (or the hub) gave up."""
 
 import os
 import subprocess

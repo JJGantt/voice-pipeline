@@ -277,6 +277,8 @@ AGENT_SESSION_FILE = STATE_DIR / "agent_session.json"   # full-agent mode: a SEP
 RESET_SENTINEL = "__RESET_CONTEXT__"
 
 
+# Whisper's "Thank you." on a clip with no speech: the rule in server/voice_server/transcribe.py and
+# mac-listener/listener.py, repeated because the worker's deploy (fly-worker/deploy.sh) ships neither.
 _NOTHING_SAID = re.compile(r"^\W*thank\s+you\W*$", re.IGNORECASE)
 
 
