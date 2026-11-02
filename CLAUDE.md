@@ -330,8 +330,12 @@ they confirm it is one contract, in `orchestrator/src/handoff.js`:
   nothing to wait for. Unconfirmed after 8s, the Pi presses Enter once more (the Mac does not); an
   unconfirmed command fails and is dead-lettered with his words. Typing reports nothing on its own —
   text can sit unsent in the composer, or vanish, while the call that typed it succeeds.
-- **A session waiting on a permission prompt is refused.** The keys would go to the dialog and the Enter
-  would answer it. The state comes from the session's record (`waiting` in `discover.js`).
+- **A follow-up to a session on a permission prompt is held, not typed.** The keys would go to the
+  dialog and the Enter would answer it. The state comes from the session's record (`waiting` in
+  `discover.js`); `awaitNotWaiting` wakes on that record changing and the words go in once the dialog is
+  gone (Claude Code times its dialogs out at two minutes). Only a dialog still up after 5 minutes fails
+  the command, as an error, so it reaches the ops responder. Follow-ups run outside `drain()`'s loop on a
+  per-session chain, so a held one keeps its order and holds up nothing else.
 - **Pictures** in a command's `payload.attachments` are fetched from the hub on the machine that owns
   the session and named in the prompt (`withAttachments`), for `follow_up`, `resume_session` and
   `open_session` alike, on both machines.

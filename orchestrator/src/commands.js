@@ -23,7 +23,7 @@ import { config } from './config.js';
 const exec = promisify(execFile);
 import { pendingCommands, claimCommand, finishCommand, upsertDeskSession, deskSession,
          patchDeskSession, deadLetterCommand, abandonedClaims, insertCommand } from './supabase.js';
-import { awaitSessionOn, sessionOf } from './discover.js';
+import { awaitSessionOn, sessionOf, awaitNotWaiting } from './discover.js';
 import { awaitCodexOn, codexSessionOf, codexReady } from './codex.js';
 
 /** The conversation a row's process is in, read the way its agent records it. */
@@ -89,16 +89,25 @@ function repoDir(name) {
  *
  * "Sent" is reported only once the session's transcript holds the prompt (handoff.js): typing itself
  * reports nothing, and text can sit in the composer unsent while everything looks like it worked. A
- * session blocked on a permission prompt is refused rather than typed into, since the keys would answer
- * the dialog. `expect` is what the transcript will hold when that differs from the text typed. `cmd`
+ * session blocked on a permission prompt is never typed into, since the keys would answer the dialog:
+ * the words are held until the dialog is gone (answered, or timed out by Claude Code after two
+ * minutes) and delivered then. Only a dialog still up after DIALOG_WAIT_MS fails the command. `expect` is what the transcript will hold when that differs from the text typed. `cmd`
  * is the id the watcher stamps on the prompt these words become (sessionWatch.js `expectPrompt`), so
  * the device that sent them can recognise its own message coming back by id rather than by text.
  */
+// Claude Code times its own dialogs out at two minutes; this is only the bound past that.
+const DIALOG_WAIT_MS = 5 * 60 * 1000;
+
 async function deliver(row, text, { expect = null, cmd = null } = {}) {
   if (!row) throw new Error('no such session');
   if (!row.tty) throw new Error(`no terminal recorded for ${row.id}`);
-  const s = sessionFor(row);
-  if (s?.waiting) throw new Error(`${row.id} is waiting on a ${s.waiting} — not typing into it`);
+  let s = sessionFor(row);
+  if (s?.waiting) {
+    console.log(`[commands] ${row.id} is on a ${s.waiting}; holding the follow-up until it clears`);
+    try { s = await awaitNotWaiting(row.pid, DIALOG_WAIT_MS); }
+    catch (e) { throw new Error(`${row.id} ${e.message} — not typing into it`); }
+    if (!s) throw new Error(`${row.id} ended while a follow-up waited on its dialog`);
+  }
   const tpath = s?.transcriptPath || row.transcript_path || null;
   const from = tpath ? transcriptSize(tpath) : 0;
   if (cmd) expectPrompt(row.id, text, cmd);
@@ -339,6 +348,18 @@ async function run(cmd) {
   return how;
 }
 
+const followUpChains = new Map();
+
+async function execute(cmd) {
+  try {
+    await finishCommand(cmd.id, 'done', await run(cmd));
+  } catch (e) {
+    console.error('[commands] failed:', e.message);
+    await finishCommand(cmd.id, 'error', e.message).catch((err) => console.error('[commands] finish:', err.message));
+    await deadLetterCommand(cmd, e.message).catch((err) => console.error('[commands] dead letter:', err.message));
+  }
+}
+
 async function drain() {
   if (draining) return;
   draining = true;
@@ -364,13 +385,17 @@ async function drain() {
       const target = (cmd.payload || {}).target;
       if (target && target !== 'mac') continue;
       if (!(await claimCommand(cmd.id))) continue;   // someone else took it
-      try {
-        await finishCommand(cmd.id, 'done', await run(cmd));
-      } catch (e) {
-        console.error('[commands] failed:', e.message);
-        await finishCommand(cmd.id, 'error', e.message);
-        await deadLetterCommand(cmd, e.message).catch((err) => console.error('[commands] dead letter:', err.message));
+      if (cmd.kind === 'follow_up') {
+        // Not awaited: a follow-up can be held for minutes on a dialog (deliver), and that must not
+        // stop other commands. Chained per session, so two follow-ups to one session keep their order.
+        const key = String((cmd.payload || {}).session || '');
+        const prev = followUpChains.get(key) || Promise.resolve();
+        const next = prev.then(() => execute(cmd));
+        followUpChains.set(key, next);
+        next.finally(() => { if (followUpChains.get(key) === next) followUpChains.delete(key); });
+        continue;
       }
+      await execute(cmd);
     }
   } catch (e) {
     console.error('[commands] drain error:', e.message);

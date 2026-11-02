@@ -89,6 +89,28 @@ export function awaitSession(pid, timeoutMs = 15000) {
 }
 
 /**
+ * Resolve once process `pid`'s session is no longer blocked on a dialog: the session, or null if it
+ * has gone. Woken by Claude Code rewriting its record; the timeout only bounds a dialog nobody answers
+ * and Claude Code never times out.
+ */
+export function awaitNotWaiting(pid, timeoutMs) {
+  const clear = () => { const s = sessionOf(pid); return !s ? { s: null } : !s.waiting ? { s } : null; };
+  const now = clear();
+  if (now) return Promise.resolve(now.s);
+  return new Promise((resolve, reject) => {
+    let watcher = null;
+    const finish = (fn) => { clearTimeout(timer); try { watcher?.close(); } catch {} fn(); };
+    const timer = setTimeout(() => {
+      const r = clear();
+      finish(() => r ? resolve(r.s) : reject(new Error(`still on a ${sessionOf(pid)?.waiting || 'dialog'} after ${Math.round(timeoutMs / 1000)}s`)));
+    }, timeoutMs);
+    try {
+      watcher = fs.watch(SESSIONS_DIR, () => { const r = clear(); if (r) finish(() => resolve(r.s)); });
+    } catch { /* no directory: the timeout's own check is all there is */ }
+  });
+}
+
+/**
  * Every `claude` sitting in a terminal on this machine, with the conversation it is in. Oldest first.
  *
  * A process with no controlling tty is nobody's session: the voice worker's SDK client writes the
