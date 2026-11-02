@@ -88,9 +88,11 @@ Missing/wrong token → `401`.
 2. **Re-open the desk tab right where it was** for the session that *was*
    focused (tracked as `lastFocused {id, cwd}`): if Terminal is running with a
    window, Cmd-T a new tab into the front window (System Events keystroke) and
-   `do script "cd <cwd>; claude --resume <id>"` in its selected tab, only once that
-   tab is idle — a Cmd-T that made no tab leaves a running session selected, and
-   typing there puts the launch line in that session's input; if Terminal has
+   `do script "cd <cwd>; claude --resume <id>"` in the new tab — only after
+   checking Terminal was frontmost for the keystroke, the selected tab is a new
+   tty, and it is idle. Without those checks a Cmd-T that missed leaves a running
+   session selected, and the launch line lands in that session's input as an
+   unsent paste; any check failing takes the new-window path. If Terminal has
    no window/isn't running, launch it and run there. The launchd daemon has no
    Accessibility grant, so the keystroke fails and this falls back to a new
    window (`applescript.js` `runInNewTerminal`).

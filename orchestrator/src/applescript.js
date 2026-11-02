@@ -266,23 +266,30 @@ async function runInNewTerminal(shellCmd) {
   const windows = await osascript('tell application "Terminal" to count windows').catch(() => '0');
   if (parseInt(windows, 10) === 0) return newWindow();
 
-  // `do script … in front window` runs in whatever tab is selected there, so a Cmd-T that made no tab
-  // (Terminal not yet frontmost — activating into a full-screen Space takes longer than the delay)
-  // types the launch line into the input of the session already in that tab, where it sits as an
-  // unsent paste until someone presses Enter. A fresh tab's shell is idle; a tab running anything is
-  // `busy`. So the target has to be idle before anything is typed into it, or this takes the window path.
+  // The keystroke is blind: it goes to whatever app is frontmost, and `do script … in front window`
+  // runs in whatever tab is selected there. So a Cmd-T sent before Terminal is in front (activating
+  // into a full-screen Space is slow) opens a tab in some other app, and the launch line is then typed
+  // into the session already in Terminal's front tab — where it sits as an unsent paste until someone
+  // presses Enter there. Hence three checks, each falling back to the window path: Terminal is
+  // frontmost before the keystroke, the selected tab afterwards is a DIFFERENT tty from the one before
+  // it, and that tab is idle (a fresh shell; anything running makes it `busy`).
   try {
     const tty = await osascript(`tell application "Terminal" to activate
-      delay 0.2
+      repeat 30 times
+        tell application "System Events" to if frontmost of process "Terminal" then exit repeat
+        delay 0.1
+      end repeat
+      tell application "System Events" to if not (frontmost of process "Terminal") then error "Terminal never came to the front"
+      tell application "Terminal" to set was to tty of selected tab of front window
       tell application "System Events" to keystroke "t" using command down
-      delay 0.4
       tell application "Terminal"
-        set t to selected tab of front window
-        repeat 10 times
-          if not (busy of t) then exit repeat
-          delay 0.2
+        repeat 20 times
+          set t to selected tab of front window
+          if (tty of t) is not was and not (busy of t) then exit repeat
+          delay 0.1
         end repeat
-        if busy of t then error "the front tab is running something, so no new tab was made"
+        if (tty of t) is was then error "Cmd-T made no new tab"
+        if busy of t then error "the new tab is running something"
         set t to do script "${escaped}" in t
         return tty of t
       end tell`);
