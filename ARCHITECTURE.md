@@ -20,7 +20,7 @@ INPUTS (capture + enqueue only — no model logic):
   ESP mic (jared-voice server): wake word           ─┤→ Supabase voice_requests {transcript, source}
   Mac mic (mac-listener / wakefree.py) — DISABLED  ─┘
                                                         │
-WORKER (worker/worker.py — the ONE brain):
+WORKER (worker/worker.py + worker/voice_worker/ — the ONE brain):
   claims a request, runs it, writes the reply to voice_messages
     hub turn      → Opus at default effort, full toolset, on the warm SDK client (docs/ROUTING.md)
     full-agent    → the unrestricted Claude Code agent in `agent_cwd`, its own persistent session

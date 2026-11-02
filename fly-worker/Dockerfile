@@ -50,6 +50,7 @@ COPY gmail-mcp /app/gmail-mcp
 
 WORKDIR /app
 COPY worker.py ops_report.py entrypoint.sh ./
+COPY voice_worker ./voice_worker
 
 # /data is the volume: transcripts (CLAUDE_CONFIG_DIR), the worker's log and its state survive restarts.
 ENV DATA_MCP_JS=/app/data-layer/dist/mcp.js \

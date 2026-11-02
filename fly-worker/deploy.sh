@@ -3,7 +3,7 @@
 # newest Claude Code baked in. The assembled copies are build inputs only (.gitignore); edit the sources.
 set -euo pipefail
 cd "$(dirname "$0")"
-rm -rf data-layer mcp-voice govee-mcp gmail-mcp worker.py ops_report.py
+rm -rf data-layer mcp-voice govee-mcp gmail-mcp worker.py voice_worker ops_report.py
 pick() { for d in "$@"; do [ -d "$d/.git" ] && { echo "$d"; return; }; done; echo "no checkout among: $*" >&2; exit 1; }
 DL=$(pick ~/repos/data-layer ~/data-layer)
 GV=$(pick ~/repos/govee-mcp ~/mcp-govee)
@@ -17,6 +17,7 @@ cp -R $VP/mcp-voice/src mcp-voice/src
 cp $GV/govee_mcp.py govee-mcp/
 cp $GM/gmail_mcp.py gmail-mcp/   # the script only: its .env holds the credential, which Fly keeps as secrets
 cp $VP/worker/worker.py worker.py
+cp -R $VP/worker/voice_worker voice_worker && rm -rf voice_worker/__pycache__
 cp $VP/worker/ops_report.py ops_report.py   # health/responder reporter, which worker.py imports
 # Build and push first, then swap the machine only while the worker is idle. A deploy stops the worker
 # with about 6-8s of grace (Fly follows SIGINT with SIGTERM and entrypoint.sh exits on it), and a turn

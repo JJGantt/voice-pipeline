@@ -66,5 +66,5 @@ Already registered for interactive Claude sessions in `~/.claude.json` under
 `data` server.
 
 The worker also attaches it to every Claude run it spawns, from `VOICE_MCP_JS`
-(`worker/worker.py` writes the `--mcp-config` file), so a voice turn can speak
+(the worker's `voice_worker/runners.py` writes the `--mcp-config` file), so a voice turn can speak
 and switch focus. On Fly it is copied into the image by `server/assemble.sh`.

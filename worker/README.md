@@ -4,10 +4,15 @@ Claims voice commands from the Supabase `voice_requests` queue and runs each one
 on the **Claude subscription** — hub turns on a warm Agent SDK client
 (Opus at its default effort, full toolset), full-agent turns through headless
 `claude -p` (Opus) — with the `data` MCP attached, then writes the conversation
-back to Supabase (`voice_messages`) for a live display. Every turn runs on the Claude subscription;
-there is no API-billed path (see `../docs/ROUTING.md`).
+back to Supabase (`voice_messages`) for a live display. Every turn runs on the Claude subscription,
+except a pressed command the subscription refuses for its usage limit (`../CLAUDE.md`).
 
-The same `worker.py` runs on **Fly** as its own app, `jared-voice-worker` (`WORKER_ID=fly`, built from
+`worker.py` is the entry point (main loop, signals, heartbeat thread); the work is in `voice_worker/`,
+one module per responsibility (each opens with a line saying what it holds). Names are imported
+explicitly between modules; process state several modules share (`_running`, `_standby`, ...) lives in
+`voice_worker/runstate.py` and is always read as `runstate.<name>`, never imported by value.
+
+The same worker runs on **Fly** as its own app, `jared-voice-worker` (`WORKER_ID=fly`, built from
 `../fly-worker/`), the **Pi** (`WORKER_ID=pi`) and the **Mac** (`WORKER_ID=mac`); only the environment
 differs. How a claimed turn is
 routed once it gets here is `../docs/ROUTING.md`.
@@ -276,3 +281,15 @@ What the classes mean:
   password change revokes it (the claude.ai account signs in with Google).
 - `billing` — the subscription reports a billing problem.
 - `rate-limit` — transient and already retried; nothing to do unless it persists.
+
+## Tests
+
+`tests/` covers what is costly to break: claiming and failover priority, recording-window dedupe and
+orphan recovery, and the press-provenance gate with the routing it decides. They run the real worker
+against an in-memory PostgREST (`tests/fakes.py`) and a stand-in `claude` CLI, so nothing reaches
+Supabase or Claude. From the repo root:
+
+    python3.11 -m venv .venv-test && .venv-test/bin/pip install -r worker/requirements-test.txt
+    .venv-test/bin/python -m pytest worker/tests
+
+CI runs every suite in the repo on each push (`.github/workflows/tests.yml`).

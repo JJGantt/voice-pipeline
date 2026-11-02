@@ -4,7 +4,7 @@
 
 Every hub turn, photos included, runs on **Opus at its default effort** (`HUB_MODEL` / `HUB_EFFORT`)
 with the full toolset, on the warm SDK client. There is no fast first responder and no escalation —
-Jared's call for quality over speed. Read `docs/ROUTING.md` before touching `worker.py`'s routing: it
+Jared's call for quality over speed. Read `docs/ROUTING.md` before touching the worker's routing (`worker/voice_worker/process.py`): it
 covers what every turn is told, how sends are fenced per mic, and what to get right if a faster split
 is ever rebuilt (gate by omission from an allow list, never `--disallowedTools`).
 
@@ -40,7 +40,7 @@ the watch's and phone's listeners included: judging room noise on the key is wha
 balance once. `SDK_CREDITS` connects on first use and closes on the next turn
 the subscription answers.
 
-The CLI and the Agent SDK silently prefer the key over the subscription login, so `worker.py` pops it
+The CLI and the Agent SDK silently prefer the key over the subscription login, so the worker (`voice_worker/config.py`) pops it
 from the environment at import into `CREDITS_API_KEY`, and only `SDK_CREDITS` passes it on, explicitly
 (with `CLAUDE_CODE_OAUTH_TOKEN` blanked). Nothing else it spawns can inherit it. `pi-desk/launch.sh`
 strips it separately (it sources the worker's `.env` itself). Fly holds it as a secret.
@@ -74,7 +74,7 @@ time. Editing a copy is lost work; edit the source.
 
       cd server && ./assemble.sh && flyctl deploy --now -a jared-voice
 
-- **`fly-worker/` → `jared-voice-worker`**: the voice worker. `deploy.sh` copies `worker/worker.py`,
+- **`fly-worker/` → `jared-voice-worker`**: the voice worker. `deploy.sh` copies `worker/worker.py` and `worker/voice_worker/`,
   `mcp-voice/`, the data-layer source and `govee_mcp.py` in (all gitignored), then deploys with the
   newest Claude Code baked in. Deploy with:
 
