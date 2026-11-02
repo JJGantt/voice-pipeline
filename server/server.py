@@ -49,6 +49,9 @@ _demote("realtime._async.client", lambda r: r.getMessage().startswith(
     ("Connection attempt failed:", "WebSocket connection closed with code:")))
 
 
+OPEN_TIMEOUT_S = 60   # longer than the hub's 20s /verify abort, so the caller's own limit is what applies
+
+
 async def _ops_beat():
     """The server is event-driven, so the event loop is its work loop: this beat stops when the loop is
     blocked or the process is gone (health/responder)."""
@@ -72,8 +75,11 @@ async def main():
     # WebSocket keepalive pings, so server-initiated pings were closing the connection mid-
     # utterance ("keepalive ping timeout"). The constant audio stream keeps the socket live;
     # if the ESP drops, the recv loop ends on its own.
+    # open_timeout covers process_request too, so it bounds every HTTP route. A cold /verify or
+    # /wakefree-on loads ECAPA off the loop (~12s on this box); at the library's default 10s the
+    # connection is closed with no answer and the route's work is cancelled half-done.
     async with websockets.serve(connection, "0.0.0.0", config.PORT, max_size=None,
-                                ping_interval=None, close_timeout=5,
+                                ping_interval=None, close_timeout=5, open_timeout=OPEN_TIMEOUT_S,
                                 process_request=process_request):
         await asyncio.Future()
 
