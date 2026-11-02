@@ -6,7 +6,7 @@ know before editing anything here.
 
 ## The pieces (modular boundaries)
 
-**The Mac's always-on listener is switched off** (since 2026-10-24): the watch is the everyday way in, and
+**The Mac's always-on listener is switched off**: the watch is the everyday way in, and
 the ESP keeps listening for wake words. The code and the launchd plist stay; the job is
 `launchctl disable`d and booted out, so neither the worker's `_listener_supervisor` (which kicks only a
 LOADED job with no PID) nor Hammerspoon's wake kick (`voicelistener.lua`) can bring it back. To turn it on
@@ -92,8 +92,8 @@ Two always-on mics hear the same speech and endpoint at different pauses, so a s
 reaches `voice_requests` as two, three, sometimes four rows. Two rules keep that from becoming two,
 three or four commands:
 
-**Nothing is claimed while a mic is still hearing him.** Every capture source already stamps
-`voice_presence.heard_jared_at` on each confirmed check; the worker now waits until every mic has been
+**Nothing is claimed while a mic is still hearing the speaker.** Every capture source stamps
+`voice_presence.heard_jared_at` on each confirmed check; the worker waits until every mic has been
 quiet for `MIC_QUIET_S` (2.5s) before claiming anything, with `MAX_HOLD_S` as the backstop against a
 wedged mic parking a command for ever. Short commands never notice — by the time "turn the light blue"
 is enqueued, nothing has heard anything for seconds.
@@ -103,21 +103,18 @@ are grouped transitively by overlapping recording windows (`capture_start`/`capt
 clock skew), the fullest is claimed, and the rest are marked `(superseded …)` before it runs — marked,
 never deleted, so a bad grouping is visible instead of a command that vanished.
 
-This is not a refinement. Without it, on 2026-08-27, the Mac cut a 65-second dictation into two
-mid-sentence fragments and enqueued them while the ESP was still recording; the fragments ran as
-commands, and the ESP's complete 888-character capture — the actual instruction, which asked for a
-session to be started — was discarded as a duplicate of them. Earliest-wins is the wrong rule
-whenever one mic endpoints early, which is most of the time on dictation.
+This is not a refinement. Earliest-wins is the wrong rule whenever one mic endpoints early, which is
+most of the time on dictation: the early mic's mid-sentence fragments run as commands, and the other
+mic's complete capture is discarded as their duplicate.
 
 Captures are kept for **7 days** (`sweepRetention`, pi-desk): the only time a raw request is read is
 shortly after something went wrong with it. The conversation is not affected — `voice_messages` has
 no cascade from `voice_requests`, so the readable thread outlives the capture row.
 
-**The interesting version is not built.** If the Mac hears the first half and the ESP the second — you
-walk between rooms mid-sentence — longest-wins keeps one half and loses the other. Stitching the
-halves together by their recording windows would make mic handoff work, and would be a genuinely nice
-property. It is deliberately not attempted yet: a naive concatenation would say a clause twice inside
-a command, which is worse than dropping one.
+**Stitching is not built.** If the Mac hears the first half and the ESP the second (the speaker walks
+between rooms mid-sentence), longest-wins keeps one half and loses the other. Stitching the halves by
+their recording windows would fix that, but a naive concatenation says a clause twice inside a command,
+which is worse than dropping one.
 
 ## Feedback is universal — never scoped to which input captured the command
 
@@ -131,9 +128,9 @@ Three signals, and only the first is local:
 - **Sound at a mic — LOCAL, and barely shown.** Speech energy opening a capture means nothing yet (it is
   the TV as often as not), so it shows only as the Mac HUD's faint "listening" for the Mac's own mic,
   and as nothing at all on the ESP.
-- **Hearing Jared — UNIVERSAL.** The instant any mic's speaker check confirms him it stamps
-  `voice_presence.heard_jared_at`, and every surface renders that one row: the ESP light goes solid and
-  the Mac HUD locks whether the Mac, the ESP, or both are the ones hearing him. This is the signal that
+- **Hearing the enrolled speaker — UNIVERSAL.** The instant any mic's speaker check confirms the
+  enrolled voice it stamps `voice_presence.heard_jared_at`, and every surface renders that one row: the
+  ESP light goes solid and the Mac HUD locks whether the Mac, the ESP, or both are the ones hearing it. This is the signal that
   answers "is anything listening to me", and it is deliberately not scoped to the capturing device.
 - **Processing + response — UNIVERSAL.** "working" (the brain is running) and "done" reflect **one
   shared command lifecycle** that every surface subscribes to and renders the same. An ESP-captured
@@ -167,11 +164,10 @@ lifecycle above (+ `push_activity` tool events on the web activity bar). `pi-aud
 - **The ESP light is a single-owner state machine** (server-side, `hearing > working > idle`). Every
   input — the ESP's own confirmed capture, the Mac's `voice_presence` stamps over realtime, the
   capturers' and worker's `/led-blink|off` pings, and the `voice_requests` lifecycle over realtime —
-  feeds the SAME flags and renders with precedence, so two paths can never fight the bulb. (The old
-  code let the local capture machine and the worker's pings stomp each other last-writer-wins, which is
-  what produced the solid→off→blink flicker when both mics heard one command.) There is ONE working
-  backstop timer, re-armed on every working edge and cancelled on done; stacked per-ping timers used to
-  switch the light off under a later command. Every change of the bulb's state is logged in `fly logs`
+  feeds the SAME flags and renders with precedence, so two paths can never fight the bulb (separate
+  writers going last-writer-wins flicker solid→off→blink when both mics hear one command). There is ONE
+  working backstop timer, re-armed on every working edge and cancelled on done; per-ping timers would
+  stack and switch the light off under a later command. Every change of the bulb's state is logged in `fly logs`
   as `LED <cmd> (<why>)`, and a failed send is logged rather than swallowed — when the light does
   nothing, that log answers whether the server ever asked it to.
 
@@ -182,8 +178,8 @@ so the ~7s model load overlaps capture + STT + the model's thinking and the engi
 time. Warmed by: the wake word firing (`listener.py`), wake-free speech-energy start (`wakefree.py`),
 and — as a backstop for the ESP path — any claimed `voice_request` (`listener.py`). It binds its socket
 immediately and queues lines that arrive mid-load, and **self-exits after 30s idle** to give the RAM
-back. Zero permanent cost, no cold delay. (Warming at the worker *claim* alone was too late: the claim
-lands only ~2–3 s before the spoken line, but the cold load needs ~7 s — hence the old ~5 s delay.)
+back. Zero permanent cost, no cold delay. (Warming at the worker *claim* alone is too late: the claim
+lands only ~2–3 s before the spoken line, but the cold load needs ~7 s.)
 
 While **wake-free mode is on**, the listener *pins* the daemon warm (a `/tmp/kokoro.pin` file the idle
 loop honours) and warms it on the toggle — so spaced-out commands in an active session never hit a cold
@@ -191,49 +187,47 @@ reload between them. Turning wake-free off removes the pin and the daemon idle-e
 
 ## Wake-free mode (speaker-ID gated) — ONE system, every source
 
-A toggleable always-listening mode: no wake word — you just talk, and your **voice** is the gate. It's
-a **global** mode (`app_settings.wakefree_enabled`), congruent across every listener: ON → no wake
-word, every source (Mac *and* ESP) gates on Jared's voice; OFF → the wake word everywhere.
+A toggleable always-listening mode: no wake word, and the enrolled speaker's **voice** is the gate.
+It's a **global** mode (`app_settings.wakefree_enabled`), congruent across every listener: ON → no wake
+word, every source (Mac *and* ESP) gates on the enrolled voice; OFF → the wake word everywhere.
 
 - **Speaker ID + one shared voiceprint.** ECAPA-TDNN. `enroll.py` saves a bank of per-phrase embeddings
   (`exemplars.npy`) **and uploads it to `app_settings.voiceprint`** so the ESP/Fly server uses the exact
   same one. An utterance is verified by cosine vs the closest exemplars (top-3 mean); ≥ `voiceid_threshold`
-  (default 0.30) = Jared. Enroll from **separate command-shaped phrases** (short ones + far-away
+  (default 0.30) = the enrolled speaker. Enroll from **separate command-shaped phrases** (short ones + far-away
   `--append` passes) — like-against-like coverage is what makes short/distant commands verify, not
   slices of one monologue.
-- **Capture — same logic on both ends.** Segment on speech energy → hold the capture open on Jared's
-  *verified presence* (re-score the trailing 2s with ECAPA every 0.7s) → close after N consecutive
+- **Capture — same logic on both ends.** Segment on speech energy → hold the capture open on the enrolled
+  speaker's *verified presence* (re-score the trailing 2s with ECAPA every 0.7s) → close after N consecutive
   non-confirming checks → trim silence → transcribe (Groq) + enqueue a `voice_requests` row. The TV /
   other people are filtered for free (never transcribed); the worker's `__IGNORE__` directive drops any
-  of *your* speech that isn't a command.
-  - **N rises with how long he has been talking** (`absent_misses()` in `wakefree.py`,
+  of the enrolled speaker's speech that isn't a command.
+  - **N rises with how long the speaker has been talking** (`absent_misses()` in `wakefree.py`,
     `_absent_misses()` in `server.py`): 1 miss (~2s of pause tolerated) for a short command, up to 5
-    (~4.8s) past ~32s of speech. A one-breath command should end the instant he stops rather than
+    (~4.8s) past ~32s of speech. A one-breath command should end the instant the speaker stops rather than
     record the room afterwards; a long dictated one is full of thinking-pauses, and cutting one in half
     loses the entire command — which costs far more than a few seconds of trailing silence.
   - **An accepted capture reaches BACK for the words before its trigger.** A capture that has not
-    confirmed him within 3.5s is dropped as the TV — and if he is mid-sentence, the next capture opens
-    on the next frame, so the first 3.5s of the command used to be gone (56 of 184 Mac commands in the
-    week to 2026-09-10 began within 1s of such a drop; "scoop of protein powder to the smoothie" was one).
-    Both mics now keep the last 8s of raw audio, and at capture-accept the speaker gate walks backward
-    through it in 0.5s steps, prepending each 2s window that still scores as him (bar 0.22: 99% of his
-    own clean windows pass it, TV tops out ~0.18), stopping at silence, another voice, or 5s.
-    `capture_start` moves back with it, so the worker's grouping and the data MCP's "when did he say
-    it" see the true start. `PREROLL_S`/`HISTORY_S`/`BACKFILL_*` are one setting written twice —
+    confirmed the speaker within 3.5s is dropped as the TV; if the speaker is mid-sentence, the next
+    capture opens on the next frame and would lose the command's first 3.5s. Both mics keep the last 8s
+    of raw audio, and at capture-accept the speaker gate walks backward through it in 0.5s steps,
+    prepending each 2s window that still scores as the enrolled speaker (bar 0.22: 99% of the owner's
+    clean windows pass it, TV tops out ~0.18), stopping at silence, another voice, or 5s.
+    `capture_start` moves back with it, so the worker's grouping and the data MCP's "when was it said"
+    see the true start. `PREROLL_S`/`HISTORY_S`/`BACKFILL_*` are one setting written twice —
     `server.py` and `wakefree.py`.
   - **The confirmed span is verified once more before anything is transcribed.** The live gate only
-    ever scores 2s slices, and one slice over the confirm bar commits the capture — which is how a TV
-    voice fluking a single slice past 0.30 got transcribed and ran a model turn that answered
-    `__IGNORE__` (321 such turns in the week to 2026-09-10). A longer stretch embeds far more steadily
-    than any slice: his own 4s clips never scored under 0.23, 10s clips never under 0.37, while other
+    ever scores 2s slices, and one slice over the confirm bar commits the capture, so a TV voice fluking a
+    single slice past 0.30 would be transcribed and run a model turn that answers `__IGNORE__`. A longer
+    stretch embeds far more steadily than any slice: the owner's own 4s clips never scored under 0.23, 10s clips never under 0.37, while other
     voices (JFK, synthetic male voices) land at 0.00–0.16. So at accept, after the back-fill, the
     stretch from the first confirming window to the last (first 15s of it) is scored once, and a
     capture under `voiceid_accept_threshold` is dropped before STT, logged as `confirmed span sim=… —
     dropped` with every slice score it had. It is the SPAN, never the whole capture: the capture also
     holds the pre-confirm lead-in and the trailing windows that closed it, and on the far mic those
-    are the TV — a real 14.9s ESP command whose confirmed windows scored 0.33/0.31/0.27 scored 0.20 as
-    a whole and was dropped on 2026-09-11. Accepted captures log their span score too. **The row is
-    0 (gate off) until those logs show what his far-field spans score on the ESP**; the close-mic
+    are the TV (a real ESP command whose confirmed windows scored 0.33/0.31/0.27 scored 0.20 as a
+    whole). Accepted captures log their span score too. **The row is
+    0 (gate off) until those logs show what the owner's far-field spans score on the ESP**; the close-mic
     recordings that set 0.22 say nothing about that mic.
   - **Mac:** `voice-id/wakefree.py` (ECAPA local, on-demand).
   - **ESP:** the `jared-voice` Fly server runs the same ECAPA + the shared voiceprint (lazy-loaded on
@@ -279,7 +273,7 @@ bridges to the ESP over HTTP).
 | `voice_muted` | `0` | listener + ESP — global mute (set by the FAB / push-to-talk) |
 | `voice_inject_mode` | `0` | listener + ESP — Mac mic pastes into the focused window; the ESP goes deaf |
 | `agent_mode` / `agent_cwd` | `0` | worker — full-agent (coding) mode and its working directory |
-| `voiceid_threshold` | `0.30` | wakefree + ESP server — "it's Jared" cosine threshold for the live 2s-slice gate |
+| `voiceid_threshold` | `0.30` | wakefree + ESP server — "it's the enrolled speaker" cosine threshold for the live 2s-slice gate |
 | `voiceid_accept_threshold` | `0` | wakefree + ESP server — the confirmed-span bar at capture-accept; a capture under it is dropped before STT. `0` = off (measure only). No hub UI yet; set the row directly |
 | `wakefree_pause_s` | `2.0` | ESP server only — the energy endpoint it falls back to while wake-free is on but ECAPA/the voiceprint has not loaded (and during enrollment). The speaker-gated path ignores it |
 | `voiceprint` | — | wakefree (local) + ESP server — base64 ECAPA exemplar bank (uploaded by `enroll.py`) |
