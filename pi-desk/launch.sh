@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Start one Claude session. Run inside tmux by index.js; never called by hand.
 #
-#   launch.sh <repo-dir> <repo-name> <prompt-file> [resume-id] [session-id] [cgroup-dir]
+#   launch.sh <repo-dir> <repo-name> <prompt-file> [resume-id] [session-id] [cgroup-dir] [incident-launcher]
 #
 # The prompt arrives as a FILE, not an argument. It is dictated speech — arbitrary text with quotes,
 # apostrophes and newlines in it — and threading that through tmux's command string is a quoting
 # problem with no safe answer. Reading it here means it is never shell syntax at any point.
 set -uo pipefail
-DIR="$1"; NAME="$2"; PROMPT_FILE="${3:-}"; RESUME_ID="${4:-}"; SESSION_ID="${5:-}"; CGROUP="${6:-}"
+DIR="$1"; NAME="$2"; PROMPT_FILE="${3:-}"; RESUME_ID="${4:-}"; SESSION_ID="${5:-}"; CGROUP="${6:-}"; INCIDENT="${7:-}"
 HERE="$(dirname "$0")"
 
 # Into the session's own memory cgroup (pi-desk/cgroups.js) BEFORE claude starts, so claude, its tool
@@ -91,6 +91,17 @@ if [ "${DESK_MACHINE:-pi}" = fly ]; then
   EXTRA=()
 fi
 
+# An ops-responder incident session (index.js isIncident) starts through the health repo's launcher,
+# which runs claude with that agent's narrow permissions, and never with the browser: it reads text
+# anyone can write. health/responder/README.md § The incident agent's permissions.
+CLAUDE=(claude)
+if [ -n "$INCIDENT" ]; then
+  [ -x "$INCIDENT" ] || { echo "launch.sh: no incident launcher at $INCIDENT" >&2; exit 1; }
+  CLAUDE=("$INCIDENT")
+  EXTRA=()
+  [ "${DESK_MACHINE:-pi}" = fly ] || EXTRA=(--remote-control "$NAME")
+fi
+
 if [ -n "$PROMPT_FILE" ] && [ -s "$PROMPT_FILE" ]; then
   PROMPT="$(cat "$PROMPT_FILE")"
   rm -f "$PROMPT_FILE"
@@ -98,6 +109,6 @@ if [ -n "$PROMPT_FILE" ] && [ -s "$PROMPT_FILE" ]; then
   # dispatcher ("start a session in X and have it...") are not read as an order to dispatch again.
   # A system prompt, so surfaces still show only the user's words. The Mac's orchestrator reads the same file.
   [ -z "$RESUME_ID" ] && SYS_TEXT="$(cat "$HERE/../orchestrator/dispatched-session.txt")"$'\n\n'"$SYS_TEXT"
-  exec claude --model "$MODEL" "${EXTRA[@]}" "${RESUME[@]}" --append-system-prompt "$SYS_TEXT" "$PROMPT"
+  exec "${CLAUDE[@]}" --model "$MODEL" "${EXTRA[@]}" "${RESUME[@]}" --append-system-prompt "$SYS_TEXT" "$PROMPT"
 fi
-exec claude --model "$MODEL" "${EXTRA[@]}" "${RESUME[@]}" --append-system-prompt "$SYS_TEXT"
+exec "${CLAUDE[@]}" --model "$MODEL" "${EXTRA[@]}" "${RESUME[@]}" --append-system-prompt "$SYS_TEXT"

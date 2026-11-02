@@ -443,7 +443,9 @@ function summarise(reply) {
     const finish = (v) => { if (!done) { done = true; resolve(v); } };
     let child;
     try {
-      child = spawn('claude', ['-p', '--model', 'haiku'], { stdio: ['pipe', 'pipe', 'ignore'] });
+      // No tools and no MCP servers: the reply can quote anything a session read (an incident's log
+      // lines, a web page), and summarising it needs nothing but the text.
+      child = spawn('claude', ['-p', '--model', 'haiku', '--tools', '', '--strict-mcp-config'], { stdio: ['pipe', 'pipe', 'ignore'] });
     } catch (_) { return finish(null); }
     const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch (_) {} finish(null); }, 45000);
     child.stdout.on('data', (c) => { out += c; if (out.length > 4000) out = out.slice(0, 4000); });

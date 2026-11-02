@@ -811,7 +811,14 @@ const REPORT_DIRECTIVE =
   + 'well: the report is an extra artifact, never a replacement for replying.]';
 
 // ---- launching ------------------------------------------------------------
-function launch(dir, name, prompt, resumeId = null, reuse = null, agent = 'claude') {
+// An ops-responder incident session reads text anyone can write (error messages, logs), so it never
+// runs as an ordinary session: it starts through the health repo's launcher, with that repo's narrow
+// permissions (health/responder/README.md § The incident agent's permissions). The label is the marker
+// because it is the one field every relaunch carries: dispatch, queue, resume and hand-over alike.
+const INCIDENT_LAUNCHER = path.join(REPO_ROOT, 'health', 'responder', 'bin', 'incident-claude');
+const isIncident = (label) => /^Incident: /.test(String(label || ''));
+
+function launch(dir, name, prompt, resumeId = null, reuse = null, agent = 'claude', incident = false) {
   const session = reuse || `hub-${name}-${Date.now().toString(36)}`;
   // The Remote Control name is an IDENTITY in the Claude app and must be unique per SESSION. The
   // tmux name already carries a timestamp suffix for exactly that reason, so the RC name reuses it
@@ -839,7 +846,8 @@ function launch(dir, name, prompt, resumeId = null, reuse = null, agent = 'claud
   // Fly has no cgroup budgets: the machine is the session's own, and there is no Mac hand-off to make.
   const cg = FLY ? '' : limitSession(session);
   if (!FLY) watchSession(session, onHeavy);
-  const args = ['new-session', '-d', '-s', session, '-c', dir, launcher, dir, rcName, promptFile, resumeId || '', session, cg];
+  const args = ['new-session', '-d', '-s', session, '-c', dir, launcher, dir, rcName, promptFile, resumeId || '', session, cg,
+                incident ? INCIDENT_LAUNCHER : ''];
   // The first of these spawns creates the tmux SERVER, and the server keeps this environment for
   // its whole life — every later session in it inherits the lot, including ones a person opens by
   // hand. run.sh loaded worker/.env into this process, so without scrubbing here the server carries
@@ -935,6 +943,13 @@ async function startSession({ name, prompt, resumeId = null, commandId = null, r
                               knownClaudeId = null, transcriptPath = null, mirrorOffset = null, origin = null,
                               reuse = null, msg = null, agent = 'claude' }) {
   if (agent === 'codex' && !codexReady()) throw new Error(`Codex is not signed in on the ${FLY ? 'Fly machine' : 'Pi'}`);
+  const incident = isIncident(label);
+  if (incident) {
+    // Refuse rather than fall back: an incident session started as an ordinary one has every permission.
+    if (agent !== 'claude') throw new Error('an incident session runs only as Claude');
+    await ensureRepo('health');
+    if (!fs.existsSync(INCIDENT_LAUNCHER)) throw new Error(`no incident launcher at ${INCIDENT_LAUNCHER}`);
+  }
   if (reuse) {
     const same = (await liveSessions()).find((l) => l.name === reuse);
     // Running already: a second process on one transcript forks the conversation (see resume_session).
@@ -951,7 +966,7 @@ async function startSession({ name, prompt, resumeId = null, commandId = null, r
   // doing, and a report on a one-line change is noise — so it is opt-in, set by the voice tool
   // when the user actually asks. A bare session with no prompt has nothing to report on either way.
   const full = [warning, spoken, (report && spoken) ? REPORT_DIRECTIVE : null].filter(Boolean).join('\n\n');
-  const session = launch(dir, name, full, resumeId, reuse, agent);
+  const session = launch(dir, name, full, resumeId, reuse, agent, incident);
   // The sender's message id, stamped on the prompt these words become, exactly as a follow-up typed
   // into a running session is (`typeInto`). Without it the device that sent the words never sees its
   // own id come back, and its placeholder stays under the whole turn.
@@ -1315,7 +1330,8 @@ function exitIfIdle(residentCount) {
 }
 // The ops responder's way in when Supabase is down (health/responder/README.md). Every other route to a
 // session here reads or writes Supabase, so this one touches neither: the responder wakes the machine,
-// posts the incident prompt, and it runs as a plain `claude -p` in the health checkout. Nothing about it
+// posts the incident prompt, and it runs as `claude -p` in the health checkout, through that repo's
+// incident launcher. Nothing about it
 // appears in the session list, which is itself in Supabase. When it exits the run is reported done, so
 // whatever it left open is handed to the user.
 let incidentRuns = 0;
@@ -1327,11 +1343,6 @@ async function incidentRun(run, prompt) {
     else execFileSync('gh', ['repo', 'clone', 'JJGantt/health', dir], { timeout: 120e3 });
   } catch (e) { console.error(`[pi-desk] incident ${run}: health checkout: ${e.message}`); }
   incidentRuns += 1;
-  const log = fs.openSync(path.join(process.env.HOME || '/tmp', `incident-${run}.log`), 'a');
-  const child = spawn('claude', ['-p', prompt, '--output-format', 'text'], {
-    cwd: fs.existsSync(dir) ? dir : process.env.HOME, stdio: ['ignore', log, log],
-    env: { ...process.env, OPS_URL, OPS_TOKEN: process.env.OPS_TOKEN || '' },
-  });
   const finish = async (why) => {
     incidentRuns -= 1;
     idleSince = Date.now();
@@ -1341,6 +1352,18 @@ async function incidentRun(run, prompt) {
         body: JSON.stringify({ note: why }) });
     } catch (e) { console.error(`[pi-desk] incident ${run}: could not report done: ${e.message}`); }
   };
+  // The launcher, never plain claude: health/responder/README.md § The incident agent's permissions.
+  // Without it the run is refused, not started with this machine's own permissions.
+  const launcher = path.join(dir, 'responder', 'bin', 'incident-claude');
+  if (!fs.existsSync(launcher)) {
+    console.error(`[pi-desk] incident ${run}: no incident launcher at ${launcher}`);
+    return finish(`fly-desk has no incident launcher (${launcher})`);
+  }
+  const log = fs.openSync(path.join(process.env.HOME || '/tmp', `incident-${run}.log`), 'a');
+  const child = spawn(launcher, ['-p', prompt, '--model', 'opus', '--output-format', 'text'], {
+    cwd: dir, stdio: ['ignore', log, log],
+    env: { ...process.env, OPS_URL, OPS_TOKEN: process.env.OPS_TOKEN || '' },
+  });
   child.on('error', (e) => { console.error(`[pi-desk] incident ${run}: claude did not start: ${e.message}`); finish(`claude did not start on fly-desk: ${e.message}`); });
   child.on('exit', (code) => { console.log(`[pi-desk] incident ${run}: claude exited ${code}`); finish(`fly-desk claude exited ${code}`); });
 }

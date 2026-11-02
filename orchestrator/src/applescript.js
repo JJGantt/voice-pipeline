@@ -17,6 +17,7 @@ import path from 'node:path';
 import { config } from './config.js';
 import { findSessionFile } from './sessions.js';
 import { typeable } from './handoff.js';
+import { claudeBinFor, claudeBinForSession } from './incident.js';
 
 const execFileP = promisify(execFile);
 
@@ -324,7 +325,8 @@ function checkLaunch(raw, marker, what) {
 
 // Re-open a desk tab and resume the session "right where it was".
 export async function reopenDeskTab(cwd, id) {
-  const raw = await runInNewTerminal(`cd ${shQuote(cwd)}; ${shQuote(config.CLAUDE_BIN)} --model ${shQuote(config.DESK_MODEL)} --resume ${shQuote(id)}`);
+  const bin = await claudeBinForSession(id);
+  const raw = await runInNewTerminal(`cd ${shQuote(cwd)}; ${shQuote(bin)} --model ${shQuote(config.DESK_MODEL)} --resume ${shQuote(id)}`);
   return checkLaunch(raw, id, `resume of ${id}`);
 }
 
@@ -340,7 +342,9 @@ export async function reopenDeskTab(cwd, id) {
 // itself, where no such limit applies. (This is the same reason pi-desk hands tmux a file path.)
 const DISPATCHED = fs.readFileSync(new URL('../dispatched-session.txt', import.meta.url), 'utf8').trim();
 
-export async function openFreshTab(cwd, name, prompt, sessionId = null, resumeId = null, note = null) {
+// `label` is the session's dispatch label: an incident session starts through incident.js's launcher.
+export async function openFreshTab(cwd, name, prompt, sessionId = null, resumeId = null, note = null, label = null) {
+  const bin = claudeBinFor(label);
   // The Remote Control name is an IDENTITY in the Claude app, so it has to be unique per SESSION,
   // not per repo. Named after the repo alone, two sessions on status-hub both register as
   // "status-hub" and the app lists two entries claiming to be the same session. Bare
@@ -368,9 +372,9 @@ export async function openFreshTab(cwd, name, prompt, sessionId = null, resumeId
   // ends, however it ends, the shell goes too. With the profile's "When the shell exits: Close if the
   // shell exited cleanly" the tab then closes itself. Without that setting it is left as "[Process
   // completed]", which closeHuskForTty clears.
-  const raw = await runInNewTerminal(`cd ${shQuote(cwd)}; ${env}${shQuote(config.CLAUDE_BIN)}${model}${resume}${rc}${sys}${first}; exit 0`);
+  const raw = await runInNewTerminal(`cd ${shQuote(cwd)}; ${env}${shQuote(bin)}${model}${resume}${rc}${sys}${first}; exit 0`);
   // The Remote Control name is unique to this launch; without one, the resumed id; failing both, claude.
-  return checkLaunch(raw, rcName || resumeId || config.CLAUDE_BIN, `session ${sessionId || rcName || cwd}`);
+  return checkLaunch(raw, rcName || resumeId || bin, `session ${sessionId || rcName || cwd}`);
 }
 
 // A Codex session is started by the same launcher the Pi uses (pi-desk/launch-codex.sh): the flags that

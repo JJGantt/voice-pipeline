@@ -3,6 +3,7 @@
 // written back into the pty. Clients can resize it.
 import { spawn } from 'node-pty';
 import { config } from './config.js';
+import { claudeBinForSession } from './incident.js';
 
 let active = null; // { pty, clients:Set<ws>, id, cwd }
 
@@ -15,10 +16,11 @@ export function activeInfo() {
 }
 
 // Spawn `claude --model <DESK_MODEL> --resume <id>` in cwd and make it the active pty, replacing
-// (and killing) any previous one.
-export function startSession(id, cwd) {
+// (and killing) any previous one. An incident session resumes through its launcher (incident.js).
+export async function startSession(id, cwd) {
+  const bin = await claudeBinForSession(id);
   killActive();
-  const pty = spawn(config.CLAUDE_BIN, ['--model', config.DESK_MODEL, '--resume', id], {
+  const pty = spawn(bin, ['--model', config.DESK_MODEL, '--resume', id], {
     name: 'xterm-256color',
     cols: config.PTY_COLS,
     rows: config.PTY_ROWS,

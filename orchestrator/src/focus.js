@@ -74,7 +74,7 @@ async function reconcile(targetFocus) {
 
   // 2. Spawn the pty (becomes the active pty, replacing any previous).
   try {
-    startSession(id, cwd);
+    await startSession(id, cwd);
     console.log(`[focus] spawned pty: claude --resume ${id} (cwd=${cwd})`);
   } catch (e) {
     console.error('[focus] startSession failed:', e.message);

@@ -143,6 +143,16 @@ export async function deskSession(id) {
   return rows[0] || null;
 }
 
+// The label of the session a conversation belongs to (incident.js). Throws when it cannot be read,
+// so a caller never mistakes an outage for "no label".
+export async function labelForClaudeSession(claudeId) {
+  const res = await fetch(`${base()}/desk_sessions?claude_session_id=eq.${encodeURIComponent(claudeId)}&select=label`
+    + '&label=not.is.null&limit=1', { headers: headers() });
+  if (!res.ok) throw new Error(`desk_sessions -> ${res.status}`);
+  const rows = await res.json();
+  return rows[0] ? rows[0].label : null;
+}
+
 export async function patchDeskSession(id, patch) {
   const res = await fetch(`${base()}/desk_sessions?id=eq.${encodeURIComponent(id)}`, {
     method: 'PATCH',

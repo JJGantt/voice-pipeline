@@ -20,7 +20,9 @@ parking, follow-ups, resume and transfer all behave as on the Pi.
 
 When Supabase is down nothing can be dispatched (every route in reads Supabase), so the ops responder
 (health/responder/README.md) wakes this machine and posts the incident to `POST /incident` (Bearer
-`OPS_TOKEN`). It runs as a plain `claude -p` in a `health` checkout, logs to `$HOME/incident-<run>.log`,
+`OPS_TOKEN`). It runs as `claude -p` in a `health` checkout, started through that repo's
+`responder/bin/incident-claude` with the incident agent's permissions rather than this machine's
+allow-list (refused if the launcher is missing), logs to `$HOME/incident-<run>.log`,
 and reports the run done to the responder when it exits. It counts as work for the idle exit, so the
 machine stays up until it finishes. It does not appear in the session list, which lives in Supabase.
 

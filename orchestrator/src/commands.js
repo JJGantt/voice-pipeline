@@ -38,6 +38,7 @@ const [MOVED_NOTE, MOVED_MID_TURN, MOVED_BETWEEN_TURNS] = fs.readFileSync(new UR
   .split(/^---$/m).map((s) => s.trim());
 import { ensureTrusted } from './trust.js';
 import { openFreshTab, openCodexTab, sendToTty, closeTabForTty } from './applescript.js';
+import { isIncident } from './incident.js';
 import { withAttachments, transcriptSize, awaitSubmitted } from './handoff.js';
 import { expectPrompt } from './sessionWatch.js';
 import { mirrorUp, mirrorDown } from './mirror.js';
@@ -190,11 +191,12 @@ async function run(cmd) {
     // running session — without it the sender's placeholder stays under the whole turn.
     if (prompt) expectPrompt(sessionId, prompt, (cmd.payload || {}).msg || cmd.id);
     if (row.agent === 'codex' && !codexReady()) throw new Error('Codex is not signed in on the Mac');
+    if (row.agent === 'codex' && isIncident(row.label)) throw new Error('an incident session runs only as Claude');
     beginLaunch();   // until the row exists — see open_session below
     try {
       const raw = row.agent === 'codex'
         ? await openCodexTab(dir, row.repo, prompt, sessionId, row.claude_session_id)
-        : await openFreshTab(dir, row.repo, prompt, sessionId, row.claude_session_id);
+        : await openFreshTab(dir, row.repo, prompt, sessionId, row.claude_session_id, null, row.label);
       const [how, tty] = String(raw).split('\t');
       // A NEW row for the new tab, exactly as the Pi makes a new tmux session on resume. The old row
       // stays parked until retention drops it; it is where that stretch of the conversation happened.
@@ -261,7 +263,8 @@ async function run(cmd) {
       // and `moved` when it closed a session mid-turn for doing heavy work there (pi-desk onHeavy).
       const note = moved
         ? `${MOVED_NOTE.replace('{why}', String(moved))}\n\n${midTurn ? MOVED_MID_TURN : MOVED_BETWEEN_TURNS}` : null;
-      const raw = await openFreshTab(dir, repo, (cmd.payload || {}).prompt || null, sessionId, claudeId, note);
+      const raw = await openFreshTab(dir, repo, (cmd.payload || {}).prompt || null, sessionId, claudeId, note,
+                                     (cmd.payload || {}).label || null);
       const [how, tty] = String(raw).split('\t');
       await upsertDeskSession({
         id: sessionId, worker: 'desk', repo, status: 'resident',
@@ -308,6 +311,7 @@ async function run(cmd) {
   const sessionId = `mac-${cmd.id.slice(0, 8)}`;
   const agent = (cmd.payload || {}).agent === 'codex' ? 'codex' : 'claude';
   if (agent === 'codex' && !codexReady()) throw new Error('Codex is not signed in on the Mac');
+  if (agent === 'codex' && isIncident((cmd.payload || {}).label)) throw new Error('an incident session runs only as Claude');
   // Held from before the tab opens until its row exists. In between, the new claude looks exactly
   // like a session nobody dispatched, and adopting it would give one session two rows.
   beginLaunch();
@@ -315,7 +319,7 @@ async function run(cmd) {
   try {
     const raw = agent === 'codex'
       ? await openCodexTab(target, name, prompt, sessionId)
-      : await openFreshTab(target, name, prompt, sessionId);
+      : await openFreshTab(target, name, prompt, sessionId, null, null, (cmd.payload || {}).label || null);
     // openFreshTab reports "<how>\t<tty>"; the tty is the handle a later follow-up addresses.
     [how, tty] = String(raw).split('\t');
     console.log(`[commands] opened session in ${target} (${how}${tty ? `, tty ${tty}` : ''}, trust: ${trust}`
