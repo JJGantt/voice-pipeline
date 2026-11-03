@@ -31,6 +31,7 @@ import { closeHuskForTty, closeTabForTty } from './applescript.js';
 import { sessionOf } from './discover.js';
 import { liveCodexSessions, codexSessionOf } from './codex.js';
 import fs from 'node:fs';
+import { streak } from './streak.js';
 
 // A tab is opened, the shell starts, then claude starts. Ending a session that is still coming up
 // would delete a job the instant it was dispatched.
@@ -51,6 +52,7 @@ const MIRROR_FAIL_RAISE_MS = 5 * 60 * 1000;
 // tick, so a write that fails (a Supabase gateway 502) is simply made again 30s later; only a streak
 // that outlasts this is an incident, raised once.
 const patchFailing = new Map();
+const listStreak = streak('[desk-sessions] list');
 const PATCH_FAIL_RAISE_MS = 5 * 60 * 1000;
 
 const ms = (t) => (t ? new Date(t).getTime() : 0);
@@ -362,7 +364,8 @@ async function tick() {
 
   let rows;
   try { rows = await deskSessionsFor('desk'); }
-  catch (e) { return console.error('[desk-sessions] list:', e.message); }
+  catch (e) { return listStreak.fail(e); }
+  listStreak.ok();
   // Codex sessions (`agent = 'codex'`) too, read from the rollout each holds open (codex.js). Only the
   // ones a row was written for: a `codex` opened by hand is not adopted.
   const live = [...(await liveClaudeSessions()).map((p) => ({ ...p, agent: 'claude' })), ...liveCodexSessions()];

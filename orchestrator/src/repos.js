@@ -25,6 +25,7 @@ import { config } from './config.js';
 import { upsertRepos, pruneRepos, heartbeatDesk } from './supabase.js';
 import { loginExpiresAt } from './login.js';
 
+
 const execFileP = promisify(execFile);
 
 let timer = null;
@@ -134,7 +135,8 @@ async function beat() {
     failingSince = null;
   } catch (e) {
     const cause = e.cause ? ` (${e.cause.code || e.cause.message || e.cause})` : '';
-    console.error(`[repos] presence error ${new Date().toISOString()}: ${e.message}${cause}`);
+    // A warning: the wake from sleep fails this once, and the exit below is the report for a streak.
+    console.warn(`[repos] presence error ${new Date().toISOString()}: ${e.message}${cause} (will retry)`);
     failingSince ??= Date.now();
     if (Date.now() - failingSince >= config.PRESENCE_FAIL_EXIT_MS) {
       console.error(`[repos] presence failing since ${new Date(failingSince).toISOString()} — exiting for launchd to restart`);

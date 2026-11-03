@@ -43,6 +43,7 @@ import { withAttachments, transcriptSize, awaitSubmitted } from './handoff.js';
 import { expectPrompt } from './sessionWatch.js';
 import { mirrorUp, mirrorDown } from './mirror.js';
 import { fingerprint, noteRemoteInput } from './idle.js';
+import { streak } from './streak.js';
 
 // Appended only when a dispatch ASKED for a write-up (`report` on the command payload, set by the
 // voice tool when the user says so). Reports are opt-in because most dispatched work just needs
@@ -368,6 +369,7 @@ async function execute(cmd) {
   }
 }
 
+const drainStreak = streak('[commands] drain');
 async function drain() {
   if (draining) return;
   draining = true;
@@ -405,8 +407,9 @@ async function drain() {
       }
       await execute(cmd);
     }
+    drainStreak.ok();
   } catch (e) {
-    console.error('[commands] drain error:', e.message);
+    drainStreak.fail(e);
   } finally {
     draining = false;
   }
@@ -421,6 +424,7 @@ async function drain() {
  * in flight.
  */
 const CLAIM_STALE_S = parseInt(process.env.CLAIM_STALE_S || '900', 10);
+const sweepStreak = streak('[commands] sweep claims');
 async function sweepAbandonedClaims() {
   try {
     const cutoff = new Date(Date.now() - CLAIM_STALE_S * 1000).toISOString();
@@ -429,7 +433,8 @@ async function sweepAbandonedClaims() {
       await deadLetterCommand(cmd, 'the Mac stopped before it finished this');
       console.log(`[commands] swept abandoned claim ${cmd.id}`);
     }
-  } catch (e) { console.error('[commands] sweep claims:', e.message); }
+    sweepStreak.ok();
+  } catch (e) { sweepStreak.fail(e); }
 }
 
 export function startCommands() {

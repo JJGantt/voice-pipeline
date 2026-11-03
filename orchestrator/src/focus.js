@@ -12,6 +12,7 @@ import { getFocus, patchFocus } from './supabase.js';
 import { cwdFromSessionFile } from './sessions.js';
 import { ttyForSession, closeTabForTty, reopenDeskTab } from './applescript.js';
 import { startSession, killActive } from './pty.js';
+import { streak } from './streak.js';
 
 let currentFocus = null; // last focus value we acted on
 let lastFocused = null; // { id, cwd } — the session most recently shown on the wall
@@ -92,6 +93,7 @@ async function reconcile(targetFocus) {
   currentFocus = id;
 }
 
+const pollStreak = streak('[focus] poll');
 async function tick() {
   if (reconciling) return;
   reconciling = true;
@@ -99,8 +101,9 @@ async function tick() {
     const row = await getFocus();
     const target = row && row.focus ? row.focus : 'hub';
     await reconcile(target);
+    pollStreak.ok();
   } catch (e) {
-    console.error('[focus] poll error:', e.message);
+    pollStreak.fail(e);
   } finally {
     reconciling = false;
   }
