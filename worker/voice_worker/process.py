@@ -73,6 +73,31 @@ def fetch_attachments(paths: list) -> tuple[str | None, list[str]]:
     return tmpdir, local
 
 
+def about_directive(db: Supabase, about_id: str) -> str:
+    """A command spoken from an answer opened in the answers inbox (status-hub docs/WATCH.md, "The
+    answers inbox") is about THAT answer, which may be days old and long out of the replayed context, so
+    the question and the answer ride on the prompt. A lookup that fails sends the command without them:
+    the words alone are still his command, and the error is reported."""
+    try:
+        [ans] = db.get("voice_messages", f"id=eq.{about_id}&select=text,request_id,session_id,session_label,created_at") or [None]
+        if not ans:
+            return ""
+        ask = None
+        if ans.get("request_id"):
+            [ask] = db.get("voice_messages", f"role=eq.user&request_id=eq.{ans['request_id']}&select=text&limit=1") or [None]
+        who = (f"the session \"{ans.get('session_label') or ans['session_id']}\" ({ans['session_id']})"
+               if ans.get("session_id") else "you")
+        q = ((ask or {}).get("text") or "").strip()
+        return ("\n\n[He said this while looking at an earlier answer, opened on its own from his answers "
+                "inbox, so it is about that answer — a follow-up to it, not a new subject. It was written by "
+                + who + " at " + str(ans.get("created_at") or "?") + "."
+                + (" What he had asked:\n" + q[:4000] + "\n" if q else "")
+                + " The answer:\n" + (ans.get("text") or "").strip()[:12000] + "\n]")
+    except Exception as e:  # noqa: BLE001
+        log_error(f"about_directive: could not read answer {about_id}: {e}")
+        return ""
+
+
 def fallback_directive(db: Supabase, rid: str) -> str:
     """What a fallback command's run is told. The FIRST fallback command of an outage starts the
     troubleshooting session; later ones within FALLBACK_OUTAGE_S only say the fallback is in use, so a
@@ -205,6 +230,8 @@ def process_request(db: Supabase, req: dict) -> None:
     # button, and a list of labels here drifted from the hub's — the phone's listener was in neither.
     ambient = bool(req.get("always_on"))
     prompt = build_prompt(req, transcript, ambient=ambient, manual=manual)
+    if req.get("about_id"):
+        prompt += about_directive(db, req["about_id"])
 
     # ---- ONE route. Every hub command, photos included, runs on the warm SDK client (HUB_MODEL, full
     # toolset). Full-agent mode is the unrestricted coding agent on its own --resume session.
@@ -412,7 +439,7 @@ def _record_outcome(db: Supabase, req: dict, result: dict, prompt: str, *, trans
         result = SDK.run(prompt + NUTRITION_DIRECTIVE + TOOLS_DIRECTIVE, on_event=on_event, manual=manual, hold=hold)
         text = (result.get("text") or "").strip()
 
-    text, needs_read = take_read_marker(text)
+    text, needs_read, read_label = take_read_marker(text)
 
     # A failure here is this machine's, not the command's, until every machine has tried it: hand it on.
     # Nothing has been written to the thread yet, so the worker that takes it writes the whole turn.
@@ -446,6 +473,7 @@ def _record_outcome(db: Supabase, req: dict, result: dict, prompt: str, *, trans
     if result["ok"]:
         reply = {"focus": "hub", "mode": msg_mode, "role": "assistant", "text": text, "done": True,
                  "worker": WORKER_ID, "needs_read": needs_read,
+                 **({"label": read_label} if needs_read and read_label else {}),
                  # Which engine wrote it, when not the subscription: the surfaces colour the reply by it
                  # (credits amber, Codex blue), so a fallback is visible on the reply itself.
                  **({"engine": result["_engine"]} if result.get("_engine") else {})}

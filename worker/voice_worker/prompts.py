@@ -112,20 +112,26 @@ DELIBERATE_DIRECTIVE = (
 )
 
 
-# Appended to every hub turn. The watch keeps a flagged reply reachable until it has actually been on
-# screen (status-hub docs/WATCH.md, "Unread answers"), so a later command cannot bury it; most replies
-# are confirmations he never needs to read, and those must NOT be flagged or they would queue up
-# unread forever. The marker is stripped before the reply is stored (`take_read_marker`), and the
-# replayed day puts it back on flagged replies (`recent_context`), so the history the model reads
-# shows the convention being followed rather than a run of untagged answers to copy.
+# Appended to every hub turn. A flagged reply goes into the answers inbox (status-hub docs/WATCH.md,
+# "The answers inbox"), kept for good and held unread until it has actually been on screen, so a later
+# command cannot bury it; most replies are confirmations he never needs to read, and those must NOT be
+# flagged or they would fill the inbox. The marker carries the inbox row's LABEL — the question,
+# shortened — because the model writing the answer already knows what was asked, where a second model
+# would have to be run to work it out. The marker is stripped before the reply is stored
+# (`take_read_marker`), and the replayed day puts it back on flagged replies (`recent_context`), so the
+# history the model reads shows the convention being followed rather than a run of untagged answers.
 READ_MARKER = "[[read]]"
+READ_LABEL_MAX = 80
+_READ_RE = re.compile(r"\[\[read(?::\s*([^\]]*))?\]\]", re.I)
 
 
 READ_DIRECTIVE = (
     "\n\n[Decide by what he ASKED FOR, not by what your reply happens to contain. If he asked a question "
     "or asked you to find something out for him (a fact, a lookup, a calculation, a summary, a "
-    "recommendation, what he did last time), end your reply with " + READ_MARKER + " as the very last "
-    "thing. If he asked you to DO something, leave it off, even when your reply describes what you "
+    "recommendation, what he did last time), end your reply with [[read: <label>]] as the very last "
+    "thing, where <label> is his question cut down to as few words as still say what he asked — a few "
+    "words, never a sentence, no full stop (\"Sunday surf\", \"Protein left today\", \"Why the wall "
+    "froze\"). It names the answer in a list he scrolls on his watch. If he asked you to DO something, leave it off, even when your reply describes what you "
     "picked, copied, looked up along the way or worked out to do it: logging, staging or editing food, "
     "a set, a list item, a light, putting something on the TV, starting, moving or messaging a session. "
     "Also leave it off when you did nothing because the words were not meant for you. One exception "
@@ -135,11 +141,19 @@ READ_DIRECTIVE = (
 )
 
 
-def take_read_marker(text: str) -> tuple[str, bool]:
-    """The reply without the read marker, and whether it carried one."""
-    if READ_MARKER not in (text or ""):
-        return text, False
-    return text.replace(READ_MARKER, "").strip(), True
+def take_read_marker(text: str) -> tuple[str, bool, str | None]:
+    """The reply without the read marker, whether it carried one, and the label it gave (None when the
+    marker came bare, as a model copying older replayed history may write it)."""
+    found = list(_READ_RE.finditer(text or ""))
+    if not found:
+        return text, False, None
+    label = next((m.group(1).strip() for m in reversed(found) if (m.group(1) or "").strip()), None)
+    return _READ_RE.sub("", text).strip(), True, (label[:READ_LABEL_MAX] if label else None)
+
+
+def read_marker(label: str | None) -> str:
+    """The marker as a flagged reply carried it, for the replayed history."""
+    return f"[[read: {label}]]" if label else READ_MARKER
 
 
 # A second speech-to-text reading from a different Whisper model, present only when its words differ

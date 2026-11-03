@@ -12,7 +12,7 @@ import httpx
 from .config import AGENT_SESSION_FILE, HTTP_TIMEOUT_S, HUB_SESSION_FILE, SESSION_IDLE_RESET_S, STATE_DIR
 from .db import Supabase, headers, note_ok, report_failure
 from .logs import _parse_ts, log, log_error, now_iso
-from .prompts import READ_MARKER, is_ignore
+from .prompts import is_ignore, read_marker
 
 
 def session_file(agent: bool) -> Path:
@@ -84,7 +84,7 @@ def live_load() -> bool:
             page = get("voice_messages",
                        "focus=eq.hub&mode=eq.hub&role=in.(user,assistant)"
                        f"&created_at=gte.{since}&order=created_at.asc&limit=1000&offset={len(rows)}"
-                       "&select=id,focus,mode,role,text,created_at,ignored,done,needs_read,session_id,session_label")
+                       "&select=id,focus,mode,role,text,created_at,ignored,done,needs_read,label,session_id,session_label")
             rows += page
             if len(page) < 1000:
                 break
@@ -218,8 +218,10 @@ def recent_context() -> str:
         txt = (r.get('text') or '').strip()
         if r.get('ignored'):
             return f"[{when}] You (ignored as room noise, not acted on): {txt}"
-        if r.get('needs_read') and r.get('role') == 'assistant':
-            txt = f"{txt} {READ_MARKER}"
+        # A relayed session reply is flagged too (it is in the inbox by being relayed), but it never
+        # carried the marker, so the replay leaves it off rather than teach that sessions write one.
+        if r.get('needs_read') and r.get('role') == 'assistant' and not r.get('session_id'):
+            txt = f"{txt} {read_marker(r.get('label'))}"
         return f"[{when}] {who}: {txt}"
     # A bare sentinel reply is dropped from the replay. It is never shown as a reply — but a deliberate
     # turn that emitted one anyway was saved as `Assistant: __IGNORE__`, and replaying that line taught

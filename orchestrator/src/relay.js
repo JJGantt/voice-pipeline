@@ -39,8 +39,12 @@ export async function relayFirstReply(sessionId, tail) {
   const rows = await rest('voice_messages?on_conflict=session_id', {
     method: 'POST',
     headers: { Prefer: 'resolution=ignore-duplicates,return=representation' },
+    // needs_read: the orchestrator said at dispatch that he will want to read what comes back
+    // (data-layer start_session `needs_read`), so it goes into the answers inbox (status-hub
+    // docs/WATCH.md) under the job's own label. Most dispatched jobs need no answer read and stay out.
     body: JSON.stringify([{ focus: 'hub', mode: 'hub', role: 'assistant', done: true, text,
-                            session_id: sessionId, session_label: label }]),
+                            session_id: sessionId, session_label: label,
+                            ...(c.payload.needs_read ? { needs_read: true, label: c.payload.label || label } : {}) }]),
   });
   settled.add(sessionId);
   // No notification here: the hub pushes every session's finished reply, this one included, keyed by
