@@ -12,6 +12,7 @@ import httpx
 
 from .config import SUPABASE_KEY, SUPABASE_URL, UNTRANSCRIBED_MAX_S, WORKER_ID, _NOTHING_SAID
 from .logs import alert_failure, log, log_error, now_iso
+from .db import report_failure
 
 
 # THE LAST TRANSCRIBER. When Groq and OpenAI both fail, the hub keeps the clip and queues the row
@@ -84,4 +85,4 @@ def sweep_untranscribed() -> None:
         for r in rows or []:
             threading.Thread(target=transcribe_local, args=(r,), daemon=True).start()
     except Exception as e:  # noqa: BLE001
-        log_error(f"untranscribed sweep failed: {e}")
+        report_failure(f"untranscribed sweep failed: {e}", e)

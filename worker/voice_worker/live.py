@@ -10,7 +10,7 @@ from pathlib import Path
 import httpx
 
 from .config import AGENT_SESSION_FILE, HTTP_TIMEOUT_S, HUB_SESSION_FILE, SESSION_IDLE_RESET_S, STATE_DIR
-from .db import Supabase, _note_failure, headers
+from .db import Supabase, headers, note_ok, report_failure
 from .logs import _parse_ts, log, log_error, now_iso
 from .prompts import READ_MARKER, is_ignore
 
@@ -89,11 +89,11 @@ def live_load() -> bool:
             if len(page) < 1000:
                 break
     except Exception as e:  # noqa: BLE001
-        _note_failure(e)
-        log_error(f"live state load failed: {e}")
+        report_failure(f"live state load failed: {e}", e)
         with _live_lock:
             _live["loaded"] = False
         return False
+    note_ok()
     with _live_lock:
         _live.update(loaded=True, settings=settings, focus=focus, thread={r["id"]: r for r in rows})
     log(f"live state loaded: {len(rows)} thread rows, focus={focus}")

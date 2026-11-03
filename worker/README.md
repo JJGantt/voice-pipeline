@@ -26,6 +26,10 @@ routed once it gets here is `../docs/ROUTING.md`.
    `NET_DEGRADED_S` (180s) beats `info:{degraded:true}` instead. A flaky link lets
    enough beats through to look alive while every claim and reply takes minutes,
    so freshness alone cannot be the test.
+   Those same failures log as `WARN … (will retry)` and report to the ops responder only once they
+   have lasted `TRANSPORT_RAISE_S` (5 min) straight (`db.report_failure`): the first request after
+   the Mac wakes always fails on a socket closed while it slept, and that is not an incident. A 4xx
+   or any other error reports at once.
 2. **Claim (serialized, never concurrent)** — woken by a Supabase realtime INSERT
    on `voice_requests`; the poll below is only a backstop.
    - **Priority gate:** if any worker ranked *higher* in `WORKER_PRIORITY` has a
