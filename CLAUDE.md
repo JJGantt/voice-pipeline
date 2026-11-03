@@ -283,6 +283,9 @@ When the source machine is unreachable there is nothing to close and nothing lef
 destination is asked directly and the old row is marked `transferred`. That is the case the whole
 mechanism exists for — the laptop is shut and the work should carry on — and it costs whatever the
 session said after its last completed turn, which is nothing, because that is when mirroring runs.
+A follow-up to a session whose machine is asleep takes the same path, with the words as
+`resume_mirrored`'s `prompt` (plus `attachments` and `msg`), so the destination resumes the session and
+answers them; both handlers resolve the prompt with `withAttachments` like any other.
 
 A session that asks to close ITSELF is never closed by a command: closing it mid-turn kills it before
 its reply is written. data-layer stamps `close_after_turn` instead, and the host (`closeAfterTurn`,

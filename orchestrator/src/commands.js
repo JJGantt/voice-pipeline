@@ -257,13 +257,17 @@ async function run(cmd) {
     ensureTrusted(dir);
     if (repo !== 'root') await pull(dir);
     const sessionId = `mac-${cmd.id.slice(0, 8)}`;
+    // A follow-up rides along when the session's machine was asleep and the sender moved the session
+    // here to deliver it (data-layer deliverFollowUp, the hub's session followup).
+    const prompt = await withAttachments((cmd.payload || {}).prompt, cmd.payload) || null;
+    if (prompt && !moved) expectPrompt(sessionId, prompt, (cmd.payload || {}).msg || cmd.id);
     beginLaunch();   // until the row exists — see open_session below
     try {
       // A prompt rides along when the Pi hands over a resume it had no room for (pi-desk handResumeToMac),
       // and `moved` when it closed a session mid-turn for doing heavy work there (pi-desk onHeavy).
       const note = moved
         ? `${MOVED_NOTE.replace('{why}', String(moved))}\n\n${midTurn ? MOVED_MID_TURN : MOVED_BETWEEN_TURNS}` : null;
-      const raw = await openFreshTab(dir, repo, (cmd.payload || {}).prompt || null, sessionId, claudeId, note,
+      const raw = await openFreshTab(dir, repo, prompt, sessionId, claudeId, note,
                                      (cmd.payload || {}).label || null);
       const [how, tty] = String(raw).split('\t');
       await upsertDeskSession({
@@ -273,7 +277,7 @@ async function run(cmd) {
         claude_session_id: claudeId, transcript_path: file,
         // Everything already uploaded stays uploaded: this machine carries on appending from here.
         mirror_offset: fs.statSync(file).size,
-        remote_inputs: (cmd.payload || {}).prompt ? [fingerprint((cmd.payload || {}).prompt)] : [],
+        remote_inputs: prompt ? [fingerprint(prompt)] : [],
         active_at: new Date().toISOString(),
       });
       return `resumed ${claudeId.slice(0, 8)} here (${how})`;

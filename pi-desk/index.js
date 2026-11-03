@@ -1138,7 +1138,11 @@ async function run(cmd) {
     // Nothing mirrored means the session never sat idle long enough to be uploaded. Resuming would
     // open an empty conversation wearing its id, which is worse than not resuming at all.
     if (!file) throw new Error(`nothing has been mirrored for ${claudeId}`);
-    return startSession({ name, resumeId: claudeId, commandId: cmd.id,
+    // A follow-up rides along when its session's machine was asleep and the sender moved the session
+    // here to deliver it (data-layer deliverFollowUp, the hub's session followup).
+    const prompt = await withAttachments((cmd.payload || {}).prompt, cmd.payload) || null;
+    return startSession({ name, resumeId: claudeId, commandId: cmd.id, prompt,
+                          msg: prompt ? ((cmd.payload || {}).msg || cmd.id) : null,
                           label: (cmd.payload || {}).label || null,
                           origin: (cmd.payload || {}).origin || 'dispatched',
                           knownClaudeId: claudeId, transcriptPath: file,
