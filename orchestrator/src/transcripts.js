@@ -38,6 +38,10 @@ export function turnStart(d) {
   // A slash command is recorded as markup around what the user typed; what the user typed is the prompt.
   const cmd = raw.startsWith('<command-name>') && raw.match(/<command-name>([^<]*)<\/command-name>/);
   if (cmd) {
+    // `/exit` is how a session is PARKED (pi-desk sessions.js, applescript.js): typed by the machine
+    // when the session goes idle, not by the user. Shown, it lands in every session view as the user's last
+    // words. Not a turn, so the turn before it stands.
+    if (isExit(cmd[1])) return null;
     const args = (raw.match(/<command-args>([^<]*)<\/command-args>/) || [])[1] || '';
     return { prompt: `${cmd[1].trim()}${args.trim() ? ` ${args.trim()}` : ''}` };
   }
@@ -63,7 +67,11 @@ const NOT_HIM = ['<task-notification>', '<agent-message'];
 const LOCAL_OUTPUT = ['<local-command-stdout>', '<local-command-stderr>', '<bash-input>', '<bash-stdout>', '<bash-stderr>'];
 export function fromHim(text) {
   const t = String(text || '').trimStart();
-  return !NOT_HIM.some((tag) => t.startsWith(tag));
+  return !NOT_HIM.some((tag) => t.startsWith(tag)) && !isExit(t);
+}
+// `/exit` (and its alias `/quit`) alone, the way parking types it.
+function isExit(text) {
+  return /^\/(exit|quit)$/.test(String(text || '').trim());
 }
 
 // A DICTATED MESSAGE TOO LONG FOR THE TERMINAL IS STILL THE MESSAGE.

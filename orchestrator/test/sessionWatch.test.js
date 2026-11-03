@@ -35,3 +35,17 @@ test('words nobody registered carry no id', () => {
   assert.equal(run(fresh('hub-d'), user('something else'), false)[0].cmd, undefined);
   assert.equal(run(fresh('hub-e'), user('what was typed'), false)[0].cmd, undefined);
 });
+
+// Parking a session types `/exit` into it. That is the machine closing the session, not the user
+// speaking, so no surface may show it as the user's words, and the turn before it stands.
+test('the /exit that parks a session is not shown as the user\'s words', () => {
+  const st = fresh('hub-x');
+  run(st, user('real question'), true);
+  const turn = st.turn;
+  const exit = '<command-name>/exit</command-name>\n            <command-message>exit</command-message>\n            <command-args></command-args>';
+  assert.deepEqual(run(st, user(exit), true), []);
+  assert.equal(st.turn, turn);
+  assert.deepEqual(run(st, { type: 'queue-operation', operation: 'enqueue', content: '/exit' }, true), []);
+  // Another slash command is still what the user typed.
+  assert.equal(run(st, user('<command-name>/model</command-name><command-args>opus</command-args>'), true)[0].text, '/model opus');
+});
