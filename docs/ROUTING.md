@@ -200,8 +200,10 @@ rather than `Assistant`, so the model can tell which session said what and pass 
 applies on a turn that is not manual (a wake-word capture is deliberate but not manual): the session
 tools and the sends are refused there, and `NO_PRESS_DIRECTIVE` tells the model to say it needs the button.
 
-Every turn also gets `READ_DIRECTIVE`: a reply to a QUESTION ends with the `[[read]]` marker, and a
-reply to a request to DO something does not. The directive is worded around what was asked for, not
+Every turn also gets `READ_DIRECTIVE`: a reply to a QUESTION ends with the `[[read: <label>]]` marker,
+the label being the question cut to a few words, and a reply to a request to DO something does not.
+The label names the answer's row in the answers inbox; the model writing the answer already knows what
+was asked, so it writes the label rather than a second model being run on every answer. The directive is worded around what was asked for, not
 what the reply contains, because a confirmation routinely carries information — the video picked
 for the TV and what it is about, the past entry a staged meal was copied from — and judged by its
 content the model flags those, and the room-noise "that wasn't meant for me" replies with them. A
@@ -211,8 +213,16 @@ away assuming it worked, so a failure is exactly the reply that must not be miss
 A failure caused by a BROKEN or MISSING tool also starts a session to fix it (`DELIBERATE_DIRECTIVE`),
 with the user's request, the tool and its exact error as the prompt; a failure that is the state of the world
 (the TV is off) starts nothing, since there is no code to change. `take_read_marker` strips it
-before the reply is stored or spoken and sets `voice_messages.needs_read`, which the watch uses to
-keep the answer reachable until it has been on screen (status-hub `docs/WATCH.md`, "Unread answers").
+before the reply is stored or spoken and sets `voice_messages.needs_read` and `label`, which file the
+answer in the answers inbox (status-hub `docs/WATCH.md`, "The answers inbox"). A bare `[[read]]`, as a
+model copying older history may write, still flags it, with no label; the inbox then shows the
+question's own words.
+
+A session started with `start_session`'s `needs_read` has its relayed first reply filed in the inbox
+too (`relay.js`, from the desk_commands payload). The orchestrator decides it at dispatch, because most
+dispatched jobs need no answer read. A command spoken with an inbox answer open carries `about_id`, and
+`about_directive` puts that question and answer on its prompt, since the answer may be days out of the
+replayed context.
 The replayed day puts the marker back on flagged replies (`_line`), for the same reason the ignore
 sentinel is kept out of it: the model copies what the history shows, and a history of untagged
 answers would teach it to stop tagging.
