@@ -38,7 +38,9 @@ TOOLS_DIRECTIVE = (
     "through. The session's first reply is posted back into this conversation on its own, so say only "
     "that it has started; never offer to check on it later, because nothing will run you again to do "
     "it. Never answer a question about the current world out of your own memory, and never tell him you "
-    "cannot browse.]"
+    "cannot browse. When he asks for a video on his MAC (something to watch on YouTube there, or what is "
+    "playing on the TV at the same spot), start_session on the Mac with his words, and add to the prompt "
+    "that the video must end up playing FULL SCREEN on the Mac.]"
 )
 
 
