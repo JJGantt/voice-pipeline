@@ -51,9 +51,7 @@ Three blocks ride on every hub prompt beside the replayed conversation and the t
 - `TOOLS_DIRECTIVE` — picks between tools that look interchangeable: `log_recipe` only for a recipe the
   user names, never for "same as yesterday" (that copies the logged entry); read the workout catalog and pass
   the exercise id, with `upsert_catalog_exercise` only for a genuinely new movement; look things up with
-  WebSearch/WebFetch in the turn, and `start_session` only for what needs the signed-in browser; a
-  video put on the Mac is a Mac `start_session` whose prompt adds that it plays full screen, so the
-  session needs no other doc to know how he wants it.
+  WebSearch/WebFetch in the turn, and `start_session` only for what needs the signed-in browser.
 - `DELIBERATE_DIRECTIVE` on a pushed or typed command, or `ADDRESSING_DIRECTIVE`
   on a room-mic turn (below).
 
