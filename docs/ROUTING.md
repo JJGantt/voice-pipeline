@@ -200,6 +200,11 @@ rather than `Assistant`, so the model can tell which session said what and pass 
 applies on a turn that is not manual (a wake-word capture is deliberate but not manual): the session
 tools and the sends are refused there, and `NO_PRESS_DIRECTIVE` tells the model to say it needs the button.
 
+A request to put on, play or watch something that names no device goes to the **bedroom TV**; the Mac
+gets it only when that same request names the Mac. The directive says so outright because the model,
+left to infer it, carries the device over from earlier in the replayed day — after a "sorry, I meant on
+my Mac", the next unqualified "put it on YouTube" goes to a Mac session.
+
 Every turn also gets `READ_DIRECTIVE`: a reply to a QUESTION ends with the `[[read: <label>]]` marker,
 the label being the question cut to a few words, and a reply to a request to DO something does not.
 The label names the answer's row in the answers inbox; the model writing the answer already knows what
