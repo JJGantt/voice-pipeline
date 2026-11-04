@@ -247,7 +247,7 @@ async function park(name, extra = {}) {
   queueDirty = true;   // memory just came free, so queued work gets another look on the next tick
   await sb(`desk_sessions?id=eq.${encodeURIComponent(name)}`, {
     method: 'PATCH', headers: { Prefer: 'return=minimal' },
-    body: JSON.stringify({ status: 'evicted', ended: new Date().toISOString(), ...extra }),
+    body: JSON.stringify({ status: 'evicted', ended: new Date().toISOString(), working: false, ...extra }),
   }).catch((e) => console.error('[pi-desk] mark evicted:', e.message));
 }
 
@@ -593,7 +593,7 @@ async function reconcileSessions() {
       if (liveNames.has(r.id)) continue;
       await sb(`desk_sessions?id=eq.${encodeURIComponent(r.id)}`, {
         method: 'PATCH', headers: { Prefer: 'return=minimal' },
-        body: JSON.stringify({ status: 'evicted', ended: new Date().toISOString() }),
+        body: JSON.stringify({ status: 'evicted', ended: new Date().toISOString(), working: false }),
       });
       console.log(`[pi-desk] session left residency: ${r.id}`);
     }
