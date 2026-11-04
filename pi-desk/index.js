@@ -44,7 +44,7 @@ import { sessionOf } from '../orchestrator/src/discover.js';
 import { codexSessionOf, codexReady } from '../orchestrator/src/codex.js';
 import { sweepScratch } from './scratch.js';
 import { createRequire } from 'node:module';
-import { setupCgroups, limitSession, watchSession, liftBudget, sessionUsage, SESSION_BUDGET_MB } from './cgroups.js';
+import { setupCgroups, limitSession, watchSession, liftBudget, sessionUsage, SESSION_BUDGET_MB, COMMAND_BUDGET_MB } from './cgroups.js';
 import { syncSessionWatch, reportTurnEnd, expectPrompt } from '../orchestrator/src/sessionWatch.js';
 import { relayFirstReply } from '../orchestrator/src/relay.js';
 
@@ -115,9 +115,9 @@ const WORKER = FLY ? 'fly-desk' : 'pi-desk';
 // working sessions while the processor sat idle. Admission is makeRoom: launch when shortfall() is
 // clear, park idle sessions until it is, and hand the work to the Mac when it still is not.
 //
-// This Pi is not for memory-heavy work. Each session runs in a cgroup with a budget (cgroups.js), and
-// one that goes over it with memory it cannot give back is moved to the Mac (onHeavy) rather than
-// left to push the machine into the kernel's OOM killer, which takes whole sessions mid-turn.
+// This Pi is not for memory-heavy work. Each session runs in a cgroup (cgroups.js), and one whose
+// commands hold more than COMMAND_BUDGET_MB is moved to the Mac (onHeavy) rather than left to push the
+// machine into the kernel's OOM killer, which takes whole sessions mid-turn.
 
 // A TIME bound, and the one the other limits do not provide.
 //
@@ -270,6 +270,17 @@ async function makeRoom(residents, forWhat) {
   return null;
 }
 
+/**
+ * Why new work should start on the Mac rather than here, or null. The Pi holds one session comfortably
+ * beside the wall display and the automation browser, and a second is what runs it into swap, so while
+ * one is running and the Mac is awake the next goes to the Mac. With the Mac asleep this says nothing,
+ * and the Pi takes the work if memory allows (makeRoom), parking idle sessions to fit it.
+ */
+async function preferMac(residents) {
+  if (FLY || !residents.length || !(await macIsAwake(false))) return null;
+  return `the Pi is already running ${residents.length === 1 ? 'a session' : `${residents.length} sessions`}`;
+}
+
 /** Where the Mac keeps a project, from the list its orchestrator publishes; the Pi's layout differs. */
 async function macPath(name) {
   if (name === 'root') return '~';
@@ -337,7 +348,7 @@ async function onHeavy(name, usage) {
   if (moving.has(name)) return;
   moving.add(name);
   try {
-    const why = `its work was holding ${usage.anonMb}MB, over its ${SESSION_BUDGET_MB}MB budget on the Pi, which is not for memory-heavy work`;
+    const why = `its commands were holding ${usage.commandMb}MB, over the ${COMMAND_BUDGET_MB}MB a session's commands may hold on the Pi, which is not for memory-heavy work`;
     if (!(await macIsAwake(false))) {
       console.log(`[pi-desk] ${name}: ${why}. The Mac is asleep — it stays, unthrottled`);
       liftBudget(name);
@@ -679,7 +690,9 @@ async function runQueue(residents) {
 
   // No room here and the Mac awake: the queued work goes to the Mac rather than waiting on this Pi.
   // The queue holds work only for as long as neither machine can take it.
-  const why = await makeRoom(residents, next.repo);
+  // A Codex resume cannot move, so only memory decides it.
+  const why = (!(next.resume_id && next.agent === 'codex') && await preferMac(residents))
+           || await makeRoom(residents, next.repo);
   const toMac = why && await macIsAwake(false);
   if (why && !toMac) {
     console.log(`[pi-desk] holding queue: ${why}`);
@@ -1071,10 +1084,12 @@ async function run(cmd) {
     }
     if (!row.claude_session_id) throw new Error(`${id} has no recorded claude session id — cannot resume`);
     const report = (cmd.payload || {}).report === true;
-    // A resume is admitted exactly like new work (makeRoom): here if memory allows, else on the Mac
-    // with its whole conversation, else queued until one of them can take it.
+    // A resume is admitted exactly like new work: on the Mac with its whole conversation when a session
+    // is already running here and the Mac is awake (preferMac), else here if memory allows (makeRoom),
+    // else on the Mac, else queued until one of them can take it.
     // A Codex conversation is not mirrored, so it cannot be handed to the Mac: it waits here for room.
-    const why = await makeRoom(await residentsNow(), id);
+    const residents = await residentsNow();
+    const why = (row.agent !== 'codex' && await preferMac(residents)) || await makeRoom(residents, id);
     if (why) {
       if (row.agent !== 'codex' && await macIsAwake(false)) return `handed to the Mac as ${await handResumeToMac(row, prompt)} — ${why}`;
       await sb('desk_queue', {
@@ -1157,13 +1172,15 @@ async function run(cmd) {
   const agent = payload.agent === 'codex' ? 'codex' : 'claude';
   if (agent === 'codex' && !codexReady()) throw new Error(`Codex is not signed in on the ${FLY ? 'Fly machine' : 'Pi'}`);
 
-  // Capacity is checked HERE, not inside startSession, so a request that cannot run on this Pi goes to
-  // the Mac, or waits as a queued row when the Mac is asleep, rather than being dropped or forced onto a
-  // full machine. A resume does the same in its own handler; the queue runner calls startSession
+  // Capacity is checked HERE, not inside startSession, so a request that should not run on this Pi —
+  // a session is already running here (preferMac) or memory is short (makeRoom) — goes to the Mac, or
+  // waits as a queued row when the Mac is asleep, rather than being dropped or forced onto a full
+  // machine. A resume does the same in its own handler; the queue runner calls startSession
   // directly because it has just made the room.
   // Fetched now, before a possible wait in the queue: the prompt stored there is what gets launched.
   const spoken = await withAttachments(payload.prompt, payload);
-  const why = await makeRoom(await residentsNow(), name);
+  const residents = await residentsNow();
+  const why = await preferMac(residents) || await makeRoom(residents, name);
   if (why) {
     if (await macIsAwake(false)) return `handed to the Mac as ${await handOpenToMac(payload)} — ${why}`;
     await sb('desk_queue', {

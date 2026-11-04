@@ -10,14 +10,16 @@
 //
 //   - CLEANUP. Closing a session kills everything in its cgroup, so a job it started cannot outlive it.
 //     Before this, a parked session's Python jobs and a `flyctl agent` stayed resident for days.
-//   - A BUDGET per session. memory.high is the point at which a session counts as doing heavy work,
-//     which this Pi is not for (index.js moves it to the Mac). memory.max is the hard ceiling: past
+//   - A BUDGET per session. memory.high is the point at which the kernel tells us a session is large;
+//     it counts as doing heavy work, which this Pi is not for (index.js moves it to the Mac), only when
+//     its COMMANDS hold the memory (commands.js). memory.max is the hard ceiling: past
 //     it the kernel kills inside that session only, and tool.sh puts every command a session runs
 //     ahead of claude itself, so what dies is the command, never the conversation.
 //   - AN EVENT. The kernel rewrites memory.events when a cgroup crosses memory.high, and inotify sees
 //     it, so heavy work is noticed the moment it happens without anything polling memory.
 import fs from 'node:fs';
 import path from 'node:path';
+import { commandMb } from './commands.js';
 
 // The unit's own cgroup, whichever child this process has already been moved into.
 const self = fs.readFileSync('/proc/self/cgroup', 'utf8').match(/^0::(.*)$/m)?.[1] || '';
@@ -26,10 +28,16 @@ const SUPERVISOR = path.join(UNIT, 'supervisor');
 const SESSIONS = path.join(UNIT, 's');
 
 const MB = 1024 * 1024;
-// A session at rest is ~490MB with its tool servers (claude ~340, the MCP servers ~150). The budget
-// leaves room for ordinary commands — git, grep, a test run — and not for a Python job holding
-// hundreds of megabytes, which is the work that belongs on the Mac.
+// A session is ~575MB from its first minute (claude ~340, its tool servers ~230) and grows with the
+// conversation. SESSION_BUDGET_MB is what admission (index.js) reserves for one. SESSION_HIGH_MB is
+// memory.high, the line at which the kernel says a session is large; it sits above the budget because
+// at the budget the kernel throttles and pushes the session into swap while it is doing nothing heavy.
+// COMMAND_BUDGET_MB is what the session's commands may hold before it counts as heavy work. An
+// ordinary command peaks well under it — the hub's test suite at ~130MB, its build at ~65MB — and a
+// Python job holding hundreds of megabytes, the work that belongs on the Mac, goes over.
 export const SESSION_BUDGET_MB = Number(process.env.PI_DESK_SESSION_BUDGET_MB || 800);
+const SESSION_HIGH_MB = Number(process.env.PI_DESK_SESSION_HIGH_MB || 1000);
+export const COMMAND_BUDGET_MB = Number(process.env.PI_DESK_COMMAND_BUDGET_MB || 300);
 const SESSION_MAX_MB = Number(process.env.PI_DESK_SESSION_MAX_MB || 1200);
 const SUPERVISOR_MAX_MB = Number(process.env.PI_DESK_SUPERVISOR_MAX_MB || 400);
 
@@ -122,7 +130,7 @@ export async function setupCgroups(live) {
     return;
   }
   for (const s of sessions) limitSession(s.name);
-  console.log(`[cgroups] ${sessions.length} session(s) budgeted at ${SESSION_BUDGET_MB}MB (ceiling ${SESSION_MAX_MB}MB)`);
+  console.log(`[cgroups] ${sessions.length} session(s) limited at ${SESSION_HIGH_MB}MB (ceiling ${SESSION_MAX_MB}MB)`);
 }
 
 /** Create a session's cgroup with its budget, before launch.sh moves into it. Returns its path. */
@@ -132,7 +140,7 @@ export function limitSession(name) {
   if (enabled) {
     try {
       write(path.join(cg, 'memory.max'), SESSION_MAX_MB * MB);
-      write(path.join(cg, 'memory.high'), SESSION_BUDGET_MB * MB);
+      write(path.join(cg, 'memory.high'), SESSION_HIGH_MB * MB);
     } catch (e) { console.error(`[cgroups] limits for ${name}: ${e.message}`); }
   }
   return cg;
@@ -203,11 +211,29 @@ export function sessionUsage(name) {
 const watchers = new Map();
 
 /**
- * Call `onHeavy(name, usage)` when a session goes over its budget with memory it cannot give back.
+ * Memory each process in a cgroup cannot give back (anon resident plus swapped), with its parent and
+ * command line — the table commands.js judges.
+ */
+function procTable(cg) {
+  const out = [];
+  for (const pid of procsOf(cg)) {
+    try {
+      const st = fs.readFileSync(`/proc/${pid}/status`, 'utf8');
+      const kb = (k) => Number(st.match(new RegExp(`^${k}:\\s+(\\d+)`, 'm'))?.[1] || 0);
+      const cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' ');
+      out.push({ pid, ppid: kb('PPid'), cmd, kb: kb('RssAnon') + kb('VmSwap') });
+    } catch { /* exited while listing */ }
+  }
+  return out;
+}
+
+/**
+ * Call `onHeavy(name, usage)` when a session's COMMANDS hold more than COMMAND_BUDGET_MB.
  *
- * memory.events counts every crossing of memory.high, and the kernel crosses it reclaiming page cache
- * too — a session reading large files touches the budget without holding anything. So a crossing
- * counts only when anon memory alone is over the budget: that is a process actually holding it.
+ * The kernel's crossing of memory.high is the event; what is holding the memory decides it. When it
+ * is the session itself — claude and its tool servers after a long conversation — nothing is heavy,
+ * and memory.high is raised to COMMAND_BUDGET_MB above where the session now stands, so a command that
+ * later grows that far still crosses it. memory.max stays the hard ceiling either way.
  */
 export function watchSession(name, onHeavy) {
   if (!enabled || watchers.has(name)) return;
@@ -219,7 +245,13 @@ export function watchSession(name, onHeavy) {
       if (n <= seen) return;
       seen = n;
       const u = sessionUsage(name);
-      if (u && u.anonMb >= SESSION_BUDGET_MB) onHeavy(name, u);
+      if (!u) return;
+      const cmdMb = commandMb(procTable(sessionCgroup(name)));
+      if (cmdMb >= COMMAND_BUDGET_MB) return onHeavy(name, { ...u, commandMb: cmdMb });
+      const next = u.currentMb + COMMAND_BUDGET_MB;
+      console.log(`[cgroups] ${name} is at ${u.currentMb}MB, its commands ${cmdMb}MB — not heavy work; ` +
+                  `memory.high raised to ${Math.min(next, SESSION_MAX_MB)}MB`);
+      try { write(path.join(sessionCgroup(name), 'memory.high'), next < SESSION_MAX_MB ? next * MB : 'max'); } catch {}
     });
     w.on('error', () => stopWatching(name));
     watchers.set(name, w);

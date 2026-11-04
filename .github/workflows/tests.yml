@@ -30,3 +30,5 @@ jobs:
           node-version: "20"
       - run: npm ci
       - run: npm test
+      # pi-desk has no package.json; its modules are ES modules that node detects by syntax.
+      - run: node --experimental-detect-module --test ../pi-desk/test/*.test.js
