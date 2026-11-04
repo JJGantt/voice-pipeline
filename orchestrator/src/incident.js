@@ -1,11 +1,9 @@
-// An ops-responder incident session reads text anyone can write (error messages, logs, overheard
-// speech), so it never runs as an ordinary session here: every launch and resume of one goes through
-// the health repo's launcher, which starts claude with that agent's narrow permissions
+// An ops-responder incident session starts through the health repo's launcher on every launch and
+// resume, which runs claude with permission checks off so it can fix what it finds
 // (health/responder/README.md § The incident agent's permissions). pi-desk/index.js does the same.
 //
 // The label is the marker because it is the one field every relaunch carries (dispatch, resume,
-// hand-over between machines). A launch that cannot find the launcher is refused, never started with
-// this machine's own permissions.
+// hand-over between machines). A launch that cannot find the launcher is refused.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';

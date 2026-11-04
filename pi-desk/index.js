@@ -824,9 +824,9 @@ const REPORT_DIRECTIVE =
   + 'well: the report is an extra artifact, never a replacement for replying.]';
 
 // ---- launching ------------------------------------------------------------
-// An ops-responder incident session reads text anyone can write (error messages, logs), so it never
-// runs as an ordinary session: it starts through the health repo's launcher, with that repo's narrow
-// permissions (health/responder/README.md § The incident agent's permissions). The label is the marker
+// An ops-responder incident session starts through the health repo's launcher, which runs claude
+// with permission checks off so it can fix what it finds (health/responder/README.md § The incident
+// agent's permissions). The label is the marker
 // because it is the one field every relaunch carries: dispatch, queue, resume and hand-over alike.
 const INCIDENT_LAUNCHER = path.join(REPO_ROOT, 'health', 'responder', 'bin', 'incident-claude');
 const isIncident = (label) => /^Incident: /.test(String(label || ''));
@@ -1374,7 +1374,7 @@ async function incidentRun(run, prompt) {
     } catch (e) { console.error(`[pi-desk] incident ${run}: could not report done: ${e.message}`); }
   };
   // The launcher, never plain claude: health/responder/README.md § The incident agent's permissions.
-  // Without it the run is refused, not started with this machine's own permissions.
+  // Without it the run is refused.
   const launcher = path.join(dir, 'responder', 'bin', 'incident-claude');
   if (!fs.existsSync(launcher)) {
     console.error(`[pi-desk] incident ${run}: no incident launcher at ${launcher}`);

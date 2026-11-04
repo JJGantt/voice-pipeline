@@ -92,14 +92,12 @@ if [ "${DESK_MACHINE:-pi}" = fly ]; then
 fi
 
 # An ops-responder incident session (index.js isIncident) starts through the health repo's launcher,
-# which runs claude with that agent's narrow permissions, and never with the browser: it reads text
-# anyone can write. health/responder/README.md § The incident agent's permissions.
+# which runs claude with permission checks off so the agent can fix what it finds.
+# health/responder/README.md § The incident agent's permissions.
 CLAUDE=(claude)
 if [ -n "$INCIDENT" ]; then
   [ -x "$INCIDENT" ] || { echo "launch.sh: no incident launcher at $INCIDENT" >&2; exit 1; }
   CLAUDE=("$INCIDENT")
-  EXTRA=()
-  [ "${DESK_MACHINE:-pi}" = fly ] || EXTRA=(--remote-control "$NAME")
 fi
 
 if [ -n "$PROMPT_FILE" ] && [ -s "$PROMPT_FILE" ]; then
