@@ -40,7 +40,7 @@ export async function relayFirstReply(sessionId, tail) {
     method: 'POST',
     headers: { Prefer: 'resolution=ignore-duplicates,return=representation' },
     // needs_read: the orchestrator said at dispatch that he will want to read what comes back
-    // (data-layer start_session `needs_read`), so it goes into the answers inbox (status-hub
+    // (data-layer start_session `needs_read`), so it goes into the inbox (status-hub
     // docs/WATCH.md) under the job's own label. Most dispatched jobs need no answer read and stay out.
     body: JSON.stringify([{ focus: 'hub', mode: 'hub', role: 'assistant', done: true, text,
                             session_id: sessionId, session_label: label,

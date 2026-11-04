@@ -116,8 +116,8 @@ DELIBERATE_DIRECTIVE = (
 )
 
 
-# Appended to every hub turn. A flagged reply goes into the answers inbox (status-hub docs/WATCH.md,
-# "The answers inbox"), kept for good and held unread until it has actually been on screen, so a later
+# Appended to every hub turn. A flagged reply goes into the inbox (status-hub docs/WATCH.md,
+# "The inbox"), kept for good and held unread until it has actually been on screen, so a later
 # command cannot bury it; most replies are confirmations he never needs to read, and those must NOT be
 # flagged or they would fill the inbox. The marker carries the inbox row's LABEL — the question,
 # shortened — because the model writing the answer already knows what was asked, where a second model
@@ -126,7 +126,7 @@ DELIBERATE_DIRECTIVE = (
 # history the model reads shows the convention being followed rather than a run of untagged answers.
 READ_MARKER = "[[read]]"
 READ_LABEL_MAX = 80
-_READ_RE = re.compile(r"\[\[read(?::\s*([^\]]*))?\]\]", re.I)
+_READ_RE = re.compile(r"\[\[read(\s+again)?(?::\s*([^\]]*))?\]\]", re.I)
 
 
 READ_DIRECTIVE = (
@@ -144,7 +144,11 @@ READ_DIRECTIVE = (
     "Also leave it off when you did nothing because the words were not meant for you. One exception "
     "overrides all of this: if anything you tried to do for him failed, was refused, only partly "
     "worked, or could not be done, ALWAYS end with the marker, because he assumes it worked and needs "
-    "to find out it did not. The marker is removed before he sees the reply.]"
+    "to find out it did not. ONE QUESTION IS ONE ROW: when this reply answers the same question as your "
+    "last reply carrying the marker, because he narrowed, corrected or clarified it (\"I mean the new "
+    "one\", \"no, for Saturday\"), write [[read again: <label>]] instead, with the label for the question "
+    "as he now means it; this reply then takes that earlier row's place. A new question, even on the "
+    "same subject, is a plain [[read: <label>]]. The marker is removed before he sees the reply.]"
 )
 
 
@@ -154,8 +158,14 @@ def take_read_marker(text: str) -> tuple[str, bool, str | None]:
     found = list(_READ_RE.finditer(text or ""))
     if not found:
         return text, False, None
-    label = next((m.group(1).strip() for m in reversed(found) if (m.group(1) or "").strip()), None)
+    label = next((m.group(2).strip() for m in reversed(found) if (m.group(2) or "").strip()), None)
     return _READ_RE.sub("", text).strip(), True, (label[:READ_LABEL_MAX] if label else None)
+
+
+def read_again(text: str) -> bool:
+    """Whether the marker was `[[read again: …]]`: this answer replaces the last flagged one in the inbox,
+    because it answers the same question, clarified."""
+    return any(m.group(1) for m in _READ_RE.finditer(text or ""))
 
 
 def read_marker(label: str | None) -> str:

@@ -310,7 +310,7 @@ What the classes mean:
 ## Tests
 
 `tests/` covers what is costly to break: claiming and failover priority, recording-window dedupe and
-orphan and lease recovery, and the press-provenance gate with the routing it decides. They run the real worker
+orphan and lease recovery, the read marker that files an answer in the inbox, and the press-provenance gate with the routing it decides. They run the real worker
 against an in-memory PostgREST (`tests/fakes.py`) and a stand-in `claude` CLI, so nothing reaches
 Supabase or Claude. From the repo root:
 

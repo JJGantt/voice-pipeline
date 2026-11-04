@@ -207,7 +207,7 @@ my Mac", the next unqualified "put it on YouTube" goes to a Mac session.
 
 Every turn also gets `READ_DIRECTIVE`: a reply to a QUESTION ends with the `[[read: <label>]]` marker,
 the label being the question cut to a few words, and a reply to a request to DO something does not.
-The label names the answer's row in the answers inbox; the model writing the answer already knows what
+The label names the answer's row in the inbox; the model writing the answer already knows what
 was asked, so it writes the label rather than a second model being run on every answer. The directive is worded around what was asked for, not
 what the reply contains, because a confirmation routinely carries information — the video picked
 for the TV and what it is about, the past entry a staged meal was copied from — and judged by its
@@ -219,9 +219,17 @@ A failure caused by a BROKEN or MISSING tool also starts a session to fix it (`D
 with the user's request, the tool and its exact error as the prompt; a failure that is the state of the world
 (the TV is off) starts nothing, since there is no code to change. `take_read_marker` strips it
 before the reply is stored or spoken and sets `voice_messages.needs_read` and `label`, which file the
-answer in the answers inbox (status-hub `docs/WATCH.md`, "The answers inbox"). A bare `[[read]]`, as a
+answer in the inbox (status-hub `docs/WATCH.md`, "The inbox"). A bare `[[read]]`, as a
 model copying older history may write, still flags it, with no label; the inbox then shows the
 question's own words.
+
+**One question is one inbox row.** When a reply answers the same question as the last flagged one —
+he narrowed, corrected or clarified it ("I mean the new one") — the model writes
+`[[read again: <label>]]` instead, and the worker clears `needs_read` on that earlier answer once the
+new turn is written (`last_flagged` / `unflag` in process.py), so the clarified answer takes its row.
+The earlier reply stays in the thread. A command spoken from an answer open in the inbox (`about_id`)
+is never flagged: it lists under that answer as a follow-up, so a row of its own would be the same
+answer twice.
 
 A session started with `start_session`'s `needs_read` has its relayed first reply filed in the inbox
 too (`relay.js`, from the desk_commands payload). The orchestrator decides it at dispatch, because most

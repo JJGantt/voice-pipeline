@@ -18,7 +18,7 @@ from .live import agent_settings, get_focus, read_session, recent_context, sessi
 from .logs import _parse_ts, alert_failure, log, log_error, now_iso
 from .outbound import inject_to_terminal, ping_esp_led, push_activity
 from .presence import claude_unready, hand_off
-from .prompts import ADDRESSING_DIRECTIVE, AGENT_SYSTEM, ALT_TRANSCRIPT_DIRECTIVE, ATTACH_DIRECTIVE, DELIBERATE_DIRECTIVE, NO_PRESS_DIRECTIVE, NUTRITION_DIRECTIVE, READ_DIRECTIVE, SHARED_STATE_NOTE, SHARE_DIRECTIVE, TOOLS_DIRECTIVE, is_ignore, take_read_marker
+from .prompts import ADDRESSING_DIRECTIVE, AGENT_SYSTEM, ALT_TRANSCRIPT_DIRECTIVE, ATTACH_DIRECTIVE, DELIBERATE_DIRECTIVE, NO_PRESS_DIRECTIVE, NUTRITION_DIRECTIVE, READ_DIRECTIVE, SHARED_STATE_NOTE, SHARE_DIRECTIVE, TOOLS_DIRECTIVE, is_ignore, read_again, take_read_marker
 from .runners import CODEX_TIMEOUT_S, SDK, SDK_CREDITS, codex_ready, limit_refused, run_claude, run_codex, run_subscription, set_cmd_ts
 
 
@@ -74,8 +74,8 @@ def fetch_attachments(paths: list) -> tuple[str | None, list[str]]:
 
 
 def about_directive(db: Supabase, about_id: str) -> str:
-    """A command spoken from an answer opened in the answers inbox (status-hub docs/WATCH.md, "The
-    answers inbox") is about THAT answer, which may be days old and long out of the replayed context, so
+    """A command spoken from an answer opened in the inbox (status-hub docs/WATCH.md, "The
+    inbox") is about THAT answer, which may be days old and long out of the replayed context, so
     the question and the answer ride on the prompt. A lookup that fails sends the command without them:
     the words alone are still his command, and the error is reported."""
     try:
@@ -96,6 +96,28 @@ def about_directive(db: Supabase, about_id: str) -> str:
     except Exception as e:  # noqa: BLE001
         log_error(f"about_directive: could not read answer {about_id}: {e}")
         return ""
+
+
+def last_flagged(db: Supabase, mode: str) -> str | None:
+    """The newest answer in the inbox that the hub itself wrote (a relayed session reply is the session's,
+    never something a hub reply revises)."""
+    try:
+        [r] = db.get("voice_messages", f"focus=eq.hub&mode=eq.{mode}&role=eq.assistant&needs_read=is.true"
+                     "&session_id=is.null&order=created_at.desc&limit=1&select=id") or [None]
+        return r and r["id"]
+    except Exception as e:  # noqa: BLE001
+        log_error(f"last_flagged: {e}")
+        return None
+
+
+def unflag(db: Supabase, mid: str) -> None:
+    """Take an answer out of the inbox because a clarified answer to the same question replaces it
+    (`[[read again]]`). The row stays in the thread; it only stops being an inbox row."""
+    try:
+        db.patch("voice_messages", f"id=eq.{mid}", {"needs_read": False})
+        log(f"inbox: {mid} replaced by a clarified answer")
+    except Exception as e:  # noqa: BLE001
+        log_error(f"unflag {mid}: {e}")
 
 
 def fallback_directive(db: Supabase, rid: str) -> str:
@@ -439,7 +461,12 @@ def _record_outcome(db: Supabase, req: dict, result: dict, prompt: str, *, trans
         result = SDK.run(prompt + NUTRITION_DIRECTIVE + TOOLS_DIRECTIVE, on_event=on_event, manual=manual, hold=hold)
         text = (result.get("text") or "").strip()
 
+    again = read_again(text)
     text, needs_read, read_label = take_read_marker(text)
+    # A command spoken from an answer opened in the inbox lists under THAT answer
+    # (`/api/voice-inbox/:id` follow-ups), so it is never an inbox row of its own: one question, one row.
+    if req.get("about_id"):
+        needs_read = False
 
     # A failure here is this machine's, not the command's, until every machine has tried it: hand it on.
     # Nothing has been written to the thread yet, so the worker that takes it writes the whole turn.
@@ -477,7 +504,11 @@ def _record_outcome(db: Supabase, req: dict, result: dict, prompt: str, *, trans
                  # Which engine wrote it, when not the subscription: the surfaces colour the reply by it
                  # (credits amber, Codex blue), so a fallback is visible on the reply itself.
                  **({"engine": result["_engine"]} if result.get("_engine") else {})}
+        # The last flagged answer, read BEFORE this turn's rows land, so it cannot be this one.
+        replaced = last_flagged(db, msg_mode) if needs_read and again else None
         if finish(db, req, {"status": "done", "result": text}, [user, reply]):
+            if replaced:
+                unflag(db, replaced)
             push_activity(text[:240], "done")  # close out the activity bar w/ the result
             log(f"done request {rid}: {text[:120]!r}")
         return
