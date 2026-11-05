@@ -221,15 +221,16 @@ with the user's request, the tool and its exact error as the prompt; a failure t
 before the reply is stored or spoken and sets `voice_messages.needs_read`, which files the answer in
 the inbox (status-hub `docs/WATCH.md`, "The inbox").
 
-**The inbox label is written by Haiku, not by the answering model** (`labels.py`): once the reply row is
-written, a background `claude -p --model haiku` with no tools turns the transcript and the answer into
-the question in a few words, and patches it onto the row as `label`; until then, or if that fails
-(reported as an error), the inbox shows the question's own words. The answering model is not asked for
-the label because, asked to write it inside its marker, it drifts into leaving it off, and a bare
-marker in the replayed day is copied by every later turn. A label written inside a marker anyway is
-dropped. The replayed day puts `[[read]]` back on every flagged hub reply (`_line`).
-Answering a question by starting a session is not flagged: the dispatch passes `needs_read` and the
-session's relayed answer is the row.
+**The inbox label is written by a separate Sonnet call, not by the answering model** (`labels.py`):
+once the reply row is written, a background `claude -p --model sonnet` with no tools labels what he
+said — his words and his two hub messages before them, never the answer — in a few words, ending in
+`?` only when it was a question, and patches it onto the row as `label`. Until then, or if that fails
+(reported as an error), the inbox shows the question's own words. Given the answer, the label drifts to
+what the answer covered rather than what was asked; the earlier messages are what resolve "it" and
+"the one that just came out". The answering model is not asked for the label because, asked to write
+it inside its marker, it drifts into leaving it off, and a bare marker in the replayed day is copied by
+every later turn. A label written inside a marker anyway is dropped. The replayed day puts `[[read]]`
+back on every flagged hub reply (`_line`).
 
 **One question is one inbox row.** When a reply answers the same question as the last flagged one —
 he narrowed, corrected or clarified it ("I mean the new one") — the model writes

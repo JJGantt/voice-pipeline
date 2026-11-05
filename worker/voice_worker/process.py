@@ -462,7 +462,7 @@ def _record_outcome(db: Supabase, req: dict, result: dict, prompt: str, *, trans
             if replaced:
                 unflag(db, replaced)
             if needs_read:
-                label_later(db, rid, transcript, text)
+                label_later(db, rid, transcript)
             push_activity(text[:240], "done")  # close out the activity bar w/ the result
             log(f"done request {rid}: {text[:120]!r}")
         return

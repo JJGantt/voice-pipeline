@@ -32,7 +32,7 @@ export async function relayFirstReply(sessionId, tail) {
   const [s] = await rest(`desk_sessions?id=eq.${encodeURIComponent(sessionId)}&select=command_id,label,custom_title`);
   if (!s) return;   // not published yet; the next tick finds it
   const [c] = s.command_id
-    ? await rest(`desk_commands?id=eq.${encodeURIComponent(s.command_id)}&select=payload`)
+    ? await rest(`desk_commands?id=eq.${encodeURIComponent(s.command_id)}&select=payload,created`)
     : [];
   if (!c?.payload?.relay) { settled.add(sessionId); return; }
   const label = s.custom_title || s.label || c.payload.label || null;
@@ -49,15 +49,21 @@ export async function relayFirstReply(sessionId, tail) {
   });
   settled.add(sessionId);
   // The job label stands in until Haiku has turned the dispatched question into the row's real label.
-  if (c.payload.needs_read && rows?.length) labelRow(rows[0].id, c.payload.prompt || label, text);
+  if (c.payload.needs_read && rows?.length) labelRow(rows[0].id, c.payload.prompt || label, c.created);
   // No notification here: the hub pushes every session's finished reply, this one included, keyed by
   // turn and carrying the session to open (status-hub /api/session-activity). A second push from here
   // would buzz twice for one reply.
 }
 
-async function labelRow(id, question, answer) {
-  const got = await makeLabel(question, answer);
-  if (!got) { console.error(`[relay] inbox label: haiku gave nothing for ${id}`); return; }
+async function labelRow(id, question, at) {
+  let earlier = [];
+  try {
+    const before = at ? `&created_at=lt.${encodeURIComponent(at)}` : '';
+    earlier = (await rest(`voice_messages?focus=eq.hub&role=eq.user&ignored=is.false${before}&select=text&order=created_at.desc&limit=2`))
+      .map((r) => r.text).reverse();
+  } catch (e) { console.error(`[relay] inbox label: earlier questions: ${e.message}`); }
+  const got = await makeLabel(question, earlier);
+  if (!got) { console.error(`[relay] inbox label: the model gave nothing for ${id}`); return; }
   try {
     const rows = await rest(`voice_messages?id=eq.${id}`, {
       method: 'PATCH', headers: { Prefer: 'return=representation' }, body: JSON.stringify({ label: got }) });
