@@ -13,6 +13,7 @@ from . import runstate
 from .claim import _duplicate_of_recent, claim_one, finish, hold
 from .config import CREDITS_API_KEY, FALLBACK_OUTAGE_S, HUB_EFFORT, HUB_MODEL, RESET_SENTINEL, SUPABASE_KEY, SUPABASE_URL, WORKER_ID, _NOTHING_SAID
 from .db import Supabase
+from .labels import label_later
 from .governor import maybe_auto_disable_wakefree
 from .live import get_focus, recent_context
 from .logs import _parse_ts, alert_failure, log, log_error, now_iso
@@ -417,7 +418,7 @@ def _record_outcome(db: Supabase, req: dict, result: dict, prompt: str, *, trans
         text = (result.get("text") or "").strip()
 
     again = read_again(text)
-    text, needs_read, read_label = take_read_marker(text)
+    text, needs_read = take_read_marker(text)
     # A command spoken from an answer opened in the inbox lists under THAT answer
     # (`/api/voice-inbox/:id` follow-ups), so it is never an inbox row of its own: one question, one row.
     if req.get("about_id"):
@@ -452,7 +453,6 @@ def _record_outcome(db: Supabase, req: dict, result: dict, prompt: str, *, trans
     if result["ok"]:
         reply = {"focus": "hub", "mode": "hub", "role": "assistant", "text": text, "done": True,
                  "worker": WORKER_ID, "needs_read": needs_read,
-                 **({"label": read_label} if needs_read and read_label else {}),
                  # Which engine wrote it, when not the subscription: the surfaces colour the reply by it
                  # (credits amber, Codex blue), so a fallback is visible on the reply itself.
                  **({"engine": result["_engine"]} if result.get("_engine") else {})}
@@ -461,6 +461,8 @@ def _record_outcome(db: Supabase, req: dict, result: dict, prompt: str, *, trans
         if finish(db, req, {"status": "done", "result": text}, [user, reply]):
             if replaced:
                 unflag(db, replaced)
+            if needs_read:
+                label_later(db, rid, transcript, text)
             push_activity(text[:240], "done")  # close out the activity bar w/ the result
             log(f"done request {rid}: {text[:120]!r}")
         return

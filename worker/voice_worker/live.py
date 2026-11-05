@@ -10,7 +10,7 @@ import httpx
 from .config import HTTP_TIMEOUT_S, SESSION_IDLE_RESET_S
 from .db import Supabase, headers, note_ok, report_failure
 from .logs import _parse_ts, log
-from .prompts import is_ignore, read_marker
+from .prompts import READ_MARKER, is_ignore
 
 
 # LIVE STATE: the settings a turn consults, the voice focus, and today's hub thread, held in memory.
@@ -162,10 +162,8 @@ def recent_context() -> str:
             return f"[{when}] You (ignored as room noise, not acted on): {txt}"
         # A relayed session reply is flagged too (it is in the inbox by being relayed), but it never
         # carried the marker, so the replay leaves it off rather than teach that sessions write one.
-        # A flagged reply with NO label replays with no marker at all: a bare [[read]] in the history is
-        # copied by the next turn, which then writes one bare too, and the day never gets a label again.
-        if r.get('needs_read') and r.get('role') == 'assistant' and not r.get('session_id') and r.get('label'):
-            txt = f"{txt} {read_marker(r['label'])}"
+        if r.get('needs_read') and r.get('role') == 'assistant' and not r.get('session_id'):
+            txt = f"{txt} {READ_MARKER}"
         return f"[{when}] {who}: {txt}"
     # A bare sentinel reply is dropped from the replay. It is never shown as a reply — but a deliberate
     # turn that emitted one anyway was saved as `Assistant: __IGNORE__`, and replaying that line taught

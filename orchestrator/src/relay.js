@@ -10,6 +10,7 @@
 // both paths that notice a finished turn — the transcript watcher and the reconcile tick, on either
 // host — can call this freely.
 import { config } from './config.js';
+import { makeLabel } from './label.js';
 
 // Sessions already relayed, or known not to be hub dispatches. Only a cache of lookups: after a restart
 // each running session costs one read again, and the unique column keeps a second insert harmless.
@@ -41,13 +42,25 @@ export async function relayFirstReply(sessionId, tail) {
     headers: { Prefer: 'resolution=ignore-duplicates,return=representation' },
     // needs_read: the orchestrator said at dispatch that he will want to read what comes back
     // (data-layer start_session `needs_read`), so it goes into the inbox (status-hub
-    // docs/WATCH.md) under the job's own label. Most dispatched jobs need no answer read and stay out.
+    // docs/WATCH.md). Most dispatched jobs need no answer read and stay out.
     body: JSON.stringify([{ focus: 'hub', mode: 'hub', role: 'assistant', done: true, text,
                             session_id: sessionId, session_label: label,
                             ...(c.payload.needs_read ? { needs_read: true, label: c.payload.label || label } : {}) }]),
   });
   settled.add(sessionId);
+  // The job label stands in until Haiku has turned the dispatched question into the row's real label.
+  if (c.payload.needs_read && rows?.length) labelRow(rows[0].id, c.payload.prompt || label, text);
   // No notification here: the hub pushes every session's finished reply, this one included, keyed by
   // turn and carrying the session to open (status-hub /api/session-activity). A second push from here
   // would buzz twice for one reply.
+}
+
+async function labelRow(id, question, answer) {
+  const got = await makeLabel(question, answer);
+  if (!got) { console.error(`[relay] inbox label: haiku gave nothing for ${id}`); return; }
+  try {
+    const rows = await rest(`voice_messages?id=eq.${id}`, {
+      method: 'PATCH', headers: { Prefer: 'return=representation' }, body: JSON.stringify({ label: got }) });
+    if (!rows.length) console.error(`[relay] inbox label: row ${id} not found`);
+  } catch (e) { console.error(`[relay] inbox label: ${e.message}`); }
 }

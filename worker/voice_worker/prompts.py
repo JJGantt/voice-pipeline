@@ -119,25 +119,22 @@ DELIBERATE_DIRECTIVE = (
 # Appended to every hub turn. A flagged reply goes into the inbox (status-hub docs/WATCH.md,
 # "The inbox"), kept for good and held unread until it has actually been on screen, so a later
 # command cannot bury it; most replies are confirmations he never needs to read, and those must NOT be
-# flagged or they would fill the inbox. The marker carries the inbox row's LABEL — the question,
-# shortened — because the model writing the answer already knows what was asked, where a second model
-# would have to be run to work it out. The marker is stripped before the reply is stored
-# (`take_read_marker`), and the replayed day puts it back on flagged replies (`recent_context`), so the
-# history the model reads shows the convention being followed rather than a run of untagged answers.
-READ_LABEL_MAX = 80
-_READ_RE = re.compile(r"\[\[read(\s+again)?(?::\s*([^\]]*))?\]\]", re.I)
+# flagged or they would fill the inbox. The model only DECIDES whether a reply is flagged; the inbox
+# row's label is written afterwards by a separate Haiku pass (`labels.py`), because a model asked to
+# write the label itself drifts into leaving it off, and once a bare marker is in the replayed day every
+# later turn copies it. The marker is stripped before the reply is stored (`take_read_marker`), and the
+# replayed day puts it back on flagged replies (`recent_context`), so the history the model reads shows
+# the convention being followed rather than a run of untagged answers.
+_READ_RE = re.compile(r"\[\[read(\s+again)?(?::[^\]]*)?\]\]", re.I)
+READ_MARKER = "[[read]]"
 
 
 READ_DIRECTIVE = (
     "\n\n[Decide by what he ASKED FOR, not by what your reply happens to contain. If he asked a question "
     "or asked you to find something out for him (a fact, a lookup, a calculation, a summary, a "
-    "recommendation, what he did last time), end your reply with [[read: <label>]] as the very last "
-    "thing, where <label> is the question your reply answers, shortened but still phrased as that "
-    "question, so it says what he wanted to know and not only what it was about (\"Who is Paul Rust?\", "
-    "not \"Paul Rust\"; \"Is Sunday good for surf?\", not \"Sunday surf\"). Keep the whole shape of the "
-    "question in as few words as carry it, under about 50 characters. When he also asked you to do "
-    "something in the same breath, the label is only the question part. It names the answer in a list "
-    "he scrolls on his watch and phone. If he asked you to DO something, leave it off, even when your reply describes what you "
+    "recommendation, what he did last time), end your reply with [[read]] as the very last thing. "
+    "When he also asked you to do something in the same breath, still end with it. "
+    "If he asked you to DO something, leave it off, even when your reply describes what you "
     "picked, copied, looked up along the way or worked out to do it: logging, staging or editing food, "
     "a set, a list item, a light, putting something on the TV, starting, moving or messaging a session. "
     "If you answer a question by starting a session, leave it off too and pass start_session's "
@@ -147,31 +144,24 @@ READ_DIRECTIVE = (
     "worked, or could not be done, ALWAYS end with the marker, because he assumes it worked and needs "
     "to find out it did not. ONE QUESTION IS ONE ROW: when this reply answers the same question as your "
     "last reply carrying the marker, because he narrowed, corrected or clarified it (\"I mean the new "
-    "one\", \"no, for Saturday\"), write [[read again: <label>]] instead, with the label for the question "
-    "as he now means it; this reply then takes that earlier row's place. A new question, even on the "
-    "same subject, is a plain [[read: <label>]]. The marker is removed before he sees the reply.]"
+    "one\", \"no, for Saturday\"), write [[read again]] instead; this reply then takes that earlier "
+    "row's place. A new question, even on the same subject, is a plain [[read]]. The marker is removed "
+    "before he sees the reply.]"
 )
 
 
-def take_read_marker(text: str) -> tuple[str, bool, str | None]:
-    """The reply without the read marker, whether it carried one, and the label it gave (None when the
-    marker came bare, as a model copying older replayed history may write it)."""
-    found = list(_READ_RE.finditer(text or ""))
-    if not found:
-        return text, False, None
-    label = next((m.group(2).strip() for m in reversed(found) if (m.group(2) or "").strip()), None)
-    return _READ_RE.sub("", text).strip(), True, (label[:READ_LABEL_MAX] if label else None)
+def take_read_marker(text: str) -> tuple[str, bool]:
+    """The reply without the read marker, and whether it carried one. A label written inside the marker
+    (`[[read: …]]`, copied from older history) is ignored: `labels.py` writes the label."""
+    if not _READ_RE.search(text or ""):
+        return text, False
+    return _READ_RE.sub("", text).strip(), True
 
 
 def read_again(text: str) -> bool:
     """Whether the marker was `[[read again: …]]`: this answer replaces the last flagged one in the inbox,
     because it answers the same question, clarified."""
     return any(m.group(1) for m in _READ_RE.finditer(text or ""))
-
-
-def read_marker(label: str) -> str:
-    """The marker as a labelled flagged reply carried it, for the replayed history."""
-    return f"[[read: {label}]]"
 
 
 # A second speech-to-text reading from a different Whisper model, present only when its words differ
