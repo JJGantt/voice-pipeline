@@ -124,7 +124,6 @@ DELIBERATE_DIRECTIVE = (
 # would have to be run to work it out. The marker is stripped before the reply is stored
 # (`take_read_marker`), and the replayed day puts it back on flagged replies (`recent_context`), so the
 # history the model reads shows the convention being followed rather than a run of untagged answers.
-READ_MARKER = "[[read]]"
 READ_LABEL_MAX = 80
 _READ_RE = re.compile(r"\[\[read(\s+again)?(?::\s*([^\]]*))?\]\]", re.I)
 
@@ -141,6 +140,8 @@ READ_DIRECTIVE = (
     "he scrolls on his watch and phone. If he asked you to DO something, leave it off, even when your reply describes what you "
     "picked, copied, looked up along the way or worked out to do it: logging, staging or editing food, "
     "a set, a list item, a light, putting something on the TV, starting, moving or messaging a session. "
+    "If you answer a question by starting a session, leave it off too and pass start_session's "
+    "needs_read instead: the session's answer is what gets filed, and your reply only says it started. "
     "Also leave it off when you did nothing because the words were not meant for you. One exception "
     "overrides all of this: if anything you tried to do for him failed, was refused, only partly "
     "worked, or could not be done, ALWAYS end with the marker, because he assumes it worked and needs "
@@ -168,9 +169,9 @@ def read_again(text: str) -> bool:
     return any(m.group(1) for m in _READ_RE.finditer(text or ""))
 
 
-def read_marker(label: str | None) -> str:
-    """The marker as a flagged reply carried it, for the replayed history."""
-    return f"[[read: {label}]]" if label else READ_MARKER
+def read_marker(label: str) -> str:
+    """The marker as a labelled flagged reply carried it, for the replayed history."""
+    return f"[[read: {label}]]"
 
 
 # A second speech-to-text reading from a different Whisper model, present only when its words differ

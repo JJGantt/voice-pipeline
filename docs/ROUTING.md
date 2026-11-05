@@ -219,9 +219,12 @@ A failure caused by a BROKEN or MISSING tool also starts a session to fix it (`D
 with the user's request, the tool and its exact error as the prompt; a failure that is the state of the world
 (the TV is off) starts nothing, since there is no code to change. `take_read_marker` strips it
 before the reply is stored or spoken and sets `voice_messages.needs_read` and `label`, which file the
-answer in the inbox (status-hub `docs/WATCH.md`, "The inbox"). A bare `[[read]]`, as a
-model copying older history may write, still flags it, with no label; the inbox then shows the
-question's own words.
+answer in the inbox (status-hub `docs/WATCH.md`, "The inbox"). A bare `[[read]]` still flags it,
+with no label; the inbox then shows the question's own words. The replayed day puts the marker back
+only on LABELLED flagged replies: a bare one in the history is copied, so one unlabelled answer would
+leave every later answer that day unlabelled too, and the inbox a list of his own raw commands.
+Answering a question by starting a session is not flagged: the dispatch passes `needs_read` and the
+session's relayed answer is the row.
 
 **One question is one inbox row.** When a reply answers the same question as the last flagged one —
 he narrowed, corrected or clarified it ("I mean the new one") — the model writes
