@@ -82,9 +82,9 @@ Everything else that differs, from the code (`grep -rn WORKER_ID worker/voice_wo
   until the next restart.
 - **Feeder:** the PetLibro server is LAN-only (tinytuya), so even with the right path Fly could not
   reach the feeder without a route into the home network.
-- **Lights:** `govee_mcp.py` tries a LAN multicast scan first (1.2s timeout) and falls back to the
-  Govee cloud API. On Fly the scan can never answer, so every light command is cloud-only and pays
-  the scan timeout first (from the code; not timed on Fly).
+- **Lights:** on Fly every light command goes to the Govee cloud API. The Dockerfile sets
+  `GOVEE_LAN=0` so `govee_mcp.py` skips its LAN multicast scan, which can never answer there and
+  otherwise costs ~1.2s of every command before the cloud is tried.
 - **Full-agent (coding) mode:** off on Fly by design — `session_agent = ag["mode"] and WORKER_ID != "fly"`.
 - **Inject into a terminal session:** goes to the orchestrator at `ORCH_URL` (default
   `localhost:7682`), which only the Mac runs; any other worker hands the request off on failure.

@@ -56,6 +56,7 @@ ENV DATA_MCP_JS=/app/data-layer/dist/mcp.js \
     VOICE_MCP_JS=/app/mcp-voice/src/index.js \
     GOVEE_PY=python3 \
     GOVEE_MCP_PY=/app/govee-mcp/govee_mcp.py \
+    GOVEE_LAN=0 \
     GMAIL_PY=/opt/gmail-venv/bin/python \
     GMAIL_MCP_PY=/app/gmail-mcp/gmail_mcp.py \
     CLAUDE_CONFIG_DIR=/data/claude \
