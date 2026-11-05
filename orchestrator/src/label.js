@@ -5,12 +5,17 @@ import { spawn } from 'node:child_process';
 
 const LABEL_MAX = 40;
 const PROMPT =
-  'Someone asked their voice assistant the question below and got the answer below. Write the label '
-  + 'for this answer in an inbox list on a watch. The label is the QUESTION, rewritten as short as it '
-  + "can be while still saying what was asked: always a question ending in '?', at most 5 words, "
-  + 'ideally 3, understandable with no other context (resolve \'it\', \'that one\', \'what about '
-  + 'Saturday\' from the answer). Examples: "Who is Paul Rust?", "Surf good Sunday?", "Resident Evil '
-  + 'streaming?", "When does Costco close?". Output only the label, no quotes.';
+  "Someone asked their voice assistant the question below. Write the label for the answer in an inbox "
+  + "list on a watch: THE QUESTION THEY ASKED, compressed to its key words. Always a question ending in "
+  + "'?', 2 to 5 words, never more. Label what they ASKED, never what the answer went on to cover. The "
+  + "answer is given ONLY to turn words like 'it', 'that movie', 'what about Saturday' into the thing "
+  + "they refer to. Examples, question -> label: "
+  + "'What else is there on this movie, the Resident Evil movie, worth watching?' -> 'More on Resident Evil?'; "
+  + "'Is that movie I just saved, what is that available on?' (answer about Chemical Hearts) -> 'Where is Chemical Hearts streaming?'; "
+  + "'What catalog are you talking about?' -> 'What catalog?'; "
+  + "'Yeah I don't agree with him though, is there another reviewer, did YMS review it?' (answer about Resident Evil) -> 'Did YMS review Resident Evil?'; "
+  + "'Why does Safari keep closing itself on my Mac?' -> 'Why does Safari close?'. "
+  + "Output only the label, no quotes.";
 
 /** Haiku's label, or null when it could not be had (the caller reports that). */
 export function makeLabel(question, answer) {
