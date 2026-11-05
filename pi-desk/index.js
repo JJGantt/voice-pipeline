@@ -43,6 +43,7 @@ import { sessionOf } from '../orchestrator/src/discover.js';
 // The same, for a Codex session (`agent = 'codex'`): its conversation is the rollout its process holds open.
 import { codexSessionOf, codexReady } from '../orchestrator/src/codex.js';
 import { sweepScratch } from './scratch.js';
+import { forwardMovedFollowUp } from './moved.js';
 import { createRequire } from 'node:module';
 import { setupCgroups, limitSession, watchSession, liftBudget, sessionUsage, SESSION_BUDGET_MB, COMMAND_BUDGET_MB } from './cgroups.js';
 import { syncSessionWatch, reportTurnEnd, expectPrompt } from '../orchestrator/src/sessionWatch.js';
@@ -1024,6 +1025,20 @@ async function run(cmd) {
   if (cmd.kind === 'follow_up') {
     const target = String((cmd.payload || {}).session || '').trim();
     if (!/^hub-[A-Za-z0-9._-]+$/.test(target)) throw new Error(`unusable session name: ${target}`);
+    // Sent moments after this session was handed to the Mac: the words follow it there (moved.js). The
+    // answer is the handoff form, so a sender that follows handoffs reports the Mac's verdict.
+    if (!(await liveSessions()).some((l) => l.name === target && l.alive)) {
+      const row = (await sb(`desk_sessions?id=eq.${encodeURIComponent(target)}&select=status,claude_session_id`))?.[0];
+      const resume = row?.status === 'transferred' && row.claude_session_id
+        ? (await sb(`desk_commands?kind=eq.resume_mirrored&payload->>claude_session_id=eq.${encodeURIComponent(row.claude_session_id)}`
+                    + '&select=id,payload&order=created.desc&limit=1'))?.[0]
+        : null;
+      const fwd = forwardMovedFollowUp(cmd.payload || {}, row, resume, randomUUID());
+      if (fwd) {
+        await sb('desk_commands', { method: 'POST', headers: { Prefer: 'return=minimal' }, body: JSON.stringify(fwd) });
+        return `handed to the Mac as ${fwd.id} — ${target} moved there as ${fwd.payload.session}`;
+      }
+    }
     const prompt = await withAttachments((cmd.payload || {}).prompt, cmd.payload);
     if (!prompt) throw new Error('no prompt to send');
     // The hub passes the sender's own message id as `msg` when it has one; the command id otherwise.
