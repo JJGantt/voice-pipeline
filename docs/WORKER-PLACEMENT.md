@@ -33,7 +33,7 @@ The code is the same everywhere; only the environment differs.
 - **Hub turns:** one warm `ClaudeSDKClient` (`SdkRunner`), Opus at its default effort with the full
   toolset, driving the INSTALLED CLI (`cli_path=shutil.which("claude")`). It connects at worker start
   (`SDK.warm`) and again right after any recycle, then stays up for the life of the process (each turn
-  is a `/clear` on it). Full-agent turns are a fresh `claude -p --model opus` (`run_claude`).
+  is a `/clear` on it). The watch's fallback turns run on it too.
 - **Billing:** the Claude subscription (`CLAUDE_CODE_OAUTH_TOKEN`) on all three. `worker.py` pops
   `ANTHROPIC_API_KEY` at import, before any client or subprocess starts, so no turn inherits one; only
   the usage-limit fallback (`SDK_CREDITS`, see CLAUDE.md) passes it on.
@@ -85,11 +85,9 @@ Everything else that differs, from the code (`grep -rn WORKER_ID worker/voice_wo
 - **Lights:** on Fly every light command goes to the Govee cloud API. The Dockerfile sets
   `GOVEE_LAN=0` so `govee_mcp.py` skips its LAN multicast scan, which can never answer there and
   otherwise costs ~1.2s of every command before the cloud is tried.
-- **Full-agent (coding) mode:** off on Fly by design — `session_agent = ag["mode"] and WORKER_ID != "fly"`.
 - **Inject into a terminal session:** goes to the orchestrator at `ORCH_URL` (default
   `localhost:7682`), which only the Mac runs; any other worker hands the request off on failure.
-- **Mac-only housekeeping:** `publish_repo_dirs()` (the agent cwd picker) and the Mac mic's listener
-  supervisor.
+- **Mac-only housekeeping:** the Mac mic's listener supervisor.
 - **Photos:** work everywhere — attachments are fetched from Supabase storage into a temp dir.
 - **Clock:** Fly runs with `TZ=America/New_York` (`fly-worker/fly.toml`); without it, naive local
   timestamps are written four hours late.

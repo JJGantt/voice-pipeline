@@ -10,13 +10,13 @@ mic → transcript → voice_requests (Supabase)
            __IGNORE__ (room mic, not for us)  or  the reply
 ```
 
-**One path, one model.** Every hub turn — photos included — runs on the warm `SdkRunner`: `HUB_MODEL`
+**One path, one model.** Every turn (photos, and the watch's fallback when the hub is down, included) runs on the warm `SdkRunner`: `HUB_MODEL`
 (`opus`) at `HUB_EFFORT` (unset = the model's default, which is adaptive: it thinks as hard as the turn
 needs), with `ALL_TOOLS` plus `Read`. There is no fast first responder and no escalation. Decision:
 quality over speed. A low-effort first responder judges worse exactly where it matters (macro
 estimates, and what to make of web results). A latency optimisation is the owner's decision; see
 "Splitting it again" below before building one.
-Full-agent mode is separate: the unrestricted coding agent on its own `--resume` session.
+Nothing on the worker has shell or file-editing tools: work that needs them is a `start_session`.
 
 The bottom activity bar shows the prompt, tool calls, and what the model says between them. Every
 runner reports in-between text the same way: held until the next tool call, dropped if none follows,
@@ -66,22 +66,20 @@ A text or an email reaches a real person, so it may be sent only on a command th
 no send on any path: the warm client's fence (`SdkRunner.gate`, run as a PreToolUse hook) refuses
 `SEND_TOOLS` and switching JaredBot on (`JAREDBOT_TOOL` with `on: true`, an auto-replier that texts on the
 owner's behalf) unless `SdkRunner.run(..., manual=True)`; `manual` defaults to False, so a caller that forgets it
-fails closed. Switching JaredBot off stays open to any mic. The unrestricted agent and Codex have no fence
-and keep every tool, which is safe only because they refuse any command that is not manual (below), and
-the credits runner is reached only by manual commands.
+fails closed. Switching JaredBot off stays open to any mic. Codex has no fence and keeps every MCP tool,
+which is safe only because it refuses any command that is not manual (below), and the credits runner is
+reached only by manual commands.
 
 The fence, not `allowed_tools`, is what holds the list. The warm client is Claude Code, which also
 applies the host user's settings, and the Mac's pre-approve every data, gmail and messages tool in auto
 mode — with `allowed_tools` alone a room-mic turn can send email. A hook's deny outranks any allow rule.
 The fence also allows `Read` only inside the current turn's photo directory.
 
-## Sessions and the unrestricted agent need a press
+## Sessions need a press
 
 Anything that reaches the worker without a manual press cannot start a session. A command may reach a
 Claude session (`start_session`, `follow_up`, `resume_session`, `transfer_session`, or the pty inject
-into a focused Mac session), the unrestricted agent (`run_claude`, `--dangerously-skip-permissions`:
-full-agent mode and the watch's fallback path), Codex (`run_codex`, every MCP tool pre-approved) or the
-credits runner only when `is_manual(req)`: its `source` is in `MANUAL_SOURCES` AND it is not stamped
+into a focused Mac session), Codex (`run_codex`, every MCP tool pre-approved) or the credits runner only when `is_manual(req)`: its `source` is in `MANUAL_SOURCES` AND it is not stamped
 `always_on`. The labels there are the ones only a press or a keyboard writes: `watch-cmd` (the watch's
 Hub control), `watch-fallback` (the same press through Supabase when the hub is down), `web` and
 `web-quick` (the hub's mic buttons and its typed box) and `share` (the iPhone share sheet).
@@ -91,16 +89,15 @@ TV can say the wake word; nor is any listener (`watch`, `phone`, `mac`, `fly` wa
 client invents, or an unstamped row. The hub lets an uploading client name its own `source`, so a new
 device is not manual until its label is added here, after checking that every writer of it is a button.
 
-Enforced at each point, not once: `process_request` routes a non-manual command to the fenced warm client
-even with agent mode on or a session focused; the fence refuses `SESSION_START_TOOLS` and the sends unless
-`SdkRunner.run(..., manual=True)`; `run_claude` and `run_codex` refuse outright unless called with
-`manual=True`. A non-manual turn also carries `NO_PRESS_DIRECTIVE`, so the model says it needs the
+Enforced at each point, not once: `process_request` answers a non-manual command on the fenced warm client
+even with a session focused; the fence refuses `SESSION_START_TOOLS` and the sends unless
+`SdkRunner.run(..., manual=True)`; `run_codex` refuses outright unless called with `manual=True`. A non-manual turn also carries `NO_PRESS_DIRECTIVE`, so the model says it needs the
 button rather than trying, for a session or a send alike.
 
 ## Session-only tools are removed from the schema
 
-`SESSION_TOOLS` are taken out of every runner's schema (`disallowed_tools` on the warm client,
-`--disallowedTools` on `run_claude`), so the request becomes a `start_session` instead:
+`SESSION_TOOLS` are taken out of every runner's schema (`disallowed_tools` on the warm client and the
+credits client), so the request becomes a `start_session` instead:
 
 - `build_walmart_cart_url`, `record_walmart_cart` and `save_shopping_item` only mean something next to
   the signed-in browser, which no worker runner has. The reads (`get_shopping_items`,

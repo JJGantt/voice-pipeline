@@ -22,8 +22,7 @@ INPUTS (capture + enqueue only — no model logic):
                                                         │
 WORKER (worker/worker.py + worker/voice_worker/ — the ONE brain):
   claims a request, runs it, writes the reply to voice_messages
-    hub turn      → Opus at default effort, full toolset, on the warm SDK client (docs/ROUTING.md)
-    full-agent    → the unrestricted Claude Code agent in `agent_cwd`, its own persistent session
+    every turn    → Opus at default effort, full toolset, on the warm SDK client (docs/ROUTING.md)
                                                         │
 TOOLS (the only capabilities): data · voice · govee   (MCP, stdio)
 SOURCE OF TRUTH:  Supabase (felyggqjjhltwokdfhop)
@@ -51,14 +50,12 @@ and every ordinary stage bills the **subscription**:
   installed `claude` (`cli_path`), not the SDK's bundled copy: the bundled one lags, and the `opus` alias
   resolves to whatever model the running CLI knows. Each hub turn is a
   fresh `session_id` on that warm process, with the whole day's hub conversation (since 4 AM, each line timestamped) replayed into the prompt.
-  Every hub turn runs here, photos included (`Read` is fenced to the turn's photo directory): the spawn
+  Every hub turn runs here, photos and the watch's fallback included (`Read` is fenced to the turn's photo directory): the spawn
   cost `claude -p` pays per command — CLI plus four MCP servers, 3.6s on the Pi, ~42% of a simple turn
   before the model sees a token — is paid once at connect.
-- **`run_claude`** — headless `claude -p`, also on the subscription. It streams `stream-json`, so
-  tool calls (and the text between them) surface live on the activity bar. This runs full-agent
-  turns and the fallback run on a command every other worker failed.
-There is no API-billed runner. Both runners bill the subscription on every worker, Fly included (it
-holds its own `CLAUDE_CODE_OAUTH_TOKEN`). A run that fails transiently is retried on the subscription
+
+There is no API-billed runner on the ordinary path. It bills the subscription on every worker, Fly
+included (it holds its own `CLAUDE_CODE_OAUTH_TOKEN`). A run that fails transiently is retried on the subscription
 (`run_subscription`) and otherwise surfaces as an error.
 
 ## Device fallback
@@ -73,12 +70,8 @@ Which host should run the agent, what each one can and cannot do, and measured s
   everywhere. It has no route to iMessage, Gmail or the feeder, which are rare enough not to count
   (`docs/WORKER-PLACEMENT.md`). The Mac is last so a session started by voice outlives the laptop
   closing. Claiming is an atomic `PATCH ... status=eq.pending`, so it is safe even when two workers race.
-- **Worker affinity** overrides priority in **full-agent (coding) mode only**: while its window is
-  live, the conversation stays on the worker that claimed the last request, because a full-agent CLI
-  session lives on one machine. It releases when the window resets or the owner goes silent past
-  `OWNER_GRACE_S`. Hub turns follow `WORKER_PRIORITY` alone: each is a fresh run handed the day's
-  thread from the live state every worker holds, so pinning one bought nothing and kept commands on a
-  slower worker for up to `session_reset_s` (an hour).
+- **Priority alone decides.** Every turn follows `WORKER_PRIORITY`: each is a fresh run handed the day's
+  thread from the live state every worker holds, so which worker claims it does not matter.
 - **A failure falls through.** A turn that fails on one worker without calling a tool goes back to
   `pending` with that worker in `voice_requests.failed_on`, and the next healthy worker takes it
   immediately; it ends as an error only once no healthy worker is left untried
@@ -272,7 +265,6 @@ bridges to the ESP over HTTP).
 | `wakefree_enabled` | `0` | listener + ESP server — global wake-free on/off (mic handoff + ESP bridge) |
 | `voice_muted` | `0` | listener + ESP — global mute (set by the FAB / push-to-talk) |
 | `voice_inject_mode` | `0` | listener + ESP — Mac mic pastes into the focused window; the ESP goes deaf |
-| `agent_mode` / `agent_cwd` | `0` | worker — full-agent (coding) mode and its working directory |
 | `voiceid_threshold` | `0.30` | wakefree + ESP server — "it's the enrolled speaker" cosine threshold for the live 2s-slice gate |
 | `voiceid_accept_threshold` | `0` | wakefree + ESP server — the confirmed-span bar at capture-accept; a capture under it is dropped before STT. `0` = off (measure only). No hub UI yet; set the row directly |
 | `wakefree_pause_s` | `2.0` | ESP server only — the energy endpoint it falls back to while wake-free is on but ECAPA/the voiceprint has not loaded (and during enrollment). The speaker-gated path ignores it |

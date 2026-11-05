@@ -13,7 +13,6 @@ the write-back), `runners` (where a turn runs), `presence` (heartbeats, priority
 docs/ROUTING.md is the routing contract.
 """
 
-import json
 import logging
 import os
 import signal
@@ -27,41 +26,14 @@ import httpx
 import ops_report as ops
 
 from voice_worker import runstate
-from voice_worker.config import HEARTBEAT_INTERVAL_S, HOLD_RETRY_S, HTTP_TIMEOUT_S, HUB_TOKEN, IDLE_POLL_DEGRADED_S, IDLE_POLL_S, STANDBY_HEARTBEAT_S, STANDBY_POLL_S, STATE_DIR, SUPABASE_KEY, SUPABASE_URL, WORKER_ID, WORKER_PRIORITY
-from voice_worker.db import Supabase, headers
+from voice_worker.config import HEARTBEAT_INTERVAL_S, HOLD_RETRY_S, HTTP_TIMEOUT_S, HUB_TOKEN, IDLE_POLL_DEGRADED_S, IDLE_POLL_S, STANDBY_HEARTBEAT_S, STANDBY_POLL_S, STATE_DIR, SUPABASE_KEY, WORKER_ID, WORKER_PRIORITY
+from voice_worker.db import Supabase
 from voice_worker.governor import maybe_auto_reenable_wakefree
-from voice_worker.logs import log, log_error, now_iso
+from voice_worker.logs import log, log_error
 from voice_worker.presence import heartbeat
 from voice_worker.process import one_iteration
 from voice_worker.runners import SDK
 from voice_worker.waker import RealtimeWaker
-
-
-def publish_repo_dirs() -> None:
-    """Mac-only: scan the home tree for git repos and publish the list to app_settings.agent_cwd_options
-    (JSON array) so the hub's full-agent working-directory picker offers the actual repos. The agent runs on
-    whichever worker claims a request, but the Mac is primary, so its paths drive the dropdown; run_claude
-    falls back to $HOME if a published path doesn't exist on the worker that ends up running it."""
-    if WORKER_ID != "mac":
-        return
-    home = os.path.expanduser("~")
-    found = set()
-    for root in (home, os.path.join(home, "repos")):
-        try:
-            for entry in os.scandir(root):
-                if entry.is_dir() and os.path.isdir(os.path.join(entry.path, ".git")):
-                    found.add(entry.path)
-        except OSError:
-            pass
-    opts = sorted(found)
-    try:
-        httpx.post(f"{SUPABASE_URL}/rest/v1/app_settings?on_conflict=key",
-                   headers={**headers(), "Prefer": "resolution=merge-duplicates"},
-                   json={"key": "agent_cwd_options", "value": json.dumps(opts), "updated_at": now_iso()},
-                   timeout=10)
-        log(f"published {len(opts)} repo dirs for the agent cwd picker")
-    except Exception as e:  # noqa: BLE001
-        log_error(f"publish_repo_dirs failed: {e}")
 
 
 _waker = None   # the RealtimeWaker, so a signal can cut the main loop's wait short
@@ -176,7 +148,6 @@ def main() -> int:
 
     with httpx.Client(timeout=HTTP_TIMEOUT_S) as client:
         db = Supabase(client)
-        publish_repo_dirs()   # Mac-only: refresh the agent cwd picker's repo list
 
         if once:
             heartbeat(db)

@@ -20,5 +20,5 @@ kill_timeout = "20s"   # time for the worker to announce it is stopping; a turn 
 [[vm]]
   size = "shared-cpu-1x"
   # 2GB: the warm hub client holds a Claude process and its MCP servers (~550MB measured), with room for
-  # a full-agent spawn on top.
+  # the credits client alongside it.
   memory = "2gb"

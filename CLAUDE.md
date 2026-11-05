@@ -33,7 +33,7 @@ subscription (`run_subscription`, `SUBSCRIPTION_RETRY_S`) and then surfaced as a
 onto the key: that turns a passing "529 Overloaded" on an Opus turn into a Console-billed Opus run.
 
 The one exception is a hub turn started by a press or typed (`is_manual`, docs/ROUTING.md § Sessions
-and the unrestricted agent need a press) that the subscription refuses for its
+need a press) that the subscription refuses for its
 usage limit (`limit_refused`: the turn's `rate_limit_event` said `rejected`, or the CLI's "You've hit
 your 5-hour limit"). It re-runs on `SDK_CREDITS`, a second warm client billed to `ANTHROPIC_API_KEY`,
 which the Max plan's monthly Console credits pay for. It is not handed to another worker, since every
@@ -119,7 +119,7 @@ Realtime is the pickup path everywhere here; every poll cadence is a backstop an
 free-plan quota. If pickup feels slow, fix the subscription — do not shorten the poll.
 
 **An idle cycle asks ONE question: is anything pending?** `IDLE_POLL_S` is 60s. Two other reads —
-"does a live context window belong to someone else?" (`should_defer` → `context_owner`)
+"is a higher-priority worker up?" (`should_defer` → `higher_priority_target`)
 and "are there orphaned claims?" (`reclaim_stale`) — answer nothing while there is nothing to claim, so
 `claim_one` reads `pending` FIRST and those two run on their own 60s clocks. Deferring is still decided
 fresh, before any claim, the instant something IS pending. Putting either back on the cycle costs
@@ -166,8 +166,9 @@ A `voice_requests` row with status `fallback` came from the watch through Supaba
 edge function (data-layer), because the hub on Fly did not answer. Only `FALLBACK_WORKER` (the Pi)
 claims it, in the same read as its `pending` rows, with no deferring or holding. Every other worker's
 claim filter must stay `status=eq.pending`: a Fly worker can be up while the hub is down, and a widened
-filter there would put the fallback back on Fly. (`worker/tests/test_claiming.py` holds this.) The run is the unrestricted Opus agent with
-`fallback_directive`; `_hub_unreachable` skips the pushes to the hub for its duration, since each would
+filter there would put the fallback back on Fly. (`worker/tests/test_claiming.py` holds this.) The run is an ordinary hub turn on the
+fenced SDK client with `fallback_directive` appended (it may start the troubleshooting session with
+`start_session`, which every pressed turn may); `_hub_unreachable` skips the pushes to the hub for its duration, since each would
 only spend its timeout. Status-hub `docs/WATCH.md` § When the hub does not answer has the watch's half.
 
 ## Reading a session: two handles, two columns

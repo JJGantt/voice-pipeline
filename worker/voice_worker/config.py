@@ -211,12 +211,6 @@ STANDBY_HEARTBEAT_S = 60.0   # deferring → beat at 60s (still < 90s fresh) ins
 STANDBY_POLL_S = 120.0       # deferring → idle-poll every 120s (realtime carries real commands)
 
 
-# Worker affinity: a LIVE hub context window stays pinned to the worker that owns it (the last worker to
-# claim), overriding priority, so the conversation + its machine-local context aren't lost to a needless
-# switch. Affinity releases only when the window resets (idle > session_reset_s / new day) or the owner goes
-# silent past this grace — longer than HEARTBEAT_FRESH_S so a brief owner hiccup can't cause a context-losing
-# switch, short enough that a genuinely-offline owner hands off promptly (then the new owner starts fresh).
-OWNER_GRACE_S = 150.0
 
 
 # A worker whose own Supabase calls failed (network, not a 4xx) within this window is DEGRADED: it says so
@@ -261,15 +255,6 @@ HTTP_TIMEOUT_S = 30.0
 
 
 CLAUDE_TIMEOUT_S = float(os.environ.get("CLAUDE_TIMEOUT_S", "300"))
-
-
-AGENT_TIMEOUT_S = float(os.environ.get("AGENT_TIMEOUT_S", "900"))  # full-agent (coding) runs get a longer leash
-
-
-HUB_SESSION_FILE = STATE_DIR / "hub_session.json"       # hub mode: idle/day reset, or manual
-
-
-AGENT_SESSION_FILE = STATE_DIR / "agent_session.json"   # full-agent mode: a SEPARATE, persistent context that
 
 
 # Sentinel the hub UI enqueues to force a fresh Claude session (manual "Reset context").
@@ -333,7 +318,6 @@ for _ok, _why in (
     (STANDBY_HEARTBEAT_S < HEARTBEAT_FRESH_S, "STANDBY_HEARTBEAT_S must stay under HEARTBEAT_FRESH_S, or a "
                                               "standing-by worker looks dead to the workers below it"),
     (HEARTBEAT_INTERVAL_S < HEARTBEAT_FRESH_S, "HEARTBEAT_INTERVAL_S must stay under HEARTBEAT_FRESH_S"),
-    (OWNER_GRACE_S > HEARTBEAT_FRESH_S, "OWNER_GRACE_S must exceed HEARTBEAT_FRESH_S"),
 ):
     if not _ok:
         raise SystemExit(f"voice worker config: {_why}")

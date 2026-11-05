@@ -1,8 +1,8 @@
 """The press-provenance gate and the routing it decides.
 
 Rule: anything that reaches the worker without a manual press cannot start or message a Claude session,
-cannot send a text or an email (or switch the JaredBot auto-replier on), and never reaches the
-unrestricted agent (--dangerously-skip-permissions), Codex or the credits runner.
+cannot send a text or an email (or switch the JaredBot auto-replier on), and never reaches Codex or the
+credits runner. Every turn runs on the fenced SDK client; nothing spawns an unrestricted `claude -p`.
 Manual = a source only a press or a keyboard writes, AND not always_on. Everything else fails closed.
 """
 
@@ -47,24 +47,14 @@ def claimed(h, source, always_on, transcript="start a session to fix the build",
     return dict(h.pg.insert("voice_requests", **row))
 
 
-def setting(h, key, value):
-    h.pg.rows("app_settings").append({"key": key, "value": value})
-
-
 @pytest.mark.parametrize("source,always_on,manual", [c for c in CASES if c[0]])
-def test_agent_mode_reaches_the_unrestricted_agent_only_on_a_press(load, source, always_on, manual):
+def test_every_turn_runs_on_the_fenced_client_with_its_provenance(load, source, always_on, manual):
     h = load(WORKER_ID="pi")
-    setting(h, "agent_mode", "1")
     sdk = h.install_runners()
     h.w.process_request(h.db, claimed(h, source, always_on))
-    argvs = h.claude_calls()
-    if manual:
-        assert argvs and "--dangerously-skip-permissions" in argvs[0]
-        assert sdk.calls == []
-    else:
-        assert argvs == []
-        assert len(sdk.calls) == 1 and sdk.calls[0]["manual"] is False
-        assert h.w.NO_PRESS_DIRECTIVE in sdk.calls[0]["prompt"]
+    assert h.claude_calls() == []
+    assert len(sdk.calls) == 1 and sdk.calls[0]["manual"] is manual
+    assert (h.w.NO_PRESS_DIRECTIVE in sdk.calls[0]["prompt"]) is not manual
 
 
 SESSION_CALLS = [("mcp__data__start_session", {"prompt": "x"}), ("mcp__data__follow_up", {"prompt": "x"}),
@@ -98,19 +88,18 @@ def test_silencing_jaredbot_stays_open_to_any_mic(load):
     assert r.gate("mcp__voice__set_jaredbot", {"on": True})[0] == "deny"
 
 
-def test_unrestricted_runners_refuse_without_a_press_even_if_called_directly(load):
-    h = load()
-    assert h.w.run_claude("rm -rf ~", None, manual=False)["ok"] is False
-    assert h.claude_calls() == []
-    assert h.w.run_codex("rm -rf ~", manual=False)["ok"] is False
+def test_codex_refuses_without_a_press_even_if_called_directly(load):
+    assert load().w.run_codex("rm -rf ~", manual=False)["ok"] is False
 
 
-def test_watch_fallback_runs_on_the_agent_with_the_troubleshooting_directive(load):
+def test_watch_fallback_runs_on_the_fenced_client_with_the_troubleshooting_directive(load):
     h = load(WORKER_ID="pi")
-    h.install_runners()
+    sdk = h.install_runners(h.runner(tools=[("mcp__data__start_session", {"prompt": "x"})]))
     h.w.process_request(h.db, claimed(h, "watch-fallback", False, transcript="log a banana"))
-    argv = h.claude_calls()[0]
-    assert "--dangerously-skip-permissions" in argv and "FALLBACK:" in argv[argv.index("-p") + 1]
+    assert h.claude_calls() == []
+    call = sdk.calls[0]
+    assert call["manual"] is True and "FALLBACK:" in call["prompt"] and "start ONE session" in call["prompt"]
+    assert call["decisions"]["mcp__data__start_session"] != "deny"   # it may open the troubleshooting session
 
 
 @pytest.mark.parametrize("source,always_on,injected", [("watch-cmd", False, True), ("fly", False, False),

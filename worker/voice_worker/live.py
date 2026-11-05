@@ -1,45 +1,16 @@
 """Live state (settings, focus, today's thread) held in memory off realtime, and the replayed day."""
 
-import json
 import os
 import threading
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
-from pathlib import Path
 
 import httpx
 
-from .config import AGENT_SESSION_FILE, HTTP_TIMEOUT_S, HUB_SESSION_FILE, SESSION_IDLE_RESET_S, STATE_DIR
+from .config import HTTP_TIMEOUT_S, SESSION_IDLE_RESET_S
 from .db import Supabase, headers, note_ok, report_failure
-from .logs import _parse_ts, log, log_error, now_iso
+from .logs import _parse_ts, log
 from .prompts import is_ignore, read_marker
-
-
-def session_file(agent: bool) -> Path:
-    """Hub mode and full-agent mode keep SEPARATE, independently-persisted Claude sessions, so switching
-    between them never carries over or clobbers the other's context."""
-    return AGENT_SESSION_FILE if agent else HUB_SESSION_FILE
-
-
-def read_session(agent: bool) -> dict | None:
-    f = session_file(agent)
-    try:
-        if f.exists():
-            return json.loads(f.read_text())
-    except Exception as e:  # noqa: BLE001
-        log_error(f"read {f.name} failed: {e}")
-    return None
-
-
-def write_session(agent: bool, session_id: str) -> None:
-    f = session_file(agent)
-    try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        f.write_text(
-            json.dumps({"session_id": session_id, "last_activity_iso": now_iso()})
-        )
-    except Exception as e:  # noqa: BLE001
-        log_error(f"write {session_file(agent).name} failed: {e}")
 
 
 # LIVE STATE: the settings a turn consults, the voice focus, and today's hub thread, held in memory.
@@ -47,7 +18,7 @@ def write_session(agent: bool, session_id: str) -> None:
 # that reload the backstop behind the events) and kept current by its app_settings / voice_focus /
 # voice_messages events, so a command reads none of them from the database. Reading them per command
 # cost ~0.7s of round trips before a turn could start.
-LIVE_SETTINGS = ("agent_mode", "agent_cwd", "session_reset_s", "voice_reset_at")
+LIVE_SETTINGS = ("session_reset_s", "voice_reset_at")
 
 
 _live = {"loaded": False, "settings": {}, "focus": "hub", "thread": {}}
@@ -138,35 +109,6 @@ def session_reset_s() -> float:
         return float(_live_view()["settings"].get("session_reset_s") or SESSION_IDLE_RESET_S)
     except (TypeError, ValueError):
         return SESSION_IDLE_RESET_S
-
-
-def agent_settings() -> dict:
-    """Full-agent-mode knobs from app_settings: `agent_mode` (bool — upgrade the subscription path to the
-    unrestricted Claude Code agent) and `agent_cwd` (where that agent runs; default $HOME)."""
-    s = _live_view()["settings"]
-    cwd = (s.get("agent_cwd") or "").strip()
-    return {"mode": str(s.get("agent_mode", "")).strip().lower() in ("1", "true", "on", "yes"),
-            "cwd": os.path.expanduser(cwd) if cwd else os.path.expanduser("~")}
-
-
-def should_reset_session(state: dict | None, agent: bool = False) -> bool:
-    """Reset (start fresh) if: no state, idle > the reset budget, or it's a new calendar day. In full-agent
-    mode the conversation resets MANUALLY only — a long coding session shouldn't be wiped by an idle gap or a
-    midnight rollover (switching the mode off triggers a reset via the hub), so only a missing session forces
-    a fresh start."""
-    if not state or not state.get("session_id"):
-        return True
-    if agent:
-        return False
-    last = _parse_ts(state.get("last_activity_iso", ""))
-    if not last:
-        return True
-    now = datetime.now(timezone.utc)
-    if (now - last).total_seconds() > session_reset_s():
-        return True
-    if last.astimezone().date() != now.astimezone().date():
-        return True
-    return False
 
 
 # The hub agent's day: it begins at 4 AM in the owner's own timezone, not at midnight and not in the host's

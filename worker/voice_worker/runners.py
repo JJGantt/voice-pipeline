@@ -1,4 +1,4 @@
-"""Where a turn runs: the warm SDK client (fenced), the unrestricted `claude -p` agent, and Codex."""
+"""Where a turn runs: the warm SDK client (fenced), and Codex."""
 
 import asyncio
 import json
@@ -6,7 +6,6 @@ import os
 import pathlib
 import re
 import shutil
-import signal
 import subprocess
 import tempfile
 import threading
@@ -16,7 +15,7 @@ from datetime import datetime, timezone
 
 import httpx
 
-from .config import AGENT_TIMEOUT_S, ALL_TOOLS, JAREDBOT_TOOL, CLAUDE_BIN, CLAUDE_TIMEOUT_S, CREDITS_API_KEY, DATA_MCP_JS, GMAIL_MCP_PY, GMAIL_PY, GOVEE_MCP_PY, GOVEE_PY, HAS_MESSAGES, HTTP_TIMEOUT_S, HUB_EFFORT, HUB_MODEL, MESSAGES_HEADERS, MESSAGES_MCP_URL, PETLIBRO_MCP_PY, PETLIBRO_PY, SEND_TOOLS, SESSION_START_TOOLS, SESSION_TOOLS, STATE_DIR, SUPABASE_KEY, SUPABASE_URL, VOICE_MCP_JS, WORKER_ID
+from .config import ALL_TOOLS, JAREDBOT_TOOL, CLAUDE_BIN, CLAUDE_TIMEOUT_S, CREDITS_API_KEY, DATA_MCP_JS, GMAIL_MCP_PY, GMAIL_PY, GOVEE_MCP_PY, GOVEE_PY, HAS_MESSAGES, HTTP_TIMEOUT_S, HUB_EFFORT, HUB_MODEL, MESSAGES_HEADERS, MESSAGES_MCP_URL, PETLIBRO_MCP_PY, PETLIBRO_PY, SEND_TOOLS, SESSION_START_TOOLS, SESSION_TOOLS, STATE_DIR, SUPABASE_KEY, SUPABASE_URL, VOICE_MCP_JS, WORKER_ID
 from .db import headers
 from .logs import classify_failure, log, log_error
 from .outbound import push_activity
@@ -137,211 +136,6 @@ LEASE_LOST_RESULT = {"session_id": None, "text": "", "result": "", "ok": False, 
                      "raw_error": "could not confirm this worker still holds the request", "_unheld": True}
 
 
-def _kill_group(proc) -> None:
-    """Kill a run and everything it started. A grandchild holding stdout open would otherwise keep the
-    stream reader from ever reaching EOF, and the claim with it."""
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except Exception:  # noqa: BLE001
-        try:
-            proc.kill()
-        except Exception:  # noqa: BLE001
-            pass
-
-
-def run_claude(transcript: str, resume_session_id: str | None, *, manual: bool, on_event=None, hold=None,
-               system_append: str = "", model: str = "opus", cwd: str | None = None) -> dict:
-    """Run the UNRESTRICTED Claude Code agent headless (`claude -p --dangerously-skip-permissions`) and
-    STREAM its stream-json output, parsing events as they arrive. Full-agent mode and the watch's
-    fallback path are its only callers; every hub turn runs on the fenced SdkRunner instead.
-
-    Every native tool executes, alongside the MCP tools, in `cwd`, for up to AGENT_TIMEOUT_S. There is no
-    fence on this path, which is why it refuses outright unless the caller says the command was started
-    by a press (`manual`, from is_manual): a microphone must never reach it.
-
-    on_event(kind, payload) fires live during the run so progress can be surfaced — on_event("tool",
-    {"name", "input"}) for each tool call, on_event("text", ...) for narration a tool call followed.
-    `hold` is the request's lease: renewed for the whole run before it starts, and at every tool call,
-    where a claim taken back kills the run (this path has no fence to refuse the tool).
-
-    Returns {"session_id", "text", "result", "ok", "raw_error"}.
-    """
-    if manual is not True:
-        log_error("run_claude refused a command that was not started by a press")
-        return {"session_id": None, "text": "", "result": "", "ok": False,
-                "raw_error": "the unrestricted agent only runs commands started by a press"}
-    mcp_path = write_mcp_config()
-    cmd = [CLAUDE_BIN, "-p", transcript]
-    if resume_session_id:
-        cmd += ["--resume", resume_session_id]
-    cmd += [
-        "--model", model,
-        "--mcp-config", mcp_path,
-        "--strict-mcp-config",
-        "--output-format", "stream-json",
-        "--verbose",
-        "--dangerously-skip-permissions",   # all native tools execute; MCP tools still present
-        # Out of the schema: the session-only tools (SESSION_TOOLS).
-        "--disallowedTools", *SESSION_TOOLS,
-    ]
-    if system_append:
-        cmd += ["--append-system-prompt", system_append]
-    timeout_s = AGENT_TIMEOUT_S
-    if hold and not hold(timeout_s):
-        return dict(LEASE_LOST_RESULT)
-    if cwd and not os.path.isdir(cwd):   # a published path may not exist on the worker that runs it
-        log(f"agent cwd {cwd!r} not present here; falling back to $HOME")
-        cwd = os.path.expanduser("~")
-
-    session_id = None
-    assistant_chunks: list[str] = []
-    result_text = ""
-    raw_error = None
-    proc = None
-    timed_out = {"v": False}
-    lost = {"v": False}   # the claim was taken back mid-run
-    t_spawn = t_init = t_first = None   # timing seams: spawn → MCP-ready (system init) → first model token
-    n_tools = 0
-
-    # Subscription path: `claude -p` uses the logged-in Claude subscription. ANTHROPIC_API_KEY is popped
-    # from the environment at import, so no subprocess can inherit it and silently bill the API.
-    sub_env = os.environ.copy()
-    # Load ALL MCP tool schemas inline every turn — no lazy tool-search/discovery round-trip. This is a
-    # tool-centric agent (its whole job is calling these tools), and the trimmed toolset is well under the
-    # context budget, so we want every tool callable directly. (Default 'auto' defers above 10% of context.)
-    sub_env["ENABLE_TOOL_SEARCH"] = "false"
-
-    try:
-        t_spawn = time.monotonic()
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, bufsize=1, env=sub_env, cwd=cwd,  # line-buffered; cwd is where a full agent operates
-            start_new_session=True,   # its own process group, so a kill reaches anything it spawned
-        )
-        # Watchdog: kill the run if it exceeds the timeout, which ends the streaming loop at EOF.
-        done = threading.Event()
-
-        def _watchdog():
-            if not done.wait(timeout_s):
-                timed_out["v"] = True
-                _kill_group(proc)
-
-        threading.Thread(target=_watchdog, daemon=True).start()
-
-        # Drain stderr concurrently so it can't fill its pipe and deadlock the stdout reader below.
-        err_buf: list[str] = []
-
-        def _drain_err():
-            try:
-                for el in proc.stderr:
-                    err_buf.append(el)
-            except Exception:  # noqa: BLE001
-                pass
-
-        threading.Thread(target=_drain_err, daemon=True).start()
-
-        # Stream events as claude emits them (one JSON object per line).
-        said = []   # text since the last tool call: progress once a tool follows it, else the reply
-        for line in proc.stdout:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                ev = json.loads(line)
-            except Exception:  # noqa: BLE001
-                continue
-            etype = ev.get("type")
-
-            if etype == "system":  # init event = process up + MCP servers loaded (the cold-start boundary)
-                if t_init is None:
-                    t_init = time.monotonic()
-                if ev.get("session_id"):
-                    session_id = ev["session_id"]
-
-            elif etype == "assistant":  # text lives in content[*].text; tool calls in content[*].tool_use
-                if t_first is None:     # first model output → end of "thinking before it says anything"
-                    t_first = time.monotonic()
-                msg = ev.get("message", {})
-                for block in msg.get("content", []) or []:
-                    if not isinstance(block, dict):
-                        continue
-                    if block.get("type") == "text":
-                        assistant_chunks.append(block.get("text", ""))
-                        said.append(block.get("text", ""))
-                    elif block.get("type") == "tool_use":
-                        n_tools += 1
-                        tname = block.get("name", "")
-                        if hold and not hold(0.0, tname):
-                            lost["v"] = True
-                            _kill_group(proc)
-                            break
-                        if on_event:
-                            try:
-                                if "".join(said).strip():
-                                    on_event("text", {"text": "\n".join(said)})
-                                on_event("tool", {"name": tname, "input": block.get("input")})
-                            except Exception:  # noqa: BLE001
-                                pass
-                        said = []
-                if ev.get("session_id"):
-                    session_id = ev["session_id"]
-
-            elif etype == "result":  # final event
-                if ev.get("session_id"):
-                    session_id = ev["session_id"]
-                if isinstance(ev.get("result"), str):
-                    result_text = ev["result"]
-                if ev.get("is_error"):
-                    raw_error = ev.get("result") or "claude reported is_error"
-
-        done.set()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:   # stdout closed but the process lingers: the reply is already in
-            _kill_group(proc)
-        stderr = "".join(err_buf)
-        t_end = time.monotonic()
-        if t_spawn:                       # latency breakdown of this run (where the seconds actually go)
-            cold = f"{t_init - t_spawn:.1f}s" if t_init else "n/a"
-            ttf  = f"{t_first - t_init:.1f}s" if (t_first and t_init) else "n/a"
-            gen  = f"{t_end - t_first:.1f}s" if t_first else "n/a"
-            log(f"timing: cold-start(spawn→mcp) {cold} | first-token {ttf} | "
-                f"gen+{n_tools}tools {gen} | total {t_end - t_spawn:.1f}s | "
-                f"model={model} resume={'y' if resume_session_id else 'n'} agent=y")
-
-        if lost["v"]:
-            return {**LEASE_LOST_RESULT, "session_id": session_id, "used_tools": True, "_unheld": False}
-        if timed_out["v"]:
-            return {"session_id": session_id, "text": "", "result": "",
-                    "ok": False, "raw_error": f"claude timed out after {timeout_s}s"}
-        if proc.returncode not in (0, None) and not result_text and not assistant_chunks:
-            raw_error = raw_error or f"claude exited {proc.returncode}: {stderr[:500]}"
-
-        text = result_text or "\n".join(c for c in assistant_chunks if c).strip()
-        return {
-            "session_id": session_id,
-            "text": text,
-            "result": result_text,
-            "ok": raw_error is None and bool(text),
-            "raw_error": raw_error,
-        }
-    except Exception as e:  # noqa: BLE001
-        if proc is not None:
-            _kill_group(proc)
-        return {
-            "session_id": session_id,
-            "text": "",
-            "result": "",
-            "ok": False,
-            "raw_error": f"claude invocation failed: {e}",
-        }
-    finally:
-        try:
-            os.unlink(mcp_path)
-        except Exception:  # noqa: BLE001
-            pass
-
-
 _SDK_LOOP_LOCK = threading.Lock()
 
 
@@ -382,8 +176,7 @@ class SdkRunner:
     One long-lived headless Claude Code process holds the four MCP servers, so the per-command spawn
     spawn cost is paid once, not per turn. Each hub turn runs in a FRESH conversation (`/clear` on the
     same warm process, see _turn): the caller replays the day's hub conversation into the prompt. Pinned to HUB_MODEL
-    at HUB_EFFORT with the full toolset at connect; full-agent and fallback turns keep their own `claude -p`
-    spawns. A failed turn is retried by `run_subscription` and then surfaced, never moved onto the paid API.
+    at HUB_EFFORT with the full toolset at connect, the watch's fallback turns included. A failed turn is retried by `run_subscription` and then surfaced, never moved onto the paid API.
     """
 
     def __init__(self, model: str = HUB_MODEL, effort: "str | None" = HUB_EFFORT, credits: bool = False):

@@ -1,9 +1,8 @@
 # Voice-command worker daemon
 
 Claims voice commands from the Supabase `voice_requests` queue and runs each one
-on the **Claude subscription** — hub turns on a warm Agent SDK client
-(Opus at its default effort, full toolset), full-agent turns through headless
-`claude -p` (Opus) — with the `data` MCP attached, then writes the conversation
+on the **Claude subscription**, every turn on a warm Agent SDK client
+(Opus at its default effort, full toolset) with the `data` MCP attached, then writes the conversation
 back to Supabase (`voice_messages`) for a live display. Every turn runs on the Claude subscription,
 except a pressed command the subscription refuses for its usage limit (`../CLAUDE.md`).
 
@@ -35,13 +34,8 @@ routed once it gets here is `../docs/ROUTING.md`.
    - **Priority gate:** if any worker ranked *higher* in `WORKER_PRIORITY` has a
      `last_seen` within `HEARTBEAT_FRESH_S` (90s) and is not degraded, skip and
      let them take it.
-   - **Affinity override (full-agent mode only):** while `agent_mode` is on, a live
-     context window stays pinned to the worker that claimed the last request, even
-     against priority, until the window resets, the owner goes silent past
-     `OWNER_GRACE_S`, or the owner reports itself degraded — a full-agent CLI session
-     lives on one machine. A hub turn follows priority alone: it is a fresh run handed
-     the day's thread from the live state every worker holds, so pinning it buys
-     nothing and would hold commands on a slower worker for up to `session_reset_s`.
+   - **Priority alone decides:** a turn is a fresh run handed the day's thread from the live
+     state every worker holds, so priority alone decides who claims it.
    - **Degraded stands down:** a degraded worker does not claim while any other
      worker is healthy.
    - **Failover deadline (`failover_wait`):** a request still pending `FAILOVER_S`
@@ -59,7 +53,7 @@ routed once it gets here is `../docs/ROUTING.md`.
      (see *The lease*). If the returned representation is empty, someone else won
      the race — skip.
    - **Handed-off requests:** a request listing workers in `failed_on` is never
-     claimed by them again, and skips affinity: it defers only to a higher-ranked
+     claimed by them again: it defers only to a higher-ranked
      worker that has not tried it (see *Handing a failed turn on*).
 3. **Process** the claimed request:
    - Read the `voice_focus` singleton. `focus == 'hub'` runs here; any other value
@@ -85,7 +79,7 @@ routed once it gets here is `../docs/ROUTING.md`.
 | `SUPABASE_KEY` | *(required, no default)* | **Must be the service_role key** — it bypasses RLS and needs full read/write on `voice_requests`, `voice_messages`, `worker_presence`, `voice_focus`. The anon key will NOT work. |
 | `WORKER_ID` | `mac` | Also `pi`, `fly`. Identifies this worker in the queue + presence. |
 | `WORKER_PRIORITY` | `fly,pi,mac` | Ordered, highest first. A worker only claims if no higher-priority worker has a fresh heartbeat. Set only as the default in `voice_worker/config.py`; no host overrides it. |
-| `STATE_DIR` | `~/.voice-worker` | Stores `hub_session.json` and `agent_session.json` (session id + last activity). `/data/voice-worker` on Fly, on the volume. |
+| `STATE_DIR` | `~/.voice-worker` | Stores `cmd_ts`, the capture-start timestamp the data MCP stamps writes with. `/data/voice-worker` on Fly, on the volume. |
 | `HUB_MODEL` / `HUB_EFFORT` | `opus` / *(unset)* | The hub turn's model and effort; unset is the model's default (`docs/ROUTING.md`). |
 | `CLAUDE_BIN` | `claude` | Path to the Claude Code CLI. |
 | `DATA_MCP_JS` | `~/repos/data-layer/dist/mcp.js` | The **built** data MCP entrypoint — a source change there does nothing until `npm run build`. |
@@ -98,7 +92,6 @@ routed once it gets here is `../docs/ROUTING.md`.
 | `HUB_URL` / `HUB_TOKEN` | `https://jared-status-hub.fly.dev` / _(empty)_ | The status hub and its kiosk token, for the live tool-call activity bar. Set in `.env` (Fly: a secret); unset, the worker reports an error at start and pushes nothing. |
 | `CLAUDE_TIMEOUT_S` | `300` | Max seconds for a single hub run. |
 | `LEASE_S` | `120` | How far past the turn's last renewal a claim's lease runs (see *The lease*). |
-| `AGENT_TIMEOUT_S` | `900` | Full-agent (coding) runs get a longer leash. |
 
 ### The service key
 
@@ -159,12 +152,7 @@ higher-priority worker whose heartbeat is fresh. Failover needs no coordination
 beyond that shared table, and is safe even if two claim at once, because the
 PATCH is atomic (`status=eq.pending` guard + `return=representation` race check).
 
-## Hub-session reset rule
-
-Hub mode and full-agent mode keep **separate**, independently-persisted sessions
-(`hub_session.json` / `agent_session.json` in `STATE_DIR`). Flipping the
-`agent_mode` toggle changes which one a request resumes; it never clobbers the
-other's context.
+## What a turn remembers
 
 **The hub agent sees the whole day.** Every hub turn is a fresh run with the
 conversation replayed into its prompt (`recent_context()`): everything said
@@ -175,7 +163,7 @@ idle gap does not cut it, and a host's own timezone does not move the
 boundary. A heavy day is about 12k tokens.
 
 **None of that is read per command.** The day's thread, the voice focus and the settings a turn consults
-(`agent_mode`, `agent_cwd`, `session_reset_s`, `voice_reset_at`) are held in memory (`_live`): loaded
+(`session_reset_s`, `voice_reset_at`) are held in memory (`_live`): loaded
 when the realtime socket subscribes, and kept current by that socket's `voice_messages`, `voice_focus`
 and `app_settings` events. The socket is recycled every ~5 minutes and each subscribe reloads, which is
 the backstop for a channel that goes deaf while still reporting SUBSCRIBED. Read per command, these
@@ -185,11 +173,7 @@ cost ~0.7s before a turn could start; from memory they are microseconds.
 
 **Only an always-on capture is checked for a duplicate.** Two room mics can hear one utterance; a
 press, a watch command or a typed message comes from one device on purpose, so it skips
-`_duplicate_of_recent` and the read of the last 12 requests it costs. `session_reset_s` still bounds which
-worker owns the conversation in full-agent mode (affinity); it does not bound what the agent
-remembers.
-
-The agent session resets only on a manual reset.
+`_duplicate_of_recent` and the read of the last 12 requests it costs.
 
 ## allowedTools (blast-radius note)
 
@@ -198,10 +182,6 @@ and messages) — never `Bash`, `Edit` or `Write`. `Read` is allowed only inside
 turn's photo directory, which is how the model views an image file. The warm client enforces the
 list with a PreToolUse hook (`_fence`), because Claude Code also applies the host's own permission
 settings; `../docs/ROUTING.md` has why.
-
-Full-agent mode is the opposite shape: `--dangerously-skip-permissions` in
-`agent_cwd`, every native tool live. It exists for dictated coding work and is
-gated behind the `agent_mode` setting.
 
 ## Handing a failed turn on
 
@@ -252,7 +232,7 @@ half-done) or when it is older than the conversation window.
 The heartbeat runs on its own thread so a long turn never looks dead, which also means a process whose
 turn is wedged keeps heartbeating. So a claim also carries a lease, `voice_requests.lease_until`, which
 only the turn itself renews (`claim.hold`): at claim, at the start of each run attempt by that attempt's
-own deadline (`CLAUDE_TIMEOUT_S` + 30, `AGENT_TIMEOUT_S`, `CODEX_TIMEOUT_S`), and before every tool call,
+own deadline (`CLAUDE_TIMEOUT_S` + 30, `CODEX_TIMEOUT_S`), and before every tool call,
 each time to at least `LEASE_S` (120s) ahead. A claim whose lease has passed is an orphan whatever its
 owner's heartbeat says, and `reclaim_stale` takes it back with an UPDATE guarded on the lease still being
 past, so a renewal that lands first keeps it. The owner's heartbeat meanwhile reports `info.stalled`, so
@@ -262,8 +242,7 @@ reads the column in the query it already makes.
 
 Every renewal is a write guarded on `status=claimed`, this `claimed_by` and this `claim_epoch`, so it
 doubles as the check that the claim is still this process's. Once it is not, the process does nothing
-more for the request: the fence (`SdkRunner.gate`) refuses the tool, `run_claude` kills the agent at its
-next tool call, and nothing is written. A renewal that fails on the network refuses that one tool too.
+more for the request: the fence (`SdkRunner.gate`) refuses the tool, and nothing is written. A renewal that fails on the network refuses that one tool too.
 Every outcome a turn writes (its thread rows and the request's final state) goes through `finish`, the
 `voice_finish` function (data-layer 00159), which writes them in one transaction only while the caller
 still holds the claim. A worker that lost a claim therefore cannot post a reply beside the one that took

@@ -14,18 +14,17 @@ from .claim import _duplicate_of_recent, claim_one, finish, hold
 from .config import CREDITS_API_KEY, FALLBACK_OUTAGE_S, HUB_EFFORT, HUB_MODEL, RESET_SENTINEL, SUPABASE_KEY, SUPABASE_URL, WORKER_ID, _NOTHING_SAID
 from .db import Supabase
 from .governor import maybe_auto_disable_wakefree
-from .live import agent_settings, get_focus, read_session, recent_context, session_file, should_reset_session, write_session
+from .live import get_focus, recent_context
 from .logs import _parse_ts, alert_failure, log, log_error, now_iso
 from .outbound import inject_to_terminal, ping_esp_led, push_activity
 from .presence import claude_unready, hand_off
-from .prompts import ADDRESSING_DIRECTIVE, AGENT_SYSTEM, ALT_TRANSCRIPT_DIRECTIVE, ATTACH_DIRECTIVE, DELIBERATE_DIRECTIVE, NO_PRESS_DIRECTIVE, NUTRITION_DIRECTIVE, READ_DIRECTIVE, SHARED_STATE_NOTE, SHARE_DIRECTIVE, TOOLS_DIRECTIVE, is_ignore, read_again, take_read_marker
-from .runners import CODEX_TIMEOUT_S, SDK, SDK_CREDITS, codex_ready, limit_refused, run_claude, run_codex, run_subscription, set_cmd_ts
+from .prompts import ADDRESSING_DIRECTIVE, ALT_TRANSCRIPT_DIRECTIVE, ATTACH_DIRECTIVE, DELIBERATE_DIRECTIVE, NO_PRESS_DIRECTIVE, NUTRITION_DIRECTIVE, READ_DIRECTIVE, SHARE_DIRECTIVE, TOOLS_DIRECTIVE, is_ignore, read_again, take_read_marker
+from .runners import CODEX_TIMEOUT_S, SDK, SDK_CREDITS, codex_ready, limit_refused, run_codex, run_subscription, set_cmd_ts
 
 
 # PROVENANCE: was this command started by a deliberate act of the user's hand? Only such a command may reach
 # anything that can do unbounded work in the user's name: a Claude session (start_session, follow_up, a pty
-# inject into a focused one), the unrestricted full agent (--dangerously-skip-permissions), Codex, or the
-# Console-billed credits runner. Everything a microphone heard by itself (always-on capture, a wake word
+# inject into a focused one), Codex, or the Console-billed credits runner. Everything a microphone heard by itself (always-on capture, a wake word
 # the TV can say, a watch or phone listener) is not, because nothing guarantees the user was the one talking.
 #
 # A row is manual only when it says so twice: its `source` is one of these labels, each of which is only
@@ -98,11 +97,11 @@ def about_directive(db: Supabase, about_id: str) -> str:
         return ""
 
 
-def last_flagged(db: Supabase, mode: str) -> str | None:
+def last_flagged(db: Supabase) -> str | None:
     """The newest answer in the inbox that the hub itself wrote (a relayed session reply is the session's,
     never something a hub reply revises)."""
     try:
-        [r] = db.get("voice_messages", f"focus=eq.hub&mode=eq.{mode}&role=eq.assistant&needs_read=is.true"
+        [r] = db.get("voice_messages", "focus=eq.hub&mode=eq.hub&role=eq.assistant&needs_read=is.true"
                      "&session_id=is.null&order=created_at.desc&limit=1&select=id") or [None]
         return r and r["id"]
     except Exception as e:  # noqa: BLE001
@@ -156,18 +155,12 @@ def process_request(db: Supabase, req: dict) -> None:
     # Only for audio captures (typed/web commands have no capture_start → real wall clock).
     set_cmd_ts((req.get("capture_start") or "").strip() or None)
 
-    # Manual context reset from the hub UI: drop the CURRENT mode's session so the next command starts
-    # fresh — full-agent mode resets its own context, hub mode its own (whichever you're in). The status-hub
-    # already cleared the visible thread and pushed a live reset to every surface — here we just forget the
-    # Claude session and ack (no Claude run, no turns).
+    # Manual context reset from the hub UI. The status-hub already stamped `voice_reset_at`, which bounds
+    # the replayed conversation (recent_context), cleared the visible thread and pushed a live reset to every
+    # surface; here it is only acknowledged (no Claude run, no turns).
     if transcript.strip() == RESET_SENTINEL:
-        reset_agent = agent_settings()["mode"] and WORKER_ID != "fly"
-        try:
-            session_file(reset_agent).unlink(missing_ok=True)
-        except Exception as e:
-            log_error(f"reset: unlink session failed: {e}")
         finish(db, req, {"status": "done", "result": "(context reset)"})
-        log(f"{'agent' if reset_agent else 'hub'} context reset — session dropped")
+        log("context reset acknowledged")
         return
 
     # A command that is only "thank you" is never run: from a microphone it is what Whisper writes for a
@@ -178,14 +171,14 @@ def process_request(db: Supabase, req: dict) -> None:
         log(f"ignored {transcript!r}: nothing said")
         return
 
-    # THE HUB DID NOT ANSWER. The watch sent this through the voice-fallback edge function; it is run
-    # here on Opus with every tool, says so, and the first one of an outage starts a session to find out
-    # why. See fallback_directive.
+    # THE HUB DID NOT ANSWER. The watch sent this through the voice-fallback edge function; it runs here as
+    # an ordinary hub turn that says so, and the first one of an outage starts a session to find out why.
+    # See fallback_directive.
     fallback = (req.get("source") or "") == "watch-fallback"
     runstate._hub_unreachable = fallback
 
-    # Started by a press or typed? Only then may this command reach a session, the unrestricted agent,
-    # Codex or the credits runner. Fails closed: see MANUAL_SOURCES.
+    # Started by a press or typed? Only then may this command reach a session, Codex or the credits
+    # runner. Fails closed: see MANUAL_SOURCES.
     manual = is_manual(req)
 
     # A focused Mac session receives typed-into-its-terminal words, so only a pressed command goes there;
@@ -216,27 +209,10 @@ def process_request(db: Supabase, req: dict) -> None:
     # (The user turn is written AFTER the model runs — deferred so a wake-word false positive that the
     # model drops never appears in the conversation. See below.)
 
-    # Context. Full-agent (coding) mode keeps a real CLI --resume session — its context (open files, long
-    # tool chains) can't be reconstructed from replies. The HUB conversation does NOT use --resume: each
-    # turn is a FRESH process handed the recent transcript (recent_context), so the two models never share a
-    # session and can't cross-contaminate. Only agent mode reads/writes a persisted session id.
-    ag = agent_settings()
-    # The full agent runs with --dangerously-skip-permissions, so a command a microphone heard by itself
-    # never gets it, even with agent mode on: it is answered on the fenced hub client.
-    session_agent = ag["mode"] and WORKER_ID != "fly" and manual
-    ctx = ""
-    if session_agent:
-        state = read_session(True)
-        if should_reset_session(state, agent=True):
-            resume_id = None
-            log("agent session: starting FRESH (reset rule fired)")
-        else:
-            resume_id = state["session_id"]
-            log(f"agent session: resuming {resume_id}")
-    else:
-        resume_id = None
-        ctx = recent_context()
-        log(f"hub: fresh run + {len(ctx)} chars injected conversation" if ctx else "hub: fresh run (no prior context)")
+    # Context. Each turn is a FRESH conversation handed the recent transcript (recent_context); there is no
+    # --resume.
+    ctx = recent_context()
+    log(f"hub: fresh run + {len(ctx)} chars injected conversation" if ctx else "hub: fresh run (no prior context)")
 
     _emit = _activity_emitter()
     _hold = lambda for_s=0.0, tool=None: hold(db, req, for_s, tool)  # noqa: E731 — the lease, renewed by this turn
@@ -255,18 +231,16 @@ def process_request(db: Supabase, req: dict) -> None:
     if req.get("about_id"):
         prompt += about_directive(db, req["about_id"])
 
-    # ---- ONE route. Every hub command, photos included, runs on the warm SDK client (HUB_MODEL, full
-    # toolset). Full-agent mode is the unrestricted coding agent on its own --resume session.
+    # ---- ONE route. Every hub command, photos and the watch's fallback included, runs on the warm SDK
+    # client (HUB_MODEL, full toolset).
     attachments = req.get("attachments") or []
     if isinstance(attachments, str):
         try:
             attachments = json.loads(attachments)
         except Exception:  # noqa: BLE001
             attachments = []
-    use_agent = session_agent   # full-agent (coding) mode → the unrestricted agent, on its own session
-    hub_route = f"hub {HUB_MODEL}@{HUB_EFFORT or 'default'}" + (" +photo" if attachments else "")
-    log(f"route={'fallback→opus agent' if fallback else 'agent' if use_agent else hub_route} src={source}"
-        f" manual={'y' if manual else 'n'}")
+    hub_route = f"hub {HUB_MODEL}@{HUB_EFFORT or 'default'}" + (" +photo" if attachments else "") + (" +fallback" if fallback else "")
+    log(f"route={hub_route} src={source} manual={'y' if manual else 'n'}")
     ping_esp_led("blink")   # working — the ESP light blinks for EVERY command, not just ESP-sourced ones
     push_activity(transcript[:240], "working")   # bottom-strip: the prompt being worked
 
@@ -283,20 +257,16 @@ def process_request(db: Supabase, req: dict) -> None:
             prompt += ("\n\n[The user attached photo(s), but they could not be retrieved — tell them "
                        "that briefly instead of guessing at the contents.]")
 
-    result = _run_turn(db, req, prompt, ctx, manual=manual, fallback=fallback,
-                       use_agent=use_agent, resume_id=resume_id, agent_cwd=ag["cwd"],
-                       read_dir=att_tmp if att_paths else None, on_event=_emit, hold=_hold)
+    if fallback:
+        prompt += fallback_directive(db, rid)
+    result = _run_turn(prompt, ctx, manual=manual, read_dir=att_tmp if att_paths else None,
+                       on_event=_emit, hold=_hold)
 
     if att_tmp:
         shutil.rmtree(att_tmp, ignore_errors=True)   # staged photos served their turn
 
-    if result.get("session_id") and session_agent:   # only full-agent mode keeps a CLI session; hub replays ctx
-        write_session(True, result["session_id"])
-        log(f"captured agent session_id {result['session_id']}")
-
     _record_outcome(db, req, result, prompt, transcript=transcript, attachments=attachments,
-                    manual=manual, ambient=ambient, fallback=fallback, session_agent=session_agent,
-                    on_event=_emit, hold=_hold)
+                    manual=manual, ambient=ambient, fallback=fallback, on_event=_emit, hold=_hold)
 
 
 def _activity_emitter():
@@ -390,33 +360,18 @@ def build_prompt(req: dict, transcript: str, *, ambient: bool, manual: bool) -> 
     return prompt
 
 
-def _run_turn(db: Supabase, req: dict, prompt: str, ctx: str, *, manual: bool, fallback: bool,
-              use_agent: bool, resume_id, agent_cwd: str, read_dir, on_event, hold) -> dict:
-    """Run the turn on the route its provenance and mode allow, and return the runner's result."""
+def _run_turn(prompt: str, ctx: str, *, manual: bool, read_dir, on_event, hold) -> dict:
+    """Run the turn on the route its provenance allows, and return the runner's result."""
     # Dispatch — one route, the same on every worker (Pi, Mac, and Fly, which holds its own subscription
     # token). Everything runs on the Claude SUBSCRIPTION; there is no paid path. A run that fails
     # transiently is retried (`run_subscription`), and one that still fails surfaces as an error. `ctx`
     # (the replayed hub conversation) rides on a FRESH conversation; there is no --resume for hub turns.
-    # agent → the unrestricted coding agent (its own --resume session). Everything else, photos included,
-    # → the warm SDK client. A failure that called no tool is handed to another worker below rather than
-    # ended here.
-    hub_prompt = ctx + prompt   # ctx is "" in agent mode (uses --resume) or when there's no live conversation
+    # Every turn, photos and the watch's fallback included, → the warm SDK client. A failure that called no
+    # tool is handed to another worker by the caller rather than ended here.
+    hub_prompt = ctx + prompt   # ctx is "" when there's no live conversation
     unready = claude_unready()
     if unready:
         result = {"session_id": None, "text": "", "result": "", "ok": False, "raw_error": unready}
-    elif fallback and manual:
-        # Opus, the unrestricted agent, a FRESH run with the day's conversation replayed — whatever broke,
-        # it can handle the command and see enough to say what is wrong. Never the --resume agent session.
-        fb_prompt = (ctx or recent_context()) + prompt + fallback_directive(db, req["id"])
-        result = run_subscription(
-            lambda: run_claude(fb_prompt, None, manual=manual, on_event=on_event, hold=hold,
-                               system_append=AGENT_SYSTEM + "\n\n" + SHARED_STATE_NOTE,
-                               model="opus", cwd=os.path.expanduser("~")),
-            "subscription Opus (fallback)")
-    elif use_agent:
-        result = run_claude(prompt, resume_id, manual=manual, on_event=on_event, hold=hold,
-                            system_append=AGENT_SYSTEM + "\n\n" + SHARED_STATE_NOTE, model="opus",
-                            cwd=agent_cwd)
     else:
         # The warm SDK client, not a per-command `claude -p`: that spawn (CLI + four stdio MCP servers)
         # measured 3.6s on the Pi before the model saw a token; the warm client pays it once.
@@ -443,7 +398,7 @@ def _run_turn(db: Supabase, req: dict, prompt: str, ctx: str, *, manual: bool, f
 
 
 def _record_outcome(db: Supabase, req: dict, result: dict, prompt: str, *, transcript: str, attachments: list,
-                    manual: bool, ambient: bool, fallback: bool, session_agent: bool, on_event, hold) -> None:
+                    manual: bool, ambient: bool, fallback: bool, on_event, hold) -> None:
     """Write the turn back: the thread rows, the request's final state, or a hand-off to another worker.
     Nothing here is written by a worker whose claim was taken back (`finish`)."""
     rid = req["id"]
@@ -474,9 +429,6 @@ def _record_outcome(db: Supabase, req: dict, result: dict, prompt: str, *, trans
             and not limit_refused(result) and hand_off(db, req, result.get("raw_error") or "unknown error")):
         return
 
-    # Tag every row with the mode so the hub UI can show this mode's thread separately and switch live.
-    # Defined up here because the ignore branch below writes a row too.
-    msg_mode = "agent" if session_agent else "hub"
 
     # Wake-word false positive: the model judged the transcript noise or a mishear. No ASSISTANT turn is
     # written — nothing was done and nothing is spoken — but the words are KEPT, flagged `ignored`.
@@ -486,7 +438,7 @@ def _record_outcome(db: Supabase, req: dict, result: dict, prompt: str, *, trans
     # far as the model could see, had never been said. Which is precisely what happened on 2026-08-28.
     if ambient and is_ignore(text):
         if finish(db, req, {"status": "done", "result": "(ignored: wake-word false positive)"},
-                  [{"focus": "hub", "mode": msg_mode, "role": "user", "text": transcript, "done": True,
+                  [{"focus": "hub", "mode": "hub", "role": "user", "text": transcript, "done": True,
                     "ignored": True, "worker": WORKER_ID}]):
             push_activity("(ignored — likely noise)", "done")
             log(f"ignored likely false-positive (kept in thread): {transcript[:60]!r}")
@@ -495,17 +447,17 @@ def _record_outcome(db: Supabase, req: dict, result: dict, prompt: str, *, trans
 
     # Real turn → the user bubble (deferred past the noise check) and the reply, written with the request's
     # final state in one transaction.
-    user = {"focus": "hub", "mode": msg_mode, "role": "user", "text": transcript, "done": True,
+    user = {"focus": "hub", "mode": "hub", "role": "user", "text": transcript, "done": True,
             **({"attachments": attachments} if attachments else {})}
     if result["ok"]:
-        reply = {"focus": "hub", "mode": msg_mode, "role": "assistant", "text": text, "done": True,
+        reply = {"focus": "hub", "mode": "hub", "role": "assistant", "text": text, "done": True,
                  "worker": WORKER_ID, "needs_read": needs_read,
                  **({"label": read_label} if needs_read and read_label else {}),
                  # Which engine wrote it, when not the subscription: the surfaces colour the reply by it
                  # (credits amber, Codex blue), so a fallback is visible on the reply itself.
                  **({"engine": result["_engine"]} if result.get("_engine") else {})}
         # The last flagged answer, read BEFORE this turn's rows land, so it cannot be this one.
-        replaced = last_flagged(db, msg_mode) if needs_read and again else None
+        replaced = last_flagged(db) if needs_read and again else None
         if finish(db, req, {"status": "done", "result": text}, [user, reply]):
             if replaced:
                 unflag(db, replaced)
@@ -514,7 +466,7 @@ def _record_outcome(db: Supabase, req: dict, result: dict, prompt: str, *, trans
         return
     err = result.get("raw_error") or "unknown error"
     # Still surface whatever assistant text we did get, if any.
-    partial = ([{"focus": "hub", "mode": msg_mode, "role": "assistant", "done": True, "worker": WORKER_ID,
+    partial = ([{"focus": "hub", "mode": "hub", "role": "assistant", "done": True, "worker": WORKER_ID,
                  "text": take_read_marker(result["text"])[0]}] if result.get("text") else [])
     if finish(db, req, {"status": "error", "error": err}, [user, *partial]):
         push_activity(text[:240], "done")

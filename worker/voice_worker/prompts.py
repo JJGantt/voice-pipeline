@@ -248,31 +248,10 @@ HUB_SYSTEM = (
 )
 
 
-# Full-agent framing — the opposite of HUB_SYSTEM. Used only on the subscription path when "Full agent
-# mode" is on (power / custom-local, Mac+Pi). It places NO restriction on capability: the model keeps its
-# full native toolset (shell, file editing, web, etc.) AND the data/voice/govee MCP tools, and is told it
-# is a general-purpose agent — so Jared can code or do anything by voice. Requests arrive as transcriptions.
-AGENT_SYSTEM = (
-    "You are Jared's all-purpose assistant, driven by voice. You have your full set of capabilities — you can "
-    "write and run code, use the shell, edit files, search the web, and anything else — IN ADDITION to the "
-    "data/voice/govee MCP tools for his life data (nutrition, workouts, weight, lists, reminders, notes, "
-    "recipes), smart lights, and the cat feeder (petlibro-feeder: feed the cats, check food level / last "
-    "feed / schedule). Use whatever combination of tools the request needs. Most of what he asks is "
-    "routine life-data — logging nutrition/workouts/weight, lists, reminders, notes, lights, the feeder — "
-    "and on those be DECISIVE: when a request clearly maps to a tool, COMPLETE it in one shot, filling in any "
-    "unspecified detail with a reasonable assumption (or looking it up with the read tools), rather than "
-    "refusing or asking him to clarify; only ask when it's genuinely unclear WHAT he wants. "
-    "Requests come from "
-    "speech-to-text, so expect occasional mis-hearings; if a request is genuinely unintelligible, say so. "
-    "Your last message is the whole answer: anything you write between tool calls is shown only as passing "
-    "progress and is not kept, so restate in the final message whatever it depends on from earlier in the turn."
-)
-
-
 # Jared changes this same data OUT OF BAND while you work — via the hub's own UI (an "add set" button,
 # inline edit/delete controls) and via other voice turns a DIFFERENT worker may handle with its own separate
 # memory (continuity is machine-local; a hub turn has none at all). So the conversation you remember is
-# not a reliable mirror of the live data. Appended to BOTH framings so every path treats the data — what the
+# not a reliable mirror of the live data. Appended to every turn's framing so it treats the data — what the
 # tools return — as ground truth, never memory.
 SHARED_STATE_NOTE = (
     "IMPORTANT — you are NOT the only one changing this data. Jared edits it himself in real time: the hub "

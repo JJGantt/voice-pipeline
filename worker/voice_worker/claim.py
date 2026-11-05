@@ -26,8 +26,8 @@ def refresh_standby(db: Supabase) -> None:
 
     `runstate._standby` only chooses this worker's poll cadence — the claim decision is made fresh in
     `claim_one` the moment something is actually pending, so a minute-stale flag here can cost nothing
-    but a cycle at the wrong interval. Asking every cycle meant a `voice_requests` read (via
-    `context_owner`) plus sometimes a `worker_presence` read, for ever, to learn nothing."""
+    but a cycle at the wrong interval. Asking every cycle meant a `worker_presence` read, for ever, to
+    learn nothing."""
     global _last_standby_check
     now_mono = time.monotonic()
     if now_mono - _last_standby_check < STANDBY_CHECK_S:

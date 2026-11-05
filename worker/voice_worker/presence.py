@@ -6,9 +6,8 @@ import uuid
 from datetime import datetime, timezone
 
 from . import runstate
-from .config import CLAUDE_BIN, HEARTBEAT_FRESH_S, OWNER_GRACE_S, WORKER_ID, WORKER_PRIORITY
+from .config import CLAUDE_BIN, HEARTBEAT_FRESH_S, WORKER_ID, WORKER_PRIORITY
 from .db import Supabase, degraded
-from .live import agent_settings, session_reset_s
 from .logs import _parse_ts, alert_failure, log, now_iso
 from .outbound import push_activity
 
@@ -82,65 +81,11 @@ def higher_priority_target(db: Supabase, exclude: "set | frozenset" = frozenset(
     return next((w for w in above if w in healthy), None)
 
 
-def context_owner(db: Supabase) -> str | None:
-    """The worker that owns the currently-LIVE hub context window, or None if there is no live window
-    (idle past the reset budget, or a new calendar day) or its owner is offline. Derived purely from the
-    shared voice_requests log — the worker that claimed the most recent request — so it needs no extra
-    state and every worker computes the same answer. This is what lets a live context stay on its owner
-    even when a higher-priority worker is available: only a reset or the owner going offline releases it.
-    (One tiny indexed lookup per claim attempt — a single ~60-byte row.)"""
-    rows = db.get(
-        "voice_requests",
-        "claimed_by=not.is.null&order=claimed_at.desc&limit=1&select=claimed_by,claimed_at",
-    )
-    if not rows:
-        return None
-    owner = rows[0].get("claimed_by")
-    claimed_at = _parse_ts(rows[0].get("claimed_at") or "")
-    if not owner or not claimed_at:
-        return None
-    now = datetime.now(timezone.utc)
-    age = (now - claimed_at).total_seconds()
-    # Same "is the window still live?" test the local session uses: idle budget + calendar-day rollover.
-    if age > session_reset_s():
-        return None
-    if claimed_at.astimezone().date() != now.astimezone().date():
-        return None
-    # An owner reporting a degraded link releases affinity at once: keeping the conversation on one
-    # machine is not worth minutes per command.
-    if any(r.get("worker") == owner and (r.get("info") or {}).get("degraded") for r in presence_rows(db)):
-        return None
-    # Liveness: a claim IS proof the owner was running. If it claimed within the grace window, treat the
-    # owner as alive WITHOUT a presence read — this survives a briefly-unavailable presence query (e.g. the
-    # Mac just woke and its worker_presence GET timed out), which otherwise let a waking higher-priority
-    # worker wrongly STEAL a live window from the owner that had handled a command seconds earlier.
-    if age <= OWNER_GRACE_S:
-        return owner
-    # Older claim (still inside the window): fall back to the heartbeat to confirm the owner is still up.
-    for row in presence_rows(db):
-        if row.get("worker") == owner:
-            ts = _parse_ts(row.get("last_seen", ""))
-            if ts and (now - ts).total_seconds() <= OWNER_GRACE_S:
-                return owner
-            return None   # owner went offline → release affinity so a fallback can take over
-    return None
-
-
 def defer_target(db: Supabase, tried: "set | frozenset" = frozenset()) -> str | None:
-    """The worker THIS one should leave a request to, or None to claim it. In full-agent mode, affinity
-    first: a live context window owned by a DIFFERENT worker that is still online keeps the conversation
-    there, over priority; if I own it, I claim. Otherwise priority ordering. A request other workers have already failed on
-    (`tried`) skips affinity — the owner is likely the worker that just failed it — and goes to the
-    highest-ranked worker that has not tried it."""
-    if tried:
-        return higher_priority_target(db, tried)
-    # Affinity only in full-agent mode, whose CLI session lives on one machine. A hub turn is a fresh run
-    # handed the day's thread from the live state, which every worker holds, so keeping it on the last
-    # claimer bought nothing — and kept commands on a slower worker for up to an hour.
-    owner = context_owner(db) if agent_settings()["mode"] else None
-    if owner is not None:
-        return None if owner == WORKER_ID else owner
-    return higher_priority_target(db)
+    """The worker THIS one should leave a request to, or None to claim it: priority ordering. A request
+    other workers have already failed on (`tried`) goes to the highest-ranked worker that has not tried it.
+    Every worker holds the day's thread in its live state, so which one claims a turn does not matter."""
+    return higher_priority_target(db, tried)
 
 
 def should_defer(db: Supabase) -> bool:
@@ -175,7 +120,7 @@ def hand_off(db: Supabase, req: dict, err: str) -> bool:
     """Put a request this worker failed back to 'pending' for a worker that has not tried it yet.
 
     Only for a turn that called no tool, so running it again cannot repeat anything it did. The workers
-    tried so far ride in `failed_on`; none of them claims it again, and the rest skip affinity and
+    tried so far ride in `failed_on`; none of them claims it again, and the rest skip
     priority for it (`claim_one`), so the next healthy one takes it at once. False when no healthy
     worker is left untried — the caller then closes it as an error, as before."""
     tried = sorted(set(req.get("failed_on") or []) | {WORKER_ID})
