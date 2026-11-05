@@ -303,12 +303,13 @@ SEND_TOOLS = ["mcp__messages__send_message", "mcp__gmail__send_email"]
 JAREDBOT_TOOL = "mcp__voice__set_jaredbot"
 
 
-# Tools that only mean something next to the user's signed-in browser, which this worker does not have: a cart
-# URL has to be opened there, a cart recording is what its /cart page showed, and an item id is read off
-# the retailer's site. Here they could only be called with made-up values, so they are REMOVED from every
-# runner's schema: a cart request has to become a start_session, never a turn with no browser.
+# Tools that only mean something inside a session, REMOVED from every runner's schema. The cart tools need the
+# user's signed-in browser, which this worker does not have: a cart URL has to be opened there, a cart
+# recording is what its /cart page showed, and an item id is read off the retailer's site. publish_report
+# writes up work a session has finished; a voice turn does none. Here they could only be called with
+# made-up values, so the request has to become a start_session instead.
 SESSION_TOOLS = ["mcp__data__build_walmart_cart_url", "mcp__data__record_walmart_cart",
-                 "mcp__data__save_shopping_item"]
+                 "mcp__data__save_shopping_item", "mcp__data__publish_report"]
 
 
 # The tools that start a Claude session or put words into one. Refused on every turn that is not

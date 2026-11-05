@@ -97,13 +97,18 @@ even with agent mode on or a session focused; the fence refuses `SESSION_START_T
 `manual=True`. A non-manual turn also carries `NO_PRESS_DIRECTIVE`, so the model says it needs the
 button rather than trying, for a session or a send alike.
 
-## Browser-only tools are removed from the schema
+## Session-only tools are removed from the schema
 
-`build_walmart_cart_url`, `record_walmart_cart` and `save_shopping_item` (`SESSION_TOOLS`) only mean
-something next to the signed-in browser, which no worker runner has. They are taken out of every
-runner's schema (`disallowed_tools` on the warm client, `--disallowedTools` on `run_claude`), so a cart
-request becomes a `start_session`, where a browser exists. The reads (`get_shopping_items`,
-`get_walmart_cart`) stay.
+`SESSION_TOOLS` are taken out of every runner's schema (`disallowed_tools` on the warm client,
+`--disallowedTools` on `run_claude`), so the request becomes a `start_session` instead:
+
+- `build_walmart_cart_url`, `record_walmart_cart` and `save_shopping_item` only mean something next to
+  the signed-in browser, which no worker runner has. The reads (`get_shopping_items`,
+  `get_walmart_cart`) stay.
+- `publish_report` writes up work a session has finished; a voice turn has none.
+
+The voice assistant answers and dispatches. Anything that operates a machine (restarting, reloading,
+fixing) is a session's job, never a tool here; the Pi already heals the wall itself (`kiosk-health.py`).
 
 ## A command can arrive with two transcripts
 

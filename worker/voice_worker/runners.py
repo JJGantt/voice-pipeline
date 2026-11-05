@@ -181,7 +181,7 @@ def run_claude(transcript: str, resume_session_id: str | None, *, manual: bool, 
         "--output-format", "stream-json",
         "--verbose",
         "--dangerously-skip-permissions",   # all native tools execute; MCP tools still present
-        # Out of the schema: the browser-only tools, which no worker has the browser for.
+        # Out of the schema: the session-only tools (SESSION_TOOLS).
         "--disallowedTools", *SESSION_TOOLS,
     ]
     if system_append:
@@ -495,7 +495,7 @@ class SdkRunner:
             # The credits runner is the usage-limit fallback, so the sessions it starts run on Codex.
             mcp_servers=write_mcp_config(codex_sessions=self.credits),
             allowed_tools=list(self.tools),
-            disallowed_tools=list(SESSION_TOOLS),   # browser-only: out of sight entirely
+            disallowed_tools=list(SESSION_TOOLS),   # session-only: out of sight entirely
             # The stable hub framing lives here so the prefix caches across turns; per-turn context
             # (the replayed conversation) rides on the prompt instead.
             system_prompt={"type": "preset", "preset": "claude_code",
