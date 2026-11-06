@@ -215,9 +215,13 @@ content the model flags those, and the room-noise "that wasn't meant for me" rep
 request that FAILED, or only partly worked, is flagged regardless: the user gives a command and looks
 away assuming it worked, so a failure is exactly the reply that must not be missed.
 
-A failure caused by a BROKEN or MISSING tool also starts a session to fix it (`DELIBERATE_DIRECTIVE`),
-with the user's request, the tool and its exact error as the prompt; a failure that is the state of the world
-(the TV is off) starts nothing, since there is no code to change. `take_read_marker` strips it
+A failure caused by a BROKEN tool (it errors or misbehaves) also starts a session to fix it
+(`DELIBERATE_DIRECTIVE`), with the user's request, the tool and its exact error as the prompt; a failure that
+is the state of the world (the TV is off) starts nothing, since there is no code to change. A request no tool
+covers is not a failure: it is an ordinary handoff, and the session gets the request alone. Do not extend
+this rule to MISSING tools. Every request that belongs in a session has no tool by definition, so the rule
+turns each handoff into "answer it and build the orchestrator a tool for it", which is the orchestrator
+growing into a session. `take_read_marker` strips it
 before the reply is stored or spoken and sets `voice_messages.needs_read`, which files the answer in
 the inbox (status-hub `docs/WATCH.md`, "The inbox").
 
