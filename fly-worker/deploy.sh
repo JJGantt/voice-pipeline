@@ -45,4 +45,26 @@ wait_idle() {
   echo "worker still busy after 5 minutes; deploying anyway" >&2
 }
 wait_idle
+SWAPPED_AT=$(date -u +%Y-%m-%dT%H:%M:%S)
 flyctl deploy --now -a jared-voice-worker --image "registry.fly.io/jared-voice-worker:$LABEL"
+# A deploy that recreates the machine can leave the new one created but never started, and a later
+# update keeps it stopped; flyctl reports success either way. So start whatever is stopped and wait
+# for the worker's own heartbeat, which is the only proof it is running.
+for m in $(flyctl machine list -a jared-voice-worker --json | python3 -c 'import json,sys; print(" ".join(x["id"] for x in json.load(sys.stdin) if x["state"]!="started"))'); do
+  echo "machine $m is not running after the deploy; starting it" >&2
+  flyctl machine start "$m" -a jared-voice-worker
+done
+wait_beat() {
+  local url key seen i
+  url=${SUPABASE_URL:-$(sed -n 's/^SUPABASE_URL=//p' "$DL/.env" 2>/dev/null)}
+  key=${SUPABASE_KEY:-$(sed -n 's/^SUPABASE_KEY=//p' "$DL/.env" 2>/dev/null)}
+  [ -n "$key" ] || { echo "no Supabase key here; cannot confirm the worker is beating" >&2; return 1; }
+  for i in $(seq 1 24); do   # 2 minutes; it beats every 60s
+    seen=$(curl -fsS "$url/rest/v1/worker_presence?worker=eq.fly&select=last_seen" -H "apikey: $key" \
+           -H "Authorization: Bearer $key" | sed -n 's/.*"last_seen":"\([^".+]*\).*/\1/p')
+    [[ -n "$seen" && "$seen" > "$SWAPPED_AT" ]] && { echo "worker beating ($seen UTC)"; return 0; }
+    sleep 5
+  done
+  echo "worker has not beaten since the deploy" >&2; return 1
+}
+wait_beat
