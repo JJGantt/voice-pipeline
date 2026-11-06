@@ -5,7 +5,10 @@ set -euo pipefail
 cd "$(dirname "$0")"
 rm -rf data-layer mcp-voice govee-mcp gmail-mcp worker.py voice_worker requirements.txt
 pick() { for d in "$@"; do [ -d "$d/.git" ] && { echo "$d"; return; }; done; echo "no checkout among: $*" >&2; exit 1; }
-DL=$(pick ~/repos/data-layer ~/data-layer)
+DL=${DATA_LAYER_DIR:-$(pick ~/repos/data-layer ~/data-layer)}
+# The image carries this checkout's src/, so a stale one silently ships old tools to every voice turn.
+git -C "$DL" fetch -q origin && [ "$(git -C "$DL" rev-list --count HEAD..origin/main)" = 0 ] \
+  || { echo "$DL is behind origin/main; update it or set DATA_LAYER_DIR" >&2; exit 1; }
 GV=$(pick ~/repos/govee-mcp ~/mcp-govee)
 GM=$(pick ~/repos/gmail-mcp)
 VP=$(cd .. && pwd)
