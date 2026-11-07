@@ -81,7 +81,9 @@ Everything else that differs, from the code (`grep -rn WORKER_ID worker/voice_wo
   `TAILSCALE_AUTHKEY` secret, or if `tailscale up` fails at boot, the server is simply not registered
   until the next restart.
 - **Feeder:** the PetLibro server is LAN-only (tinytuya), so even with the right path Fly could not
-  reach the feeder without a route into the home network.
+  reach the feeder without a route into the home network. Feeding works anyway through the data
+  MCP's `feed_cats`, which writes a `feeder_commands` row for the Pi's collector to dispense; only the
+  feeder's status, food-level and schedule reads are missing on Fly.
 - **Lights:** on Fly every light command goes to the Govee cloud API. The Dockerfile sets
   `GOVEE_LAN=0` so `govee_mcp.py` skips its LAN multicast scan, which can never answer there and
   otherwise costs ~1.2s of every command before the cloud is tried.
@@ -174,5 +176,5 @@ Fly lacking them does not count against it.
 
 The Pi and then the Mac are the fallbacks: a Fly worker that stops heartbeating, reports itself
 degraded or fails a turn without acting hands the command to the next healthy worker
-(`worker/README.md` § Handing a failed turn on). A command that needs the feeder is answered on Fly without it;
+(`worker/README.md` § Handing a failed turn on). A command that needs the feeder's status or schedule is answered on Fly without it (feeding goes through `feed_cats`);
 Gmail and iMessage reach Fly's Opus as described above.

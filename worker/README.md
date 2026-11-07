@@ -143,7 +143,8 @@ the first fallback and the Mac the second. Fly is first on speed: measured on
 identical commands it answers the common turn in 2.8s median against the
 Pi's 4.4s, and Opus turns cost about the same on both, ~15s
 (`../docs/WORKER-PLACEMENT.md`). It is also independent of the house. It cannot
-reach iMessage, Gmail or the feeder; those are rare enough not to count against it.
+reach iMessage, Gmail or the feeder's own server (feeding still works there,
+through the data MCP's `feed_cats`); those are rare enough not to count against it.
 The Mac is last because work started by voice can be long-running, and closing the
 laptop must not kill it.
 

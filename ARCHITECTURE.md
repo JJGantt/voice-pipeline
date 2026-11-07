@@ -67,7 +67,8 @@ Which host should run the agent, what each one can and cannot do, and measured s
   a fresh heartbeat claims and the others defer, so **Fly takes a command whenever it is up**, then the
   Pi, then the Mac. Fly is first because it answers the common turn faster (2.8s median against
   the Pi's 4.4s on identical commands, measured on the warm client) and is independent of the house; Opus turns cost about the same
-  everywhere. It has no route to iMessage, Gmail or the feeder, which are rare enough not to count
+  everywhere. It has no route to iMessage, Gmail or the feeder's own server (it feeds through the data MCP's
+  `feed_cats` relay), which are rare enough not to count
   (`docs/WORKER-PLACEMENT.md`). The Mac is last so a session started by voice outlives the laptop
   closing. Claiming is an atomic `PATCH ... status=eq.pending`, so it is safe even when two workers race.
 - **Priority alone decides.** Every turn follows `WORKER_PRIORITY`: each is a fresh run handed the day's
