@@ -48,6 +48,9 @@ export function endLaunch() { launching = Math.max(0, launching - 1); }
 // Mirror upload failures per row: when the streak started and whether it has been raised yet.
 const mirrorFailing = new Map();
 const MIRROR_FAIL_RAISE_MS = 5 * 60 * 1000;
+// Rows already reported for a turn in flight with no transcript on disk.
+const missingTranscript = new Set();
+const MISSING_TRANSCRIPT_GRACE_MS = 15 * 1000;
 // Same for the row patch in tick(). The patch is re-derived from the row against reality on every
 // tick, so a write that fails (a Supabase gateway 502) is simply made again 30s later; only a streak
 // that outlasts this is an incident, raised once.
@@ -204,6 +207,15 @@ async function reconcile(row, proc) {
   }
 
   const tail = row.transcript_path ? readTail(row.transcript_path) : null;
+  // A turn in flight has already written its prompt to the transcript. If the file this row names is
+  // not there, every reader (replies, the mirror, the hub's thread view) sees an empty session and
+  // nothing else fails, so it is reported here, once per row.
+  if (proc && proc.busy === true && row.agent !== 'codex' && proc.statusAt
+      && Date.now() - ms(proc.statusAt) > MISSING_TRANSCRIPT_GRACE_MS
+      && !missingTranscript.has(row.id) && !(row.transcript_path && fs.existsSync(row.transcript_path))) {
+    missingTranscript.add(row.id);
+    console.error(`[desk-sessions] ${row.id} is mid-turn but its transcript is missing: ${row.transcript_path}`);
+  }
   if (tail) {
     // Carry the old reply forward rather than blanking it: a transcript that momentarily reads as
     // empty (mid-write, or a rotated file) must not erase what the session already said.
