@@ -34,13 +34,6 @@ export function extractMeta(text) {
   return { title: customTitle || aiTitle, cwd };
 }
 
-// Derive the on-disk project dir name Claude uses from an absolute cwd.
-// (Slashes/dots become dashes. Used as a hint; not authoritative.)
-export function projectDirFromCwd(cwd) {
-  if (!cwd) return null;
-  return cwd.replace(/[/.]/g, '-');
-}
-
 // ---- filesystem-backed helpers -------------------------------------------
 
 // Find the absolute path to <id>.jsonl anywhere under PROJECTS_DIR.

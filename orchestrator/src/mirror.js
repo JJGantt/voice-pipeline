@@ -15,6 +15,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { projectDir } from './transcripts.js';
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://felyggqjjhltwokdfhop.supabase.co';
 const BUCKET = 'transcripts';
@@ -148,7 +149,7 @@ export async function mirrorDown(claudeId, cwd, { movedMidTurn = false } = {}) {
     if (!res.ok) throw new Error(`mirrorDown ${n} ${res.status}`);
     chunks.push(Buffer.from(await res.arrayBuffer()));
   }
-  const dir = path.join(os.homedir(), '.claude', 'projects', cwd.replace(/[/.]/g, '-'));
+  const dir = projectDir(cwd);
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, `${claudeId}.jsonl`);
   const text = localize(Buffer.concat(chunks).toString('utf8'));

@@ -13,9 +13,12 @@ import { isRollout, readCodexTail } from './codex.js';
 
 const PROJECTS = process.env.CLAUDE_PROJECTS_DIR || path.join(os.homedir(), '.claude', 'projects');
 
-/** Claude Code's directory name for a working directory: the path with / and . turned into dashes. */
+/**
+ * Claude Code's directory for a working directory: every character that is not a letter or digit
+ * becomes a dash, so `litter_robot_analyzer` is stored under `litter-robot-analyzer`.
+ */
 export function projectDir(cwd) {
-  return path.join(PROJECTS, cwd.replace(/[/.]/g, '-'));
+  return path.join(PROJECTS, cwd.replace(/[^a-zA-Z0-9]/g, '-'));
 }
 
 /**
