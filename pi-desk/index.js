@@ -1211,9 +1211,13 @@ async function run(cmd) {
 }
 
 let draining = false;
+// A command that lands while a drain is running would not be in the rows that drain already read, and its
+// realtime event would be dropped by the guard below; without this it waits for the backstop poll.
+let drainAgain = false;
 async function drain() {
-  if (draining) return;
+  if (draining) { drainAgain = true; return; }
   draining = true;
+  drainAgain = false;
   try {
     const rows = await sb('desk_commands?status=eq.pending&select=*&order=created.asc');
     if (!rows?.length) return;
@@ -1250,6 +1254,7 @@ async function drain() {
     console.error('[pi-desk] drain:', e.message);
   } finally {
     draining = false;
+    if (drainAgain) drain().catch((e) => console.error(`[desk] drain re-run failed: ${e.message || e}`));
   }
 }
 

@@ -59,6 +59,9 @@ const REPORT_DIRECTIVE =
 
 let timer = null;
 let draining = false;
+// A command that lands while a drain is running would not be in the rows that drain already read, and its
+// realtime event would be dropped by the guard below; without this it waits for the backstop poll.
+let drainAgain = false;
 
 /**
  * Bring a checkout up to date before a session opens in it.
@@ -371,8 +374,9 @@ async function execute(cmd) {
 
 const drainStreak = streak('[commands] drain');
 async function drain() {
-  if (draining) return;
+  if (draining) { drainAgain = true; return; }
   draining = true;
+  drainAgain = false;
   try {
     for (const cmd of await pendingCommands()) {
       const ageS = (Date.now() - new Date(cmd.created).getTime()) / 1000;
@@ -412,6 +416,7 @@ async function drain() {
     drainStreak.fail(e);
   } finally {
     draining = false;
+    if (drainAgain) drain().catch((e) => console.error(`[commands] drain re-run failed: ${e.message || e}`));
   }
 }
 
