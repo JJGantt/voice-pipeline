@@ -52,7 +52,8 @@ Three blocks ride on every hub prompt beside the replayed conversation and the t
   user names, never for "same as yesterday" (that copies the logged entry); read the workout catalog and pass
   the exercise id, with `upsert_catalog_exercise` only for a genuinely new movement; look things up with
   WebSearch/WebFetch in the turn, and `start_session` only for what needs the signed-in browser — which
-  includes a site that blocks the turn's fetch (Reddit: a session reads it in the Pi's browser).
+  includes a source he NAMED (Reddit, a particular site) that blocks the turn's fetch: a session reads it
+  in the Pi's browser. A blocked page he did not ask for is skipped in favour of readable sources.
 - `DELIBERATE_DIRECTIVE` on a pushed or typed command, or `ADDRESSING_DIRECTIVE`
   on a room-mic turn (below).
 
