@@ -413,6 +413,8 @@ def finish(db: Supabase, req: dict, fields: dict, messages: "list | tuple" = ())
     or error), in one transaction and only while this process still holds the claim (`voice_finish`,
     data-layer 00159). False means nothing was written: the claim was taken back, and the worker that took
     it writes the outcome instead."""
+    if req.get("_timing"):
+        fields = {**fields, "timing": {**req["_timing"], "finished": now_iso()}}
     body = {"p_id": req["id"], "p_worker": WORKER_ID, "p_epoch": WORKER_EPOCH, "p_fields": fields,
             "p_messages": list(messages)}
     got = db.post("rpc/voice_finish", body)

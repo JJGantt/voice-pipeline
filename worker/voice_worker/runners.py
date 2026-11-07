@@ -17,7 +17,7 @@ import httpx
 
 from .config import ALL_TOOLS, JAREDBOT_TOOL, CLAUDE_BIN, CLAUDE_TIMEOUT_S, CREDITS_API_KEY, DATA_MCP_JS, GMAIL_MCP_PY, GMAIL_PY, GOVEE_MCP_PY, GOVEE_PY, HAS_MESSAGES, HTTP_TIMEOUT_S, HUB_EFFORT, HUB_MODEL, MESSAGES_HEADERS, MESSAGES_MCP_URL, PETLIBRO_MCP_PY, PETLIBRO_PY, SEND_TOOLS, SESSION_START_TOOLS, SESSION_TOOLS, STATE_DIR, SUPABASE_KEY, SUPABASE_URL, VOICE_MCP_JS, WORKER_ID
 from .db import headers
-from .logs import classify_failure, log, log_error
+from .logs import classify_failure, log, log_error, now_iso
 from .outbound import push_activity
 from .presence import claude_unready
 from .prompts import HUB_SYSTEM, SHARED_STATE_NOTE
@@ -137,6 +137,22 @@ LEASE_LOST_RESULT = {"session_id": None, "text": "", "result": "", "ok": False, 
 
 
 _SDK_LOOP_LOCK = threading.Lock()
+
+
+def _result_timing(msg) -> dict:
+    """The run's own measurements from its ResultMessage: wall and API time, turns, and the token counts
+    that say whether the prompt cache was warm (a cold cache re-reads the whole system prompt and tools)."""
+    out = {"model_done": now_iso()}
+    for k in ("duration_ms", "duration_api_ms", "num_turns"):
+        v = getattr(msg, k, None)
+        if isinstance(v, (int, float)):
+            out[k] = v
+    usage = getattr(msg, "usage", None) or {}
+    if isinstance(usage, dict):
+        for k in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
+            if isinstance(usage.get(k), (int, float)):
+                out[k] = usage[k]
+    return out
 
 
 def report_usage(info: dict) -> None:
@@ -334,10 +350,15 @@ class SdkRunner:
                 pass
         self._used = True
         self.limit_hit = False
+        # Where the turn's time goes (voice_requests.timing): sent, the first output of any kind (thinking,
+        # text or a tool call), the result, and the API's own account of tokens and cache.
+        timing = {"run_sent": now_iso()}
         await self._client.query(prompt, session_id=uuid.uuid4().hex)
         chunks, result_text, ok, raw_error = [], "", True, None
         used_tools = False
         async for msg in self._client.receive_response():
+            if isinstance(msg, AssistantMessage) and "first_output" not in timing:
+                timing["first_output"] = now_iso()
             if isinstance(msg, AssistantMessage):
                 for b in msg.content:
                     if isinstance(b, TextBlock):
@@ -362,10 +383,11 @@ class SdkRunner:
             elif isinstance(msg, ResultMessage):
                 ok = not msg.is_error
                 result_text = msg.result or ""
+                timing.update(_result_timing(msg))
                 if msg.is_error:
                     raw_error = result_text or msg.subtype
         return {"session_id": None, "text": "\n".join(chunks).strip(), "used_tools": used_tools,
-                "result": result_text, "ok": ok, "raw_error": raw_error}
+                "result": result_text, "ok": ok, "raw_error": raw_error, "timing": timing}
 
     def close(self):
         """Drop the warm client, if there is one, without starting another."""

@@ -150,6 +150,8 @@ def process_request(db: Supabase, req: dict) -> None:
     rid = req["id"]
     transcript = req.get("transcript") or ""
     log(f"claimed request {rid}: {transcript[:80]!r}")
+    # Stage stamps for voice_requests.timing; `finish` writes them with the outcome.
+    req["_timing"] = {"worker": WORKER_ID, "worker_start": now_iso()}
 
     # Timestamp carry-through: the data MCP defaults every write's timestamp to when the audio recording
     # STARTED (not ~30s later at pipeline end), so a voice-logged set lands at the user's rest-clock moment.
@@ -260,8 +262,10 @@ def process_request(db: Supabase, req: dict) -> None:
 
     if fallback:
         prompt += fallback_directive(db, rid)
+    req["_timing"]["prompt_built"] = now_iso()
     result = _run_turn(prompt, ctx, manual=manual, read_dir=att_tmp if att_paths else None,
                        on_event=_emit, hold=_hold)
+    req["_timing"].update(result.get("timing") or {})
 
     if att_tmp:
         shutil.rmtree(att_tmp, ignore_errors=True)   # staged photos served their turn

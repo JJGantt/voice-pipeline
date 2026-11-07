@@ -297,3 +297,9 @@ Supabase or Claude. From the repo root:
     .venv-test/bin/python -m pytest worker/tests
 
 CI runs every suite in the repo on each push (`.github/workflows/tests.yml`).
+
+## Timing
+
+Each turn stamps its stages (claimed, prompt built, sent to the model, first output, result, token and
+cache counts, written) into `voice_requests.timing` through `finish`, next to the hub's and the watch's
+stamps. The keys are listed in status-hub `docs/HUB-INTERNALS.md` § Command timing.
