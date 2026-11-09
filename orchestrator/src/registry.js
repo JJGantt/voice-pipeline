@@ -8,10 +8,13 @@
 import { config } from './config.js';
 import { scanRegistry } from './sessions.js';
 import { upsertSessions, pruneSessions } from './supabase.js';
+import { streak } from './streak.js';
 
 let timer = null;
 let running = false;
 let lastWritten = null; // rows as last successfully pushed
+// A failed write is re-made by the next tick (lastWritten stays behind), so a blip is a warning.
+const writeStreak = streak('[registry] write');
 
 function needsWrite(rows) {
   if (!lastWritten || rows.length !== lastWritten.length) return true;
@@ -33,8 +36,9 @@ async function tick() {
       await pruneSessions(rows.map((r) => r.id));
       lastWritten = rows;
     }
+    writeStreak.ok();
   } catch (e) {
-    console.error('[registry] error:', e.message);
+    writeStreak.fail(e);
   } finally {
     running = false;
   }
