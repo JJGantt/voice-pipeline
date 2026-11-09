@@ -145,6 +145,12 @@ a machine that then died — the whole payload, prompt included. A dispatched pr
 of dictated speech nobody can repeat, so losing one costs far more than the launch it was meant to
 start.
 
+An expiry is also reported to the ops responder as an error. On the Pi and Fly the usual cause is a
+`desk_commands` channel that is SUBSCRIBED but delivering nothing: the 5-minute backstop then finds the
+row only after `COMMAND_TTL_S` (120s). pi-desk records every id the channel delivers, and a pending
+command it owns that was inserted while SUBSCRIBED and never delivered is reported as `channel deaf while
+SUBSCRIBED` and the channel is rejoined (`pi-desk/heard.js`, `realtime.js` `rejoin`).
+
 It is **not** a retry queue, and adding automatic retry would be the wrong fix: work that could not
 run when it was asked for has usually stopped being wanted by the time the machine comes back, and a
 prompt that fires hours late is worse than one that never fired. Retry is a decision made afterwards,

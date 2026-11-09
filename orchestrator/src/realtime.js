@@ -26,6 +26,9 @@ export function watchTable({ channel: channelName, table, event = '*', onChange,
   let epoch = 0;
   let backoffMs = BACKOFF_START_MS;
   let healthy = false;
+  // When the current channel last reached SUBSCRIBED. A row inserted after this that the channel never
+  // delivered means it is deaf while SUBSCRIBED, which no status callback reports.
+  let subscribedAt = 0;
   const log = tag || table;
 
   const scheduleRebuild = () => {
@@ -51,7 +54,7 @@ export function watchTable({ channel: channelName, table, event = '*', onChange,
           if (myEpoch !== epoch) return; // stale channel, already rebuilt
           healthy = status === 'SUBSCRIBED';
           console.log(`[${log}] realtime:`, status);
-          if (healthy) backoffMs = BACKOFF_START_MS; // recovered — reset the backoff
+          if (healthy) { backoffMs = BACKOFF_START_MS; subscribedAt = Date.now(); } // recovered — reset the backoff
           else scheduleRebuild();
         });
     } catch (e) {
@@ -64,6 +67,18 @@ export function watchTable({ channel: channelName, table, event = '*', onChange,
 
   return {
     isHealthy: () => healthy,
+    subscribedAt: () => (healthy ? subscribedAt : 0),
+    // Tear the channel down and subscribe afresh, for a caller that has seen it miss a row.
+    rejoin() {
+      healthy = false;
+      if (resubTimer) clearTimeout(resubTimer);
+      resubTimer = null;
+      epoch += 1;
+      try { if (channel) supa.removeChannel(channel); } catch { /* ignore */ }
+      channel = null;
+      backoffMs = BACKOFF_START_MS;
+      subscribe();
+    },
     stop() {
       if (resubTimer) clearTimeout(resubTimer);
       try { if (channel) supa.removeChannel(channel); } catch { /* ignore */ }

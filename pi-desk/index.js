@@ -72,6 +72,7 @@ const QUEUE_BACKSTOP_MS = 10 * 60 * 1000;
 // its header documents a hard-won lesson — supabase-js does not reliably recover a dead channel, and
 // callers that fall back to a tight poll burn ~20k reads a day without noticing.
 import { watchTable } from '../orchestrator/src/realtime.js';
+import { missedByChannel } from './heard.js';
 
 // Errors go to the ops responder (health/responder) through a copy of its reporter, as does the beat from
 // the reconcile tick below. The Fly host sleeps whenever nothing runs, so it sends no beat: its silence
@@ -1210,6 +1211,26 @@ async function run(cmd) {
   return startSession({ name, prompt: spoken, commandId: cmd.id, report: payload.report === true, label: payload.label || null, agent });
 }
 
+// Ids the desk_commands channel has delivered, with when. A pending command this machine owns that was
+// inserted while the channel was SUBSCRIBED, and that the channel never delivered, means it is deaf
+// while still reporting SUBSCRIBED: supabase-js raises nothing for that, and the backstop that found
+// the row is too slow for COMMAND_TTL_S, so the command expires. Report it and rejoin the channel.
+let rt = null;
+const heard = new Map();
+function onCommandEvent(payload) {
+  const id = payload?.new?.id;
+  if (id) heard.set(id, Date.now());
+  for (const [k, at] of heard) if (Date.now() - at > 3600000) heard.delete(k);
+  return drain();
+}
+function checkHeard(cmd) {
+  if (!rt || !missedByChannel(cmd, heard, rt.subscribedAt())) return;
+  heard.set(cmd.id, Date.now());   // one report per row
+  const ageS = Math.round((Date.now() - new Date(cmd.created).getTime()) / 1000);
+  console.error(`[pi-desk] desk_commands channel deaf while SUBSCRIBED: ${cmd.id} (${cmd.kind}) inserted ${ageS}s ago was never delivered; rejoining`);
+  rt.rejoin();
+}
+
 let draining = false;
 // A command that lands while a drain is running would not be in the rows that drain already read, and its
 // realtime event would be dropped by the guard below; without this it waits for the backstop poll.
@@ -1230,11 +1251,12 @@ async function drain() {
       if (!mine) continue;
 
       const ageS = (Date.now() - new Date(cmd.created).getTime()) / 1000;
+      checkHeard(cmd);
       if (ageS > COMMAND_TTL_S) {
         if (await claim(cmd.id)) {
           await finish(cmd.id, 'expired', `queued ${Math.round(ageS)}s ago`);
           await deadLetter(cmd, `expired unrun — queued ${Math.round(ageS)}s before this machine saw it`);
-          console.log(`[pi-desk] expired ${cmd.id} (${Math.round(ageS)}s old)`);
+          console.error(`[pi-desk] expired ${cmd.id} unrun (${Math.round(ageS)}s old > COMMAND_TTL_S ${COMMAND_TTL_S})`);
         }
         continue;
       }
@@ -1445,7 +1467,7 @@ setInterval(heartbeat, PRESENCE_MS);
 // Realtime is the primary path: a command inserted anywhere reaches this within a moment, rather
 // than waiting out a poll interval. Both INSERT (a new command) and UPDATE (a queued row released)
 // matter, so the subscription is not narrowed to inserts.
-const rt = watchTable({ channel: 'pi-desk-commands', table: 'desk_commands', event: '*', onChange: drain, tag: 'pi-desk' });
+rt = watchTable({ channel: 'pi-desk-commands', table: 'desk_commands', event: '*', onChange: onCommandEvent, tag: 'pi-desk' });
 // A queued session gets its own subscription rather than a poll. Reconciling straight away means a
 // freed slot is taken the moment the row lands instead of up to a tick later, and the flag is what
 // makes the read happen at all — see runQueue.
