@@ -13,6 +13,7 @@ import time
 
 from . import runstate
 from .config import FALLBACK_WORKER, IDLE_POLL_DEGRADED_S, SUPABASE_KEY, SUPABASE_URL, WORKER_ID
+from .db import TRANSPORT_RAISE_S, is_link_failure
 from .live import live_event, live_load
 from .logs import log, log_error
 from .transcribe import local_whisper_ready, sweep_untranscribed, transcribe_local
@@ -28,6 +29,8 @@ class RealtimeWaker:
         self._loop = None
         self._sock = None
         self._started = False
+        self._fail_since = 0.0   # monotonic start of the current run of failed connects; 0 = none
+        self._fail_raised = False
 
     def start(self) -> None:
         if self._started or not REALTIME_ENABLED:
@@ -79,7 +82,7 @@ class RealtimeWaker:
                 if runstate._running and self._sock.is_connected:
                     log("realtime waker recycling socket (proactive half-open guard)")
             except Exception as e:  # noqa: BLE001
-                log_error(f"realtime listener error: {e}; retrying in 5s (poll fallback active)")
+                self._report(e)
             self.healthy = False   # disconnected (or never subscribed) → main loop tightens its poll
             try:
                 if self._sock:
@@ -119,8 +122,27 @@ class RealtimeWaker:
         except Exception as e:  # noqa: BLE001 — a bad frame must not take the listener down
             log_error(f"live event failed: {e}")
 
+    def _report(self, e: Exception) -> None:
+        """A link failure (DNS, refused, reset: every Mac wake starts with a few) is a warning until
+        connects have failed for TRANSPORT_RAISE_S straight, then one error for the streak; any other
+        failure is an error at once. A SUBSCRIBED ends the streak."""
+        msg = f"realtime listener error: {e}; retrying in 5s (poll fallback active)"
+        if not is_link_failure(e):
+            log_error(msg)
+            return
+        now = time.monotonic()
+        if not self._fail_since:
+            self._fail_since = now
+        if not self._fail_raised and now - self._fail_since >= TRANSPORT_RAISE_S:
+            self._fail_raised = True
+            log_error(f"{msg} (failing for {int(now - self._fail_since)}s)")
+        else:
+            log(f"WARN {msg}")
+
     def _on_sub(self, state, err=None) -> None:
         self.healthy = "SUBSCRIBED" in str(state).upper()   # any other state (TIMED_OUT/CLOSED/ERROR) → degraded poll
+        if self.healthy:
+            self._fail_since, self._fail_raised = 0.0, False
         if self.healthy:   # a fresh subscription missed whatever happened while it was down: reload
             threading.Thread(target=live_load, name="live-load", daemon=True).start()
             threading.Thread(target=sweep_untranscribed, name="untranscribed-sweep", daemon=True).start()

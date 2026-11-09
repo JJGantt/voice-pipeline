@@ -120,7 +120,8 @@ def _listener_supervisor(stop_evt: threading.Event) -> None:
 
 def _demote_realtime_retry(record):
     if record.levelno == logging.ERROR and record.getMessage().startswith(
-            ("Connection attempt failed:", "WebSocket connection closed with code:")):
+            ("Connection attempt failed:", "WebSocket connection closed with code:",
+             "Connection failed permanently after")):
         record.levelno, record.levelname = logging.WARNING, "WARNING"
     return True
 
@@ -142,7 +143,8 @@ def main() -> int:
     # realtime-py logs each failed connect attempt and each socket close at ERROR, then retries by itself;
     # with the socket recycled every 5 min, one slow handshake would open an incident for a reconnect that
     # lands seconds later. Re-level those to WARNING (the reporter forwards ERROR and above). Giving up
-    # ("Connection failed permanently…") is not demoted, and RealtimeWaker reports its own failures.
+    # ("Connection failed permanently…") is demoted too: connect() re-raises it, and RealtimeWaker._report
+    # turns a link failure that lasts TRANSPORT_RAISE_S into one error.
     logging.getLogger("realtime._async.client").addFilter(_demote_realtime_retry)
     log(f"starting (priority={WORKER_PRIORITY}, state_dir={STATE_DIR}, once={once})")
 
