@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-from .config import HTTP_TIMEOUT_S, SESSION_IDLE_RESET_S
+from .config import HTTP_TIMEOUT_S
 from .db import Supabase, headers, note_ok, report_failure
 from .logs import _parse_ts, log
 from .prompts import READ_MARKER, is_ignore
@@ -18,7 +18,7 @@ from .prompts import READ_MARKER, is_ignore
 # that reload the backstop behind the events) and kept current by its app_settings / voice_focus /
 # voice_messages events, so a command reads none of them from the database. Reading them per command
 # cost ~0.7s of round trips before a turn could start.
-LIVE_SETTINGS = ("session_reset_s", "voice_reset_at")
+LIVE_SETTINGS = ("voice_reset_at",)
 
 
 _live = {"loaded": False, "settings": {}, "focus": "hub", "thread": {}}
@@ -103,14 +103,6 @@ def _live_view() -> dict:
                 "thread": list(_live["thread"].values())}
 
 
-def session_reset_s() -> float:
-    """Idle budget before the hub conversation resets, from the hub setting `session_reset_s`."""
-    try:
-        return float(_live_view()["settings"].get("session_reset_s") or SESSION_IDLE_RESET_S)
-    except (TypeError, ValueError):
-        return SESSION_IDLE_RESET_S
-
-
 # The hub agent's day: it begins at 4 AM in the owner's own timezone, not at midnight and not in the host's
 # zone (the Fly worker runs in UTC). The same boundary the hub uses for every "today" (lib/dates.js).
 DAY_TZ = ZoneInfo(os.environ.get("TZ_DISPLAY", "America/New_York"))
@@ -175,7 +167,8 @@ def recent_context() -> str:
     now_local = now.astimezone(DAY_TZ).strftime("%-I:%M %p")
     return ("[Today so far: everything said between you since the day began, oldest first, each line "
             "with its time. Context only; tool RESULTS are not included, so call a tool if you need "
-            f"current data. It is now {now_local}.\n" + "\n".join(lines) + "]\n\n")
+            "current data. Earlier days are not here: read_conversation reads them. "
+            f"It is now {now_local}.\n" + "\n".join(lines) + "]\n\n")
 
 
 def get_focus() -> str:

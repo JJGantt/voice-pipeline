@@ -5,9 +5,8 @@ from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 
 from . import runstate
-from .config import BUSY_WAIT_S, DEDUP_TOL_S, DEDUP_WINDOW_S, FAILOVER_S, FALLBACK_WORKER, HEARTBEAT_FRESH_S, LEASE_S, MAX_HOLD_S, MIC_QUIET_S, RECLAIM_SWEEP_S, STANDBY_CHECK_S, UNTRANSCRIBED_MAX_S, WORKER_ID
+from .config import BUSY_WAIT_S, DEDUP_TOL_S, DEDUP_WINDOW_S, FAILOVER_S, FALLBACK_WORKER, HEARTBEAT_FRESH_S, LEASE_S, ORPHAN_REPLAY_MAX_S, MAX_HOLD_S, MIC_QUIET_S, RECLAIM_SWEEP_S, STANDBY_CHECK_S, UNTRANSCRIBED_MAX_S, WORKER_ID
 from .db import Supabase, degraded
-from .live import session_reset_s
 from .logs import _parse_ts, alert_failure, log, log_error, now_iso
 from .presence import WORKER_EPOCH, claude_unready, defer_target, other_worker_healthy, presence_rows, replay_safe, should_defer, untried_workers
 
@@ -118,7 +117,7 @@ def reclaim_stale(db: Supabase) -> None:
                  else f"'{owner}' died mid-run")
         created = _parse_ts(req.get("created_at") or "")
         what = f"Request {req['id']} ({(req.get('transcript') or '')[:200]!r}) was orphaned by '{owner}'"
-        if req.get("acted_at") or (created and (now - created).total_seconds() > session_reset_s()):
+        if req.get("acted_at") or (created and (now - created).total_seconds() > ORPHAN_REPLAY_MAX_S):
             why = ("it had already acted, so it may be half-done and was not replayed" if req.get("acted_at")
                    else "it is too old to run now")
             if db.patch("voice_requests", guard,

@@ -262,7 +262,6 @@ bridges to the ESP over HTTP).
 
 | key | default | read by |
 |---|---|---|
-| `session_reset_s` | `300` | worker — idle seconds before the hub conversation resets |
 | `wakefree_enabled` | `0` | listener + ESP server — global wake-free on/off (mic handoff + ESP bridge) |
 | `voice_muted` | `0` | listener + ESP — global mute (set by the FAB / push-to-talk) |
 | `voice_inject_mode` | `0` | listener + ESP — Mac mic pastes into the focused window; the ESP goes deaf |

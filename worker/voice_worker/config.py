@@ -248,7 +248,7 @@ MAX_HOLD_S = float(os.environ.get("MAX_HOLD_S", "25"))
 HOLD_RETRY_S = 1.0            # how soon to look again while holding — not the idle backstop
 
 
-SESSION_IDLE_RESET_S = 5 * 60       # default reset budget (5min idle); hub setting session_reset_s overrides
+ORPHAN_REPLAY_MAX_S = 5 * 60   # an orphaned request older than this is closed, not re-run: what was said is stale
 
 
 HTTP_TIMEOUT_S = 30.0

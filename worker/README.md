@@ -161,10 +161,12 @@ since the day began at **4 AM Eastern** (`day_start`, `TZ_DISPLAY`, the hub's ow
 "today"), or since the last manual "Reset context" (`voice_reset_at`) if that is
 later, oldest first, each line with its time, room chatter marked as ignored. An
 idle gap does not cut it, and a host's own timezone does not move the
-boundary. A heavy day is about 12k tokens.
+boundary. A heavy day is about 12k tokens. Earlier days are not replayed: the
+model reads them on demand with the data MCP's `read_conversation`, from the
+same `voice_messages` rows.
 
 **None of that is read per command.** The day's thread, the voice focus and the settings a turn consults
-(`session_reset_s`, `voice_reset_at`) are held in memory (`_live`): loaded
+(`voice_reset_at`) are held in memory (`_live`): loaded
 when the realtime socket subscribes, and kept current by that socket's `voice_messages`, `voice_focus`
 and `app_settings` events. The socket is recycled every ~5 minutes and each subscribe reloads, which is
 the backstop for a channel that goes deaf while still reporting SUBSCRIBED. Read per command, these
