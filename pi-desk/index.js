@@ -1488,10 +1488,10 @@ const pollLoop = () => {
 };
 pollTimer = setTimeout(pollLoop, POLL_DEGRADED_MS);
 
-// Every caller goes through here. A bare call let one Supabase connect timeout become an unhandled
-// rejection that exited the process; the next tick re-reads everything anyway, so a failure warns and
-// only a five-minute streak is an error.
-const reconcileStreak = streak('[pi-desk] reconcile');
+// Every caller goes through here: a bare call let one Supabase connect timeout become an unhandled
+// rejection that exited the process. The next tick re-reads everything, so one failure warns and the
+// second in a row is an error. Single blips arrive about daily; a minute-long outage is rarer and real.
+const reconcileStreak = streak('[pi-desk] reconcile', { failures: 2 });
 function reconcile() {
   reconcileSessions().then(() => reconcileStreak.ok(), (e) => reconcileStreak.fail(e));
 }
