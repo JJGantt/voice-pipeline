@@ -1199,7 +1199,13 @@ async function run(cmd) {
   const residents = await residentsNow();
   const why = await preferMac(residents) || await makeRoom(residents, name);
   if (why) {
-    if (await macIsAwake(false)) return `handed to the Mac as ${await handOpenToMac(payload)} — ${why}`;
+    if (await macIsAwake(false)) {
+      // The payload's path is this Pi's layout (~/repos/x, or ~/x for the Pi-only checkouts); the Mac
+      // launches only paths it published, so the path is re-resolved by name, as the queue runner does.
+      const p = await macPath(name);
+      if (!p) throw new Error(`the Mac has no project ${name}`);
+      return `handed to the Mac as ${await handOpenToMac({ ...payload, path: p })} — ${why}`;
+    }
     await sb('desk_queue', {
       method: 'POST', headers: { Prefer: 'return=minimal' },
       body: JSON.stringify([{ id: randomUUID(), worker: WORKER, repo: name,
