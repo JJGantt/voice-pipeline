@@ -73,6 +73,7 @@ const QUEUE_BACKSTOP_MS = 10 * 60 * 1000;
 // callers that fall back to a tight poll burn ~20k reads a day without noticing.
 import { watchTable } from '../orchestrator/src/realtime.js';
 import { missedByChannel } from './heard.js';
+import { streak } from '../orchestrator/src/streak.js';
 
 // Errors go to the ops responder (health/responder) through a copy of its reporter, as does the beat from
 // the reconcile tick below. The Fly host sleeps whenever nothing runs, so it sends no beat: its silence
@@ -1474,7 +1475,7 @@ rt = watchTable({ channel: 'pi-desk-commands', table: 'desk_commands', event: '*
 watchTable({ channel: 'pi-desk-queue', table: 'desk_queue', event: '*', tag: 'pi-desk-queue',
   onChange: () => {
     queueDirty = true;
-    reconcileSessions().catch((e) => console.error('[pi-desk] queue reconcile:', e.message));
+    reconcile();
   } });
 
 drain();
@@ -1487,8 +1488,15 @@ const pollLoop = () => {
 };
 pollTimer = setTimeout(pollLoop, POLL_DEGRADED_MS);
 
-reconcileSessions();
-setInterval(() => { if (!FLY) ops.beat(Math.max(60, PRESENCE_MS / 1000)); reconcileSessions(); }, PRESENCE_MS);
+// Every caller goes through here. A bare call let one Supabase connect timeout become an unhandled
+// rejection that exited the process; the next tick re-reads everything anyway, so a failure warns and
+// only a five-minute streak is an error.
+const reconcileStreak = streak('[pi-desk] reconcile');
+function reconcile() {
+  reconcileSessions().then(() => reconcileStreak.ok(), (e) => reconcileStreak.fail(e));
+}
+reconcile();
+setInterval(() => { if (!FLY) ops.beat(Math.max(60, PRESENCE_MS / 1000)); reconcile(); }, PRESENCE_MS);
 sweepAbandonedClaims();
 setInterval(sweepAbandonedClaims, 300000);
 // One retention rule in one place: the Pi, which is always on. Fly is asleep almost always.
