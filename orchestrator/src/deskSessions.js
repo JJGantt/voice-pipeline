@@ -57,6 +57,15 @@ const MISSING_TRANSCRIPT_GRACE_MS = 15 * 1000;
 const patchFailing = new Map();
 const listStreak = streak('[desk-sessions] list');
 const PATCH_FAIL_RAISE_MS = 5 * 60 * 1000;
+// The hub-thread relay. Both callers fire on every finished turn the tick or the watcher sees, and the
+// tick re-runs it until the reply is in, so a single failure heals itself; a streak per session is the
+// error. Per session, because a relay that succeeds for one says nothing about another that is failing.
+const relayStreaks = new Map();
+function relay(id, tail) {
+  let s = relayStreaks.get(id);
+  if (!s) relayStreaks.set(id, (s = streak(`[desk-sessions] relay ${id}`)));
+  relayFirstReply(id, tail).then(() => { relayStreaks.delete(id); }, (e) => s.fail(e));
+}
 
 const ms = (t) => (t ? new Date(t).getTime() : 0);
 const later = (a, b) => (!a ? b || null : !b ? a : ms(a) >= ms(b) ? a : b);
@@ -246,7 +255,7 @@ async function reconcile(row, proc) {
   const busy = proc && proc.busy != null ? proc.busy : !!(tail && tail.working);
   patch.working = alive && busy;
   // The net under the watcher's relay, for a finished turn fs.watch dropped.
-  if (alive && tail && !busy) relayFirstReply(row.id, tail).catch((e) => console.error('[desk-sessions] relay:', e.message));
+  if (alive && tail && !busy) relay(row.id, tail);
   // The same net for the reply's notification. A finished turn newer than the one this row records is
   // one the watcher never reported, and without this the phone would never hear of it. Newer than the
   // row itself too: a resumed session's new row starts with no reply recorded, and the last turn of
@@ -426,7 +435,7 @@ async function tick() {
   // then does reaches the wall the instant it happens, without waiting for the next one.
   syncSessionWatch(residents,
     (id, tail) => {
-      relayFirstReply(id, tail).catch((e) => console.error('[desk-sessions] relay:', e.message));
+      relay(id, tail);
       // Returned: the watcher sends `done` only once the row holds the reply.
       return patchDeskSession(id, {
         working: false,
