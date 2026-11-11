@@ -6,8 +6,8 @@ from datetime import datetime, timezone
 import httpx
 
 from .config import SUPABASE_URL
-from .db import headers
-from .logs import log, log_error, now_iso
+from .db import headers, report_failure
+from .logs import log, now_iso
 
 
 AO_IGNORE_STREAK_OFF = 3    # consecutive ignored turns that put the brakes on… (owner-chosen values)
@@ -52,7 +52,7 @@ def maybe_auto_disable_wakefree() -> None:
                    timeout=10)
         log(f"always-on auto-disabled: last {AO_IGNORE_STREAK_OFF} turns all noise within the hour")
     except Exception as e:  # noqa: BLE001 — the governor must never take a turn down
-        log_error(f"wakefree auto-off check failed: {e}")
+        report_failure(f"wakefree auto-off check failed: {e}", e)
 
 
 AO_AUTOOFF_COOLDOWN_S = 300     # minimum brake hold before a re-arm is even considered
@@ -119,4 +119,4 @@ def maybe_auto_reenable_wakefree() -> None:
         _set("wakefree_autooff_at", "")
         log(f"always-on auto-re-enabled: quiet after {int(age)}s braked")
     except Exception as e:  # noqa: BLE001 — never take the heartbeat down
-        log_error(f"wakefree auto-reenable check failed: {e}")
+        report_failure(f"wakefree auto-reenable check failed: {e}", e)
