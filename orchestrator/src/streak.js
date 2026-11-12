@@ -1,6 +1,7 @@
 // A loop that re-runs its read or write on the next tick heals a single failure by itself. console.error
-// opens an incident, so a failure here is a warning, and the error is raised once per streak. Any success
-// ends the streak.
+// opens an incident, so each failure here is a console.warn, which the reporter sends to the ops
+// responder as an occurrence: counted against its watch, never dropped. The error is raised once per
+// streak. Any success ends the streak.
 //
 // By default the streak is TIME: RAISE_MS of failing straight. That is for the Mac, where every wake fires
 // the overdue timers before Wi-Fi is back and the first requests of the next minute or so fail as a matter

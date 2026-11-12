@@ -15,7 +15,7 @@ from . import runstate
 from .config import FALLBACK_WORKER, IDLE_POLL_DEGRADED_S, SUPABASE_KEY, SUPABASE_URL, WORKER_ID
 from .db import TRANSPORT_RAISE_S, is_link_failure
 from .live import live_event, live_load
-from .logs import log, log_error
+from .logs import log, log_error, log_occurrence
 from .transcribe import local_whisper_ready, sweep_untranscribed, transcribe_local
 
 
@@ -123,7 +123,7 @@ class RealtimeWaker:
             log_error(f"live event failed: {e}")
 
     def _report(self, e: Exception) -> None:
-        """A link failure (DNS, refused, reset: every Mac wake starts with a few) is a warning until
+        """A link failure (DNS, refused, reset: every Mac wake starts with a few) is an occurrence until
         connects have failed for TRANSPORT_RAISE_S straight, then one error for the streak; any other
         failure is an error at once. A SUBSCRIBED ends the streak."""
         msg = f"realtime listener error: {e}; retrying in 5s (poll fallback active)"
@@ -137,7 +137,7 @@ class RealtimeWaker:
             self._fail_raised = True
             log_error(f"{msg} (failing for {int(now - self._fail_since)}s)")
         else:
-            log(f"WARN {msg}")
+            log_occurrence(msg)
 
     def _on_sub(self, state, err=None) -> None:
         self.healthy = "SUBSCRIBED" in str(state).upper()   # any other state (TIMED_OUT/CLOSED/ERROR) → degraded poll

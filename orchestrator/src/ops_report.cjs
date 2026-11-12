@@ -5,7 +5,11 @@
 //   ops.install({ machine: 'fly', service: 'status-hub' });   // uncaught errors + console.error
 //   ops.report(err, { context });                              // an error caught and handled
 //   ops.report(msg, { machine, service, stack });              // on behalf of a client that sent it here
+//   ops.occurrence(msg);                                       // a failure handled by itself (a retry, a blip)
 //   ops.beat(60);                                              // from the loop that does the work
+//
+// install() also sends every console.warn as an occurrence: never an incident by itself, but counted by
+// the responder against its watch, which raises an incident when that rate is crossed.
 //
 // Env: OPS_TOKEN (required to send), OPS_URLS (comma list, first that answers wins; default the Fly
 // responder), OPS_SPOOL (a file that holds what could not be sent, so a crash or an outage loses
@@ -33,6 +37,7 @@ let MACHINE = process.env.OPS_MACHINE || os.hostname();
 let SERVICE = process.env.OPS_SERVICE || path.basename(process.argv[1] || 'node');
 let SPOOL = process.env.OPS_SPOOL || '';
 const origError = console.error.bind(console);
+const origWarn = console.warn.bind(console);
 // Set by install() when this process is not the service it names; see there.
 let off = false;
 
@@ -73,14 +78,17 @@ async function flushSpool() {
     if (!fs.existsSync(p)) return;
     const lines = fs.readFileSync(p, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
     const errors = lines.filter((l) => l.kind === 'error').map((l) => l.item);
-    if (!errors.length || await post('error', errors)) fs.rmSync(p, { force: true });
+    const occurrences = lines.filter((l) => l.kind === 'occurrence').map((l) => l.item);
+    if ((!errors.length || await post('error', errors)) && (!occurrences.length || await post('occurrence', occurrences))) {
+      fs.rmSync(p, { force: true });
+    }
   } finally { flushing = false; }
 }
 
 async function send(kind, item) {
   if (await post(kind, [item])) { flushSpool(); return true; }
   // A missed beat is not worth keeping: the next one replaces it, and its absence is the signal.
-  if (kind === 'error') spoolAppend(kind, item);
+  if (kind !== 'beat') spoolAppend(kind, item);
   return false;
 }
 
@@ -97,6 +105,22 @@ function report(err, extra = {}) {
   if (recent.size > 500) recent.delete(recent.keys().next().value);
   return send('error', { machine: extra.machine || MACHINE, service: extra.service || SERVICE, message, at: new Date(now).toISOString(),
     stack: err instanceof Error ? err.stack : extra.stack, context: extra.context });
+}
+
+const recentOcc = new Map();
+function occurrence(msg, extra = {}) {
+  const message = msg instanceof Error ? `${msg.name}: ${msg.message}` : String(msg);
+  const fp = `${extra.service || ''}|${message.split('\n')[0].replace(/\d+/g, 'N').slice(0, 200)}`;
+  const now = Date.now();
+  const seen = recentOcc.get(fp);
+  if (seen && now - seen.at < COALESCE_MS) { seen.count += 1; return Promise.resolve(true); }
+  if (seen && seen.count > 1) {
+    send('occurrence', { machine: seen.machine, service: seen.service, message: seen.message, count: seen.count - 1 });
+  }
+  recentOcc.set(fp, { at: now, count: 1, message, machine: extra.machine || MACHINE, service: extra.service || SERVICE });
+  if (recentOcc.size > 500) recentOcc.delete(recentOcc.keys().next().value);
+  return send('occurrence', { machine: extra.machine || MACHINE, service: extra.service || SERVICE,
+    message: message.slice(0, 2000), at: new Date(now).toISOString() });
 }
 
 function beat(everyS = 60, info) {
@@ -129,7 +153,11 @@ function install(opts = {}) {
     const text = util.format(...args);
     report(err ? Object.assign(new Error(text), { name: err.name, stack: err.stack }) : text);
   };
+  console.warn = (...args) => {
+    origWarn(...args);
+    occurrence(util.format(...args));
+  };
   flushSpool();
 }
 
-module.exports = { install, report, beat };
+module.exports = { install, report, occurrence, beat };

@@ -5,7 +5,7 @@ import time
 import httpx
 
 from .config import NET_DEGRADED_S, SUPABASE_KEY, SUPABASE_URL
-from .logs import log, log_error
+from .logs import log, log_error, log_occurrence
 
 
 def headers() -> dict:
@@ -49,7 +49,7 @@ def note_ok() -> None:
 
 
 def report_failure(msg: str, e: Exception) -> None:
-    """Log a failed Supabase call: a link failure as a warning until it has lasted TRANSPORT_RAISE_S,
+    """Log a failed Supabase call: a link failure as an occurrence until it has lasted TRANSPORT_RAISE_S,
     then once as an error for the streak; anything else (a bad query, a bug) as an error right away."""
     global _streak_since, _streak_raised
     _note_failure(e)
@@ -63,7 +63,7 @@ def report_failure(msg: str, e: Exception) -> None:
         _streak_raised = True
         log_error(f"{msg} (Supabase unreachable for {int(now - _streak_since)}s)")
     else:
-        log(f"WARN {msg} (will retry)")
+        log_occurrence(f"{msg} (will retry)")
 
 
 def degraded() -> bool:

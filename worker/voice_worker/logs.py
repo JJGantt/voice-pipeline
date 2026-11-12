@@ -35,9 +35,16 @@ def log(msg: str) -> None:
     print(f"{now_iso()} [{WORKER_ID}] {msg}", flush=True)
 
 
+def log_occurrence(msg: str) -> None:
+    """A failure a retry or fallback is already handling: logged as a warning and sent to the ops
+    responder as an occurrence, which is counted against its watch and never an incident by itself."""
+    log(f"WARN {msg}")
+    ops.occurrence(msg)
+
+
 def log_error(msg: str) -> None:
     """A failure: logged like any line, and reported to the ops responder (health/responder), where a new
-    incident starts an agent. A line that only says a retry or a fallback is coming stays `log`."""
+    incident starts an agent. A failure a retry or a fallback is already handling is `log_occurrence`."""
     log(msg)
     ops.report(msg)
 
