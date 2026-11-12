@@ -268,10 +268,10 @@ async function reconcile(row, proc) {
   const turnAt = proc && proc.statusAt ? proc.statusAt : later(tail && tail.turnAt, row.active_at);
   if (turnAt && ms(turnAt) !== ms(row.active_at)) patch.active_at = turnAt;
 
-  // Mirror at the end of a turn, which is the only moment the transcript is a complete thought.
-  // Idle-only on purpose: uploading mid-turn would ship half an answer, and the tail is re-read on
-  // the next tick anyway. This is what makes a session pickable up on the other machine later —
-  // including when this one is asleep, which is exactly when it matters.
+  // The transcript watcher mirrors as the session writes (mirrorAsWritten below), which is what makes a
+  // session pickable up on another machine at any moment — including mid-turn while this one is
+  // asleep or gone, which is exactly when it matters. This is the net under it for a write fs.watch
+  // dropped, at the end of a turn.
   // A Codex rollout is not mirrored: Codex sessions are resumed only on the machine that ran them.
   if (tail && !busy && row.claude_session_id && row.agent !== 'codex' && tail.bytes > (row.mirror_offset || 0)) {
     try {
@@ -450,7 +450,22 @@ async function tick() {
       patchDeskSession(id, { working: true, active_at: at })
         .catch((e) => console.error('[desk-sessions] turn-start patch:', e.message));
     },
-    (id, tail) => closeAfterTurn(id, tail));
+    (id, tail) => closeAfterTurn(id, tail),
+    mirrorAsWritten);
+}
+
+/**
+ * Upload what a session has just written (the transcript watcher calls this a few seconds after a
+ * write, sessionWatch.js `onAppend`). Re-reads the row so a session moved off this machine is not
+ * uploaded over by the copy left here: only this machine's resident row mirrors.
+ */
+async function mirrorAsWritten(id, tpath) {
+  const row = await deskSession(id);
+  if (!row || row.status !== 'resident' || row.worker !== 'desk' || row.agent === 'codex') return;
+  if (!row.claude_session_id || row.transcript_path !== tpath) return;
+  const at = await mirrorUp(row.claude_session_id, tpath, row.mirror_offset || 0);
+  if (at == null || at === row.mirror_offset) return;
+  await patchDeskSession(id, { mirror_offset: at, mirror_at: new Date().toISOString() });
 }
 
 // One tick at a time. Parking a session takes seconds (`/exit`, then a wait), so a tick that parks

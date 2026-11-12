@@ -13,6 +13,8 @@
 //   tool_use    → the hub's /api/session-activity, transient, straight out to the wall over SSE
 //   text        → the same, state 'text': what it says between tool calls (never the final reply)
 //   end_turn    → the same, carrying the reply, AND the host writes `last_reply` to the row
+//   any write   → a few seconds later the host uploads the new whole lines to the mirror (`onAppend`),
+//                 so a session whose machine dies mid-turn can be moved from its last few seconds
 //
 // The tick still runs and still does both of those. It is the NET now, not the mechanism, and it
 // keeps that job for two reasons that are not going away: liveness cannot be event-driven, because
@@ -31,6 +33,11 @@ import { codexPrompt, codexCommentary, codexToolLine, codexTurnStart, codexTurnE
 // fs.watch fires several times for one append, so coalesce. Long enough to batch a write, far short
 // of anything a person notices.
 const DEBOUNCE_MS = 120;
+// The transcript also goes up to the mirror as it is written, so a session can be moved from its last
+// few seconds if its machine dies mid-turn. At most one upload per this window per session: the first
+// write after an upload arms it and later writes ride along, so a turn that writes continuously is still
+// uploaded every few seconds rather than only once it pauses.
+const MIRROR_EVERY_MS = 3000;
 
 const watched = new Map();   // session id -> { id, path, offset, rest, watcher, timer, onTurnEnd }
 
@@ -465,6 +472,13 @@ function attach(st) {
     st.watcher = fs.watch(st.path, () => {
       clearTimeout(st.timer);
       st.timer = setTimeout(() => drain(st), DEBOUNCE_MS);
+      if (!st.mirrorTimer) {
+        st.mirrorTimer = setTimeout(() => {
+          st.mirrorTimer = null;
+          Promise.resolve().then(() => st.onAppend(st.id, st.path))
+            .catch((e) => console.error('[sessionWatch] mirror as written:', e.message));
+        }, MIRROR_EVERY_MS);
+      }
     });
     st.watcher.on('error', () => detach(st.id));
   } catch {
@@ -477,6 +491,7 @@ function detach(id) {
   const st = watched.get(id);
   if (!st) return;
   clearTimeout(st.timer);
+  clearTimeout(st.mirrorTimer);
   try { st.watcher?.close(); } catch { /* already gone */ }
   watched.delete(id);
 }
@@ -490,9 +505,10 @@ function detach(id) {
  * `onTurnEnd(id, tail)` and `onActivity(id, isoTimestamp)` are the host writing its own row: the Mac
  * and the Pi patch `desk_sessions` through different clients, and this module should not know which.
  * `onReported(id, tail)` runs once the hub has been told the turn ended — the moment a session that
- * asked to close itself (`close_after_turn`) can go without losing its reply.
+ * asked to close itself (`close_after_turn`) can go without losing its reply. `onAppend(id, path)` runs a
+ * few seconds after the transcript is written to (MIRROR_EVERY_MS), and is where the host mirrors it.
  */
-export function syncSessionWatch(rows, onTurnEnd, onActivity = () => {}, onReported = () => {}) {
+export function syncSessionWatch(rows, onTurnEnd, onActivity = () => {}, onReported = () => {}, onAppend = () => {}) {
   const live = new Set();
   for (const r of rows || []) {
     if (r.status !== 'resident' || !r.transcript_path) continue;
@@ -506,7 +522,8 @@ export function syncSessionWatch(rows, onTurnEnd, onActivity = () => {}, onRepor
     // tool calls onto the wall as though they were happening now.
     let offset = 0;
     try { offset = fs.statSync(r.transcript_path).size; } catch { continue; }
-    const st = { id: r.id, path: r.transcript_path, offset, rest: '', watcher: null, timer: null, onTurnEnd, onActivity, onReported,
+    const st = { id: r.id, path: r.transcript_path, offset, rest: '', watcher: null, timer: null, mirrorTimer: null,
+                 onTurnEnd, onActivity, onReported, onAppend,
                  said: null, queue: [], chain: Promise.resolve(),
                  turn: null, last: null, partial: true, attachOffset: offset };
     watched.set(r.id, st);

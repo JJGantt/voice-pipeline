@@ -450,6 +450,24 @@ async function heartbeat() {
 }
 
 // ---- live sessions --------------------------------------------------------
+/**
+ * Upload what a session has just written (the transcript watcher calls this a few seconds after a
+ * write, sessionWatch.js `onAppend`). Re-reads the row so a session moved off this machine is not
+ * uploaded over by the copy left here: only this worker's resident row mirrors.
+ */
+async function mirrorAsWritten(name, tpath) {
+  const row = (await sb(`desk_sessions?id=eq.${encodeURIComponent(name)}`
+    + '&select=status,worker,agent,claude_session_id,transcript_path,mirror_offset'))?.[0];
+  if (!row || row.status !== 'resident' || row.worker !== WORKER || row.agent === 'codex') return;
+  if (!row.claude_session_id || row.transcript_path !== tpath) return;
+  const at = await mirrorUp(row.claude_session_id, tpath, row.mirror_offset || 0);
+  if (at == null || at === row.mirror_offset) return;
+  await sb(`desk_sessions?id=eq.${encodeURIComponent(name)}&status=eq.resident`, {
+    method: 'PATCH', headers: { Prefer: 'return=minimal' },
+    body: JSON.stringify({ mirror_offset: at, mirror_at: new Date().toISOString() }),
+  });
+}
+
 // The later of two timestamps, either possibly missing.
 const laterOf = (a, b) => (!a ? b || null : !b ? a : (Date.parse(a) >= Date.parse(b) ? a : b));
 
@@ -515,8 +533,9 @@ async function reconcileSessions() {
     // Reported only once the row below is written, as the watcher does: a surface told `done` fetches
     // the reply at once, and asked first it gets the previous one.
     const unreported = row && tail.replyAt && at(tail.replyAt) > Math.max(at(row.reply_at), at(row.started));
-    // Mirror at the end of a turn — the only moment the transcript is a complete thought — so this
-    // session can be picked up on the Mac later, including while this machine is unreachable.
+    // The transcript watcher mirrors as the session writes (mirrorAsWritten), so it can be picked up on
+    // another machine at any moment, including mid-turn while this one is unreachable. This is the net
+    // under it for a write fs.watch dropped, at the end of a turn.
     let mirrored = null;
     if (!busy && cid && tpath && agent !== 'codex' && tail.bytes > mirrorFrom) {
       try { mirrored = await mirrorUp(cid, tpath, mirrorFrom); }
@@ -639,7 +658,8 @@ async function reconcileSessions() {
         body: JSON.stringify({ working: true, active_at: at }),
       }).catch((e) => console.error('[pi-desk] turn-start patch:', e.message));
     },
-    (id, tail) => closeAfterTurn(id, tail));
+    (id, tail) => closeAfterTurn(id, tail),
+    mirrorAsWritten);
 
   const kept = await reapIdleSessions(residents);
   lastResidentCount = kept.length;   // what the next heartbeat publishes to the hub's status strip
