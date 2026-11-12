@@ -272,8 +272,11 @@ async function runInNewTerminal(shellCmd) {
   // into a full-screen Space is slow) opens a tab in some other app, and the launch line is then typed
   // into the session already in Terminal's front tab — where it sits as an unsent paste until someone
   // presses Enter there. Hence three checks, each falling back to the window path: Terminal is
-  // frontmost before the keystroke, the selected tab afterwards is a DIFFERENT tty from the one before
-  // it, and that tab is idle (a fresh shell; anything running makes it `busy`).
+  // frontmost before the keystroke, the selected tab afterwards has a tty that NO tab had before it,
+  // and that tab is idle (a fresh shell; anything running makes it `busy`). Comparing only against the
+  // previously selected tab is not enough: when the front window changes instead of a tab opening, the
+  // other window's tab passes, and `busy` is false for a tab running tmux or screen (Terminal's
+  // close-without-asking list), so the launch line lands in a Claude session's input inside tmux.
   try {
     const tty = await osascript(`tell application "Terminal" to activate
       repeat 30 times
@@ -281,15 +284,20 @@ async function runInNewTerminal(shellCmd) {
         delay 0.1
       end repeat
       tell application "System Events" to if not (frontmost of process "Terminal") then error "Terminal never came to the front"
-      tell application "Terminal" to set was to tty of selected tab of front window
+      set was to {}
+      tell application "Terminal" to repeat with w in windows
+        repeat with x in tabs of w
+          set end of was to (tty of x) as text
+        end repeat
+      end repeat
       tell application "System Events" to keystroke "t" using command down
       tell application "Terminal"
         repeat 20 times
           set t to selected tab of front window
-          if (tty of t) is not was and not (busy of t) then exit repeat
+          if was does not contain ((tty of t) as text) and not (busy of t) then exit repeat
           delay 0.1
         end repeat
-        if (tty of t) is was then error "Cmd-T made no new tab"
+        if was contains ((tty of t) as text) then error "Cmd-T made no new tab"
         if busy of t then error "the new tab is running something"
         set t to do script "${escaped}" in t
         return tty of t
