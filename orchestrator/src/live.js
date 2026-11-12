@@ -9,9 +9,9 @@
 // suspends the timer with everything else, which is correct: a sleeping Mac's sessions are frozen and
 // have to move too.
 //
-// Fire-and-forget: a beat never waits on the one before, and a miss is logged at most once a minute,
-// as a plain line. The responder notices a machine that cannot reach it; flooding it with an error per
-// missed beat would only repeat what the silence already says.
+// Fire-and-forget: a beat never waits on the one before. A miss is an OCCURRENCE (console.warn, which the
+// ops reporter counts), at most one a minute: the responder's 15s silence deadline is what declares a
+// machine DOWN, and the counted misses are what show a link that keeps dropping beats short of that.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -42,7 +42,7 @@ export function startLive(machine, { url = process.env.OPS_LIVE_URL || 'https://
   const miss = (why) => {
     if (Date.now() - lastMissLog < MISS_LOG_MS) return;
     lastMissLog = Date.now();
-    console.log(`[live] /live beat missed: ${why}`);
+    console.warn(`[live] /live beat missed: ${why}`);
   };
   const beat = () => {
     fetch(url, {
