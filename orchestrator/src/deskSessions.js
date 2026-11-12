@@ -19,7 +19,9 @@
 // before was kept "running" by the next session opened in its tab, which then never got a row of its
 // own.
 import { config } from './config.js';
-import { deskSession, deskSessionsFor, patchDeskSession, upsertDeskSession } from './supabase.js';
+import { deskSession, deskSessionsFor, patchDeskSession, upsertDeskSession, residentElsewhere,
+         insertCommand } from './supabase.js';
+import { movedTo, RESTARTED_MARKER } from './route.js';
 import { sweepStashedPrompts } from './handoff.js';
 import { liveClaudeSessions } from './discover.js';
 import { mirrorUp, mirrorReset } from './mirror.js';
@@ -109,10 +111,30 @@ function placeholderLabel(tty, startedAt) {
   return `${where} · ${when}`;
 }
 
-async function adopt(s, rows) {
+// Sessions already reported as moved away while this Mac was gone, so each is reported once.
+const fenced = new Set();
+
+/**
+ * Close the tab of a session another machine has taken over (contract §5): it was moved while this
+ * Mac was asleep or unreachable, and two processes on one conversation diverge. The row is not
+ * written back to resident.
+ */
+async function fence(id, tty, where) {
+  if (!fenced.has(id)) {
+    fenced.add(id);
+    console.error(`[desk-sessions] ${id} was moved to ${where} while this machine was away; closed the local copy`);
+  }
+  if (tty) await closeTabForTty(tty);
+}
+
+async function adopt(s, rows, elsewhere) {
   const tail = readTail(s.transcriptPath);
   const startedIso = new Date(s.startedAt).toISOString();
   const existing = rows.find((r) => r.claude_session_id === s.claudeId);
+  // A process left running from before its session was moved elsewhere is closed, not revived. One
+  // started after the move is a resume by hand, and is the user's.
+  const where = movedTo(existing || { claude_session_id: s.claudeId, status: null }, elsewhere, s.startedAt);
+  if (where) return fence(existing?.id || `mac-${s.claudeId.slice(0, 8)}`, s.tty, where);
   if (existing) {
     // The same conversation running again — `claude --resume` by hand, in a new tab. Revive the row
     // rather than making a second one: its label, its origin and its history are still right.
@@ -176,7 +198,7 @@ function realChanges(before, patch) {
   return out;
 }
 
-async function reconcile(row, proc) {
+async function reconcile(row, proc, startup = false) {
   const alive = !!proc;
   const ageS = (Date.now() - ms(row.started)) / 1000;
   // Snapshot BEFORE anything below mutates `row` — the rebind path and the close path both write back
@@ -184,6 +206,7 @@ async function reconcile(row, proc) {
   // persisted.
   const before = { ...row };
   const patch = { last_seen: new Date().toISOString() };
+  let resumeAfter = false;   // found gone mid-turn on the first tick: resumed once the row says parked
 
   if (proc) {
     if (row.pid !== proc.pid) patch.pid = proc.pid;
@@ -303,7 +326,15 @@ async function reconcile(row, proc) {
     patch.ended = new Date().toISOString();
     patch.working = false;
     row.status = patch.status;   // stop watching it on this tick, not the next
-    console.log(`[desk-sessions] ${row.id} ${patch.status} (its process has exited)`);
+    // On the first tick after this process starts, a session that was mid-turn did not end: it died
+    // with the Mac (a restart), in the middle of work. It is parked and then resumed with a note
+    // saying so, rather than left parked. Fenced first: a session another machine took over is not.
+    if (startup && before.working === true && row.claude_session_id) {
+      console.error(`[desk-sessions] ${row.id} was mid-turn when this machine went down; resuming it`);
+      resumeAfter = true;
+    } else {
+      console.log(`[desk-sessions] ${row.id} ${patch.status} (its process has exited)`);
+    }
     // A dispatched session's window is the session's alone; once it has exited nothing in it is
     // anyone's. A window opened by hand is left for the user.
     if (row.origin !== 'adopted') {
@@ -319,9 +350,16 @@ async function reconcile(row, proc) {
     await patchDeskSession(row.id, { ...changes, last_seen: patch.last_seen });
   }
   if (unreported) reportTurnEnd(row.id, tail);
+  if (resumeAfter) {
+    await insertCommand('resume_session', { target: 'mac', session: row.id, prompt: RESTARTED_MARKER('mac') })
+      .catch((e) => console.error(`[desk-sessions] resuming ${row.id} after the restart failed:`, e.message));
+  }
   // The net under the watcher for a self-close whose turn end fs.watch dropped.
   if (alive && !busy && row.close_after_turn) await closeAfterTurn(row.id, tail);
 }
+
+// Until the first tick has completed: see the restart case in reconcile.
+let startupTick = true;
 
 // Sessions being closed right now, so the watcher and the tick never both close one.
 const closing = new Set();
@@ -396,14 +434,26 @@ async function tick() {
   const live = [...(await liveClaudeSessions()).map((p) => ({ ...p, agent: 'claude' })), ...liveCodexSessions()];
   const byPid = new Map(live.map((p) => [p.pid, p]));
   const claimed = new Set();
+  // Conversations another machine holds resident, for fencing: one read per tick.
+  let elsewhere;
+  try { elsewhere = new Map((await residentElsewhere('desk')).map((r) => [r.claude_session_id, r])); }
+  catch (e) { return listStreak.fail(e); }
+  const startup = startupTick;
 
   // Every running row finds its process first, so what is left over is exactly what nobody tracks.
   const residents = rows.filter((r) => r.status === 'resident');
   for (const row of residents) {
     const proc = processOf(row, live.filter((p) => p.agent === (row.agent || 'claude')), byPid, claimed);
     if (proc) claimed.add(proc.pid);
+    const where = proc ? movedTo(row, elsewhere, proc.startedAt) : null;
+    if (where) {
+      try { await fence(row.id, row.tty, where); } catch (e) { console.error(`[desk-sessions] fencing ${row.id}:`, e.message); }
+      row.status = 'fenced';   // not watched, not reaped
+      continue;
+    }
     try {
-      await reconcile(row, proc);
+      // A session another machine took over while this one was down is not resumed here on restart.
+      await reconcile(row, proc, startup && !elsewhere.has(row.claude_session_id));
       patchFailing.delete(row.id);
       if (row.status === 'resident' && proc) {
         let bytes = 0;
@@ -426,7 +476,7 @@ async function tick() {
   if (!launching) {
     for (const s of live) {
       if (claimed.has(s.pid) || s.agent === 'codex') continue;
-      try { await adopt(s, rows); }
+      try { await adopt(s, rows, elsewhere); }
       catch (e) { console.error('[desk-sessions] adopt:', e.message); }
     }
   }
@@ -452,6 +502,7 @@ async function tick() {
     },
     (id, tail) => closeAfterTurn(id, tail),
     mirrorAsWritten);
+  startupTick = false;
 }
 
 /**

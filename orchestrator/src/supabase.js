@@ -208,3 +208,33 @@ export async function insertCommand(kind, payload) {
   if (!res.ok) throw new Error(`insertCommand ${res.status}: ${await res.text()}`);
   return id;
 }
+
+/**
+ * Patch a session row only while it is still in `status`. Returns the rows it changed — empty when the
+ * row had moved on, which is how two machines racing to take one session agree on a single winner.
+ */
+export async function patchDeskSessionIf(id, status, patch) {
+  const res = await fetch(`${base()}/desk_sessions?id=eq.${encodeURIComponent(id)}&status=eq.${status}`, {
+    method: 'PATCH',
+    headers: headers({ Prefer: 'return=representation' }),
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) throw new Error(`patchDeskSessionIf ${res.status}: ${await res.text()}`);
+  return res.json();
+}
+
+/** Resident rows of every OTHER worker that hold a conversation, for fencing (deskSessions.js). */
+export async function residentElsewhere(worker) {
+  const res = await fetch(`${base()}/desk_sessions?status=eq.resident&worker=neq.${encodeURIComponent(worker)}`
+    + '&claude_session_id=not.is.null&select=id,worker,claude_session_id,started', { headers: headers() });
+  if (!res.ok) throw new Error(`residentElsewhere ${res.status}: ${await res.text()}`);
+  return res.json();
+}
+
+/** One machine's desk heartbeat row, or null. */
+export async function workerPresence(worker) {
+  const res = await fetch(`${base()}/worker_presence?worker=eq.${encodeURIComponent(worker)}&select=last_seen,info`,
+    { headers: headers() });
+  if (!res.ok) throw new Error(`workerPresence ${res.status}: ${await res.text()}`);
+  return (await res.json())[0] || null;
+}
