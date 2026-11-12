@@ -138,33 +138,68 @@ no credential helper the pull prompts for a username, fails instantly in a daemo
 after the first runs against a stale tree. The pull failure is non-fatal by design, so it shows up as
 wrong results rather than an error.
 
-## A command that cannot run is kept, never dropped
+## Nothing waits on one machine while another could run it
 
-Both desk consumers write `desk_dead_letters` when a command expires unrun, errors, or was claimed by
-a machine that then died — the whole payload, prompt included. A dispatched prompt is usually minutes
-of dictated speech nobody can repeat, so losing one costs far more than the launch it was meant to
-start.
+Fly, the Pi and the Mac are fallbacks for each other, and Fly is always available: `GET
+https://jared-desk-fly.fly.dev/wake` starts it. So a desk consumer that cannot run a command now hands it
+on at once (`orchestrator/src/route.js`): from the Pi to the Mac when it is beating and signed in, else
+to Fly; from the Mac to the Pi when it is, else to Fly. Fly launches regardless, and a memory shortage
+there is reported as an error rather than answered with a refusal. A handoff is a new `desk_commands` row
+with `payload.target`, and the command that was handed on answers `handed to the Mac as <id> — <why>`,
+`handed to the Pi as <id> — …` or `handed to Fly as <id> — …`, which data-layer `followHandoff` follows to
+where the work really ran.
 
-An expiry is also reported to the ops responder as an error. On the Pi and Fly the usual cause is a
-`desk_commands` channel that is SUBSCRIBED but delivering nothing: the 5-minute backstop then finds the
-row only after `COMMAND_TTL_S` (120s). pi-desk records every id the channel delivers, and a pending
-command it owns that was inserted while SUBSCRIBED and never delivered is reported as `channel deaf while
-SUBSCRIBED` and the channel is rejoined (`pi-desk/heard.js`, `realtime.js` `rejoin`).
+What gets handed on: a launch or resume with no room on the Pi; a failure another machine can get past
+(`Reroute`: a project the Mac does not have, no Codex login, no incident launcher); a heavy session
+(`onHeavy`); and a command that expired before its machine saw it (`COMMAND_TTL_S`, 120s) or was claimed
+by a machine that stopped before finishing it (`CLAIM_STALE_S`). Those last two go to Fly, a resume or a
+follow-up as a `resume_mirrored` of its conversation with the words riding along, and are reported as
+errors: work reaching Fly that way means the machine it was meant for did not take it. A late follow-up
+for a session open on the machine that finds it is simply delivered. `desk_queue` is written by nothing;
+pi-desk routes out any rows left in it once, at startup.
 
-It is **not** a retry queue, and adding automatic retry would be the wrong fix: work that could not
-run when it was asked for has usually stopped being wanted by the time the machine comes back, and a
-prompt that fires hours late is worse than one that never fired. Retry is a decision made afterwards,
-from the saved list.
+A move is prepared before anything is closed: Fly is woken first, so a destination that will not answer
+leaves the session running where it is, and a handoff that fails after the close resumes the session
+again where it was.
 
-The other half is upstream: `data-layer`'s dispatch path checks the target machine is beating AND
-signed in before it writes a command at all, because the queue itself has no way to fail — an
-unclaimed command simply expires, and a session launched on an expired `/login` answers "Login
-expired" and does nothing, while the caller has already been told a session started. Each desk
-heartbeat carries `info.login_expires_at` (`orchestrator/src/login.js`, re-read when the credential
-store changes); `desk.ts` `machinesReady` reads both beats and a new session goes to the other machine
-when the chosen one fails either test. When both fail it goes to the Fly session machine
-(`fly-desk/README.md`), which is woken by an HTTP request because it is stopped almost always; only if
-that does not answer is the prompt dead-lettered.
+`desk_dead_letters` is only for a command NO machine could take — Fly would not wake, or the work cannot
+move (a Codex conversation lives only where it ran) — and every dead letter is a `console.error`. The
+whole payload is kept, prompt included: a dispatched prompt is usually minutes of dictated speech nobody
+can repeat. A dead letter is not a retry queue; retry is a decision made afterwards, from the saved list.
+
+On the Pi and Fly the usual cause of a late command is a `desk_commands` channel that is SUBSCRIBED but
+delivering nothing: the 5-minute backstop then finds the row only after `COMMAND_TTL_S`. pi-desk records
+every id the channel delivers, and a pending command it owns that was inserted while SUBSCRIBED and never
+delivered is reported as `channel deaf while SUBSCRIBED` and the channel is rejoined (`pi-desk/heard.js`,
+`realtime.js` `rejoin`).
+
+Upstream, `data-layer`'s dispatch path checks the target machine is beating AND signed in before it
+writes a command at all, because a session launched on an expired `/login` answers "Login expired" and
+does nothing. Each desk heartbeat carries `info.login_expires_at` (`orchestrator/src/login.js`, re-read
+when the credential store changes); `desk.ts` `machinesReady` and `route.js` `presenceReady` apply the
+same rule, and a machine whose login has expired cannot take work, so it goes to the next one.
+
+## A machine that stops answering has its sessions moved
+
+pi-desk on the Pi and the Mac orchestrator POST `https://ops-responder.fly.dev/live` every 5s
+(`orchestrator/src/live.js`, `OPS_TOKEN` from the environment or `~/.config/ops/env`). A sleeping Mac
+stops beating, which is correct: its sessions are frozen too. The responder declares a machine down after
+15s of silence and writes an `evacuate` command (`{machine}`) for Fly, or for the other home machine when
+it is live. The consumer that takes it claims every resident session of that machine's worker by marking
+its row `transferred` (conditional on it still being resident, so only one machine wins each), resumes
+it from the mirror, and restarts a session that was mid-turn with `MOVED_DEAD_MARKER`. Codex sessions and
+ones with nothing mirrored cannot move; they are named in the answer and reported as errors.
+
+The machine that comes back must not keep a moved session (**fencing**): each reconcile tick closes a
+live process whose row is `transferred`, or whose conversation another worker holds resident, when the
+process started before that move — pi-desk kills the tmux session, the Mac closes the tab — and never
+writes the row back to resident. A process started after the move is a deliberate resume (by hand at the
+Mac, or under the row's own name) and is left alone. The Mac's `adopt` applies the same test, so a tab
+left from before the move is not revived as a hand-opened session.
+
+On the first tick after a consumer starts, a resident row whose process is gone and which was `working`
+did not end: it died with the machine. It is parked and resumed with `RESTARTED_MARKER`, and reported as
+an error, unless another machine already holds it.
 
 ## Status `fallback` belongs to the Pi alone
 
@@ -254,7 +289,7 @@ sessions nothing can name any more.
 
 Claude Code's per-conversation scratch directories (`/tmp/claude-<uid>/<project>/<id>/`) go the moment
 their conversation stops running (`pi-desk/scratch.js`): on the Pi `/tmp` is RAM, an idle tmpfs page
-lands in zram swap, and swap over `MAX_SWAP_PCT` holds every queued launch. A parked session resumes
+lands in zram swap, and swap over `MAX_SWAP_PCT` sends every new launch to another machine. A parked session resumes
 with an empty scratch directory.
 
 Dead letters are deliberately exempt: an unretried one holds words the user may still want, and a
@@ -263,10 +298,17 @@ retried or dismissed one is a decision worth keeping.
 ## Moving a session between machines
 
 A session is an append-only transcript plus a working directory, so handing one over is copying the
-file and resuming it. Both consumers mirror the tail of every transcript to the `transcripts` storage
-bucket at the END OF A TURN (`mirror.js`), which is the only moment it is a complete thought. Only
-the delta goes up — one transcript here is 16MB and a turn adds tens of KB — as
-`<claude_session_id>/<offset>.part`, and `desk_sessions.mirror_offset` is how much is already there.
+file and resuming it. Both consumers mirror every transcript to the `transcripts` storage bucket AS IT
+IS WRITTEN (`mirror.js`): the transcript watcher (`sessionWatch.js` `onAppend`) uploads at most every
+3s while a session writes, so a session can be moved mid-turn, from its first prompt on, losing at most
+those seconds. The reconcile tick's mirror at the end of a turn is the net under it. Only the delta goes
+up — one transcript here is 16MB and a turn adds tens of KB — as `<claude_session_id>/<offset>.part`, and
+`desk_sessions.mirror_offset` is how much is already there. `mirrorUp` uploads whole lines only (a record
+half-written at the moment of the read goes up whole next time), and uploads one at a time per
+conversation from the furthest offset this process has reached, because parts are keyed by offset and two
+uploads from one stale offset would overlap. `mirrorDown` drops any overlap it still finds. The watcher's
+upload re-reads the row first and mirrors only a session still resident on this worker, so a copy left on
+a machine that a session moved away from cannot write over the mirror its new machine appends to.
 
 A session the Pi moves mid-turn is closed with C-c — for memory (`pi-desk` `onHeavy`), or by a
 `transfer_session` to the Mac that arrives while it is working, which is every session that moves
@@ -287,9 +329,10 @@ claimed by the machine GIVING THE SESSION UP: it closes the session, flushes the
 and only then enqueues `resume_mirrored` for the destination.
 
 When the source machine is unreachable there is nothing to close and nothing left to flush, so the
-destination is asked directly and the old row is marked `transferred`. That is the case the whole
-mechanism exists for — the laptop is shut and the work should carry on — and it costs whatever the
-session said after its last completed turn, which is nothing, because that is when mirroring runs.
+destination is asked directly and the old row is marked `transferred` (an `evacuate`, or a sender moving
+a session to deliver a follow-up). That is the case the whole mechanism exists for — the laptop is shut
+and the work should carry on — and it costs at most the last few seconds the session wrote. The source,
+if it comes back, closes its copy (fencing, above).
 A follow-up to a session whose machine is asleep takes the same path, with the words as
 `resume_mirrored`'s `prompt` (plus `attachments` and `msg`), so the destination resumes the session and
 answers them; both handlers resolve the prompt with `withAttachments` like any other.

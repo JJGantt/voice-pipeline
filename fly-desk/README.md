@@ -32,7 +32,10 @@ machine stays up until it finishes. It does not appear in the session list, whic
 - **Permissions:** an allow-list in `claude-config/fly/settings.json`, as on the Pi, not
   `--dangerously-skip-permissions`. An MCP server missing from that list stops a session on a prompt
   nobody can answer, so a server added in `entrypoint.sh` needs its line there too.
-- **No cgroup budgets, no hand-offs to the Mac, no retention sweeps** (the Pi does those for everyone).
+- **No cgroup budgets, no hand-offs, no retention sweeps** (the Pi does those for everyone). It is the
+  last resort, so it never refuses or holds work: a launch short of memory starts anyway and is reported
+  as an error, and a command that reaches it late runs rather than expiring. It takes `evacuate` like any
+  consumer (sessions of a machine the ops responder found dead), and sends no `/live` beat.
 - **MCP:** data, gmail, govee-lights (for Claude in `~/.claude.json`, for Codex in `$CODEX_HOME/config.toml`). No iMessage (no tailnet here), no browser.
 - `$HOME` is `/data/home` on the `desk_data` volume, so checkouts, transcripts and `~/.claude.json`
   survive a stop. The host's log is `/data/desk.log`.

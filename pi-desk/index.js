@@ -675,10 +675,10 @@ async function reconcileSessions() {
   // On the first sweep after this process starts, a row that was mid-turn is not just parked: its
   // session died with the machine (or its tmux), in the middle of work, so it is resumed with a note
   // saying so — here, through the same admission as any resume, which hands it on when there is no
-  // room. Fly resumes from the mirror, since its disk does not survive a restart. The mark is
-  // conditional on the row still being resident, so a session another machine already took over is left.
+  // room. The mark is conditional on the row still being resident, so a session another machine already
+  // took over is left.
   try {
-    const rows = await sb(`desk_sessions?worker=eq.${WORKER}&status=eq.resident&select=id,working,claude_session_id,agent,repo,label,origin`);
+    const rows = await sb(`desk_sessions?worker=eq.${WORKER}&status=eq.resident&select=id,working,claude_session_id`);
     const liveNames = new Set(residents.map((r) => r.name));
     for (const r of rows || []) {
       if (liveNames.has(r.id)) continue;
@@ -687,14 +687,9 @@ async function reconcileSessions() {
         body: JSON.stringify({ status: 'evicted', ended: new Date().toISOString(), working: false }),
       });
       if (!parked?.length) continue;
-      if (startupSweep && r.working && r.claude_session_id && !elsewhere.has(r.claude_session_id)
-          && !(FLY && r.agent === 'codex')) {
+      if (startupSweep && r.working && r.claude_session_id && !elsewhere.has(r.claude_session_id)) {
         console.error(`[pi-desk] ${r.id} was mid-turn when this machine went down; resuming it`);
-        const prompt = RESTARTED_MARKER(MACHINE);
-        const cmd = FLY
-          ? { kind: 'resume_mirrored', payload: mirroredPayload(r, { target: MACHINE, from: MACHINE, prompt }) }
-          : { kind: 'resume_session', payload: { target: MACHINE, session: r.id, prompt } };
-        await sendCommand(cmd.kind, cmd.payload)
+        await sendCommand('resume_session', { target: MACHINE, session: r.id, prompt: RESTARTED_MARKER(MACHINE) })
           .catch((e) => console.error(`[pi-desk] resuming ${r.id} after the restart failed:`, e.message));
       } else {
         console.log(`[pi-desk] session left residency: ${r.id}`);

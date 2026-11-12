@@ -59,8 +59,8 @@ export const config = {
   // Roots scanned for git repos, ':'-separated. Only direct children are considered — deep scanning
   // would drag in vendored checkouts under node_modules.
   REPO_ROOTS: (process.env.REPO_ROOTS || path.join(HOME, 'repos')).split(':').filter(Boolean),
-  // A queued launch is only wanted for about a minute. If the Mac was asleep when the hub enqueued
-  // it, waking up to a burst of terminal windows is worse than dropping them — those expire.
+  // A command older than this when the Mac sees it is not run late here: waking up to a burst of
+  // terminal windows is wrong, and dropping the work is too, so it goes to Fly (commands.js sendToFly).
   COMMAND_TTL_S: parseInt(process.env.COMMAND_TTL_S || '120', 10),
 };
 
