@@ -348,10 +348,12 @@ async function run(cmd) {
 
   // Which conversation it is, read from the process's own record once claude is up (discover.js).
   // Async on purpose: the launch has already happened and nothing should wait on it coming up. The
-  // reconcile tick binds the same way, so a miss here costs one tick, not the session.
+  // reconcile tick binds the same way, so a miss here costs one tick, not the session. A launch that
+  // never started is reported by the launch's own check (applescript.js checkLaunch), so a miss here
+  // is a plain line: reporting it too opened a second incident for the same failed launch.
   if (tty) {
     (agent === 'codex' ? awaitCodexOn(tty, startedAt) : awaitSessionOn(tty, startedAt)).then((s) => {
-      if (!s) return console.error(`[commands] no ${agent} came up on ${tty} for ${sessionId}`);
+      if (!s) return console.log(`[commands] no ${agent} came up on ${tty} for ${sessionId} (checkLaunch reports it)`);
       console.log(`[commands] ${sessionId} -> ${agent} session ${s.claudeId}`);
       return patchDeskSession(sessionId, { pid: s.pid, claude_session_id: s.claudeId, transcript_path: s.transcriptPath });
     }).catch((e) => console.error('[commands] session:', e.message));
