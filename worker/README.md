@@ -123,6 +123,10 @@ out of the environment at import, so no spawned subprocess (the warm SDK client,
 usage-limit fallback client passes it on (CLAUDE.md, "The worker bills the API in
 exactly one case").
 
+On the Pi, the unit also loads `~/.claude/worker-token.env` (a systemd drop-in), which sets
+`CLAUDE_CODE_OAUTH_TOKEN` too. `run.sh` sources `.env` after it, so `.env`'s token is the one that
+runs. Probe auth with `.env`'s token, not that file's.
+
 ### On the Pi: systemd
 
 The Pi runs this as `voice-worker.service`. The unit is versioned here and installed by copying:

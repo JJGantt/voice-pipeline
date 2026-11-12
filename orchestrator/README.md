@@ -30,6 +30,11 @@ cp com.jaredgantt.voice-orchestrator.plist ~/Library/LaunchAgents/
 launchctl load ~/Library/LaunchAgents/com.jaredgantt.voice-orchestrator.plist
 ```
 
+The repo copy has `FILL_IN` for `TERM_BASE`, `ORCH_TOKEN` and `HUB_TOKEN`. The real values exist only
+in the installed plist, so copying the repo plist over it again breaks every authed call. launchd
+keeps the environment it read at bootstrap: after editing `EnvironmentVariables`, `launchctl bootout`
+then `bootstrap`. A `kickstart -k` or a crash-restart runs with the old values.
+
 ## Config (env, with defaults)
 
 | Var               | Default                                            |
