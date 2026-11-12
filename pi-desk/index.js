@@ -74,6 +74,7 @@ const QUEUE_BACKSTOP_MS = 10 * 60 * 1000;
 import { watchTable } from '../orchestrator/src/realtime.js';
 import { missedByChannel } from './heard.js';
 import { streak } from '../orchestrator/src/streak.js';
+import { startLive } from '../orchestrator/src/live.js';
 
 // Errors go to the ops responder (health/responder) through a copy of its reporter, as does the beat from
 // the reconcile tick below. The Fly host sleeps whenever nothing runs, so it sends no beat: its silence
@@ -1471,6 +1472,9 @@ if (!FLY) {
 }
 heartbeat();
 setInterval(heartbeat, PRESENCE_MS);
+// The 5s liveness beat the responder reads to move this Pi's sessions when it stops answering (live.js).
+// Not from Fly: it sleeps whenever nothing runs, and its silence is its normal state.
+if (!FLY) startLive('pi');
 // Realtime is the primary path: a command inserted anywhere reaches this within a moment, rather
 // than waiting out a poll interval. Both INSERT (a new command) and UPDATE (a queued row released)
 // matter, so the subscription is not narrowed to inserts.

@@ -22,6 +22,7 @@ import { markTtyRead } from './deskSessions.js';
 import { startRepos } from './repos.js';
 import { startCommands } from './commands.js';
 import { startDeskSessions } from './deskSessions.js';
+import { startLive } from './live.js';
 
 // Errors go to the ops responder (health/responder) through a copy of its reporter. The orchestrator is
 // event-driven, so the event loop is its work loop: a beat from a timer on it stops when the loop is
@@ -30,6 +31,8 @@ const ops = createRequire(import.meta.url)('./ops_report.cjs');
 ops.install({ machine: 'mac', service: 'orchestrator' });
 setInterval(() => ops.beat(60), 60e3);
 ops.beat(60);
+// The 5s liveness beat the responder reads to move this Mac's sessions when it stops answering (live.js).
+startLive('mac');
 
 // ---- HTTP -----------------------------------------------------------------
 
