@@ -199,9 +199,11 @@ export function step(st, d, out, live) {
     // turnStart is null for both, and for a terminal-local command and its output.
     const said = turnStart(d);
     if (said) st.said = null;
-    // Injected context starts nothing of its own, as in readTail: the turn before it stands.
+    // Injected context starts nothing of its own, as in readTail: the turn before it stands — and
+    // between turns it is no activity either (a park's `/exit` caveat, an idle compaction's summary).
+    // One that the model does answer is picked up by the tick from the transcript.
     if (said && !said.meta) st.turn = newTurn(d);
-    if (live && said && typeof d.timestamp === 'string') {
+    if (live && said && !said.meta && typeof d.timestamp === 'string') {
       try { st.onActivity(st.id, d.timestamp); } catch { /* the tick writes it regardless */ }
     }
     // THE USER'S WORDS, AT THE MOMENT THEY ARRIVE, as their own event in the list.

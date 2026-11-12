@@ -34,6 +34,7 @@ import { randomUUID } from 'node:crypto';
 // platform-specific in it, and two copies of "which keys make a project entry complete" would drift.
 import { ensureTrusted } from '../orchestrator/src/trust.js';
 import { readTail, liveSessions, evict, pickEviction, typeInto } from './sessions.js';
+import { turnBoundary } from '../orchestrator/src/transcripts.js';
 // Pictures attached in the hub, fetched to this machine for the session to read — shared with the Mac.
 import { withAttachments, sweepStashedPrompts } from '../orchestrator/src/handoff.js';
 import { loginExpiresAt } from '../orchestrator/src/login.js';
@@ -495,8 +496,6 @@ async function mirrorAsWritten(name, tpath) {
   });
 }
 
-// The later of two timestamps, either possibly missing.
-const laterOf = (a, b) => (!a ? b || null : !b ? a : (Date.parse(a) >= Date.parse(b) ? a : b));
 
 // Publish what is running and reap what is not, then run the queue. tmux is the source of truth
 // rather than a list this process keeps, because this process restarts and tmux does not.
@@ -632,11 +631,9 @@ async function reconcileSessions() {
           working: busy,
           reply_at: tail.replyAt || (rebound ? null : row?.reply_at) || null,
           // Both carried through for the same merge-duplicates reason as the label. `active_at` is the
-          // last turn boundary, which orders and focuses sessions everywhere: the process's record when
-          // there is one, written as-is so a wrong value cannot stick; otherwise the transcript's
-          // reconstruction, which may only move it forward.
+          // last turn boundary, which orders and focuses sessions everywhere (turnBoundary).
           pid: pid || row?.pid || null,
-          active_at: s?.statusAt || laterOf(row?.active_at, tail.turnAt) || row?.started || new Date().toISOString(),
+          active_at: turnBoundary(s, tail, row?.active_at) || row?.started || new Date().toISOString(),
           mirror_offset: mirrored ?? mirrorFrom,
           ...(mirrored ? { mirror_at: new Date().toISOString() } : {}),
           last_seen: new Date().toISOString(),

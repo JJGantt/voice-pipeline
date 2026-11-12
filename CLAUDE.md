@@ -230,7 +230,12 @@ is computed from activity (`active_at`), not stored.
 Which conversation a process is in comes from `~/.claude/sessions/<pid>.json`, which Claude Code keeps
 for every live process: the conversation id (the transcript's filename) and the working directory. It
 rewrites the id on `/clear`, deletes the file when the process exits, and says whether a turn is in flight
-and since when — the source of `working` and `active_at`. `orchestrator/src/discover.js`
+and since when — the source of `working`, and of `active_at` while a turn is in flight. Once idle,
+`active_at` comes from the transcript instead (`turnBoundary` in `transcripts.js`): Claude Code moves
+the record's time for work nobody asked for — an idle compaction about an hour after the last turn —
+and trusted then, it restamps a quiet session and lifts it to the top of every list. For the same
+reason, injected context between turns (a compaction summary, the caveat before a park's `/exit`)
+starts a turn in `readTail` only if the model answers it. `orchestrator/src/discover.js`
 reads it on both machines; on the Pi the tmux pane's pid is claude's because `launch.sh` `exec`s it.
 Do not match transcripts by birth time or recency: every session in the home directory shares one
 project directory, so each new session there looks like a `/clear` of every older one, and rows end up

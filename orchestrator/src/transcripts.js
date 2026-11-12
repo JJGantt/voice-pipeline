@@ -25,6 +25,19 @@ export function projectDir(cwd) {
  * A `user` record as the start of a turn: null when it is not one, else `{ prompt }`, whose prompt is
  * null when the turn was started by something the user did not say.
  */
+/**
+ * The row's `active_at`, the last turn boundary: from the process's own record while a turn is in
+ * flight, and from the transcript otherwise. A busy process's `statusAt` is when the turn began, which
+ * the transcript can miss on a turn long enough to push its prompt out of the window readTail reads.
+ * An idle process's `statusAt` is not a turn boundary: Claude Code also moves it for work no one
+ * asked for, an idle compaction above all, so trusted then it restamps a session that has said
+ * nothing new. Written as-is either way, so a wrong value already on the row heals on the next look.
+ */
+export function turnBoundary(proc, tail, current) {
+  if (proc && proc.busy === true && proc.statusAt) return proc.statusAt;
+  return (tail && tail.turnAt) || current || null;
+}
+
 export function turnStart(d) {
   // Tool results are recorded as user records too. They are the model's own work coming back, not
   // the user saying something, so they must not look like the start of a new turn.
@@ -289,6 +302,7 @@ export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
   let finalReply = null, replyAt = null;
   let anyAssistantText = null;  // fallback when no turn ever completed
   let promptAt = null;          // when a turn was last started — see turnAt below
+  let pendingMetaAt = null;     // injected context between turns, not answered yet
   let turnPrompt = null;        // what started the current turn
   let turnStashed = false;      // ...and whether it was a stub resolved from the stash (dropEcho)
   let finalPrompt = null;       // what started the turn finalReply ended, so the two always pair
@@ -314,16 +328,26 @@ export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
     if (t !== 'user' && t !== 'assistant') continue;
     if (t === 'user') {
       const start = turnStart(d);
-      if (start) {
-        working = true; turnText = []; promptAt = d.timestamp || promptAt;
-        // Injected context starts a turn without saying anything: the prompt before it stands. It
-        // must not count as the turn's start being seen either — a skill loading mid-turn is one of
-        // these, and counted, a turn longer than the window skipped the search further back and was
-        // stored with no prompt at all, so its reply opened on every surface with no question above it.
-        if (!start.meta) { turnPrompt = start.prompt; turnStashed = !!start.stashed; startSeen = true; }
+      if (start && !start.meta) {
+        working = true; turnText = []; promptAt = d.timestamp || promptAt; pendingMetaAt = null;
+        turnPrompt = start.prompt; turnStashed = !!start.stashed; startSeen = true;
+      } else if (start && working) {
+        // Injected context mid-turn: the turn and its prompt stand. It must not count as the turn's
+        // start being seen either — a skill loading mid-turn is one of these, and counted, a turn
+        // longer than the window skipped the search further back and was stored with no prompt at
+        // all, so its reply opened on every surface with no question above it.
+        turnText = [];
+      } else if (start) {
+        // Injected context BETWEEN turns starts one only if the model then answers it. Claude Code
+        // writes these with nothing after them: the caveat ahead of a typed `/exit` (every park), and
+        // the summary of an IDLE compaction, which it runs about an hour after the last turn. Counted
+        // on sight, either made a session idle since its last reply read as working and as active
+        // from that moment, so it jumped to the top of every list with a fresh age.
+        pendingMetaAt = d.timestamp || null;
       }
       continue;
     }
+    if (pendingMetaAt !== null) { working = true; turnText = []; promptAt = pendingMetaAt; pendingMetaAt = null; }
     const msg = d.message || {};
     const blocks = msg.content;
     if (Array.isArray(blocks)) {

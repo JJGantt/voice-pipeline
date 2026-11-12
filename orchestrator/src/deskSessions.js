@@ -25,7 +25,7 @@ import { movedTo, RESTARTED_MARKER } from './route.js';
 import { sweepStashedPrompts } from './handoff.js';
 import { liveClaudeSessions } from './discover.js';
 import { mirrorUp, mirrorReset } from './mirror.js';
-import { readTail } from './transcripts.js';
+import { readTail, turnBoundary } from './transcripts.js';
 import { syncSessionWatch, reportTurnEnd } from './sessionWatch.js';
 import { relayFirstReply } from './relay.js';
 import { reapIdle } from './idle.js';
@@ -70,7 +70,6 @@ function relay(id, tail) {
 }
 
 const ms = (t) => (t ? new Date(t).getTime() : 0);
-const later = (a, b) => (!a ? b || null : !b ? a : ms(a) >= ms(b) ? a : b);
 
 /**
  * Is `p` the process this row was started for? Its start has to fall where the row's does, which is
@@ -171,7 +170,7 @@ async function adopt(s, rows, elsewhere) {
     working: s.busy ?? tail.working, last_reply: tail.lastReply ? tail.lastReply.slice(0, 20000) : null,
     last_prompt: tail.lastPrompt ? tail.lastPrompt.slice(0, 20000) : null,
     reply_at: tail.replyAt || null,
-    active_at: s.statusAt || tail.turnAt || startedIso,
+    active_at: turnBoundary(s, tail, startedIso),
   });
   console.log(`[desk-sessions] adopted ${s.repo} in ${s.tty} (${tail.title || 'untitled'})`);
 }
@@ -286,9 +285,8 @@ async function reconcile(row, proc, startup = false) {
   // Reported only once the patch below is written, as the watcher does: a surface told `done` fetches
   // the reply at once, and asked first it gets the previous one.
   const unreported = tail && tail.replyAt && ms(tail.replyAt) > Math.max(ms(row.reply_at), ms(row.started));
-  // The record's time is the truth and is written as-is, so a wrong value cannot stick. The
-  // transcript's is a reconstruction and may only move the row forward.
-  const turnAt = proc && proc.statusAt ? proc.statusAt : later(tail && tail.turnAt, row.active_at);
+  // Written as-is, so a wrong value cannot stick (turnBoundary says which source is trusted when).
+  const turnAt = turnBoundary(proc, tail, row.active_at);
   if (turnAt && ms(turnAt) !== ms(row.active_at)) patch.active_at = turnAt;
 
   // The transcript watcher mirrors as the session writes (mirrorAsWritten below), which is what makes a
