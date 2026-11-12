@@ -81,19 +81,43 @@ export function unmarkMoveInterrupt(text) {
   return changed ? lines.join('\n') : text;
 }
 
+// How far this process has uploaded each conversation, and the upload in flight for it. Both
+// consumers mirror one conversation from more than one place (the transcript watcher as it is written,
+// the reconcile tick when it is idle, a close or a move), and parts are keyed by the offset they start
+// at, so two uploads from the same stale offset would leave overlapping parts. One upload at a time per
+// conversation, each starting where the last one ended, keeps the parts contiguous.
+const uploadedTo = new Map();
+const inFlight = new Map();
+
 /**
- * Upload everything written since `offset`. Returns the new offset, or null if there was nothing.
+ * Upload every whole line written since `offset`. Returns the offset the mirror now reaches, or null
+ * when there was nothing to upload.
+ *
+ * Only whole lines: a transcript is appended one JSON record per line, and a read can land in the
+ * middle of one being written. The tail is cut at the last newline and the returned offset is the byte
+ * after it, so the half-written record goes up whole with the next upload instead of as two halves.
  *
  * A file that has SHRUNK was rewritten under us (a compaction), so the parts already up describe a
  * transcript that no longer exists — they are dropped and the whole file goes again.
  */
-export async function mirrorUp(claudeId, transcriptPath, offset = 0) {
+export function mirrorUp(claudeId, transcriptPath, offset = 0) {
+  const next = (inFlight.get(claudeId) || Promise.resolve()).catch(() => {})
+    .then(() => uploadTail(claudeId, transcriptPath, offset));
+  inFlight.set(claudeId, next);
+  next.then(() => {}, () => {}).then(() => { if (inFlight.get(claudeId) === next) inFlight.delete(claudeId); });
+  return next;
+}
+
+async function uploadTail(claudeId, transcriptPath, offset) {
   let st;
   try { st = fs.statSync(transcriptPath); } catch { return null; }
   if (!st.isFile()) return null;
-  let from = Number(offset) || 0;
+  const asked = Number(offset) || 0;
+  // The caller's offset comes from a row that may not have been written since this process last uploaded.
+  let from = Math.max(asked, uploadedTo.get(claudeId) || 0);
   if (st.size < from) { await mirrorReset(claudeId); from = 0; }
-  if (st.size === from) return null;
+  const reached = () => (from > asked ? from : null);
+  if (st.size === from) return reached();
 
   const fd = fs.openSync(transcriptPath, 'r');
   let buf;
@@ -101,14 +125,24 @@ export async function mirrorUp(claudeId, transcriptPath, offset = 0) {
     buf = Buffer.allocUnsafe(st.size - from);
     fs.readSync(fd, buf, 0, buf.length, from);
   } finally { fs.closeSync(fd); }
+  const cut = buf.lastIndexOf(0x0a);
+  if (cut < 0) return reached();   // nothing but a line still being written
+  const body = buf.subarray(0, cut + 1);
 
   const res = await fetch(`${SUPABASE_URL}/storage/v1/object/${BUCKET}/${claudeId}/${partName(from)}`, {
     method: 'POST',
     headers: auth({ 'Content-Type': 'application/x-ndjson', 'x-upsert': 'true' }),
-    body: buf,
+    body,
   });
   if (!res.ok) throw new Error(`mirrorUp ${res.status}: ${(await res.text()).slice(0, 160)}`);
-  return st.size;
+  const to = from + body.length;
+  uploadedTo.set(claudeId, to);
+  return to;
+}
+
+/** Whether anything has been mirrored for a conversation — whether it can be resumed elsewhere. */
+export async function mirrorHas(claudeId) {
+  return (await parts(claudeId)).length > 0;
 }
 
 /** Every part uploaded for a session, in offset order. */
@@ -124,6 +158,7 @@ async function parts(claudeId) {
 
 /** Throw the mirror away — used when a transcript is rewritten under us. */
 export async function mirrorReset(claudeId) {
+  uploadedTo.delete(claudeId);
   let names;
   try { names = await parts(claudeId); } catch { return; }
   if (!names.length) return;
@@ -135,10 +170,27 @@ export async function mirrorReset(claudeId) {
 }
 
 /**
+ * The transcript the parts describe, `[{ at, buf }]` in offset order. A part that starts before the end
+ * of the ones before it repeats bytes they already hold (an upload made from an offset a row had not
+ * caught up to), so only what it adds past that end is kept.
+ */
+export function assemble(chunks) {
+  const out = [];
+  let end = 0;
+  for (const { at, buf } of chunks) {
+    const skip = Number.isFinite(at) ? Math.max(0, end - at) : 0;
+    if (skip >= buf.length) continue;
+    out.push(skip ? buf.subarray(skip) : buf);
+    end = (Number.isFinite(at) ? Math.max(at, end) : end) + buf.length - skip;
+  }
+  return Buffer.concat(out);
+}
+
+/**
  * Assemble a mirrored transcript into this machine's project directory for `cwd`, ready to resume.
  *
- * Returns the file's path, or null if nothing has been mirrored — which is the honest answer when a
- * session was never idle long enough to be uploaded, and is far better than resuming an empty one.
+ * Returns the file's path, or null if nothing has been mirrored — the honest answer for a session that
+ * never wrote a whole line, and far better than resuming an empty one.
  */
 export async function mirrorDown(claudeId, cwd, { movedMidTurn = false } = {}) {
   const names = await parts(claudeId);
@@ -147,12 +199,12 @@ export async function mirrorDown(claudeId, cwd, { movedMidTurn = false } = {}) {
   for (const n of names) {
     const res = await fetch(`${SUPABASE_URL}/storage/v1/object/${BUCKET}/${claudeId}/${n}`, { headers: auth() });
     if (!res.ok) throw new Error(`mirrorDown ${n} ${res.status}`);
-    chunks.push(Buffer.from(await res.arrayBuffer()));
+    chunks.push({ at: Number.parseInt(n, 10), buf: Buffer.from(await res.arrayBuffer()) });
   }
   const dir = projectDir(cwd);
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, `${claudeId}.jsonl`);
-  const text = localize(Buffer.concat(chunks).toString('utf8'));
+  const text = localize(assemble(chunks).toString('utf8'));
   fs.writeFileSync(file, movedMidTurn ? unmarkMoveInterrupt(text) : text, { mode: 0o600 });
   return file;
 }
