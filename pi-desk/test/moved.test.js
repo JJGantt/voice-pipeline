@@ -19,10 +19,18 @@ test('a session that ended or is still here is not forwarded', () => {
   assert.equal(forwardMovedFollowUp(payload, null, resume, 'new'), null);
 });
 
-test('only a resume of the same conversation, on the Mac, is followed', () => {
-  assert.equal(forwardMovedFollowUp(payload, row, null, 'new'), null);
-  assert.equal(forwardMovedFollowUp(payload, row,
-    { ...resume, payload: { target: 'mac', claude_session_id: 'other' } }, 'new'), null);
-  assert.equal(forwardMovedFollowUp(payload, row,
-    { ...resume, payload: { target: 'fly', claude_session_id: CONV } }, 'new'), null);
+test('a follow-up for a session moved to Fly or the Pi goes to the session named after its resume', () => {
+  const fly = { id: 'abcdef12-0000-0000-0000-000000000000', payload: { target: 'fly', claude_session_id: CONV, repo: 'status-hub' } };
+  assert.deepEqual(forwardMovedFollowUp(payload, row, fly, 'new'), {
+    id: 'new', kind: 'follow_up',
+    payload: { prompt: 'show them on a map', target: 'fly', session: 'hub-status-hub-abcdef12', msg: 'm1' },
+  });
+  const pi = { id: 'abcdef12-1', payload: { target: 'pi', claude_session_id: CONV } };
+  assert.equal(forwardMovedFollowUp(payload, row, pi, 'new').payload.session, 'hub-root-abcdef12');
+});
+
+test('a resume for another conversation, or to nowhere known, is not followed', () => {
+  assert.equal(forwardMovedFollowUp(payload, row, null, 'n'), null);
+  assert.equal(forwardMovedFollowUp(payload, row, { ...resume, payload: { ...resume.payload, claude_session_id: 'other' } }, 'n'), null);
+  assert.equal(forwardMovedFollowUp(payload, row, { ...resume, payload: { ...resume.payload, target: 'moon' } }, 'n'), null);
 });

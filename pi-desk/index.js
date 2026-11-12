@@ -51,7 +51,10 @@ import { relayFirstReply } from '../orchestrator/src/relay.js';
 
 // Shared with the Mac rather than reimplemented: both halves of a transfer must agree byte for
 // byte on what a mirrored transcript is.
-import { mirrorUp, mirrorDown, mirrorReset } from '../orchestrator/src/mirror.js';
+import { mirrorUp, mirrorDown, mirrorReset, mirrorHas } from '../orchestrator/src/mirror.js';
+// Where work goes when this machine cannot take it now, shared with the Mac (route.js).
+import { wakeFly, presenceReady, nextMachine, handedVerdict, Reroute, mirroredPayload, flyCommandFor,
+         MOVED_DEAD_MARKER, RESTARTED_MARKER, evacuateVerdict, movedTo, DESK_WORKER } from '../orchestrator/src/route.js';
 
 // Postgres and JS spell the same instant differently, so timestamps are compared as instants.
 const TS_COLUMNS = new Set(['reply_at', 'active_at', 'ended', 'mirror_at', 'last_seen']);
@@ -62,12 +65,6 @@ const sameColumn = (col, next, current) => (TS_COLUMNS.has(col)
 // orchestrator/src/deskSessions.js, and the two must not drift apart.
 const LAST_SEEN_REFRESH_MS = 10 * 60 * 1000;
 
-// The queue is empty essentially always — 14 rows have ever been written to it — and `desk_queue` is
-// in the realtime publication now (data-layer 00104), so the tick reads it only when something has
-// actually been queued. Starts true so a row queued while this process was down is still found.
-let queueDirty = true;
-let lastQueueRead = 0;
-const QUEUE_BACKSTOP_MS = 10 * 60 * 1000;
 // The same self-healing subscription the Mac's orchestrator uses. Shared rather than reimplemented:
 // its header documents a hard-won lesson — supabase-js does not reliably recover a dead channel, and
 // callers that fall back to a tight poll burn ~20k reads a day without noticing.
@@ -100,8 +97,9 @@ const POLL_DEGRADED_MS = Number(process.env.POLL_DEGRADED_MS || 5000);
 const PRESENCE_MS = Number(process.env.PRESENCE_MS || 30000);
 // Matches the hub's DESK_STALE_S. Below this the Mac is considered awake and owns untargeted work.
 const MAC_STALE_S = Number(process.env.MAC_STALE_S || 90);
-// A queued command older than this is not worth running: the moment has passed, and opening a
-// session for a request made an hour ago is worse than doing nothing.
+// A pending command older than this was meant for a machine that did not take it in time. It is not
+// run late here and not dropped: it goes to Fly (sendToFly), which is always there. Fly itself runs
+// whatever reaches it, however old.
 const COMMAND_TTL_S = Number(process.env.COMMAND_TTL_S || 120);
 // How long a session gets to commit, push and update docs before it is closed regardless. Generous
 // on purpose: this is real work, and cutting it short is the thing wrapping up exists to prevent.
@@ -117,10 +115,11 @@ const WORKER = FLY ? 'fly-desk' : 'pi-desk';
 // because a turn is almost entirely waiting on the API. So there is no session count and no cap on how
 // many may be mid-turn: a count only stands in for memory, and a "busy" cap held a request behind two
 // working sessions while the processor sat idle. Admission is makeRoom: launch when shortfall() is
-// clear, park idle sessions until it is, and hand the work to the Mac when it still is not.
+// clear, park idle sessions until it is, and hand the work on when it still is not: to the Mac when it is
+// awake and signed in, else to Fly (route.js). Nothing waits here for room.
 //
 // This Pi is not for memory-heavy work. Each session runs in a cgroup (cgroups.js), and one whose
-// commands hold more than COMMAND_BUDGET_MB is moved to the Mac (onHeavy) rather than left to push the
+// commands hold more than COMMAND_BUDGET_MB is moved off it (onHeavy) rather than left to push the
 // machine into the kernel's OOM killer, which takes whole sessions mid-turn.
 
 // A TIME bound, and the one the other limits do not provide.
@@ -248,7 +247,6 @@ async function closeAfterTurn(name, tail) {
 /** Close a session so it can be resumed later, and record that it was parked. */
 async function park(name, extra = {}) {
   await evict(name);
-  queueDirty = true;   // memory just came free, so queued work gets another look on the next tick
   await sb(`desk_sessions?id=eq.${encodeURIComponent(name)}`, {
     method: 'PATCH', headers: { Prefer: 'return=minimal' },
     body: JSON.stringify({ status: 'evicted', ended: new Date().toISOString(), working: false, ...extra }),
@@ -293,27 +291,53 @@ async function macPath(name) {
 }
 
 /**
- * Send a new session to the Mac because this Pi has no room. Returns the command id.
- *
- * A NEW command rather than re-targeting this one: the Mac wakes on inserts only. The id goes back in
- * this command's detail (`handed to the Mac as <id>`), which is how start_session follows the work to
- * where it actually launched and reports that, instead of reporting a hand-off as a start.
+ * Where work this machine cannot take now goes: the Mac when it is awake and signed in (for `agent`),
+ * else Fly. Null on Fly, which is the last resort and launches anyway.
  */
-async function handOpenToMac(payload) {
+async function elsewhere(agent = 'claude') {
+  if (FLY) return null;
+  return nextMachine('pi', { macReady: await macIsAwake(false, agent) });
+}
+
+/** Insert a command for another machine, waking Fly first when it is for Fly. Returns its id. */
+async function sendCommand(kind, payload) {
+  if (payload.target === 'fly' && !FLY) await wakeFly();
   const id = randomUUID();
   await sb('desk_commands', {
     method: 'POST', headers: { Prefer: 'return=minimal' },
-    body: JSON.stringify({ id, kind: 'open_session', payload: { ...payload, target: 'mac' } }),
+    body: JSON.stringify({ id, kind, payload }),
   });
   return id;
 }
 
 /**
- * Resume a parked Pi session on the Mac because this Pi has no room — the transfer path for a session
- * that is already closed. Its transcript is flushed to the mirror, the row is marked transferred so
- * only one machine ever holds it, and the Mac resumes it from the mirror. Returns the command id.
+ * Send a new session to another machine because this one cannot take it. Returns the verdict.
+ *
+ * A NEW command rather than re-targeting this one: each machine wakes on inserts only. The id goes back in
+ * this command's detail (`handed to the Mac as <id>`, `handed to Fly as <id>`), which is how
+ * start_session follows the work to where it actually launched and reports that, instead of reporting a
+ * hand-off as a start. The payload's path is this Pi's layout; the Mac launches only paths it published,
+ * so it is re-resolved by name, and a project the Mac does not have goes to Fly, which clones it.
  */
-async function handResumeToMac(row, prompt, moved = null) {
+async function handOpen(payload, why) {
+  let target = await elsewhere(payload.agent === 'codex' ? 'codex' : 'claude');
+  let p = null;
+  if (target === 'mac') {
+    p = await macPath(safeName(payload.name) || ROOT);
+    if (!p) { why = `${why}; the Mac has no project ${payload.name}`; target = 'fly'; }
+  }
+  const id = await sendCommand('open_session', { ...payload, ...(p ? { path: p } : {}), target });
+  return handedVerdict(target, id, why);
+}
+
+/**
+ * Resume a session on another machine from the mirror — the move for a session that is already closed
+ * here. Its transcript is flushed to the mirror, the row is marked transferred so only one machine ever
+ * holds it, and `target` resumes it. Fly is woken before anything is marked, so a machine that will not
+ * take it leaves the session where it was. Returns the command id.
+ */
+async function handResume(row, target, { prompt = null, msg = null, moved = null, midTurn = false } = {}) {
+  if (target === 'fly' && !FLY) await wakeFly();
   const at = await mirrorUp(row.claude_session_id, row.transcript_path, row.mirror_offset || 0);
   const now = new Date().toISOString();
   await sb(`desk_sessions?id=eq.${encodeURIComponent(row.id)}`, {
@@ -321,29 +345,23 @@ async function handResumeToMac(row, prompt, moved = null) {
     body: JSON.stringify({ status: 'transferred', ended: now, working: false,
                            ...(at != null ? { mirror_offset: at, mirror_at: now } : {}) }),
   });
-  const id = randomUUID();
-  await sb('desk_commands', {
-    method: 'POST', headers: { Prefer: 'return=minimal' },
-    body: JSON.stringify({ id, kind: 'resume_mirrored',
-                           payload: { target: 'mac', claude_session_id: row.claude_session_id, repo: row.repo,
-                                      label: row.label, origin: row.origin || 'dispatched', from: MACHINE,
-                                      ...(prompt ? { prompt } : {}),
-                                      ...(moved ? { moved, mid_turn: !!prompt } : {}) } }),
-  });
-  return id;
+  return sendCommand('resume_mirrored', mirroredPayload(row, { target, from: MACHINE, prompt, msg, moved, midTurn }));
 }
 
 /**
  * A session went over its memory budget holding memory it cannot give back: heavy work, which this
- * Pi is not for. It moves to the Mac now, mid-turn — closed here, everything it was running killed
- * with its cgroup, and resumed on the Mac with its whole conversation and an instruction to redo
- * what was cut off. Waiting for the turn to end is not an option, because the turn is the heavy work.
+ * Pi is not for. It moves now, mid-turn — to the Mac when it is awake, else to Fly — closed here,
+ * everything it was running killed with its cgroup, and resumed there with its whole conversation and an
+ * instruction to redo what was cut off. Waiting for the turn to end is not an option, because the turn
+ * is the heavy work.
  *
- * With the Mac asleep there is nowhere to send it, so it stays and is no longer throttled at its
- * budget; its hard ceiling still keeps the rest of the Pi safe, and tool.sh makes the command that
- * crosses it the thing that dies, not the session.
+ * Everything that can refuse the move is checked before the session is closed: Fly is woken first, so
+ * a destination that will not answer leaves the session running here, unthrottled. A handoff that fails
+ * after the close resumes the session here again rather than losing it. A session that cannot move (a
+ * Codex one, or one with no conversation yet) stays, unthrottled; its hard ceiling still keeps the rest
+ * of the Pi safe, and tool.sh makes the command that crosses it the thing that dies, not the session.
  */
-// The message that restarts a moved session's turn on the Mac. It shows in the feeds as the prompt
+// The message that restarts a moved session's turn where it lands. It shows in the feeds as the prompt
 // that turn answers, so it is a bare label saying what sent it — never a word like "Continue", which a
 // session that had just proposed something would take as the user approving it.
 const MOVED_MARKER = '[Moved from the Pi]';
@@ -353,30 +371,39 @@ async function onHeavy(name, usage) {
   moving.add(name);
   try {
     const why = `its commands were holding ${usage.commandMb}MB, over the ${COMMAND_BUDGET_MB}MB a session's commands may hold on the Pi, which is not for memory-heavy work`;
-    if (!(await macIsAwake(false))) {
-      console.log(`[pi-desk] ${name}: ${why}. The Mac is asleep — it stays, unthrottled`);
-      liftBudget(name);
-      return;
-    }
     const row = (await sb(`desk_sessions?id=eq.${encodeURIComponent(name)}&select=*`))?.[0];
     if (!row?.claude_session_id || row.agent === 'codex') {
       console.log(`[pi-desk] ${name}: ${why}, but ${row?.agent === 'codex' ? 'a Codex session cannot move' : 'it has no transcript to move'} — it stays, unthrottled`);
       liftBudget(name);
       return;
     }
-    // Whether to restart a turn on the Mac is read from the live process BEFORE it is closed. Only a
+    const target = await elsewhere();
+    if (target === 'fly') {
+      try { await wakeFly(); } catch (e) {
+        console.error(`[pi-desk] ${name}: ${why}, and Fly would not wake to take it (${e.message}) — it stays, unthrottled`);
+        liftBudget(name);
+        return;
+      }
+    }
+    // Whether to restart a turn there is read from the live process BEFORE it is closed. Only a
     // session mid-turn gets one: a background job can outgrow the budget after the turn has ended on a
     // question for the user, and any message that then restarted the session would read as the user's answer.
     // A session that was waiting on the user resumes idle, with the note, and waits for the user there.
     const pid = (await liveSessions()).find((l) => l.name === name)?.pid;
     const rec = pid ? sessionOf(pid) : null;
     const midTurn = rec?.busy === true && !rec.waiting;
-    console.log(`[pi-desk] ${name}: ${why} — moving it to the Mac (${midTurn ? 'mid-turn' : 'between turns'})`);
+    console.log(`[pi-desk] ${name}: ${why} — moving it to ${target} (${midTurn ? 'mid-turn' : 'between turns'})`);
     await evict(name);
-    const id = await handResumeToMac(row, midTurn ? MOVED_MARKER : null, why);
-    console.log(`[pi-desk] ${name} handed to the Mac as ${id}`);
+    try {
+      const id = await handResume(row, target, { prompt: midTurn ? MOVED_MARKER : null, moved: why, midTurn });
+      console.log(`[pi-desk] ${name} ${handedVerdict(target, id)}`);
+    } catch (e) {
+      console.error(`[pi-desk] ${name} was closed to move it to ${target} and the handoff failed (${e.message}); resuming it here`);
+      await startSession(resumeArgs(row, { prompt: midTurn ? MOVED_MARKER : null }))
+        .catch((e2) => console.error(`[pi-desk] resuming ${name} here after the failed move also failed:`, e2.message));
+    }
   } catch (e) {
-    console.error(`[pi-desk] moving ${name} to the Mac failed:`, e.message);
+    console.error(`[pi-desk] moving ${name} off the Pi failed:`, e.message);
   } finally {
     moving.delete(name);
   }
@@ -476,10 +503,32 @@ const laterOf = (a, b) => (!a ? b || null : !b ? a : (Date.parse(a) >= Date.pars
 // The running sessions as of the last tick: a change means one ended (or began), which is when a
 // finished conversation's scratch directory is cleared (scratch.js) — not on every tick.
 let lastLiveKey = null;
+// Until the first sweep has run: a resident row whose session is gone then was running when this
+// machine (or this process's tmux) went down, rather than one that ended while it watched.
+let startupSweep = true;
+// Sessions already reported as moved away while this machine was gone, so each is reported once.
+const fenced = new Set();
+
+/**
+ * Close the copy left here of a session another machine has taken over (contract §5): it was moved
+ * while this machine was unreachable. Its row is not written back to resident, and nothing of it is
+ * mirrored again — the row's status already stops mirrorAsWritten.
+ */
+async function fence(name, where) {
+  if (!fenced.has(name)) {
+    fenced.add(name);
+    console.error(`[pi-desk] ${name} was moved to ${where} while this machine was away; closed the local copy`);
+  }
+  await evict(name);
+}
 
 async function reconcileSessions() {
   const selfClose = [];   // sessions that asked to close themselves and have finished their turn
   const live = await liveSessions();
+  // Conversations another machine holds resident, for fencing below: one read per tick.
+  const elsewhere = new Map(((await sb(`desk_sessions?status=eq.resident&worker=neq.${WORKER}`
+    + '&claude_session_id=not.is.null&select=id,worker,claude_session_id,started')) || [])
+    .map((r) => [r.claude_session_id, r]));
   const residents = [];
   const liveKey = live.filter((l) => l.alive).map((l) => `${l.name}:${l.pid}`).sort().join(',');
   if (liveKey !== lastLiveKey) { lastLiveKey = liveKey; sweepScratch(); }
@@ -496,6 +545,8 @@ async function reconcileSessions() {
     // a flaky network the read fails while the write a moment later succeeds, which wiped dispatch labels.
     const rows = await sb(`desk_sessions?id=eq.${encodeURIComponent(name)}&select=*`);
     const row = rows?.[0] || null;
+    const where = movedTo(row, elsewhere, created);
+    if (where) { await fence(name, where); continue; }
     // Which conversation the session is in, from its process's own record (orchestrator/src/
     // discover.js) — including after a `/clear`, which starts a new one inside the same process. Until
     // claude has written that record (its first second or so) the row keeps what it had.
@@ -620,17 +671,36 @@ async function reconcileSessions() {
   // Rows we publish that tmux no longer has: mark evicted rather than delete, so the transcript stays
   // reachable and the session can be resumed. Only genuinely forgotten sessions are deleted, and only
   // when the user says so.
+  //
+  // On the first sweep after this process starts, a row that was mid-turn is not just parked: its
+  // session died with the machine (or its tmux), in the middle of work, so it is resumed with a note
+  // saying so — here, through the same admission as any resume, which hands it on when there is no
+  // room. Fly resumes from the mirror, since its disk does not survive a restart. The mark is
+  // conditional on the row still being resident, so a session another machine already took over is left.
   try {
-    const rows = await sb(`desk_sessions?worker=eq.${WORKER}&status=eq.resident&select=id`);
+    const rows = await sb(`desk_sessions?worker=eq.${WORKER}&status=eq.resident&select=id,working,claude_session_id,agent,repo,label,origin`);
     const liveNames = new Set(residents.map((r) => r.name));
     for (const r of rows || []) {
       if (liveNames.has(r.id)) continue;
-      await sb(`desk_sessions?id=eq.${encodeURIComponent(r.id)}`, {
-        method: 'PATCH', headers: { Prefer: 'return=minimal' },
+      const parked = await sb(`desk_sessions?id=eq.${encodeURIComponent(r.id)}&status=eq.resident`, {
+        method: 'PATCH', headers: { Prefer: 'return=representation' },
         body: JSON.stringify({ status: 'evicted', ended: new Date().toISOString(), working: false }),
       });
-      console.log(`[pi-desk] session left residency: ${r.id}`);
+      if (!parked?.length) continue;
+      if (startupSweep && r.working && r.claude_session_id && !elsewhere.has(r.claude_session_id)
+          && !(FLY && r.agent === 'codex')) {
+        console.error(`[pi-desk] ${r.id} was mid-turn when this machine went down; resuming it`);
+        const prompt = RESTARTED_MARKER(MACHINE);
+        const cmd = FLY
+          ? { kind: 'resume_mirrored', payload: mirroredPayload(r, { target: MACHINE, from: MACHINE, prompt }) }
+          : { kind: 'resume_session', payload: { target: MACHINE, session: r.id, prompt } };
+        await sendCommand(cmd.kind, cmd.payload)
+          .catch((e) => console.error(`[pi-desk] resuming ${r.id} after the restart failed:`, e.message));
+      } else {
+        console.log(`[pi-desk] session left residency: ${r.id}`);
+      }
     }
+    startupSweep = false;
   } catch (e) { console.error('[pi-desk] sweep:', e.message); }
 
   // Watch what is running. The tick's job here is only to NOTICE a session — everything the session
@@ -663,7 +733,6 @@ async function reconcileSessions() {
 
   const kept = await reapIdleSessions(residents);
   lastResidentCount = kept.length;   // what the next heartbeat publishes to the hub's status strip
-  await runQueue(kept);
   exitIfIdle(kept.length);
 }
 
@@ -695,97 +764,51 @@ async function reapIdleSessions(residents) {
   return kept;
 }
 
-// ---- the queue ------------------------------------------------------------
-// Deliberately not desk_commands: those expire, because a command queued while a machine slept should
-// not fire hours later. A queued SESSION is the opposite — it is waiting on purpose, and must never
-// expire. It waits as long as it takes for a slot.
-async function runQueue(residents) {
-  // Realtime says when something is queued; this read is what acts on it. Between events there is
-  // nothing to act on, so the tick no longer asks — it asked every 30s for ever against a queue that
-  // is almost always empty. The backstop covers an event missed while the socket was deaf.
-  if (!queueDirty && Date.now() - lastQueueRead < QUEUE_BACKSTOP_MS) return;
-  queueDirty = false;
-  lastQueueRead = Date.now();
-  let queued;
-  try { queued = await sb(`desk_queue?worker=eq.${WORKER}&claimed=is.null&select=*&order=created.asc&limit=1`); }
-  catch { return; }
-  const next = queued?.[0];
-  if (!next) return;
-
-  // No room here and the Mac awake: the queued work goes to the Mac rather than waiting on this Pi.
-  // The queue holds work only for as long as neither machine can take it.
-  // A Codex resume cannot move, so only memory decides it.
-  const why = (!(next.resume_id && next.agent === 'codex') && await preferMac(residents))
-           || await makeRoom(residents, next.repo);
-  const toMac = why && await macIsAwake(false);
-  if (why && !toMac) {
-    console.log(`[pi-desk] holding queue: ${why}`);
-    return;
-  }
-
-  // Claim before launching so two ticks cannot both take the same queued item.
-  try {
-    const claimed = await sb(`desk_queue?id=eq.${encodeURIComponent(next.id)}&claimed=is.null`, {
-      method: 'PATCH', headers: { Prefer: 'return=representation' },
-      body: JSON.stringify({ claimed: new Date().toISOString() }),
-    });
-    if (!Array.isArray(claimed) || !claimed.length) return;
-  } catch { return; }
-
-  try {
-    // A queued resume names its conversation; everything else about it comes from the parked row.
-    const agent = next.agent === 'codex' ? 'codex' : 'claude';
-    let args = { name: next.repo, prompt: next.prompt, report: next.report === true, label: next.label || null, agent };
-    const parked = next.resume_id
-      ? (await sb(`desk_sessions?claude_session_id=eq.${encodeURIComponent(next.resume_id)}` +
-          '&select=*&order=started.desc.nullslast&limit=1').catch(() => null))?.[0]
-      : null;
-    if (next.resume_id) {
-      args = parked ? resumeArgs(parked, { prompt: next.prompt, report: next.report === true })
-                    : { ...args, resumeId: next.resume_id };
+// ---- the old queue --------------------------------------------------------
+// `desk_queue` held work this machine had no room for, until a slot came free. Nothing writes it any
+// more: work this machine cannot take goes to another machine at once (handOpen, handResume). Rows left
+// from before are routed out once, at startup, through the same admission as any command.
+async function drainQueue() {
+  let rows;
+  try { rows = await sb(`desk_queue?worker=eq.${WORKER}&claimed=is.null&select=*&order=created.asc`); }
+  catch (e) { return console.error('[pi-desk] reading the old queue:', e.message); }
+  for (const next of rows || []) {
+    try {
+      const claimed = await sb(`desk_queue?id=eq.${encodeURIComponent(next.id)}&claimed=is.null`, {
+        method: 'PATCH', headers: { Prefer: 'return=representation' },
+        body: JSON.stringify({ claimed: new Date().toISOString() }),
+      });
+      if (!Array.isArray(claimed) || !claimed.length) continue;
+    } catch (e) { console.error('[pi-desk] claiming a queued row:', e.message); continue; }
+    // As a command, so it is admitted, launched or handed on exactly as one would be.
+    let cmd = { id: randomUUID(), kind: 'open_session',
+                payload: { name: next.repo, prompt: next.prompt || undefined, report: next.report === true || undefined,
+                           label: next.label || undefined, ...(next.agent === 'codex' ? { agent: 'codex' } : {}) } };
+    try {
+      if (next.resume_id) {
+        const parked = (await sb(`desk_sessions?claude_session_id=eq.${encodeURIComponent(next.resume_id)}` +
+          '&select=id&order=started.desc.nullslast&limit=1'))?.[0];
+        if (!parked) throw new Error(`no parked row for ${next.resume_id}`);
+        cmd = { id: cmd.id, kind: 'resume_session', payload: { session: parked.id, prompt: next.prompt || undefined, report: next.report === true } };
+      }
+      console.log(`[pi-desk] from the old queue -> ${await runCommand(cmd)}`);
+    } catch (e) {
+      console.error('[pi-desk] queued launch failed:', e.message);
+      // The queued row is deleted below either way, so its words are kept here, as for any command.
+      await deadLetter(cmd, `queued launch failed: ${e.message}`);
     }
-    let detail;
-    if (toMac && next.resume_id && agent === 'codex' && why) {
-      // Not mirrored, so it cannot go to the Mac: it keeps waiting here for room.
-      await sb(`desk_queue?id=eq.${encodeURIComponent(next.id)}`, { method: 'PATCH', headers: { Prefer: 'return=minimal' },
-        body: JSON.stringify({ claimed: null }) }).catch((e) => console.error('[pi-desk] requeue:', e.message));
-      console.log(`[pi-desk] holding queued Codex resume: ${why}`);
-      return;
-    } else if (toMac && next.resume_id) {
-      if (!parked) throw new Error(`no parked row for ${next.resume_id}`);
-      detail = `handed to the Mac as ${await handResumeToMac(parked, next.prompt)}`;
-    } else if (toMac) {
-      const p = await macPath(next.repo);
-      if (!p) throw new Error(`the Mac has no project ${next.repo}`);
-      detail = `handed to the Mac as ${await handOpenToMac({ name: next.repo, path: p, prompt: next.prompt || undefined,
-                                                              report: next.report === true || undefined,
-                                                              label: next.label || undefined,
-                                                              ...(agent === 'codex' ? { agent } : {}) })}`;
-    } else {
-      detail = await startSession(args);
-    }
-    console.log(`[pi-desk] from queue -> ${detail}`);
-  } catch (e) {
-    console.error('[pi-desk] queued launch failed:', e.message);
-    // The queued row is deleted below either way, so its words are kept here, as for any command.
-    await deadLetter({ id: null, kind: next.resume_id ? 'resume_session' : 'open_session',
-                       payload: { name: next.repo, prompt: next.prompt, label: next.label, resume_id: next.resume_id } },
-                     `queued launch failed: ${e.message}`);
+    await sb(`desk_queue?id=eq.${encodeURIComponent(next.id)}`, { method: 'DELETE', headers: { Prefer: 'return=minimal' } })
+      .catch((e) => console.error('[pi-desk] dequeue:', e.message));
   }
-  await sb(`desk_queue?id=eq.${encodeURIComponent(next.id)}`, { method: 'DELETE', headers: { Prefer: 'return=minimal' } })
-    .catch((e) => console.error('[pi-desk] dequeue:', e.message));
 }
 
-// Awake AND signed in: a Mac whose /login has expired launches a session that does nothing, which is
-// worse than keeping the work here. A beat without the field (an older orchestrator) counts as signed in.
-async function macIsAwake(ifUnsure = true) {
+// Awake AND signed in (route.js presenceReady): a Mac whose /login has expired launches a session that
+// does nothing, so it cannot take work, and work it cannot take goes to Fly. A beat without the field
+// (an older orchestrator) counts as signed in. For a Codex session, Codex signed in there is what counts.
+async function macIsAwake(ifUnsure = true, agent = 'claude') {
   try {
     const rows = await sb('worker_presence?worker=eq.desk&select=last_seen,info');
-    const seen = rows?.[0]?.last_seen;
-    if (!seen) return false;
-    const exp = rows[0].info?.login_expires_at;
-    if (exp !== undefined && !(exp && Date.parse(exp) > Date.now())) return false;
-    return (Date.now() - new Date(seen).getTime()) / 1000 <= MAC_STALE_S;
+    return presenceReady(rows?.[0], { staleS: MAC_STALE_S, agent });
   } catch { return ifUnsure; }   // routing assumes the Mac has it rather than double-launch; a hand-off assumes not
 }
 
@@ -979,13 +1002,17 @@ function resumeArgs(row, { prompt = null, report = false, commandId = null, msg 
 async function startSession({ name, prompt, resumeId = null, commandId = null, report = false, label = null,
                               knownClaudeId = null, transcriptPath = null, mirrorOffset = null, origin = null,
                               reuse = null, msg = null, agent = 'claude' }) {
-  if (agent === 'codex' && !codexReady()) throw new Error(`Codex is not signed in on the ${FLY ? 'Fly machine' : 'Pi'}`);
+  // Reroute: another machine may well have what this one lacks, so the command is handed on (runCommand).
+  if (agent === 'codex' && !codexReady()) throw new Reroute(`Codex is not signed in on the ${FLY ? 'Fly machine' : 'Pi'}`);
   const incident = isIncident(label);
   if (incident) {
     // Refuse rather than fall back: an incident session started as an ordinary one has every permission.
     if (agent !== 'claude') throw new Error('an incident session runs only as Claude');
     await ensureRepo('health');
-    if (!fs.existsSync(INCIDENT_LAUNCHER)) throw new Error(`no incident launcher at ${INCIDENT_LAUNCHER}`);
+    if (!fs.existsSync(INCIDENT_LAUNCHER)) {
+      console.error(`[pi-desk] no incident launcher at ${INCIDENT_LAUNCHER}`);
+      throw new Reroute(`no incident launcher at ${INCIDENT_LAUNCHER}`);
+    }
   }
   if (reuse) {
     const same = (await liveSessions()).find((l) => l.name === reuse);
@@ -1048,8 +1075,8 @@ async function run(cmd) {
   if (cmd.kind === 'follow_up') {
     const target = String((cmd.payload || {}).session || '').trim();
     if (!/^hub-[A-Za-z0-9._-]+$/.test(target)) throw new Error(`unusable session name: ${target}`);
-    // Sent moments after this session was handed to the Mac: the words follow it there (moved.js). The
-    // answer is the handoff form, so a sender that follows handoffs reports the Mac's verdict.
+    // Sent moments after this session was handed to another machine: the words follow it there (moved.js).
+    // The answer is the handoff form, so a sender that follows handoffs reports that machine's verdict.
     if (!(await liveSessions()).some((l) => l.name === target && l.alive)) {
       const row = (await sb(`desk_sessions?id=eq.${encodeURIComponent(target)}&select=status,claude_session_id`))?.[0];
       const resume = row?.status === 'transferred' && row.claude_session_id
@@ -1058,8 +1085,9 @@ async function run(cmd) {
         : null;
       const fwd = forwardMovedFollowUp(cmd.payload || {}, row, resume, randomUUID());
       if (fwd) {
+        if (fwd.payload.target === 'fly' && !FLY) await wakeFly();
         await sb('desk_commands', { method: 'POST', headers: { Prefer: 'return=minimal' }, body: JSON.stringify(fwd) });
-        return `handed to the Mac as ${fwd.id} — ${target} moved there as ${fwd.payload.session}`;
+        return handedVerdict(fwd.payload.target, fwd.id, `${target} moved there as ${fwd.payload.session}`);
       }
     }
     const prompt = await withAttachments((cmd.payload || {}).prompt, cmd.payload);
@@ -1124,18 +1152,15 @@ async function run(cmd) {
     const report = (cmd.payload || {}).report === true;
     // A resume is admitted exactly like new work: on the Mac with its whole conversation when a session
     // is already running here and the Mac is awake (preferMac), else here if memory allows (makeRoom),
-    // else on the Mac, else queued until one of them can take it.
-    // A Codex conversation is not mirrored, so it cannot be handed to the Mac: it waits here for room.
+    // else on the Mac, else on Fly. On Fly it launches regardless.
+    // A Codex conversation is not mirrored, so it cannot move: with no room here, no machine can take it.
     const residents = await residentsNow();
     const why = (row.agent !== 'codex' && await preferMac(residents)) || await makeRoom(residents, id);
-    if (why) {
-      if (row.agent !== 'codex' && await macIsAwake(false)) return `handed to the Mac as ${await handResumeToMac(row, prompt)} — ${why}`;
-      await sb('desk_queue', {
-        method: 'POST', headers: { Prefer: 'return=minimal' },
-        body: JSON.stringify([{ id: randomUUID(), worker: WORKER, repo: row.repo, prompt, report,
-                                label: row.label || null, resume_id: row.claude_session_id, agent: row.agent || 'claude' }]),
-      });
-      return `queued resume of ${id} — ${why}${row.agent === 'codex' ? '' : ', and the Mac is asleep'}`;
+    if (why && FLY) console.error(`[pi-desk] resuming ${id} on Fly despite a shortage: ${why}`);
+    else if (why) {
+      if (row.agent === 'codex') throw new Error(`${id} is a Codex conversation, which cannot move, and the Pi has no room: ${why}`);
+      const target = await elsewhere();
+      return handedVerdict(target, await handResume(row, target, { prompt, msg: (cmd.payload || {}).msg || cmd.id }), why);
     }
     return startSession(resumeArgs(row, { prompt, report, commandId: cmd.id, msg: (cmd.payload || {}).msg || cmd.id }));
   }
@@ -1162,6 +1187,8 @@ async function run(cmd) {
     const pid = (await liveSessions()).find((l) => l.name === id)?.pid;
     const rec = pid ? sessionOf(pid) : null;
     const midTurn = to === 'mac' && rec?.busy === true && !rec.waiting;
+    // Woken before the session is closed: a Fly that will not answer leaves it running here.
+    if (to === 'fly' && !FLY) await wakeFly();
     await evict(id);
     const at = await mirrorUp(row.claude_session_id, row.transcript_path, row.mirror_offset || 0);
     const now = new Date().toISOString();
@@ -1187,15 +1214,21 @@ async function run(cmd) {
     if (!claudeId) throw new Error('no session id to resume');
     if (!name) throw new Error(`unusable project name: ${JSON.stringify((cmd.payload || {}).repo)}`);
     const { dir } = await ensureRepo(name);
-    const file = await mirrorDown(claudeId, dir);
-    // Nothing mirrored means the session never sat idle long enough to be uploaded. Resuming would
-    // open an empty conversation wearing its id, which is worse than not resuming at all.
+    const { moved, mid_turn: midTurn } = cmd.payload || {};
+    // A session the Pi moved mid-turn was closed with C-c, which Claude Code records as the user rejecting
+    // the step it was on; mirrorDown rewrites those records so the session carries on here.
+    const file = await mirrorDown(claudeId, dir, { movedMidTurn: !!(moved && midTurn) });
+    // Nothing mirrored means the session never wrote a whole line. Resuming would open an empty
+    // conversation wearing its id, which is worse than not resuming at all.
     if (!file) throw new Error(`nothing has been mirrored for ${claudeId}`);
     // A follow-up rides along when its session's machine was asleep and the sender moved the session
     // here to deliver it (data-layer deliverFollowUp, the hub's session followup).
     const prompt = await withAttachments((cmd.payload || {}).prompt, cmd.payload) || null;
     return startSession({ name, resumeId: claudeId, commandId: cmd.id, prompt,
                           msg: prompt ? ((cmd.payload || {}).msg || cmd.id) : null,
+                          // Named from the command, so a follow-up sent to the machine it left can be
+                          // forwarded to it before it exists (moved.js).
+                          reuse: `hub-${name}-${cmd.id.slice(0, 8)}`,
                           label: (cmd.payload || {}).label || null,
                           origin: (cmd.payload || {}).origin || 'dispatched',
                           knownClaudeId: claudeId, transcriptPath: file,
@@ -1203,41 +1236,132 @@ async function run(cmd) {
                           mirrorOffset: fs.statSync(file).size });
   }
 
+  // A machine stopped answering (the ops responder's /live, health/responder): every session it held
+  // that can move is taken over HERE, from its last upload. Marking each row transferred is the claim —
+  // conditional on it still being resident, so two machines evacuating at once never both resume one,
+  // and the machine itself, if it comes back, closes its copy (the reconcile tick's fencing).
+  if (cmd.kind === 'evacuate') {
+    const machine = String((cmd.payload || {}).machine || '');
+    const worker = DESK_WORKER[machine];
+    if (!worker) throw new Error(`unknown machine to evacuate: ${JSON.stringify(machine)}`);
+    if (worker === WORKER) return `${machine} is this machine, and it is up — nothing moved`;
+    const rows = await sb(`desk_sessions?worker=eq.${worker}&status=eq.resident&select=*`);
+    const moved = [], stuck = [];
+    for (const row of rows || []) {
+      if (row.agent === 'codex' || !row.claude_session_id) {
+        stuck.push(`${row.id} (${row.agent === 'codex' ? 'a Codex session' : 'no conversation'})`);
+        continue;
+      }
+      if (!(await mirrorHas(row.claude_session_id))) { stuck.push(`${row.id} (nothing mirrored)`); continue; }
+      const now = new Date().toISOString();
+      const won = await sb(`desk_sessions?id=eq.${encodeURIComponent(row.id)}&status=eq.resident`, {
+        method: 'PATCH', headers: { Prefer: 'return=representation' },
+        body: JSON.stringify({ status: 'transferred', ended: now, working: false }),
+      });
+      if (!won?.length) continue;   // it moved or ended while this ran
+      try {
+        await run({ id: randomUUID(), kind: 'resume_mirrored',
+                    payload: mirroredPayload(row, { target: MACHINE, from: machine,
+                                                    prompt: row.working ? MOVED_DEAD_MARKER(machine) : null }) });
+        moved.push(row.id);
+      } catch (e) {
+        // Not resumed here, so it is handed back to its row as it was rather than left marked as moved.
+        await sb(`desk_sessions?id=eq.${encodeURIComponent(row.id)}&status=eq.transferred`, {
+          method: 'PATCH', headers: { Prefer: 'return=minimal' },
+          body: JSON.stringify({ status: 'resident', ended: row.ended || null, working: row.working === true }),
+        }).catch((e2) => console.error(`[pi-desk] restoring ${row.id} after a failed evacuation:`, e2.message));
+        stuck.push(`${row.id} (${e.message})`);
+      }
+    }
+    if (stuck.length) console.error(`[pi-desk] evacuating ${machine}: could not move ${stuck.join(', ')}`);
+    return evacuateVerdict(machine, moved, stuck);
+  }
+
   if (cmd.kind !== 'open_session') throw new Error(`unknown kind ${cmd.kind}`);
   const payload = cmd.payload || {};
   const name = safeName(payload.name);
   if (!name) throw new Error(`unusable project name: ${JSON.stringify(payload.name)}`);
   const agent = payload.agent === 'codex' ? 'codex' : 'claude';
-  if (agent === 'codex' && !codexReady()) throw new Error(`Codex is not signed in on the ${FLY ? 'Fly machine' : 'Pi'}`);
+  if (agent === 'codex' && !codexReady()) throw new Reroute(`Codex is not signed in on the ${FLY ? 'Fly machine' : 'Pi'}`);
 
   // Capacity is checked HERE, not inside startSession, so a request that should not run on this Pi —
-  // a session is already running here (preferMac) or memory is short (makeRoom) — goes to the Mac, or
-  // waits as a queued row when the Mac is asleep, rather than being dropped or forced onto a full
-  // machine. A resume does the same in its own handler; the queue runner calls startSession
-  // directly because it has just made the room.
-  // Fetched now, before a possible wait in the queue: the prompt stored there is what gets launched.
-  const spoken = await withAttachments(payload.prompt, payload);
+  // a session is already running here (preferMac) or memory is short (makeRoom) — goes to the Mac when
+  // it can take it, else to Fly, rather than being dropped, held, or forced onto a full machine. A
+  // resume does the same in its own handler. Fly is the last resort and launches regardless.
   const residents = await residentsNow();
   const why = await preferMac(residents) || await makeRoom(residents, name);
-  if (why) {
-    if (await macIsAwake(false)) {
-      // The payload's path is this Pi's layout (~/repos/x, or ~/x for the Pi-only checkouts); the Mac
-      // launches only paths it published, so the path is re-resolved by name, as the queue runner does.
-      const p = await macPath(name);
-      if (!p) throw new Error(`the Mac has no project ${name}`);
-      return `handed to the Mac as ${await handOpenToMac({ ...payload, path: p })} — ${why}`;
-    }
-    await sb('desk_queue', {
-      method: 'POST', headers: { Prefer: 'return=minimal' },
-      body: JSON.stringify([{ id: randomUUID(), worker: WORKER, repo: name,
-                              prompt: spoken || null,
-                              report: payload.report === true,
-                              label: payload.label || null, agent }]),
-    });
-    return `queued — ${why}, and the Mac is asleep`;
-  }
+  if (why && FLY) console.error(`[pi-desk] launching on Fly despite a shortage: ${why}`);
+  else if (why) return handOpen(payload, why);
+  const spoken = await withAttachments(payload.prompt, payload);
   return startSession({ name, prompt: spoken, commandId: cmd.id, report: payload.report === true, label: payload.label || null, agent });
 }
+
+/**
+ * Run a command, handing it to the next machine when this one cannot (a Reroute: no Codex login here,
+ * no incident launcher). Returns the verdict. On Fly there is no next machine, so a Reroute is a failure.
+ */
+async function runCommand(cmd) {
+  try { return await run(cmd); }
+  catch (e) {
+    if (!(e instanceof Reroute) || FLY) throw e;
+    const p = cmd.payload || {};
+    console.log(`[pi-desk] ${cmd.id} (${cmd.kind}) cannot run here: ${e.message} — handing it on`);
+    if (cmd.kind === 'open_session') return handOpen(p, e.message);
+    if (cmd.kind === 'resume_mirrored') {
+      const target = await elsewhere(p.agent === 'codex' ? 'codex' : 'claude');
+      return handedVerdict(target, await sendCommand('resume_mirrored', { ...p, target }), e.message);
+    }
+    if (cmd.kind === 'resume_session') {
+      const row = (await sb(`desk_sessions?id=eq.${encodeURIComponent(String(p.session || ''))}&select=*`))?.[0];
+      if (!row?.claude_session_id || row.agent === 'codex') throw e;   // a Codex conversation cannot move
+      const target = await elsewhere();
+      return handedVerdict(target, await handResume(row, target, { prompt: p.prompt || null, msg: p.msg || cmd.id }), e.message);
+    }
+    throw e;
+  }
+}
+
+/**
+ * A command this machine claimed and cannot run in time — it expired before this machine saw it, or
+ * this machine claimed it and stopped before finishing. It goes to Fly (route.js flyCommandFor): a
+ * resume or a follow-up moves its conversation there from the mirror, words included. Dead-lettered only
+ * when it cannot move (a Codex session, a kind that does not move) or Fly will not wake. Every case is a
+ * console.error: work that reaches Fly this way means the machine it was meant for did not take it.
+ */
+async function sendToFly(cmd, why, status) {
+  const p = cmd.payload || {};
+  const row = ['resume_session', 'follow_up'].includes(cmd.kind)
+    ? (await sb(`desk_sessions?id=eq.${encodeURIComponent(String(p.session || ''))}&select=*`).catch(() => null))?.[0]
+    : null;
+  const fly = flyCommandFor(cmd, row, MACHINE);
+  if (!fly) {
+    console.error(`[pi-desk] ${cmd.id} (${cmd.kind}) ${why}, and it cannot move to Fly — dead-lettered`);
+    await finish(cmd.id, status, why);
+    return deadLetter(cmd, why);
+  }
+  try {
+    if (row && fly.kind === 'resume_mirrored') {
+      // The conversation moves: the row is marked first, so the machine it was on closes its copy.
+      if (row.worker === WORKER && row.transcript_path) {
+        await mirrorUp(row.claude_session_id, row.transcript_path, row.mirror_offset || 0).catch(() => null);
+      }
+      await sb(`desk_sessions?id=eq.${encodeURIComponent(row.id)}`, {
+        method: 'PATCH', headers: { Prefer: 'return=minimal' },
+        body: JSON.stringify({ status: 'transferred', ended: new Date().toISOString(), working: false }),
+      });
+    }
+    const id = await sendCommand(fly.kind, fly.payload);
+    await finish(cmd.id, 'done', handedVerdict('fly', id, why));
+    console.error(`[pi-desk] ${cmd.id} (${cmd.kind}) ${why} — sent to Fly as ${id}`);
+  } catch (e) {
+    console.error(`[pi-desk] ${cmd.id} (${cmd.kind}) ${why}, and sending it to Fly failed (${e.message}) — dead-lettered`);
+    await finish(cmd.id, status, `${why}; Fly: ${e.message}`);
+    await deadLetter(cmd, `${why}; sending it to Fly failed: ${e.message}`);
+  }
+}
+
+/** Whether a tmux session by this name is running here with its agent in it. */
+const aliveHere = async (name) => (await liveSessions()).some((l) => l.name === name && l.alive);
 
 // Ids the desk_commands channel has delivered, with when. A pending command this machine owns that was
 // inserted while the channel was SUBSCRIBED, and that the channel never delivered, means it is deaf
@@ -1280,18 +1404,18 @@ async function drain() {
 
       const ageS = (Date.now() - new Date(cmd.created).getTime()) / 1000;
       checkHeard(cmd);
-      if (ageS > COMMAND_TTL_S) {
-        if (await claim(cmd.id)) {
-          await finish(cmd.id, 'expired', `queued ${Math.round(ageS)}s ago`);
-          await deadLetter(cmd, `expired unrun — queued ${Math.round(ageS)}s before this machine saw it`);
-          console.error(`[pi-desk] expired ${cmd.id} unrun (${Math.round(ageS)}s old > COMMAND_TTL_S ${COMMAND_TTL_S})`);
-        }
+      // Late. Fly runs whatever reaches it; elsewhere it goes to Fly — except a follow-up for a session
+      // running here, which this machine can deliver now.
+      const late = !FLY && ageS > COMMAND_TTL_S
+        && !(cmd.kind === 'follow_up' && await aliveHere(String((cmd.payload || {}).session || '')));
+      if (late) {
+        if (await claim(cmd.id)) await sendToFly(cmd, `expired unrun — queued ${Math.round(ageS)}s before this machine saw it`, 'expired');
         continue;
       }
       if (!(await claim(cmd.id))) continue;
 
       try {
-        const detail = await run(cmd);
+        const detail = await runCommand(cmd);
         await finish(cmd.id, 'done', detail);
         console.log(`[pi-desk] ${cmd.id} -> ${detail}`);
       } catch (e) {
@@ -1387,7 +1511,7 @@ async function sweepRetention() {
  * A crash or a restart between claim and finish leaves a row 'running' for ever: no consumer will
  * look at it again, and nothing anywhere says it did not happen. Only the claimer can judge this —
  * hence claimed_by — and only well after the longest legitimate launch (a cold clone) could still
- * be in flight.
+ * be in flight. What it finds goes to Fly (sendToFly) rather than being dropped.
  */
 const CLAIM_STALE_S = Number(process.env.CLAIM_STALE_S || 900);
 async function sweepAbandonedClaims() {
@@ -1395,9 +1519,7 @@ async function sweepAbandonedClaims() {
     const cutoff = new Date(Date.now() - CLAIM_STALE_S * 1000).toISOString();
     const rows = await sb(`desk_commands?status=eq.running&claimed_by=eq.${WORKER}&updated=lt.${cutoff}&select=*`);
     for (const cmd of rows || []) {
-      await finish(cmd.id, 'error', `abandoned — claimed by ${WORKER} and never finished`);
-      await deadLetter(cmd, 'the machine stopped before it finished this');
-      console.log(`[pi-desk] swept abandoned claim ${cmd.id}`);
+      await sendToFly(cmd, `abandoned — claimed by ${WORKER} and never finished`, 'error');
     }
   } catch (e) { console.error('[pi-desk] sweep claims:', e.message); }
 }
@@ -1499,16 +1621,8 @@ if (!FLY) startLive('pi');
 // than waiting out a poll interval. Both INSERT (a new command) and UPDATE (a queued row released)
 // matter, so the subscription is not narrowed to inserts.
 rt = watchTable({ channel: 'pi-desk-commands', table: 'desk_commands', event: '*', onChange: onCommandEvent, tag: 'pi-desk' });
-// A queued session gets its own subscription rather than a poll. Reconciling straight away means a
-// freed slot is taken the moment the row lands instead of up to a tick later, and the flag is what
-// makes the read happen at all — see runQueue.
-watchTable({ channel: 'pi-desk-queue', table: 'desk_queue', event: '*', tag: 'pi-desk-queue',
-  onChange: () => {
-    queueDirty = true;
-    reconcile();
-  } });
-
 drain();
+drainQueue();
 // The backstop stretches out while realtime is healthy and tightens when it is not, so a subscription
 // that dies silently degrades to slow-but-working instead of stopping altogether.
 let pollTimer = null;
