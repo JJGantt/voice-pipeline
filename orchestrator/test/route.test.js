@@ -70,3 +70,13 @@ test('a live session is fenced when its row was transferred or another worker ho
   assert.equal(movedTo(mine, new Map([['other', { worker: 'desk' }]])), null);
   assert.equal(movedTo(null), null);
 });
+
+test('a process started after the move is a deliberate resume and is not fenced', () => {
+  const ended = '2026-11-12T12:00:00Z';
+  const row = { id: 'mac-a', status: 'transferred', ended, claude_session_id: 'conv' };
+  assert.equal(movedTo(row, new Map(), Date.parse(ended) - 60e3), 'another machine');
+  assert.equal(movedTo(row, new Map(), Date.parse(ended) + 60e3), null);
+  const other = new Map([['conv', { worker: 'pi-desk', started: ended }]]);
+  assert.equal(movedTo({ ...row, status: 'resident' }, other, Date.parse(ended) - 1), 'pi');
+  assert.equal(movedTo({ ...row, status: 'resident' }, other, Date.parse(ended) + 1), null);
+});

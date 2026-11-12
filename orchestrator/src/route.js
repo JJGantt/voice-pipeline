@@ -121,10 +121,16 @@ export function evacuateVerdict(machine, moved, stuck) {
  * elsewhere: the row says `transferred`, or another worker holds the conversation resident. Its local
  * copy must then be closed, never written back to resident: two processes on one conversation diverge.
  * `elsewhere` maps a conversation id to the resident row another worker holds for it.
+ *
+ * Only a process that STARTED BEFORE the move is fenced (`startedAt`, ms). One started after it is a
+ * deliberate resume here — by hand at the keyboard, or a resume under the row's own name — and closing
+ * it would throw away what was just asked for.
  */
-export function movedTo(row, elsewhere = new Map()) {
+export function movedTo(row, elsewhere = new Map(), startedAt = 0) {
   if (!row) return null;
+  const before = (t) => !startedAt || !t || startedAt < Date.parse(t);
   const other = row.claude_session_id ? elsewhere.get(row.claude_session_id) : null;
-  if (other) return MACHINE_OF_WORKER[other.worker] || other.worker;
-  return row.status === 'transferred' ? 'another machine' : null;
+  if (other && before(other.started)) return MACHINE_OF_WORKER[other.worker] || other.worker;
+  if (row.status === 'transferred' && before(row.ended)) return 'another machine';
+  return null;
 }
