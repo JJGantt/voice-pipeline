@@ -243,8 +243,7 @@ he narrowed, corrected or clarified it ("I mean the new one") — the model writ
 `[[read again]]` instead, and the worker clears `needs_read` on that earlier answer once the
 new turn is written (`last_flagged` / `unflag` in process.py), so the clarified answer takes its row.
 The earlier reply stays in the thread. A command spoken from an answer open in the inbox (`about_id`)
-is never flagged: it lists under that answer as a follow-up, so a row of its own would be the same
-answer twice.
+is flagged like any other: its words and reply go in line in the thread, not under the answer.
 
 A session started with `start_session`'s `needs_read` has its relayed first reply filed in the inbox
 too (`relay.js`, from the desk_commands payload), labelled the same way from the dispatched prompt

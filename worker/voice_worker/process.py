@@ -423,10 +423,6 @@ def _record_outcome(db: Supabase, req: dict, result: dict, prompt: str, *, trans
 
     again = read_again(text)
     text, needs_read = take_read_marker(text)
-    # A command spoken from an answer opened in the inbox lists under THAT answer
-    # (`/api/voice-inbox/:id` follow-ups), so it is never an inbox row of its own: one question, one row.
-    if req.get("about_id"):
-        needs_read = False
 
     # A failure here is this machine's, not the command's, until every machine has tried it: hand it on.
     # Nothing has been written to the thread yet, so the worker that takes it writes the whole turn.
