@@ -8,7 +8,8 @@
 //
 // ONLY THE TAIL IS UPLOADED. Transcripts here reach 16MB and a turn adds tens of KB, so each mirror
 // writes `<claude_session_id>/<offset>.part` and the destination concatenates the parts in offset
-// order. `desk_sessions.mirror_offset` is how much is already up.
+// order. `desk_sessions.mirror_offset` is how much is already up. Every part costs the destination a
+// request, so once a conversation has COMPACT_AT parts they are folded back into one (compactFromFile).
 //
 // Both desk consumers use this — it is shared, not copied, because the two halves of a transfer have
 // to agree byte for byte on what a mirrored transcript is.
@@ -89,6 +90,9 @@ export function unmarkMoveInterrupt(text) {
 // conversation, each starting where the last one ended, keeps the parts contiguous.
 const uploadedTo = new Map();
 const inFlight = new Map();
+// Parts each conversation has in storage, as this process last knew it (listed once, then counted).
+const partCount = new Map();
+const COMPACT_AT = 20;
 
 /**
  * Upload every whole line written since `offset`. Returns the offset the mirror now reaches, or null
@@ -138,7 +142,57 @@ async function uploadTail(claudeId, transcriptPath, offset) {
   if (!res.ok) throw new Error(`mirrorUp ${res.status}: ${(await res.text()).slice(0, 160)}`);
   const to = from + body.length;
   uploadedTo.set(claudeId, to);
+  // Every part is one request for whoever resumes it, ~0.4s each, so a week-long session that had
+  // left hundreds of parts took minutes to move. Past COMPACT_AT parts the whole file goes up again as
+  // the part at offset 0 and the rest are deleted, leaving one.
+  let n = partCount.get(claudeId);
+  if (n == null) n = (await parts(claudeId)).length;
+  else n += 1;
+  partCount.set(claudeId, n);
+  if (n >= COMPACT_AT) await compactFromFile(claudeId, transcriptPath, to);
   return to;
+}
+
+/**
+ * Replace a conversation's parts with one: the transcript's first `to` bytes, from the local file.
+ * The whole part is written BEFORE anything is deleted, and `assemble` drops any later part it
+ * already covers, so a reader listing in between gets the same transcript either way.
+ */
+async function compactFromFile(claudeId, transcriptPath, to) {
+  const fd = fs.openSync(transcriptPath, 'r');
+  const whole = Buffer.allocUnsafe(to);
+  try { fs.readSync(fd, whole, 0, to, 0); } finally { fs.closeSync(fd); }
+  await replaceParts(claudeId, whole);
+}
+
+async function replaceParts(claudeId, whole) {
+  const first = partName(0);
+  const res = await fetch(`${SUPABASE_URL}/storage/v1/object/${BUCKET}/${claudeId}/${first}`, {
+    method: 'POST',
+    headers: auth({ 'Content-Type': 'application/x-ndjson', 'x-upsert': 'true' }),
+    body: whole,
+  });
+  if (!res.ok) throw new Error(`mirror compact ${res.status}: ${(await res.text()).slice(0, 160)}`);
+  const stale = (await parts(claudeId)).filter((n) => n !== first);
+  if (stale.length) {
+    const del = await fetch(`${SUPABASE_URL}/storage/v1/object/${BUCKET}`, {
+      method: 'DELETE',
+      headers: auth({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ prefixes: stale.map((n) => `${claudeId}/${n}`) }),
+    });
+    if (!del.ok) throw new Error(`mirror compact delete ${del.status}: ${(await del.text()).slice(0, 160)}`);
+  }
+  partCount.set(claudeId, 1);
+}
+
+/**
+ * Compact a mirror from what is in storage, for a conversation with no local file here — a parked
+ * session that will not upload again until it is resumed. Returns how many parts it had.
+ */
+export async function mirrorCompact(claudeId) {
+  const chunks = await fetchParts(claudeId);
+  if (chunks.length > 1) await replaceParts(claudeId, assemble(chunks));
+  return chunks.length;
 }
 
 /** Whether anything has been mirrored for a conversation — whether it can be resumed elsewhere. */
@@ -160,6 +214,7 @@ async function parts(claudeId) {
 /** Throw the mirror away — used when a transcript is rewritten under us. */
 export async function mirrorReset(claudeId) {
   uploadedTo.delete(claudeId);
+  partCount.delete(claudeId);
   let names;
   try { names = await parts(claudeId); } catch { return; }
   if (!names.length) return;
@@ -187,19 +242,11 @@ export function assemble(chunks) {
   return Buffer.concat(out);
 }
 
-/**
- * Assemble a mirrored transcript into this machine's project directory for `cwd`, ready to resume.
- *
- * Returns the file's path, or null if nothing has been mirrored — the honest answer for a session that
- * never wrote a whole line, and far better than resuming an empty one.
- */
-export async function mirrorDown(claudeId, cwd, { movedMidTurn = false } = {}) {
+/** Every part of a conversation's mirror, `[{ at, buf }]` in offset order. */
+async function fetchParts(claudeId) {
   const names = await parts(claudeId);
-  if (!names.length) return null;
-  // In parallel: a long session is hundreds of parts at ~0.4s a request, so fetched one at a time a
-  // 300-part transcript takes over two minutes, during which the session runs on no machine and this
-  // machine's command queue (drained serially) takes nothing else. Each part keeps its slot, because
-  // `assemble` relies on offset order.
+  // In parallel, so a mirror with many parts (one not compacted yet) still comes down in seconds.
+  // Each part keeps its slot, because `assemble` relies on offset order.
   const chunks = new Array(names.length);
   let next = 0;
   const fetchSome = async () => {
@@ -211,6 +258,18 @@ export async function mirrorDown(claudeId, cwd, { movedMidTurn = false } = {}) {
     }
   };
   await Promise.all(Array.from({ length: Math.min(MIRROR_FETCHES, names.length) }, fetchSome));
+  return chunks;
+}
+
+/**
+ * Assemble a mirrored transcript into this machine's project directory for `cwd`, ready to resume.
+ *
+ * Returns the file's path, or null if nothing has been mirrored — the honest answer for a session that
+ * never wrote a whole line, and far better than resuming an empty one.
+ */
+export async function mirrorDown(claudeId, cwd, { movedMidTurn = false } = {}) {
+  const chunks = await fetchParts(claudeId);
+  if (!chunks.length) return null;
   const dir = projectDir(cwd);
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, `${claudeId}.jsonl`);

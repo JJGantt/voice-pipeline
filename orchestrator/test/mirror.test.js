@@ -37,7 +37,7 @@ test('leaves a transcript with no trailing interrupt untouched', () => {
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { mirrorUp, assemble } from '../src/mirror.js';
+import { mirrorUp, assemble, mirrorDown, mirrorCompact } from '../src/mirror.js';
 
 function stubStorage() {
   const parts = new Map();   // offset -> bytes
@@ -48,6 +48,15 @@ function stubStorage() {
       await new Promise((r) => setTimeout(r, 5));   // an upload is not instant
       parts.set(Number(m[1]), Buffer.from(init.body));
       return new Response('{}', { status: 200 });
+    }
+    if (m) return new Response(parts.get(Number(m[1])), { status: 200 });   // a download
+    if (init.method === 'DELETE') {
+      for (const p of JSON.parse(init.body).prefixes) parts.delete(Number(/(\d{12})\.part$/.exec(p)[1]));
+      return new Response('[]', { status: 200 });
+    }
+    if (/\/object\/list\//.test(String(url))) {
+      const names = [...parts.keys()].map((o) => ({ name: `${String(o).padStart(12, '0')}.part` }));
+      return new Response(JSON.stringify(names), { status: 200 });
     }
     return new Response('[]', { status: 200 });
   };
@@ -100,4 +109,38 @@ test('assemble keeps only what an overlapping part adds', () => {
   const p = (at, t) => ({ at, buf: Buffer.from(t) });
   assert.equal(assemble([p(0, 'aaaa'), p(2, 'aabbb'), p(7, 'c')]).toString(), 'aaaabbbc');
   assert.equal(assemble([p(0, 'aaaa'), p(1, 'aa')]).toString(), 'aaaa');
+});
+
+test('past 20 parts the mirror is folded into one part holding the whole transcript', async () => {
+  const s = stubStorage();
+  try {
+    const lines = [];
+    const f = tmpFile('');
+    let at = 0;
+    for (let i = 0; i < 25; i++) {
+      const l = `{"turn":${i}}\n`;
+      lines.push(l);
+      fs.appendFileSync(f, l);
+      at = await mirrorUp('conv-compact', f, at);
+    }
+    // Compacted at the 20th part; five more appended after it.
+    assert.equal(s.parts.size, 6);
+    assert.equal(s.parts.get(0).toString(), lines.slice(0, 20).join(''));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mirror-down-'));
+    const out = await mirrorDown('conv-compact', dir);
+    try { assert.equal(fs.readFileSync(out, 'utf8'), lines.join('')); }
+    finally { fs.rmSync(path.dirname(out), { recursive: true, force: true }); }
+  } finally { s.restore(); }
+});
+
+test('mirrorCompact folds a stored mirror into one part without changing what it assembles to', async () => {
+  const s = stubStorage();
+  try {
+    s.parts.set(0, Buffer.from('{"a":1}\n'));
+    s.parts.set(8, Buffer.from('{"b":2}\n'));
+    s.parts.set(16, Buffer.from('{"c":3}\n'));
+    assert.equal(await mirrorCompact('conv-stored'), 3);
+    assert.deepEqual([...s.parts.keys()], [0]);
+    assert.equal(s.parts.get(0).toString(), '{"a":1}\n{"b":2}\n{"c":3}\n');
+  } finally { s.restore(); }
 });
