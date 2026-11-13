@@ -55,7 +55,7 @@ import { relayFirstReply } from '../orchestrator/src/relay.js';
 import { mirrorUp, mirrorDown, mirrorReset, mirrorHas } from '../orchestrator/src/mirror.js';
 // Where work goes when this machine cannot take it now, shared with the Mac (route.js).
 import { wakeFly, presenceReady, nextMachine, handedVerdict, Reroute, mirroredPayload, flyCommandFor,
-         MOVED_DEAD_MARKER, RESTARTED_MARKER, evacuateVerdict, movedTo, DESK_WORKER } from '../orchestrator/src/route.js';
+         MOVED_DEAD_MARKER, RESTARTED_MARKER, evacuateVerdict, staysOnMachine, movedTo, DESK_WORKER } from '../orchestrator/src/route.js';
 
 // Postgres and JS spell the same instant differently, so timestamps are compared as instants.
 const TS_COLUMNS = new Set(['reply_at', 'active_at', 'ended', 'mirror_at', 'last_seen']);
@@ -1238,8 +1238,13 @@ async function run(cmd) {
     if (!worker) throw new Error(`unknown machine to evacuate: ${JSON.stringify(machine)}`);
     if (worker === WORKER) return `${machine} is this machine, and it is up — nothing moved`;
     const rows = await sb(`desk_sessions?worker=eq.${worker}&status=eq.resident&select=*`);
-    const moved = [], stuck = [];
+    const ids = (rows || []).map((r) => r.claude_session_id).filter(Boolean);
+    const used = ids.length ? await sb(`desk_sessions?worker=eq.${worker}&claude_session_id=in.(${ids.join(',')})`
+      + `&or=(touched_at.not.is.null,origin.eq.adopted)&select=claude_session_id`) : [];
+    const usedHere = new Set((used || []).map((r) => r.claude_session_id));
+    const moved = [], stuck = [], kept = [];
     for (const row of rows || []) {
+      if (staysOnMachine(machine, row, usedHere)) { kept.push(row.id); continue; }
       if (row.agent === 'codex' || !row.claude_session_id) {
         stuck.push(`${row.id} (${row.agent === 'codex' ? 'a Codex session' : 'no conversation'})`);
         continue;
@@ -1266,7 +1271,8 @@ async function run(cmd) {
       }
     }
     if (stuck.length) console.error(`[pi-desk] evacuating ${machine}: could not move ${stuck.join(', ')}`);
-    return evacuateVerdict(machine, moved, stuck);
+    if (kept.length) console.log(`[pi-desk] evacuating ${machine}: kept ${kept.join(', ')} (used at the Mac)`);
+    return evacuateVerdict(machine, moved, stuck, kept);
   }
 
   if (cmd.kind !== 'open_session') throw new Error(`unknown kind ${cmd.kind}`);

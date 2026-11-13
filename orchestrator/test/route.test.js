@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { nextMachine, presenceReady, handedVerdict, flyCommandFor, evacuateVerdict } from '../src/route.js';
+import { nextMachine, presenceReady, handedVerdict, flyCommandFor, evacuateVerdict, staysOnMachine } from '../src/route.js';
 
 const NOW = Date.parse('2026-11-12T12:00:00Z');
 const beat = (agoS, info = {}) => ({ last_seen: new Date(NOW - agoS * 1000).toISOString(), info });
@@ -79,4 +79,16 @@ test('a process started after the move is a deliberate resume and is not fenced'
   const other = new Map([['conv', { worker: 'pi-desk', started: ended }]]);
   assert.equal(movedTo({ ...row, status: 'resident' }, other, Date.parse(ended) - 1), 'pi');
   assert.equal(movedTo({ ...row, status: 'resident' }, other, Date.parse(ended) + 1), null);
+});
+
+test('an evacuation of the Mac leaves the sessions Jared used there', () => {
+  const none = new Set();
+  assert.equal(staysOnMachine('mac', { origin: 'adopted', claude_session_id: 'a' }, none), true);
+  assert.equal(staysOnMachine('mac', { origin: 'dispatched', touched_at: '2026-11-13T15:00:00Z', claude_session_id: 'b' }, none), true);
+  // Moved back to the Mac under a new row: the mark is on an earlier row of the same conversation.
+  assert.equal(staysOnMachine('mac', { origin: 'dispatched', touched_at: null, claude_session_id: 'c' }, new Set(['c'])), true);
+  assert.equal(staysOnMachine('mac', { origin: 'dispatched', touched_at: null, claude_session_id: 'd' }, none), false);
+  assert.equal(staysOnMachine('pi', { origin: 'adopted', touched_at: 'x', claude_session_id: 'e' }, new Set(['e'])), false);
+  assert.equal(evacuateVerdict('mac', ['m-1'], [], ['m-2']),
+               'evacuated 1 session(s) from mac: m-1; could not move: none; kept, used at the Mac: m-2');
 });

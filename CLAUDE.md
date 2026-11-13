@@ -188,7 +188,9 @@ stops beating, which is correct: its sessions are frozen too. The responder decl
 it is live. The consumer that takes it claims every resident session of that machine's worker by marking
 its row `transferred` (conditional on it still being resident, so only one machine wins each), resumes
 it from the mirror, and restarts a session that was mid-turn with `MOVED_DEAD_MARKER`. Codex sessions and
-ones with nothing mirrored cannot move; they are named in the answer and reported as errors.
+ones with nothing mirrored cannot move; they are named in the answer and reported as errors. A Mac
+session Jared opened by hand or typed into at the Mac never moves (`route.js` `staysOnMachine`): it is
+work in front of him, and a closed lid or a Wi-Fi drop must not take it away.
 
 The machine that comes back must not keep a moved session (**fencing**): each reconcile tick closes a
 live process whose row is `transferred`, or whose conversation another worker holds resident, when the

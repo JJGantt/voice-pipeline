@@ -110,9 +110,20 @@ export const RESTARTED_MARKER = (machine) => `[This machine (${machine}) restart
   + 'continuing, then carry on with the task.]';
 
 /** The evacuate command's answer. */
-export function evacuateVerdict(machine, moved, stuck) {
+export function evacuateVerdict(machine, moved, stuck, kept = []) {
   return `evacuated ${moved.length} session(s) from ${machine}: ${moved.join(', ') || 'none'}`
-    + `; could not move: ${stuck.join(', ') || 'none'}`;
+    + `; could not move: ${stuck.join(', ') || 'none'}`
+    + (kept.length ? `; kept, used at the Mac: ${kept.join(', ')}` : '');
+}
+
+/**
+ * Whether an evacuation of `machine` leaves this conversation where it is. A Mac session Jared opened
+ * by hand or typed into at the Mac is his work in front of him: it is never moved off the Mac, however
+ * long the Mac is silent (a closed lid, a Wi-Fi drop). `usedHere` is the set of conversation ids with
+ * any Mac row that is `adopted` or carries `touched_at`, so a session he moved back keeps the mark.
+ */
+export function staysOnMachine(machine, row, usedHere) {
+  return machine === 'mac' && (row.origin === 'adopted' || !!row.touched_at || usedHere.has(row.claude_session_id));
 }
 
 /**
