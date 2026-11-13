@@ -524,10 +524,24 @@ async function mirrorAsWritten(id, tpath) {
 // several outlasts the interval — and a second tick started on rows read before the first wrote
 // anything would act on stale state: it parked a session the first had just found typed into.
 let ticking = false;
+let again = false;
 async function tickOnce() {
   if (ticking) return;
   ticking = true;
-  try { await tick(); } finally { ticking = false; }
+  try {
+    do { again = false; await tick(); } while (again);
+  } finally { ticking = false; }
+}
+
+/**
+ * Run a tick now rather than at the next interval: a session just bound to its transcript is watched
+ * from launch, not up to PRESENCE_MS later, which is longer than the hub waits for its first frame
+ * (status-hub `unconfirmedThread`). A tick already running read its rows before the bind, so it is
+ * followed by one more.
+ */
+export function tickSoon() {
+  if (ticking) { again = true; return; }
+  tickOnce().catch((e) => console.error('[desk-sessions] tick:', e.message));
 }
 
 export function startDeskSessions() {

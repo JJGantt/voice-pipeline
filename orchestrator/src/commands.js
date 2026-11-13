@@ -36,7 +36,7 @@ import { awaitCodexOn, codexSessionOf, codexReady } from './codex.js';
 
 /** The conversation a row's process is in, read the way its agent records it. */
 const sessionFor = (row) => (!row?.pid ? null : row.agent === 'codex' ? codexSessionOf(row.pid) : sessionOf(row.pid));
-import { beginLaunch, endLaunch } from './deskSessions.js';
+import { beginLaunch, endLaunch, tickSoon } from './deskSessions.js';
 import { watchTable } from './realtime.js';
 import { isKnownRepo } from './repos.js';
 
@@ -401,7 +401,8 @@ async function run(cmd) {
       if (!s) return console.log(`[commands] no ${agent} came up on ${tty} for ${sessionId} (checkLaunch reports it)`);
       console.log(`[commands] ${sessionId} -> ${agent} session ${s.claudeId}`);
       noteStarted(tty);
-      return patchDeskSession(sessionId, { pid: s.pid, claude_session_id: s.claudeId, transcript_path: s.transcriptPath });
+      return patchDeskSession(sessionId, { pid: s.pid, claude_session_id: s.claudeId, transcript_path: s.transcriptPath })
+        .then(tickSoon);
     }).catch((e) => console.error('[commands] session:', e.message));
   }
 

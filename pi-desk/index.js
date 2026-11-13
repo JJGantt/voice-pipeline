@@ -964,7 +964,7 @@ async function bindWhenUp(session, { attempts = 90, delayMs = 1000, agent = 'cla
       return sb(`desk_sessions?id=eq.${encodeURIComponent(session)}`, {
         method: 'PATCH', headers: { Prefer: 'return=minimal' },
         body: JSON.stringify({ pid: me.pid, claude_session_id: s.claudeId, transcript_path: s.transcriptPath }),
-      });
+      }).then(reconcileSoon);
     }
     await new Promise((r) => setTimeout(r, delayMs));
   }
@@ -1633,9 +1633,27 @@ pollTimer = setTimeout(pollLoop, POLL_DEGRADED_MS);
 // Every caller goes through here: a bare call let one Supabase connect timeout become an unhandled
 // rejection that exited the process. The next tick re-reads everything, so one failure warns and the
 // second in a row is an error. Single blips arrive about daily; a minute-long outage is rarer and real.
+// One pass at a time, as on the Mac (deskSessions.js `tickOnce`): a pass that parks sessions can outlast
+// the interval, and a second pass on rows read before the first wrote anything acts on stale state.
 const reconcileStreak = streak('[pi-desk] reconcile', { failures: 2 });
-function reconcile() {
-  reconcileSessions().then(() => reconcileStreak.ok(), (e) => reconcileStreak.fail(e));
+let reconciling = false;
+let reconcileAgain = false;
+async function reconcile() {
+  if (reconciling) return;
+  reconciling = true;
+  try {
+    do {
+      reconcileAgain = false;
+      await reconcileSessions().then(() => reconcileStreak.ok(), (e) => reconcileStreak.fail(e));
+    } while (reconcileAgain);
+  } finally { reconciling = false; }
+}
+// A pass now rather than at the next interval, so a session just bound to its transcript is watched from
+// launch, not up to PRESENCE_MS later, which is longer than the hub waits for its first frame (status-hub
+// `unconfirmedThread`). A pass already running read its rows before the bind, so one more follows it.
+function reconcileSoon() {
+  if (reconciling) reconcileAgain = true;
+  else reconcile();
 }
 reconcile();
 setInterval(() => { if (!FLY) ops.beat(Math.max(60, PRESENCE_MS / 1000)); reconcile(); }, PRESENCE_MS);
