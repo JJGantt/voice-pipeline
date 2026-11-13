@@ -129,7 +129,10 @@ async function fence(id, tty, where) {
 async function adopt(s, rows, elsewhere) {
   const tail = readTail(s.transcriptPath);
   const startedIso = new Date(s.startedAt).toISOString();
-  const existing = rows.find((r) => r.claude_session_id === s.claudeId);
+  // A conversation can have several rows (each resume or move writes one); the latest is the one it
+  // is running as now, and an older evicted row must not be revived or named in its place.
+  const existing = rows.filter((r) => r.claude_session_id === s.claudeId)
+    .sort((a, b) => ms(b.started) - ms(a.started))[0];
   // A process left running from before its session was moved elsewhere is closed, not revived. One
   // started after the move is a resume by hand, and is the user's.
   const where = movedTo(existing || { claude_session_id: s.claudeId, status: null }, elsewhere, s.startedAt);
