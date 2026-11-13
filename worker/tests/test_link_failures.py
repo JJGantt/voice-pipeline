@@ -1,8 +1,10 @@
 """How a failing realtime link is reported: a link failure (DNS, refused, reset — every Mac wake starts
 with a few) is a warning until connects have failed for TRANSPORT_RAISE_S straight, then one error for
 the streak; any other failure is an error at once; a SUBSCRIBED ends the streak. realtime-py's own
-retry and give-up records are re-levelled to WARNING, because connect() re-raises to the waker."""
+retry and give-up records are re-levelled to WARNING, because connect() re-raises to the waker. A
+background task of realtime-py's own that dies unawaited is an occurrence; any other one stays an error."""
 
+import asyncio
 import logging
 import socket
 import sys
@@ -61,3 +63,32 @@ def test_realtime_retry_and_give_up_records_are_warnings(load):
         r = logging.LogRecord("realtime._async.client", logging.ERROR, "", 0, msg, None, None)
         h.w._demote_realtime_retry(r)
         assert r.levelno == level, msg
+
+
+class AsyncRealtimeClient:   # named as realtime-py's, so its task's coroutine qualname matches
+    async def _heartbeat(self):
+        raise ValueError("Set of Tasks/Futures is empty.")
+
+
+def test_unretrieved_task_failure_is_an_occurrence_only_for_the_realtime_client(load, monkeypatch):
+    w, out = waker(load, monkeypatch)
+    wk = sys.modules["voice_worker.waker"]
+    occ = []
+    monkeypatch.setattr(wk, "log_occurrence", lambda m: occ.append(m))
+
+    async def other():
+        raise ValueError("boom")
+
+    loop = asyncio.new_event_loop()
+    default = []
+    monkeypatch.setattr(loop, "default_exception_handler", lambda ctx: default.append(ctx))
+    try:
+        for coro in (AsyncRealtimeClient()._heartbeat(), other()):
+            task = loop.create_task(coro)
+            loop.run_until_complete(asyncio.wait([task]))
+            w._on_loop_exception(loop, {"message": "Task exception was never retrieved",
+                                        "exception": task.exception(), "future": task})
+    finally:
+        loop.close()
+    assert len(occ) == 1 and "AsyncRealtimeClient._heartbeat" in occ[0] and "Set of Tasks" in occ[0]
+    assert len(default) == 1 and str(default[0]["exception"]) == "boom"

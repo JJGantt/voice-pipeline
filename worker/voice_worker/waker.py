@@ -49,6 +49,7 @@ class RealtimeWaker:
 
     def _run(self) -> None:
         asyncio.set_event_loop(self._loop)
+        self._loop.set_exception_handler(self._on_loop_exception)
         try:
             self._loop.run_until_complete(self._serve())
         except Exception as e:  # noqa: BLE001
@@ -91,6 +92,22 @@ class RealtimeWaker:
                 pass
             if runstate._running:
                 await asyncio.sleep(5.0)
+
+    def _on_loop_exception(self, loop, context) -> None:
+        """realtime-py runs its listen and heartbeat as fire-and-forget tasks, and on one dropped socket
+        both start a reconnect; the second finds no channel left to rejoin and dies in
+        asyncio.wait([]) ("Set of Tasks/Futures is empty"). Nothing awaits that task, so asyncio reports
+        "Task exception was never retrieved" at ERROR. The client is already handled: _serve sees
+        is_connected go false (or the 5-min recycle comes round) and rebuilds it. So a failed task of
+        the client's own is an occurrence; anything else keeps the default ERROR path."""
+        fut = context.get("future")
+        exc = context.get("exception")
+        coro = getattr(fut, "get_coro", lambda: None)() if fut is not None else None
+        name = getattr(coro, "__qualname__", "") or ""
+        if exc is not None and name.startswith("AsyncRealtimeClient."):
+            log_occurrence(f"realtime-py task {name} failed: {type(exc).__name__}: {exc} (waker rebuilds the client)")
+            return
+        loop.default_exception_handler(context)
 
     def _on_change(self, payload) -> None:
         """Wake on any voice_requests change that leaves a row CLAIMABLE (status 'pending').
