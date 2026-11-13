@@ -7,6 +7,8 @@
 //      has one, otherwise launch Terminal and run there.
 //   3. openFreshTab(cwd, name): the same tab-opening, but starting a NEW
 //      remote-controlled session — what the hub's repo picker fires.
+//      An incident session runs headless in tmux instead (tmux.js); the
+//      tty-addressed calls here route a tmux pane's tty there.
 //
 // Read-only helpers (enumerateTtys, ttyForSession) are SAFE to call anytime.
 import { execFile } from 'node:child_process';
@@ -17,7 +19,8 @@ import path from 'node:path';
 import { config } from './config.js';
 import { findSessionFile } from './sessions.js';
 import { typeable } from './handoff.js';
-import { claudeBinFor, claudeBinForSession } from './incident.js';
+import { claudeBinFor, claudeBinForSession, isIncident } from './incident.js';
+import { tmuxNameForTty, runInTmux, sendToTmux, closeTmux, killTmux } from './tmux.js';
 
 const execFileP = promisify(execFile);
 
@@ -127,6 +130,12 @@ async function claudePidOnTty(tty) {
 
 export async function closeTabForTty(tty) {
   if (!tty) return false;
+  const headless = await tmuxNameForTty(tty);
+  if (headless) {
+    if (!(await claudePidOnTty(tty))) { await killTmux(headless); return false; }
+    await closeTmux(headless, tty, claudePidOnTty);
+    return true;
+  }
   const running = await osascript(
     'tell application "System Events" to (exists process "Terminal")'
   );
@@ -170,6 +179,14 @@ export async function closeTabForTty(tty) {
  */
 export async function closeHuskForTty(tty) {
   if (!tty) return false;
+  // A headless session's tmux session ends with its command, so there is normally no husk; one still
+  // there with nothing on its tty is cleared all the same.
+  const headless = await tmuxNameForTty(tty);
+  if (headless) {
+    if (await claudePidOnTty(tty)) return false;
+    await killTmux(headless);
+    return true;
+  }
   try {
     const { stdout } = await execFileP('ps', ['-t', tty.replace('/dev/', ''), '-o', 'pid='], { timeout: 10000 });
     if (stdout.trim()) return false;
@@ -217,6 +234,8 @@ const ESC = 'character id 27';
 
 export async function sendToTty(tty, text) {
   const line = typeable(text);
+  const headless = await tmuxNameForTty(tty);
+  if (headless) { await sendToTmux(headless, line); return line; }
   // An AppleScript string literal cannot hold a raw line break, so each is written as `linefeed` joined
   // into the string; inside the bracketed paste it lands in the composer as a line break, not a submit.
   const escaped = line.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r\n|\r|\n/g, '" & linefeed & "');
@@ -387,7 +406,11 @@ export async function openFreshTab(cwd, name, prompt, sessionId = null, resumeId
   // ends, however it ends, the shell goes too. With the profile's "When the shell exits: Close if the
   // shell exited cleanly" the tab then closes itself. Without that setting it is left as "[Process
   // completed]", which closeHuskForTty clears.
-  const raw = await runInNewTerminal(`cd ${shQuote(cwd)}; ${env}${shQuote(bin)}${model}${resume}${rc}${sys}${first}; exit 0`);
+  const cmd = `cd ${shQuote(cwd)}; ${env}${shQuote(bin)}${model}${resume}${rc}${sys}${first}; exit 0`;
+  // An incident session is nobody's to watch, so it runs headless instead of opening a tab (tmux.js).
+  const raw = isIncident(label)
+    ? await runInTmux(sessionId || `desk-${Date.now().toString(36)}`, cmd)
+    : await runInNewTerminal(cmd);
   // The Remote Control name is unique to this launch; without one, the resumed id; failing both, claude.
   return checkLaunch(raw, rcName || resumeId || bin, `session ${sessionId || rcName || cwd}`);
 }
