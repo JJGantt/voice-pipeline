@@ -131,7 +131,7 @@ commit it.
 - `src/focus.js` — focus watcher / reconciler.
 - `src/pty.js` — single active-pty manager + client fan-out.
 - `src/applescript.js` — lsof→tty, Terminal tab enumerate/close/reopen.
-- `src/tmux.js` — headless incident sessions: a tmux session (`tmux -L desk`) instead of a tab.
+- `src/tmux.js` — freshly launched incident sessions: a tmux session (`tmux -L desk`) instead of a tab (a resumed one opens a tab).
 - `src/sessions.js` — session-file parsing + registry scan (pure helpers + FS).
 - `src/registry.js` — registry publish loop.
 - `src/repos.js` — the `~/repos` scan that publishes the `repos` table.

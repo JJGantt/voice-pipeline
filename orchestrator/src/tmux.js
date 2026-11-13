@@ -1,6 +1,7 @@
 // Headless sessions on the Mac: a tmux session instead of a Terminal tab, so nothing opens on the
-// screen. Incident sessions run this way (applescript.js openFreshTab); everything else still opens a
-// tab, because those are sessions Jared may want in front of him.
+// screen. A freshly launched incident session runs this way (applescript.js openFreshTab); everything
+// else opens a tab, because those are sessions Jared may want in front of him. That includes an
+// incident session resumed or moved to the Mac: bringing a session here is asking to see it.
 //
 // A tmux pane has a tty of its own, and the tty is the handle the rest of the orchestrator keeps
 // (`desk_sessions.tty`, discover.js, checkLaunch). So a headless session is the same row as a tab

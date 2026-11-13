@@ -7,7 +7,8 @@
 //      has one, otherwise launch Terminal and run there.
 //   3. openFreshTab(cwd, name): the same tab-opening, but starting a NEW
 //      remote-controlled session — what the hub's repo picker fires.
-//      An incident session runs headless in tmux instead (tmux.js); the
+//      A freshly launched incident session runs headless in tmux instead
+//      (tmux.js); a resumed one opens a tab like any other. The
 //      tty-addressed calls here route a tmux pane's tty there.
 //
 // Read-only helpers (enumerateTtys, ttyForSession) are SAFE to call anytime.
@@ -407,8 +408,9 @@ export async function openFreshTab(cwd, name, prompt, sessionId = null, resumeId
   // shell exited cleanly" the tab then closes itself. Without that setting it is left as "[Process
   // completed]", which closeHuskForTty clears.
   const cmd = `cd ${shQuote(cwd)}; ${env}${shQuote(bin)}${model}${resume}${rc}${sys}${first}; exit 0`;
-  // An incident session is nobody's to watch, so it runs headless instead of opening a tab (tmux.js).
-  const raw = isIncident(label)
+  // A fresh incident session is nobody's to watch, so it runs headless instead of opening a tab
+  // (tmux.js). A resume is a session brought to the Mac on purpose, so it always opens a tab.
+  const raw = isIncident(label) && !resumeId
     ? await runInTmux(sessionId || `desk-${Date.now().toString(36)}`, cmd)
     : await runInNewTerminal(cmd);
   // The Remote Control name is unique to this launch; without one, the resumed id; failing both, claude.
