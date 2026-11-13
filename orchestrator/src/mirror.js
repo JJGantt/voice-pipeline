@@ -19,6 +19,7 @@ import { projectDir } from './transcripts.js';
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://felyggqjjhltwokdfhop.supabase.co';
 const BUCKET = 'transcripts';
+const MIRROR_FETCHES = 16;   // parallel part downloads in mirrorDown
 const key = () => process.env.SUPABASE_KEY || '';
 const auth = (extra = {}) => ({ apikey: key(), Authorization: `Bearer ${key()}`, ...extra });
 // Offsets are the sort key, and lexical order has to match numeric order.
@@ -195,12 +196,21 @@ export function assemble(chunks) {
 export async function mirrorDown(claudeId, cwd, { movedMidTurn = false } = {}) {
   const names = await parts(claudeId);
   if (!names.length) return null;
-  const chunks = [];
-  for (const n of names) {
-    const res = await fetch(`${SUPABASE_URL}/storage/v1/object/${BUCKET}/${claudeId}/${n}`, { headers: auth() });
-    if (!res.ok) throw new Error(`mirrorDown ${n} ${res.status}`);
-    chunks.push({ at: Number.parseInt(n, 10), buf: Buffer.from(await res.arrayBuffer()) });
-  }
+  // In parallel: a long session is hundreds of parts at ~0.4s a request, so fetched one at a time a
+  // 300-part transcript takes over two minutes, during which the session runs on no machine and this
+  // machine's command queue (drained serially) takes nothing else. Each part keeps its slot, because
+  // `assemble` relies on offset order.
+  const chunks = new Array(names.length);
+  let next = 0;
+  const fetchSome = async () => {
+    while (next < names.length) {
+      const i = next++;
+      const res = await fetch(`${SUPABASE_URL}/storage/v1/object/${BUCKET}/${claudeId}/${names[i]}`, { headers: auth() });
+      if (!res.ok) throw new Error(`mirrorDown ${names[i]} ${res.status}`);
+      chunks[i] = { at: Number.parseInt(names[i], 10), buf: Buffer.from(await res.arrayBuffer()) };
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(MIRROR_FETCHES, names.length) }, fetchSome));
   const dir = projectDir(cwd);
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, `${claudeId}.jsonl`);
