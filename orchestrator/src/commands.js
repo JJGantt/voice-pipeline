@@ -45,7 +45,7 @@ import { isKnownRepo } from './repos.js';
 const [MOVED_NOTE, MOVED_MID_TURN, MOVED_BETWEEN_TURNS] = fs.readFileSync(new URL('../moved-session.txt', import.meta.url), 'utf8')
   .split(/^---$/m).map((s) => s.trim());
 import { ensureTrusted } from './trust.js';
-import { openFreshTab, openCodexTab, sendToTty, closeTabForTty } from './applescript.js';
+import { openFreshTab, openCodexTab, sendToTty, closeTabForTty, noteStarted } from './applescript.js';
 import { isIncident } from './incident.js';
 import { withAttachments, transcriptSize, awaitSubmitted } from './handoff.js';
 import { expectPrompt } from './sessionWatch.js';
@@ -400,6 +400,7 @@ async function run(cmd) {
     (agent === 'codex' ? awaitCodexOn(tty, startedAt) : awaitSessionOn(tty, startedAt)).then((s) => {
       if (!s) return console.log(`[commands] no ${agent} came up on ${tty} for ${sessionId} (checkLaunch reports it)`);
       console.log(`[commands] ${sessionId} -> ${agent} session ${s.claudeId}`);
+      noteStarted(tty);
       return patchDeskSession(sessionId, { pid: s.pid, claude_session_id: s.claudeId, transcript_path: s.transcriptPath });
     }).catch((e) => console.error('[commands] session:', e.message));
   }

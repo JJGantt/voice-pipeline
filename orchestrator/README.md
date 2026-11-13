@@ -105,7 +105,9 @@ WebSocket cannot set that header, so `/term` is for header-capable clients only 
    a resume, a move from the Pi, Codex) is checked once 30s later: the tty it was
    typed into must be running a process carrying that launch's marker (its Remote
    Control name, else its resume id), and `[launch] … did not start` goes to the
-   ops responder as an error when it is not (`checkLaunch`).
+   ops responder as an error when it is not (`checkLaunch`). A dispatched session
+   seen coming up on that tty (`awaitSessionOn` → `noteStarted`) counts as started
+   even if it has finished and exited before the check runs.
 3. PATCH `voice_focus` id=1: `terminal_url = null`.
 
 ## Session registry

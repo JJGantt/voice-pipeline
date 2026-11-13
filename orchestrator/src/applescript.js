@@ -341,17 +341,26 @@ async function runInNewTerminal(shellCmd) {
 // command reported success. So, once per launch, LAUNCH_CHECK_MS later, the tty it was typed into must
 // be running a process whose command line carries `marker` — something unique to this launch where
 // there is one — and an error goes to the ops responder when it is not.
+// A session that does its work and exits inside that window (an incident run that only escalates) is
+// gone by the time `ps` looks, so a sighting of it on the tty after the launch (commands.js, through
+// noteStarted) also counts as started.
 const LAUNCH_CHECK_MS = 30_000;
+const startedOn = new Map(); // tty -> when a session launched there was seen running
+export function noteStarted(tty) { if (tty) startedOn.set(tty, Date.now()); }
 function checkLaunch(raw, marker, what) {
   const tty = String(raw).split('\t')[1] || '';
   if (!tty) {
     console.error(`[launch] ${what}: Terminal reported no tty, so whether it started cannot be checked`);
     return raw;
   }
+  const launchedAt = Date.now();
   setTimeout(() => {
+    const seen = startedOn.get(tty);
+    startedOn.delete(tty);
     // `ps -t` exits 1 when nothing is on the tty at all, which is the same answer as no match.
     execFile('ps', ['-t', tty.replace(/^\/dev\//, ''), '-o', 'command='], (_err, out) => {
       if (String(out || '').includes(marker)) return;
+      if (seen >= launchedAt) return console.log(`[launch] ${what} started on ${tty} and has already exited`);
       console.error(`[launch] ${what} did not start: ${LAUNCH_CHECK_MS / 1000}s after its command was typed into ${tty}, nothing there is running ${marker}`);
     });
   }, LAUNCH_CHECK_MS).unref();
