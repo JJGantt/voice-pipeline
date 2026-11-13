@@ -15,7 +15,11 @@ import { promisify } from 'node:util';
 const execFileP = promisify(execFile);
 export const SOCKET = 'desk';
 
-const tmux = (args) => execFileP('tmux', ['-L', SOCKET, '-f', '/dev/null', ...args], { timeout: 10000 })
+// launchd gives the orchestrator no locale, and without a UTF-8 one tmux prints a tab in a format as
+// `_` and mangles non-ASCII text pasted into a session. `-u` and LANG fix both; the server hands LANG
+// on to every pane, so claude there runs in UTF-8 as it does in a Terminal tab.
+const env = { ...process.env, LANG: process.env.LANG || 'en_US.UTF-8' };
+const tmux = (args) => execFileP('tmux', ['-u', '-L', SOCKET, '-f', '/dev/null', ...args], { timeout: 10000, env })
   .then((r) => r.stdout.trim());
 
 /** The tmux session whose pane is on `tty`, or null (also when no server is running). */
