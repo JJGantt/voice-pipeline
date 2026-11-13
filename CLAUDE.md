@@ -363,10 +363,18 @@ Sessions open as WINDOWS, not tabs, until the orchestrator's `/usr/local/bin/nod
 Accessibility grant: a tab needs a Cmd-T keystroke, and the plain `do script` fallback opens a window
 whatever `AppleWindowTabbingMode` says. The out log's `tab failed` lines are this.
 
+**Incident sessions (label `Incident: …`) open no tab at all: they run headless in tmux**, on a private
+server (`tmux -L desk`), the way the Pi and Fly run every session (`orchestrator/src/tmux.js`). The
+pane's tty is the row's `tty` like any tab's, and `sendToTty`, `closeTabForTty` and `closeHuskForTty`
+route a tty that belongs to that server to tmux. Watch one with `tmux -L desk attach -t <mac-…>`.
+Every tmux call runs with `-u` and a UTF-8 `LANG`: launchd gives the orchestrator no locale, and
+without one tmux prints a tab in a `-F` format as `_` (the pane lookup then misses and a follow-up
+falls through to Terminal) and mangles non-ASCII pasted text.
+
 ## Typing into a running session: short text only, and "sent" means the transcript has it
 
 Both machines put a follow-up into a live session by typing it — the Mac into a Terminal tab's tty
-(`sendToTty`), the Pi into a tmux pane (`typeInto` in `pi-desk/sessions.js`). What they type and how
+(`sendToTty`, or the tmux pane of a headless incident session), the Pi into a tmux pane (`typeInto` in `pi-desk/sessions.js`). What they type and how
 they confirm it is one contract, in `orchestrator/src/handoff.js`:
 
 - **A message of any length is pasted as it is.** Past about 800 characters or 4 lines Claude Code wraps
