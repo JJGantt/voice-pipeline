@@ -478,7 +478,7 @@ function attach(st) {
         st.mirrorTimer = setTimeout(() => {
           st.mirrorTimer = null;
           Promise.resolve().then(() => st.onAppend(st.id, st.path))
-            .catch((e) => console.error('[sessionWatch] mirror as written:', e.message));
+            .catch((e) => console.warn('[sessionWatch] mirror as written (will retry):', e.message));
         }, MIRROR_EVERY_MS);
       }
     });
