@@ -183,7 +183,9 @@ same rule, and a machine whose login has expired cannot take work, so it goes to
 
 pi-desk on the Pi and the Mac orchestrator POST `https://ops-responder.fly.dev/live` every 5s
 (`orchestrator/src/live.js`, `OPS_TOKEN` from the environment or `~/.config/ops/env`). A sleeping Mac
-stops beating, which is correct: its sessions are frozen too. The responder declares a machine down after
+stops beating, which is correct: its sessions are frozen too. A beat that fails while the machine is awake is a counted
+occurrence sorted by where it failed (`network down`: the machine's own network, the awake twin of a closed
+lid; `responder unreachable`; `answered <status>`), with the cause on a second line of the warning. The responder declares a machine down after
 15s of silence and writes an `evacuate` command (`{machine}`) for Fly, or for the other home machine when
 it is live. The consumer that takes it claims every resident session of that machine's worker by marking
 its row `transferred` (conditional on it still being resident, so only one machine wins each), resumes
