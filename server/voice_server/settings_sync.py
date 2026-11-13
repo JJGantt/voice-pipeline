@@ -17,6 +17,7 @@ SETTINGS_POLL_S = 60.0          # backstop re-read of the flags (catches a chang
                                 # realtime applies changes instantly via _on_setting, so this is only the
                                 # rare-miss net, and SETTINGS_SOCKET_MAX_S recycles a half-open socket independently
 SETTINGS_SOCKET_MAX_S = 300.0   # recycle the realtime socket this often so a half-open one can't stay deaf
+RECONCILE_GRACE_S = 5.0        # how long realtime gets to deliver a change the poll saw first
 _MODE_KEYS = ["wakefree_enabled", "voice_muted", "voice_inject_mode", "wakefree_autooff_at", "esp_mic_enabled"]
 
 
@@ -28,20 +29,33 @@ def _on_setting(payload) -> None:
         log.error("settings apply failed: %s", e)
 
 
-def _reconcile(s: dict) -> None:
-    """Apply anything in a fresh read of the flags that drifted from the in-memory state — catches (and
-    logs) a change realtime silently dropped, so a half-open socket can't leave the ESP mute / inject /
-    wake-free stuck on a stale value."""
+def _drift(s: dict) -> dict:
+    """The flags in a fresh read that differ from the in-memory state."""
     st = modes.state
-    for k, cur in (("voice_muted", st.suppressed), ("voice_inject_mode", st.inject),
-                   ("wakefree_enabled", st.wakefree), ("esp_mic_enabled", not st.esp_off)):
-        if k in s and modes.truthy(s[k]) != cur:
-            log.warning("settings backstop: realtime missed %s → applying from poll", k)
-            modes.apply_setting(k, s[k])
+    out = {k: s[k] for k, cur in (("voice_muted", st.suppressed), ("voice_inject_mode", st.inject),
+                                  ("wakefree_enabled", st.wakefree), ("esp_mic_enabled", not st.esp_off))
+           if k in s and modes.truthy(s[k]) != cur}
     if ("wakefree_autooff_at" in s
             and bool(str(s["wakefree_autooff_at"] or "").strip()) != st.ao_braked):
-        log.warning("settings backstop: realtime missed wakefree_autooff_at → applying from poll")
-        modes.apply_setting("wakefree_autooff_at", s["wakefree_autooff_at"])
+        out["wakefree_autooff_at"] = s["wakefree_autooff_at"]
+    return out
+
+
+async def _reconcile(s: dict) -> None:
+    """Apply anything in a fresh read of the flags that drifted from the in-memory state — catches (and
+    logs) a change realtime silently dropped, so a half-open socket can't leave the ESP mute / inject /
+    wake-free stuck on a stale value.
+
+    Drift alone is not a miss: the read can land in the moment between a write and its realtime event
+    (push-to-talk flips voice_muted every few seconds, and the /capture-o fast-path changes the state
+    before the DB does). So drift is re-read after RECONCILE_GRACE_S, and only what still differs is a
+    miss."""
+    if not _drift(s):
+        return
+    await asyncio.sleep(RECONCILE_GRACE_S)
+    for k, v in _drift(await asyncio.to_thread(db.get_settings, _MODE_KEYS)).items():
+        log.warning("settings backstop: realtime missed %s → applying from poll", k)
+        modes.apply_setting(k, v)
 
 
 async def listen() -> None:
@@ -75,7 +89,7 @@ async def listen() -> None:
             while sock.is_connected and (time.monotonic() - started) < SETTINGS_SOCKET_MAX_S:
                 await asyncio.sleep(SETTINGS_POLL_S)
                 try:
-                    _reconcile(await asyncio.to_thread(db.get_settings, _MODE_KEYS))
+                    await _reconcile(await asyncio.to_thread(db.get_settings, _MODE_KEYS))
                 except Exception as e:  # noqa: BLE001
                     log.warning("settings backstop poll failed: %s", e)
             log.info("settings listener recycling realtime socket (connected=%s)", sock.is_connected)

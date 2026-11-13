@@ -109,7 +109,7 @@ the server to accept the ESP. Firmware flashed before the token existed cannot c
 ## Tests
 
 Three suites, each covering what is costly to break and nothing else: the worker's claiming,
-failover, dedupe and press-provenance gate (`worker/tests`), the voice server's token auth
+failover, dedupe and press-provenance gate (`worker/tests`), the voice server's token auth and settings backstop
 (`server/tests`), and the orchestrator's auth and transcript handling (`orchestrator/test`). They
 stub only outside services (Supabase, Claude, Groq). From the repo root:
 
