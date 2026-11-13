@@ -311,7 +311,7 @@ up — one transcript here is 16MB and a turn adds tens of KB — as `<claude_se
 `desk_sessions.mirror_offset` is how much is already there. `mirrorUp` uploads whole lines only (a record
 half-written at the moment of the read goes up whole next time), and uploads one at a time per
 conversation from the furthest offset this process has reached, because parts are keyed by offset and two
-uploads from one stale offset would overlap. `mirrorDown` drops any overlap it still finds. The watcher's
+uploads from one stale offset would overlap. `mirrorDown` drops any overlap it still finds. Every part is a separate request for the machine resuming it (about 0.4s each), so once a conversation has 20 parts `mirrorUp` re-uploads the whole file as the offset-0 part and deletes the rest; a mirror left with many parts (a parked session that has not uploaded since) still downloads in parallel, and `mirrorCompact` folds one from storage alone. The watcher's
 upload re-reads the row first and mirrors only a session still resident on this worker, so a copy left on
 a machine that a session moved away from cannot write over the mirror its new machine appends to.
 
