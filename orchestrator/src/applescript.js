@@ -273,8 +273,9 @@ async function runInNewTerminal(shellCmd) {
   // into the session already in Terminal's front tab — where it sits as an unsent paste until someone
   // presses Enter there. Hence three checks, each falling back to the window path: Terminal is
   // frontmost before the keystroke, the selected tab afterwards has a tty that NO tab had before it,
-  // and that tab is idle (a fresh shell; anything running makes it `busy`). Comparing only against the
-  // previously selected tab is not enough: when the front window changes instead of a tab opening, the
+  // and that tab is idle (a fresh shell; anything running makes it `busy`). A tab Cmd-T has just made
+  // reports its tty as `missing value` for a moment, so the wait reads that as not ready yet: coercing
+  // it to text throws. Comparing only against the previously selected tab is not enough: when the front window changes instead of a tab opening, the
   // other window's tab passes, and `busy` is false for a tab running tmux or screen (Terminal's
   // close-without-asking list), so the launch line lands in a Claude session's input inside tmux.
   try {
@@ -287,17 +288,23 @@ async function runInNewTerminal(shellCmd) {
       set was to {}
       tell application "Terminal" to repeat with w in windows
         repeat with x in tabs of w
-          set end of was to (tty of x) as text
+          set y to tty of x
+          if y is not missing value then set end of was to y as text
         end repeat
       end repeat
       tell application "System Events" to keystroke "t" using command down
       tell application "Terminal"
         repeat 20 times
           set t to selected tab of front window
-          if was does not contain ((tty of t) as text) and not (busy of t) then exit repeat
+          set y to tty of t
+          if y is not missing value then
+            if was does not contain (y as text) and not (busy of t) then exit repeat
+          end if
           delay 0.1
         end repeat
-        if was contains ((tty of t) as text) then error "Cmd-T made no new tab"
+        set y to tty of t
+        if y is missing value then error "the new tab never got a tty"
+        if was contains (y as text) then error "Cmd-T made no new tab"
         if busy of t then error "the new tab is running something"
         set t to do script "${escaped}" in t
         return tty of t
