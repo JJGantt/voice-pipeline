@@ -133,6 +133,33 @@ def test_usage_limit_moves_only_pressed_commands_onto_credits(load, source, alwa
         assert h.credits.calls[0]["manual"] is True
 
 
+@pytest.mark.parametrize("source,always_on,key,on_fast", [("watch-cmd", False, "console-key", True),
+                                                        ("watch-cmd", False, "", False),
+                                                        ("watch", True, "console-key", False)])
+def test_the_fast_route_runs_only_pressed_commands_on_the_fast_client(load, source, always_on, key, on_fast):
+    h = load(WORKER_ID="fly", ANTHROPIC_API_KEY=key)
+    sdk = h.install_runners()
+    h.w.process_request(h.db, claimed(h, source, always_on, transcript="log a banana", route="fast"))
+    assert len(h.fast.calls) == (1 if on_fast else 0)
+    assert len(sdk.calls) == (0 if on_fast else 1)
+    assert h.fast.credits and h.fast.fast   # fast mode is only ever billed to the key
+
+
+@pytest.mark.parametrize("tools,falls_back", [((), True), ((("mcp__data__add_to_list", {"text": "x"}),), False)])
+def test_a_failed_fast_turn_moves_to_the_standard_route_only_if_it_did_nothing(load, tools, falls_back):
+    h = load(WORKER_ID="fly", ANTHROPIC_API_KEY="console-key")
+    sdk = h.install_runners(fast=h.runner(fast=True, ok=False, tools=tools))
+    h.w.process_request(h.db, claimed(h, "watch-cmd", False, transcript="add x", route="fast"))
+    assert len(sdk.calls) == (1 if falls_back else 0)
+
+
+def test_a_request_without_the_fast_route_never_touches_the_fast_client(load):
+    h = load(WORKER_ID="fly", ANTHROPIC_API_KEY="console-key")
+    sdk = h.install_runners()
+    h.w.process_request(h.db, claimed(h, "watch-cmd", False, transcript="log a banana"))
+    assert h.fast.calls == [] and len(sdk.calls) == 1
+
+
 def test_machine_clients_send_tokens_in_headers_never_the_url(load):
     h = load(LED_BASE_URL="http://led.test", LED_TOKEN="led-token", HUB_TOKEN="hub-token",
              HUB_URL="http://hub.test")

@@ -10,7 +10,7 @@ mic → transcript → voice_requests (Supabase)
            __IGNORE__ (room mic, not for us)  or  the reply
 ```
 
-**One path, one model.** Every turn (photos, and the watch's fallback when the hub is down, included) runs on the warm `SdkRunner`: `HUB_MODEL`
+**One path, one model**, apart from the fast route below, which a request has to ask for. Every turn (photos, and the watch's fallback when the hub is down, included) runs on the warm `SdkRunner`: `HUB_MODEL`
 (`opus`) at `HUB_EFFORT` (unset = the model's default, which is adaptive: it thinks as hard as the turn
 needs), with `ALL_TOOLS` plus `Read`. There is no fast first responder and no escalation. Decision:
 quality over speed. A low-effort first responder judges worse exactly where it matters (macro
@@ -120,11 +120,32 @@ word and to ask when neither does. Neither model is the better transcriber: larg
 "pair putt" where turbo gets it, and turbo hears "a to-do" as "to view" where large gets it. The thread,
 the activity bar and dedupe all use `transcript` alone.
 
-## Billing: the subscription, and nothing else
+## Billing: the subscription, except where a turn is paid for on purpose
 
-A failed run is retried on the subscription and then surfaced as an error — there is no paid path. An
-API-billed fallback is attractive and wrong: at conversation volume it drains the Console balance, and
-it turns a passing "overloaded" into a Console-billed Opus run.
+A failed run is retried on the subscription and then surfaced as an error. An API-billed fallback for
+failures is attractive and wrong: at conversation volume it drains the Console balance, and it turns a
+passing "overloaded" into a Console-billed Opus run. The Console key (`CREDITS_API_KEY`, which the Max
+plan's monthly API credits pay for) is used in exactly two cases: a pressed turn the subscription
+refused for its usage limit (`SDK_CREDITS`, see CLAUDE.md), and the fast route.
+
+## The fast route
+
+A request with `voice_requests.route = 'fast'` runs on `SDK_FAST`: the same warm client, model, tools,
+fence and prompt as every other turn, with Claude Code in fast mode (`--settings {"fastMode": true}`)
+and billed to the Console key. Fast mode is the same model writing up to 2.5x faster at twice the
+per-token price; it does not shorten the wait for the first output. On a subscription login it would
+be paid from usage credits instead, so it only ever runs on the key, which the plan's monthly API
+credits cover.
+
+- **Only the watch's Hub Fast complication asks for it** (status-hub `statushub://record?route=fast`,
+  sent to `/api/voice-command` as `route=fast`). Every other route is unchanged.
+- **Only a pressed command runs on it.** Anything a microphone heard by itself goes to the standard
+  route, logged as an error, as does a request on a worker with no `ANTHROPIC_API_KEY`.
+- **A fast run that fails before calling a tool is re-run on the standard route**; one that called a
+  tool is surfaced, never repeated. The credits and Codex fallbacks do not apply to a fast turn.
+- **The fast client is connected on its first turn** (a cold connect, several seconds) and dropped when
+  the next standard turn answers, so a machine that never sees a fast request never holds a third
+  Claude process. Its turns carry `"route": "fast"` in `voice_requests.timing`.
 
 ## Splitting it again
 

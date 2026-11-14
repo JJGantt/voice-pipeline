@@ -41,11 +41,13 @@ class Harness:
     def runner(self, tools=(), reply="Done.", ok=True, **kw):
         return scripted_runner_class(self.w.SdkRunner)(tools=tools, reply=reply, ok=ok, **kw)
 
-    def install_runners(self, sdk=None, credits=None):
+    def install_runners(self, sdk=None, credits=None, fast=None):
         self.sdk = sdk or self.runner()
         self.credits = credits or self.runner(credits=True)
+        self.fast = fast or self.runner(fast=True)
         self.setall("SDK", self.sdk)
         self.setall("SDK_CREDITS", self.credits)
+        self.setall("SDK_FAST", self.fast)
         return self.sdk
 
     def claude_calls(self) -> list:

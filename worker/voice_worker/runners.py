@@ -195,12 +195,15 @@ class SdkRunner:
     at HUB_EFFORT with the full toolset at connect, the watch's fallback turns included. A failed turn is retried by `run_subscription` and then surfaced, never moved onto the paid API.
     """
 
-    def __init__(self, model: str = HUB_MODEL, effort: "str | None" = HUB_EFFORT, credits: bool = False):
+    def __init__(self, model: str = HUB_MODEL, effort: "str | None" = HUB_EFFORT, credits: bool = False,
+                 fast: bool = False):
         """The full toolset plus Read, which the fence allows only inside the current turn's photo
-        directory. `credits` bills the Console key instead of the subscription (see CREDITS_API_KEY)."""
+        directory. `credits` bills the Console key instead of the subscription (see CREDITS_API_KEY).
+        `fast` runs Claude Code in fast mode, which is paid per token and so only ever on the key."""
         self.model = model
         self.effort = effort
-        self.credits = credits
+        self.credits = credits or fast
+        self.fast = fast
         self.limit_hit = False   # the last turn's rate_limit_event said the subscription refused it
         self.tools = ALL_TOOLS + ["Read"]
         self._read_dir = None  # this turn's attachment directory, the only place Read may look
@@ -314,6 +317,9 @@ class SdkRunner:
             # environment outranks both the OAuth token and the machine's login.
             env={"ENABLE_TOOL_SEARCH": "false",
                  **({"ANTHROPIC_API_KEY": CREDITS_API_KEY, "CLAUDE_CODE_OAUTH_TOKEN": ""} if self.credits else {})},
+            # Fast mode (`fastMode`, Claude Code's /fast): the same model up to 2.5x faster at twice the
+            # per-token price. Claude Code falls back to standard speed by itself on fast mode's own rate limit.
+            **({"settings": json.dumps({"fastMode": True})} if self.fast else {}),
             can_use_tool=_deny,
             hooks={"PreToolUse": [HookMatcher(matcher=None, hooks=[_fence])]},
             cwd=os.path.expanduser("~"),
@@ -327,7 +333,8 @@ class SdkRunner:
         await client.connect()
         self._client = client
         self._used = False
-        log(f"sdk runner: warm client up ({self.model}{' @' + self.effort if self.effort else ''})")
+        log(f"sdk runner: warm client up ({self.model}{' @' + self.effort if self.effort else ''}"
+            f"{', credits' if self.credits else ''}{', fast' if self.fast else ''})")
 
     async def _teardown(self):
         if self._client is not None:
@@ -530,6 +537,10 @@ SDK = SdkRunner()
 # Connected only when a turn first needs it, and dropped once the subscription answers again, so a machine
 # that never hits the limit never holds a second Claude process.
 SDK_CREDITS = SdkRunner(credits=True)
+
+# The fast route (docs/ROUTING.md § The fast route): a turn whose request says `route = 'fast'` runs here,
+# in fast mode on the Console key. Connected on its first turn and dropped once a standard turn answers.
+SDK_FAST = SdkRunner(fast=True)
 
 
 def limit_refused(result: dict, runner: "SdkRunner | None" = None) -> bool:

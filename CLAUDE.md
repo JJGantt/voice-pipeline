@@ -1,9 +1,11 @@
 # Working in voice-pipeline
 
-## There is one route
+## There is one route, and a fast one asked for by name
 
 Every hub turn, photos included, runs on **Opus at its default effort** (`HUB_MODEL` / `HUB_EFFORT`)
-with the full toolset, on the warm SDK client. There is no fast first responder and no escalation:
+with the full toolset, on the warm SDK client. The one exception is a request whose `route` is `fast`
+(the watch's Hub Fast complication): the same turn in Claude Code's fast mode, billed to the Console
+key (docs/ROUTING.md § The fast route). There is no fast first responder and no escalation:
 quality is chosen over latency. Read `docs/ROUTING.md` before touching the worker's routing (`worker/voice_worker/process.py`): it
 covers what every turn is told, how sends are fenced per mic, and what to get right if a faster split
 is ever rebuilt (gate by omission from an allow list, never `--disallowedTools`).
@@ -25,7 +27,7 @@ Node hosts `console.error`; `log` / `console.log` / `.catch(() => {})` are invis
 for a retry or fallback that is already handling it. The Fly session host reports errors but sends no
 heartbeat, because it sleeps whenever nothing runs.
 
-## The worker bills the API in exactly one case: the subscription's usage limit
+## The worker bills the API in two cases: the subscription's usage limit, and the fast route
 
 Every turn, on every worker (Pi, Mac, and Fly, which holds its own `CLAUDE_CODE_OAUTH_TOKEN`), runs on
 the Claude subscription. A run that fails transiently (overloaded, 5xx, network) is retried on the

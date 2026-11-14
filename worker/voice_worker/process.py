@@ -20,7 +20,7 @@ from .logs import _parse_ts, alert_failure, log, log_error, now_iso
 from .outbound import inject_to_terminal, ping_esp_led, push_activity
 from .presence import claude_unready, hand_off
 from .prompts import ADDRESSING_DIRECTIVE, ALT_TRANSCRIPT_DIRECTIVE, ATTACH_DIRECTIVE, DELIBERATE_DIRECTIVE, NO_PRESS_DIRECTIVE, NUTRITION_DIRECTIVE, READ_DIRECTIVE, SHARE_DIRECTIVE, TOOLS_DIRECTIVE, is_ignore, read_again, take_read_marker
-from .runners import CODEX_TIMEOUT_S, SDK, SDK_CREDITS, codex_ready, limit_refused, run_codex, run_subscription, set_cmd_ts
+from .runners import CODEX_TIMEOUT_S, SDK, SDK_CREDITS, SDK_FAST, codex_ready, limit_refused, run_codex, run_subscription, set_cmd_ts
 
 
 # PROVENANCE: was this command started by a deliberate act of the user's hand? Only such a command may reach
@@ -264,7 +264,7 @@ def process_request(db: Supabase, req: dict) -> None:
         prompt += fallback_directive(db, rid)
     req["_timing"]["prompt_built"] = now_iso()
     result = _run_turn(prompt, ctx, manual=manual, read_dir=att_tmp if att_paths else None,
-                       on_event=_emit, hold=_hold)
+                       on_event=_emit, hold=_hold, fast=(req.get("route") == "fast"))
     req["_timing"].update(result.get("timing") or {})
 
     if att_tmp:
@@ -365,7 +365,28 @@ def build_prompt(req: dict, transcript: str, *, ambient: bool, manual: bool) -> 
     return prompt
 
 
-def _run_turn(prompt: str, ctx: str, *, manual: bool, read_dir, on_event, hold) -> dict:
+def _run_fast(run_hub, *, manual: bool) -> "dict | None":
+    """The fast route (docs/ROUTING.md § The fast route): the turn on SDK_FAST, in fast mode on the Console
+    key. None when the turn should take the standard route instead: it was not pressed for (nothing a
+    microphone heard by itself is billed to the key), there is no key on this worker, or the fast run
+    failed before calling any tool, so running it again on the subscription repeats nothing."""
+    if not manual:
+        log_error("a request asked for the fast route without a press; running it on the standard route")
+        return None
+    if not CREDITS_API_KEY:
+        log_error("a request asked for the fast route, but this worker has no ANTHROPIC_API_KEY; "
+                  "running it on the standard route")
+        return None
+    result = run_hub(SDK_FAST)
+    result.setdefault("timing", {})["route"] = "fast"
+    if result.get("ok") or result.get("used_tools"):
+        return result
+    log_error(f"fast route failed ({result.get('raw_error')}); running the turn on the standard route")
+    SDK_FAST.close()
+    return None
+
+
+def _run_turn(prompt: str, ctx: str, *, manual: bool, read_dir, on_event, hold, fast: bool = False) -> dict:
     """Run the turn on the route its provenance allows, and return the runner's result."""
     # Dispatch — one route, the same on every worker (Pi, Mac, and Fly, which holds its own subscription
     # token). Everything runs on the Claude SUBSCRIPTION; there is no paid path. A run that fails
@@ -382,9 +403,13 @@ def _run_turn(prompt: str, ctx: str, *, manual: bool, read_dir, on_event, hold) 
         # measured 3.6s on the Pi before the model saw a token; the warm client pays it once.
         run_hub = lambda sdk: sdk.run(hub_prompt + NUTRITION_DIRECTIVE + TOOLS_DIRECTIVE, on_event=on_event,  # noqa: E731
                                       manual=manual, read_dir=read_dir, hold=hold)
-        result = run_subscription(lambda: run_hub(SDK), "subscription hub")
-        if result.get("ok"):
+        fast_result = _run_fast(run_hub, manual=manual) if fast else None
+        result = fast_result or run_subscription(lambda: run_hub(SDK), "subscription hub")
+        if fast_result:
+            pass   # on the key already; neither the credits nor the Codex fallback below applies to it
+        elif result.get("ok"):
             SDK_CREDITS.close()   # the subscription answers again; the credits client has no more work
+            SDK_FAST.close()      # a standard turn: the fast client is not held warm between uses
         elif manual and limit_refused(result) and CREDITS_API_KEY:
             # Every worker shares the one account, so handing this on would only fail again elsewhere.
             log(f"subscription limit hit ({result.get('raw_error')}) — running on API credits")
