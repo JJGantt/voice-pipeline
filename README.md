@@ -55,7 +55,7 @@ load or ECAPA encode there stalls the stream. Those go through `asyncio.to_threa
   `iad`. It claims first (`WORKER_PRIORITY=fly,pi,mac`); the Pi, then the Mac, are fallbacks
   (`docs/WORKER-PLACEMENT.md` has the measurements behind that order).
 - A 1GB volume `worker_data` at `/data` holds Claude's run transcripts (`CLAUDE_CONFIG_DIR=/data/claude`,
-  pruned after 30 days), the worker's state (`STATE_DIR=/data/voice-worker`) and `/data/worker.log`
+  pruned after 7 days), the worker's state (`STATE_DIR=/data/voice-worker`) and `/data/worker.log`
   (everything the machine prints, trimmed daily to 50,000 lines).
 - `entrypoint.sh` restarts the worker whenever it exits, passes Fly's stop signal on to it, and
   updates Claude Code daily.

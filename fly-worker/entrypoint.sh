@@ -23,13 +23,19 @@ update_claude() {
     rm -rf "$dir"; echo "claude update to $want failed; still on $have" >&2
   fi
 }
-# Daily, with the history on /data kept bounded: the worker log to its last 50,000 lines and Claude's
-# run transcripts to 30 days.
-( set +e; while :; do
+# The history on /data kept bounded: the worker log to its last 50,000 lines and Claude's run
+# transcripts to 7 days, at boot and then daily. Nothing reads old transcripts back; they run about
+# 30MB a day, so a 30-day window fills the 1GB volume, and pruning only after 24h of uptime never
+# runs on a machine that restarts more often than that.
+prune_data() {
+  tail -n 50000 /data/worker.log > /data/worker.log.tmp && mv /data/worker.log.tmp /data/worker.log
+  find /data/claude/projects -type f -mtime +7 -delete 2>/dev/null
+  find /data/claude/projects -mindepth 1 -type d -empty -delete 2>/dev/null
+}
+( set +e; prune_data; while :; do
     sleep 86400
     update_claude
-    tail -n 50000 /data/worker.log > /data/worker.log.tmp && mv /data/worker.log.tmp /data/worker.log
-    find /data/claude/projects -type f -mtime +30 -delete 2>/dev/null
+    prune_data
   done ) &
 
 # TAILSCALE: the route to the Mac's iMessage server, which listens only on the home network and the

@@ -38,7 +38,7 @@ The code is the same everywhere; only the environment differs.
   `ANTHROPIC_API_KEY` at import, before any client or subprocess starts, so no turn inherits one; only
   the usage-limit fallback (`SDK_CREDITS`, see CLAUDE.md) passes it on.
 - **Session transcripts:** on the Pi and Mac they land in `~/.claude/projects/` and persist. On Fly
-  `CLAUDE_CONFIG_DIR=/data/claude`, on the volume, pruned to 30 days by the entrypoint's daily loop.
+  `CLAUDE_CONFIG_DIR=/data/claude`, on the volume, pruned to 7 days by the entrypoint at boot and daily.
   `STATE_DIR` is `/data/voice-worker`, also on the volume.
 - **Worker logs:** the Pi's are in `journalctl -u voice-worker` (retained back to 2026-10-02 when
   measured); the Mac's in `worker/worker.out.log` (back to June). Fly's are in `/data/worker.log`
