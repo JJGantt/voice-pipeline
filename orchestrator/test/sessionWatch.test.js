@@ -49,3 +49,30 @@ test('the /exit that parks a session is not shown as the user\'s words', () => {
   // Another slash command is still what the user typed.
   assert.equal(run(st, user('<command-name>/model</command-name><command-args>opus</command-args>'), true)[0].text, '/model opus');
 });
+
+// A turn end the hub never hears is never sent again (the tick reads the row, which says reported), so
+// the conversation would show the prompt with no reply under it.
+test('a turn end is sent until the hub takes it', async () => {
+  const { pushUntilHeard } = await import('../src/sessionWatch.js');
+  const answers = [null, null, {}];
+  let tries = 0;
+  const heard = await pushUntilHeard({ session: 's' }, 'turn end',
+    { send: async () => answers[tries++], waits: [0, 0, 0] });
+  assert.deepEqual(heard, {});
+  assert.equal(tries, 3);
+});
+
+test('a turn end gives up after its last wait and says so', async () => {
+  const { pushUntilHeard } = await import('../src/sessionWatch.js');
+  let tries = 0;
+  const errors = [];
+  const was = console.error;
+  console.error = (m) => errors.push(m);
+  try {
+    const heard = await pushUntilHeard({ session: 's' }, 'turn end',
+      { send: async () => { tries++; return null; }, waits: [0, 0] });
+    assert.equal(heard, null);
+  } finally { console.error = was; }
+  assert.equal(tries, 3);
+  assert.match(errors.join('\n'), /never reached the hub/);
+});

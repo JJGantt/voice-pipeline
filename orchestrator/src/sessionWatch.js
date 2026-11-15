@@ -88,9 +88,34 @@ async function push(body) {
       // would hold back every step and reply after it for as long as the process lived.
       signal: AbortSignal.timeout(10000),
     });
-    // The hub answers an event with what it holds of that turn (`emit`); everything else is empty.
-    return r.status === 200 ? await r.json().catch(() => null) : null;
-  } catch { return null; /* the wall's backstop poll covers a dropped push; never let it break the watcher */ }
+    // The hub answers an event with what it holds of that turn (`emit`); everything else is empty, and
+    // a `summary` is a bare 204. Null means only that the hub did not take it.
+    if (!r.ok) return null;
+    return r.status === 204 ? {} : await r.json().catch(() => ({}));
+  } catch { return null; /* never let a dropped push break the watcher; pushUntilHeard retries the ones that matter */ }
+}
+
+// A turn's `done` that the hub never hears is lost for good: the row's last_reply is written straight to
+// Supabase, so the reconcile tick sees the turn as reported and never sends it again, and the
+// conversation shows the prompt with no reply under it. So `done` is sent until the hub takes it, and
+// the summary behind it (which is what notifies the phone) likewise, and only after it, so a
+// notification never announces a reply the conversation does not have. The Mac's Wi-Fi drops for tens
+// of seconds at a time; the waits cover about four minutes of that before giving up with an error.
+export const RETRY_MS = [2000, 5000, 15000, 30000, 60000, 120000];
+export async function pushUntilHeard(body, what, { send = push, waits = RETRY_MS } = {}) {
+  if (send === push && (!config.HUB_URL || !config.HUB_TOKEN)) return null;
+  for (let i = 0; ; i++) {
+    const r = await send(body);
+    if (r) {
+      if (i) console.error(`[sessionWatch] ${what} for ${body.session} reached the hub only on try ${i + 1}`);
+      return r;
+    }
+    if (i >= waits.length) {
+      console.error(`[sessionWatch] ${what} for ${body.session} never reached the hub (${i + 1} tries)`);
+      return null;
+    }
+    await new Promise((res) => setTimeout(res, waits[i]));
+  }
 }
 
 /**
@@ -411,18 +436,21 @@ export function reportTurnEnd(id, tail, turn = null) {
   // does not send one (the Pi, today) simply omits the flag and the hub notifies from `done` as before.
   // `text` is the 400-character line a wall draws; `reply` is the whole answer, and `prompt` what
   // began the turn, so the hub's event log holds the finished turn in full without a second read.
-  const p = push({ session: id, state: 'done', text: tail.lastReply.slice(0, 400),
+  return pushUntilHeard({ session: id, state: 'done', text: tail.lastReply.slice(0, 400),
                    reply: tail.lastReply.slice(0, 20000),
                    prompt: tail.lastPrompt ? tail.lastPrompt.slice(0, 20000) : null,
                    at: tail.replyAt || null, summary_coming: true,
                    // The turn in order, as this machine read it: what the hub stores, and what fills
                    // in a hub that restarted and heard none of it. Absent from the tick's report of a
                    // turn end the watcher missed, which has no list.
-                   ...(turn ? { turn: turn.key, events: turn.events } : {}) });
-  summarise(tail.lastReply).then((summary) => push({
-    session: id, state: 'summary', text: tail.lastReply.slice(0, 400), at: tail.replyAt || null, summary,
-  })).catch((e) => console.error('[sessionWatch] summary push:', e.message));
-  return p;
+                   ...(turn ? { turn: turn.key, events: turn.events } : {}) }, 'turn end')
+    .then((heard) => {
+      if (!heard) return;
+      // Not awaited: the next step of the session need not wait seconds for a lock-screen sentence.
+      summarise(tail.lastReply).then((summary) => pushUntilHeard({
+        session: id, state: 'summary', text: tail.lastReply.slice(0, 400), at: tail.replyAt || null, summary,
+      }, 'reply summary')).catch((e) => console.error('[sessionWatch] summary push:', e.message));
+    });
 }
 
 // ---- the sentence that lands on a lock screen -------------------------------
