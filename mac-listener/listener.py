@@ -877,10 +877,12 @@ def _groq_transcribe(path: str):
 # cost is that saying only "thank you" is dropped too. The same rule is in server/voice_server/transcribe.py,
 # worker/voice_worker/config.py and status-hub's server/lib/transcribe.js.
 _NOTHING_SAID = re.compile(r"^\W*thank\s+you\W*$", re.IGNORECASE)
+# And a transcript with no letter or digit in it at all, like the bare "." Whisper writes for near-silence.
+_HAS_WORD = re.compile(r"[^\W_]")
 
 
 def _heard(text: str) -> str:
-    return "" if _NOTHING_SAID.match(text) else text
+    return "" if _NOTHING_SAID.match(text) or not _HAS_WORD.search(text) else text
 
 
 # Its own copy by necessity: a Mac process run from this checkout, sync, falling back to local whisper.cpp; the
