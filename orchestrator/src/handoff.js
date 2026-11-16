@@ -95,6 +95,28 @@ export function transcriptSize(transcriptPath) {
 }
 
 /**
+ * Resolve once the transcript file exists, or after `timeoutMs`; true if it exists.
+ *
+ * A session launched with its prompt on the command line writes its record at process start, seconds
+ * before its input box takes keys; text typed in that window is dropped without trace. The transcript
+ * appears as the launch prompt is taken, so its existence is the sign that typing will land. A session
+ * launched with no prompt writes none until it gets input, which is why this is bounded.
+ */
+export function awaitTranscript(transcriptPath, timeoutMs = 30000) {
+  const exists = () => fs.existsSync(transcriptPath);
+  if (exists()) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let watcher = null;
+    const done = () => { clearTimeout(timer); try { watcher?.close(); } catch {} resolve(exists()); };
+    const timer = setTimeout(done, timeoutMs);
+    const base = path.basename(transcriptPath);
+    try {
+      watcher = fs.watch(path.dirname(transcriptPath), (_ev, f) => { if ((!f || f === base) && exists()) done(); });
+    } catch { /* no directory yet — the timeout's own check is all there is */ }
+  });
+}
+
+/**
  * Whether `expect` was written to the transcript after byte `from`, waiting up to `timeoutMs` for it.
  *
  * Woken by the file changing, not by a clock: the directory is watched (the file itself may not exist

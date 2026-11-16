@@ -14,7 +14,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { awaitSession } from '../orchestrator/src/discover.js';
 import { awaitCodexSession } from '../orchestrator/src/codex.js';
-import { typeable, transcriptSize, awaitSubmitted } from '../orchestrator/src/handoff.js';
+import { typeable, transcriptSize, awaitSubmitted, awaitTranscript } from '../orchestrator/src/handoff.js';
 import { expectPrompt } from '../orchestrator/src/sessionWatch.js';
 import { removeSessionCgroup } from './cgroups.js';
 
@@ -99,6 +99,8 @@ export async function typeInto(target, text, { expect = null, cmd = null } = {})
   if (!s) throw new Error(`${target} has no ${pane.agent === 'codex' ? 'Codex rollout open' : 'Claude Code session record'} — it has not started`);
   if (s.waiting) throw new Error(`${target} is waiting on a ${s.waiting} — not typing into it`);
 
+  // A session still starting drops what is typed into it (handoff.js `awaitTranscript`).
+  if (pane.agent !== 'codex') await awaitTranscript(s.transcriptPath);
   const from = transcriptSize(s.transcriptPath);
   // The id the watcher stamps on the prompt these words become (sessionWatch.js `expectPrompt`).
   if (cmd) expectPrompt(target, text, cmd);
