@@ -37,7 +37,8 @@ Inputs are thin by design: they capture and enqueue one row, and nothing about w
 command survives into how it is processed. The one thing a device adds is where it was
 (`voice_requests.location`, sent by the watch and the browser). It is not put on the prompt: a trigger
 keeps the last fix per device in `locations` (data-layer 00129), and a model that needs it calls the
-data MCP's `get_location`.
+data MCP's `get_location`, which reads those together with the phone's and watch's background history
+(`location_points`, status-hub docs/LOCATION.md).
 
 ## Worker execution strategies
 
