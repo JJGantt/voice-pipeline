@@ -207,13 +207,15 @@ On the first tick after a consumer starts, a resident row whose process is gone 
 did not end: it died with the machine. It is parked and resumed with `RESTARTED_MARKER`, and reported as
 an error, unless another machine already holds it.
 
-## Status `fallback` belongs to the Pi alone
+## Status `fallback`: the Pi, then the Mac, then Fly
 
-A `voice_requests` row with status `fallback` came from the watch through Supabase's `voice-fallback`
-edge function (data-layer), because the hub on Fly did not answer. Only `FALLBACK_WORKER` (the Pi)
-claims it, in the same read as its `pending` rows, with no deferring or holding. Every other worker's
-claim filter must stay `status=eq.pending`: a Fly worker can be up while the hub is down, and a widened
-filter there would put the fallback back on Fly. (`worker/tests/test_claiming.py` holds this.) The run is an ordinary hub turn on the
+A `voice_requests` row with status `fallback` came through Supabase's `voice-fallback` edge function
+(data-layer), because the hub on Fly did not answer. Every worker reads `fallback` rows in the same query as
+its `pending` ones. `FALLBACK_WORKER` (the Pi) claims at once; each other worker takes it in
+`FALLBACK_ORDER` (Pi, Mac, Fly) only after every HEALTHY worker ahead of it has had `FAILOVER_S`
+(`claim.py` `fallback_target`), so a worker that is down is never waited on. Fly is last because the hub
+runs on Fly. A worker other than the Pi that wins one reports it as an error. (`worker/tests/test_claiming.py`
+holds this.) The run is an ordinary hub turn on the
 fenced SDK client with `fallback_directive` appended (it may start the troubleshooting session with
 `start_session`, which every pressed turn may); `_hub_unreachable` skips the pushes to the hub for its duration, since each would
 only spend its timeout. Status-hub `docs/WATCH.md` § When the hub does not answer has the watch's half.

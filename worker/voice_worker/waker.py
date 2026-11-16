@@ -12,7 +12,7 @@ import threading
 import time
 
 from . import runstate
-from .config import FALLBACK_WORKER, IDLE_POLL_DEGRADED_S, SUPABASE_KEY, SUPABASE_URL, WORKER_ID
+from .config import IDLE_POLL_DEGRADED_S, SUPABASE_KEY, SUPABASE_URL
 from .db import TRANSPORT_RAISE_S, is_link_failure
 from .live import live_event, live_load
 from .logs import log, log_error, log_occurrence
@@ -126,7 +126,7 @@ class RealtimeWaker:
         except AttributeError:
             return
         status = str(rec.get("status") or "")
-        if status == "pending" or (status == "fallback" and WORKER_ID == FALLBACK_WORKER):
+        if status in ("pending", "fallback"):
             self.event.set()
         elif status == "untranscribed" and rec.get("audio") and local_whisper_ready():
             threading.Thread(target=transcribe_local, args=(rec,), daemon=True).start()

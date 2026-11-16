@@ -51,19 +51,46 @@ def test_a_worker_never_reclaims_what_failed_on_it(load):
     assert status(h, row) == "pending"
 
 
-# ---- status `fallback` belongs to the Pi alone --------------------------------------------------------
+# ---- status `fallback`: the Pi first, then the Mac, then Fly -----------------------------------------
 
-def test_fallback_rows_are_claimed_only_by_the_fallback_worker(load):
-    h = load(WORKER_ID="fly")
-    row = pending(h, status="fallback", source="watch-fallback")
-    assert h.w.claim_one(h.db) is None
-    assert status(h, row) == "fallback"
-
+def test_fallback_rows_go_to_the_fallback_worker_first(load):
     h = load(WORKER_ID="pi")
     row = pending(h, status="fallback", source="watch-fallback", age=0.1)
-    h.beat("fly")   # a healthy primary does not hold a fallback back: nobody else will take it
+    h.beat("fly")   # a healthy primary does not hold a fallback back
     got = h.w.claim_one(h.db)
     assert got and got["id"] == row["id"] and status(h, row) == "claimed"
+
+    h = load(WORKER_ID="mac")
+    h.beat("pi")
+    row = pending(h, status="fallback", source="watch-fallback", age=1.0)
+    assert h.w.claim_one(h.db) is None          # a healthy Pi gets its chance
+    assert status(h, row) == "fallback" and h.w._failover_at > 0
+
+
+def test_fallback_rows_do_not_wait_on_a_worker_that_is_down(load):
+    h = load(WORKER_ID="mac")                   # no Pi beat: it is down
+    row = pending(h, status="fallback", source="watch-fallback", age=0.1)
+    got = h.w.claim_one(h.db)
+    assert got and got["id"] == row["id"] and status(h, row) == "claimed"
+
+
+def test_fly_takes_a_fallback_last(load):
+    h = load(WORKER_ID="fly")
+    h.beat("mac")
+    row = pending(h, status="fallback", source="watch-fallback", age=1.0)
+    assert h.w.claim_one(h.db) is None          # the Mac is ahead of Fly
+    h = load(WORKER_ID="fly")
+    row = pending(h, status="fallback", source="watch-fallback", age=0.1)
+    got = h.w.claim_one(h.db)                   # nobody ahead is up
+    assert got and got["id"] == row["id"]
+
+
+def test_a_healthy_worker_ahead_that_does_not_claim_is_passed_over(load):
+    h = load(WORKER_ID="mac")
+    h.beat("pi")
+    row = pending(h, status="fallback", source="watch-fallback", age=30.0)
+    got = h.w.claim_one(h.db)
+    assert got and got["id"] == row["id"]
 
 
 # ---- failover priority ----------------------------------------------------------------------------------
