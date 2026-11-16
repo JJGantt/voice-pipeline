@@ -28,13 +28,6 @@ WORKER_PRIORITY = [
 ]
 
 
-# The one worker that claims status `fallback`: commands the watch sent through Supabase's
-# `voice-fallback` edge function (data-layer) because the hub on Fly did not answer. The Pi, because it is
-# the worker that does not run on Fly and does not sleep.
-FALLBACK_WORKER = os.environ.get("FALLBACK_WORKER", "pi")
-# Who takes a `fallback` row (the hub did not answer): the fallback worker, then the Mac, then Fly, each
-# once every healthy worker ahead of it has had FAILOVER_S. Fly is last because the hub is on Fly.
-FALLBACK_ORDER = (FALLBACK_WORKER,) + tuple(w for w in ("mac", "fly") if w != FALLBACK_WORKER)
 
 
 # Within this long of an earlier fallback command, it is the same outage: no second troubleshooting session.

@@ -207,15 +207,14 @@ On the first tick after a consumer starts, a resident row whose process is gone 
 did not end: it died with the machine. It is parked and resumed with `RESTARTED_MARKER`, and reported as
 an error, unless another machine already holds it.
 
-## Status `fallback`: the Pi, then the Mac, then Fly
+## Status `fallback`: claimed like any command
 
 A `voice_requests` row with status `fallback` came through Supabase's `voice-fallback` edge function
-(data-layer), because the hub on Fly did not answer. Every worker reads `fallback` rows in the same query as
-its `pending` ones. `FALLBACK_WORKER` (the Pi) claims at once; each other worker takes it in
-`FALLBACK_ORDER` (Pi, Mac, Fly) only after every HEALTHY worker ahead of it has had `FAILOVER_S`
-(`claim.py` `fallback_target`), so a worker that is down is never waited on. Fly is last because the hub
-runs on Fly. A worker other than the Pi that wins one reports it as an error. (`worker/tests/test_claiming.py`
-holds this.) The run is an ordinary hub turn on the
+(data-layer), because the hub (Fly app `jared-status-hub`) did not answer. The workers are separate apps
+and machines, so they are usually still up. Every worker reads `fallback` rows in the same query as its
+`pending` ones and claims them by the same rule: `WORKER_PRIORITY` (Fly, Pi, Mac), skipping a worker
+whose heartbeat is stale, each next one once the healthy one ahead has had `FAILOVER_S`
+(`worker/tests/test_claiming.py`). The run is an ordinary hub turn on the
 fenced SDK client with `fallback_directive` appended (it may start the troubleshooting session with
 `start_session`, which every pressed turn may); `_hub_unreachable` skips the pushes to the hub for its duration, since each would
 only spend its timeout. Status-hub `docs/WATCH.md` § When the hub does not answer has the watch's half.

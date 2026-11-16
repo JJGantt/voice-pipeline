@@ -5,10 +5,10 @@ from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 
 from . import runstate
-from .config import BUSY_WAIT_S, DEDUP_TOL_S, DEDUP_WINDOW_S, FAILOVER_S, FALLBACK_ORDER, FALLBACK_WORKER, HEARTBEAT_FRESH_S, LEASE_S, ORPHAN_REPLAY_MAX_S, MAX_HOLD_S, MIC_QUIET_S, RECLAIM_SWEEP_S, STANDBY_CHECK_S, UNTRANSCRIBED_MAX_S, WORKER_ID
+from .config import BUSY_WAIT_S, DEDUP_TOL_S, DEDUP_WINDOW_S, FAILOVER_S, HEARTBEAT_FRESH_S, LEASE_S, ORPHAN_REPLAY_MAX_S, MAX_HOLD_S, MIC_QUIET_S, RECLAIM_SWEEP_S, STANDBY_CHECK_S, UNTRANSCRIBED_MAX_S, WORKER_ID
 from .db import Supabase, degraded
 from .logs import _parse_ts, alert_failure, log, log_error, now_iso
-from .presence import WORKER_EPOCH, _healthy, claude_unready, defer_target, other_worker_healthy, presence_rows, replay_safe, should_defer, untried_workers
+from .presence import WORKER_EPOCH, claude_unready, defer_target, other_worker_healthy, presence_rows, replay_safe, should_defer, untried_workers
 
 
 _last_transcribing_sweep = 0.0
@@ -195,14 +195,6 @@ def _same_utterance(rows: list, first: dict) -> list:
     return group
 
 
-def fallback_target(db: Supabase) -> str | None:
-    """The first healthy worker ahead of me in FALLBACK_ORDER, which a `fallback` row is left to first."""
-    order = list(FALLBACK_ORDER)
-    ahead = order[:order.index(WORKER_ID)] if WORKER_ID in order else order
-    healthy = {r.get("worker") for r in presence_rows(db) if _healthy(r)}
-    return next((w for w in ahead if w in healthy), None)
-
-
 def failover_wait(db: Supabase, waited_s: float, target: str) -> float:
     """Seconds still to leave a pending request to `target` before taking it; 0 means take it now.
 
@@ -240,25 +232,23 @@ def claim_one(db: Supabase) -> dict | None:
         "&select=id,transcript,source,status,created_at,updated_at,capture_start,capture_end,failed_on",
     )
     fb = next((r for r in pending or [] if r.get("status") == "fallback"), None)
-    if fb and runstate._running and WORKER_ID != FALLBACK_WORKER:
-        # FALLBACK_ORDER: the fallback worker first, then each next one once every healthy worker ahead
-        # of it has had its FAILOVER_S chance. Nothing waits on a machine that is down.
+    if fb and runstate._running:
+        # A `fallback` row (the hub did not answer, so it came through Supabase's voice-fallback function)
+        # goes by the same rule as any command: WORKER_PRIORITY, skipping a worker that is not beating,
+        # each next one once the healthy one ahead has had its FAILOVER_S. No holding or grouping: it came
+        # from one device.
         born = _parse_ts(fb.get("created_at") or "")
         waited = (datetime.now(timezone.utc) - born).total_seconds() if born else 0.0
-        target = fallback_target(db)
+        target = defer_target(db)
         left = failover_wait(db, waited, target) if target else 0.0
         if left > 0:
             runstate._standby = True
             runstate._failover_at = time.monotonic() + left + 0.5   # a clock arrival, not a poll
             return None
-    if fb and runstate._running:
-        # No holding or grouping: it came from one device because the hub did not answer.
         got = db.patch("voice_requests", f"id=eq.{fb['id']}&status=eq.fallback",
                        {"status": "claimed", "claimed_by": WORKER_ID, "claim_epoch": WORKER_EPOCH,
                         "claimed_at": now_iso(), "assigned_to": WORKER_ID, "updated_at": now_iso(), **_new_lease()},
                        extra_headers={"Prefer": "return=representation"})
-        if got and WORKER_ID != FALLBACK_WORKER:
-            log_error(f"took fallback request {fb['id']}: {FALLBACK_WORKER} did not claim it")
         return _leased(got[0]) if got else None
     pending = [r for r in pending or [] if r.get("status") == "pending"]
     # SPOKEN ORDER, not arrival order. A watch that loses the hub holds its clips and sends them together

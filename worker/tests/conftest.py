@@ -71,7 +71,7 @@ def load(monkeypatch, tmp_path):
         claude_log = tmp_path / "claude-argv.jsonl"
         base = {
             "SUPABASE_URL": f"http://{SUPABASE_HOST}", "SUPABASE_KEY": "service-key",
-            "WORKER_ID": "fly", "WORKER_PRIORITY": "fly,pi,mac", "FALLBACK_WORKER": "pi",
+            "WORKER_ID": "fly", "WORKER_PRIORITY": "fly,pi,mac",
             "STATE_DIR": str(tmp_path / "state"), "CLAUDE_BIN": str(HERE / "fake_claude.py"),
             "FAKE_CLAUDE_LOG": str(claude_log), "LED_BASE_URL": "", "HUB_TOKEN": "",
             "ORCH_URL": "http://orchestrator.test", "ORCH_TOKEN": "orch-token",
