@@ -84,7 +84,8 @@ Claude session (`start_session`, `follow_up`, `resume_session`, `transfer_sessio
 into a focused Mac session), Codex (`run_codex`, every MCP tool pre-approved) or the credits runner only when `is_manual(req)`: its `source` is in `MANUAL_SOURCES` AND it is not stamped
 `always_on`. The labels there are the ones only a press or a keyboard writes: `watch-cmd` (the watch's
 Hub control), `watch-fallback` (the same press through Supabase when the hub is down), `web` and
-`web-quick` (the hub's mic buttons and its typed box) and `share` (the iPhone share sheet).
+`web-quick` (the hub's mic buttons and its typed box), `share` (the iPhone share sheet) and `mac-cmd`
+(the Mac's double-tap-Control command key, `~/.hammerspoon/voice.lua`).
 
 It **fails closed**. A wake-word capture (`fly`/`mac` with `always_on` false) is not manual, because the
 TV can say the wake word; nor is any listener (`watch`, `phone`, `mac`, `fly` wake-free), any label a

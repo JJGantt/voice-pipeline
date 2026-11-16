@@ -36,7 +36,8 @@ from .runners import CODEX_TIMEOUT_S, SDK, SDK_CREDITS, SDK_FAST, codex_ready, l
 #   watch-fallback  the same press, through Supabase's voice-fallback function when the hub is down
 #   web, web-quick  the hub's mic buttons and its typed box (/api/voice-command default, /api/voice-text)
 #   share           the iPhone share sheet (/api/voice-text shared:true)
-MANUAL_SOURCES = frozenset({"watch-cmd", "watch-fallback", "web", "web-quick", "share"})
+#   mac-cmd         the Mac's double-tap-Control command key (~/.hammerspoon voice.lua)
+MANUAL_SOURCES = frozenset({"watch-cmd", "watch-fallback", "web", "web-quick", "share", "mac-cmd"})
 
 
 def is_manual(req: dict) -> bool:

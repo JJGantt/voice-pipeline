@@ -19,6 +19,7 @@ CASES = [
     ("web", False, True),             # hub mic button / typed box
     ("web-quick", False, True),       # hub navbar mic
     ("share", False, True),           # iPhone share sheet
+    ("mac-cmd", False, True),         # Mac double-tap-Control command key
     ("web", None, True),              # typed rows carry no always_on at all
     ("watch", True, False),           # the watch's always-on listener
     ("phone", True, False),           # the phone's listener
