@@ -1,5 +1,19 @@
 # Working in voice-pipeline
 
+## Nothing may add latency to a voice command
+
+A command is a person waiting with nothing to look at: every step between the end of speech and the reply
+is felt, on every command, all day. **No change may add a wait anywhere on that path** — the capture apps
+(the watch and phone apps in status-hub `apps/`, the Mac listener, the ESP), the upload, the server, the
+worker — not a GPS fix, not a lookup, not a confirmation round trip, however short, and however useful
+the thing waited for.
+
+Anything a command could use is gathered off the path: before it (when the app opens, while the user is
+speaking) or after it (the worker or a tool fetches it only when the request needs it). Location is the
+example: the watch records a fix when its app opens (status-hub `apps/Shared/LocationTrail.swift`) and
+`get_location` reads that history; the command itself carries none. If something genuinely cannot be had
+without waiting, say so before building it and let Jared decide.
+
 ## There is one route, and a fast one asked for by name
 
 Every hub turn, photos included, runs on **Opus at its default effort** (`HUB_MODEL` / `HUB_EFFORT`)
