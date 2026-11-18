@@ -53,7 +53,7 @@ then `bootstrap`. A `kickstart -k` or a crash-restart runs with the old values.
 | `COMMAND_POLL_MS` | `30000` (realtime backstop)                        |
 | `COMMAND_TTL_S`   | `120`                                              |
 | `PRESENCE_MS`     | `30000`                                            |
-| `PRESENCE_FAIL_EXIT_MS` | `300000` — presence failing this long exits the process for launchd to restart |
+| `PRESENCE_FAIL_EXIT_MS` | `300000` — presence failing this long SIGKILLs the process for launchd to restart (`process.exit` can hang there) |
 | `HUB_URL`         | `https://jared-status-hub.fly.dev`                 |
 | `HUB_TOKEN`       | _(empty: must set)_ the hub's kiosk token, for live session activity → the wall |
 | `PTY_COLS`/`PTY_ROWS` | `200` / `50`                                   |

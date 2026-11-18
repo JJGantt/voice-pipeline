@@ -140,7 +140,10 @@ async function beat() {
     failingSince ??= Date.now();
     if (Date.now() - failingSince >= config.PRESENCE_FAIL_EXIT_MS) {
       console.error(`[repos] presence failing since ${new Date(failingSince).toISOString()} — exiting for launchd to restart`);
-      process.exit(1);
+      // Not process.exit: in this state it can block forever in libuv's threadpool cleanup (main thread
+      // in uv__threadpool_cleanup → uv_thread_join on an idle worker), leaving a live, silent process
+      // launchd never restarts. SIGKILL cannot hang; stderr to a file is already written synchronously.
+      process.kill(process.pid, 'SIGKILL');
     }
   }
 }
