@@ -1484,6 +1484,9 @@ async function sweepClips() {
   }
 }
 
+// Hourly, so one network blip heals at the next run: each failure is an occurrence, and two in a row
+// (two hours of not sweeping) is the error.
+const retentionStreak = streak('[pi-desk] retention', { failures: 2 });
 async function sweepRetention() {
   try {
     await forget(await sb(`desk_sessions?status=in.(ended,transferred)&ended=lt.${ago(KEEP_CLOSED_DAYS)}&select=id,claude_session_id`),
@@ -1500,7 +1503,8 @@ async function sweepRetention() {
     // The net under the tick's sweep, for a conversation that ended inside a process that kept
     // running (a `/clear`, or the voice worker's long-lived claude moving on to a new one).
     sweepScratch();
-  } catch (e) { console.error('[pi-desk] retention:', e.message); }
+    retentionStreak.ok();
+  } catch (e) { retentionStreak.fail(e); }
 }
 
 /**
