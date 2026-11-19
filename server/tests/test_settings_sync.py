@@ -49,3 +49,12 @@ def test_value_flipped_back_during_grace_is_not_a_miss(monkeypatch, caplog):
 def test_drift_that_persists_is_a_miss_and_applied(monkeypatch, caplog):
     assert len(run(monkeypatch, caplog, {"voice_muted": "1"}, {"voice_muted": "1"})) == 1
     assert modes.state.suppressed is True
+
+
+def test_change_made_while_unsubscribed_is_applied_and_not_a_miss(monkeypatch, caplog):
+    modes.state.suppressed = True
+    monkeypatch.setattr(settings_sync.db, "get_settings", lambda keys: {"voice_muted": "0"})
+    with caplog.at_level("INFO", logger="voice"):
+        asyncio.run(settings_sync._catch_up())
+    assert modes.state.suppressed is False
+    assert not [r for r in caplog.records if "realtime missed" in r.getMessage()]

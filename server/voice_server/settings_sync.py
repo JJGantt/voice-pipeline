@@ -3,7 +3,8 @@ voice_presence → the LED's 'another mic hears the speaker', voice_requests →
 
 A Supabase realtime socket can go HALF-OPEN (is_connected stays True while no events flow), which
 silently stranded the ESP mute for days. So the listener never trusts the socket alone — it re-reads the
-flags on a slow backstop poll AND recycles the socket on a timer."""
+flags on a slow backstop poll AND recycles the socket on a timer. Each subscribe is followed by a fresh read
+of the flags, because a change written while no socket was subscribed (a recycle's 5s gap) is never delivered."""
 
 import asyncio
 import logging
@@ -58,6 +59,15 @@ async def _reconcile(s: dict) -> None:
         modes.apply_setting(k, v)
 
 
+async def _catch_up() -> None:
+    """Apply anything written while no socket was subscribed: the moments between a recycle's close and
+    the next subscribe, and between the startup read and the first subscribe. Realtime was never listening
+    then, so a change made in that gap is not a miss and is not reported as one."""
+    for k, v in _drift(await asyncio.to_thread(db.get_settings, _MODE_KEYS)).items():
+        log.info("settings: %s changed while the socket was down → applying", k)
+        modes.apply_setting(k, v)
+
+
 async def listen() -> None:
     """Restore state from app_settings on boot, then react to hub changes live over realtime — so the
     ESP's mode survives server restarts and hub toggles even with the Mac off."""
@@ -85,6 +95,7 @@ async def listen() -> None:
             ch.on_postgres_changes("UPDATE", callback=led.on_request, schema="public", table="voice_requests")
             await ch.subscribe()
             log.info("settings listener subscribed (app_settings + voice_presence + voice_requests realtime)")
+            await _catch_up()
             started = time.monotonic()
             while sock.is_connected and (time.monotonic() - started) < SETTINGS_SOCKET_MAX_S:
                 await asyncio.sleep(SETTINGS_POLL_S)
