@@ -57,6 +57,8 @@ Three blocks ride on every hub prompt beside the replayed conversation and the t
   Fuko Quicksand as every top result; and `start_session` only for what needs the signed-in browser — which
   includes a source he NAMED (Reddit, a particular site) that blocks the turn's fetch: a session reads it
   in the Pi's browser. A blocked page he did not ask for is skipped in favour of readable sources.
+  The machine follows the login: the Pi's browser is signed in to Amazon and Walmart only, so any other
+  site that needs him logged in (Krowd, a bank, a booking site) is `machine: 'mac'`.
 - `DELIBERATE_DIRECTIVE` on a pushed or typed command, or `ADDRESSING_DIRECTIVE`
   on a room-mic turn (below).
 
