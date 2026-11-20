@@ -1385,13 +1385,16 @@ let draining = false;
 // A command that lands while a drain is running would not be in the rows that drain already read, and its
 // realtime event would be dropped by the guard below; without this it waits for the backstop poll.
 let drainAgain = false;
+// A failed pass is re-done by the next one (realtime, or the backstop at POLL_DEGRADED_MS while
+// realtime is down), which re-reads whatever is still pending. Three in a row is ~15s of failing.
+const drainStreak = streak('[pi-desk] drain', { failures: 3 });
 async function drain() {
   if (draining) { drainAgain = true; return; }
   draining = true;
   drainAgain = false;
   try {
     const rows = await sb('desk_commands?status=eq.pending&select=*&order=created.asc');
-    if (!rows?.length) return;
+    if (!rows?.length) { drainStreak.ok(); return; }
     const macAwake = FLY || await macIsAwake();
 
     for (const cmd of rows) {
@@ -1422,8 +1425,9 @@ async function drain() {
         await deadLetter(cmd, e.message);
       }
     }
+    drainStreak.ok();
   } catch (e) {
-    console.error('[pi-desk] drain:', e.message);
+    drainStreak.fail(e);
   } finally {
     draining = false;
     if (drainAgain) drain().catch((e) => console.error(`[desk] drain re-run failed: ${e.message || e}`));
