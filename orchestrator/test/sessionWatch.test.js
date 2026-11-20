@@ -56,10 +56,18 @@ test('a turn end is sent until the hub takes it', async () => {
   const { pushUntilHeard } = await import('../src/sessionWatch.js');
   const answers = [null, null, {}];
   let tries = 0;
-  const heard = await pushUntilHeard({ session: 's' }, 'turn end',
-    { send: async () => answers[tries++], waits: [0, 0, 0] });
-  assert.deepEqual(heard, {});
+  const logged = { warn: [], error: [] };
+  const was = { warn: console.warn, error: console.error };
+  console.warn = (m) => logged.warn.push(m);
+  console.error = (m) => logged.error.push(m);
+  try {
+    const heard = await pushUntilHeard({ session: 's' }, 'turn end',
+      { send: async () => answers[tries++], waits: [0, 0, 0] });
+    assert.deepEqual(heard, {});
+  } finally { Object.assign(console, was); }
   assert.equal(tries, 3);
+  assert.match(logged.warn.join('\n'), /reached the hub only on try 3/);
+  assert.deepEqual(logged.error, []);
 });
 
 test('a turn end gives up after its last wait and says so', async () => {

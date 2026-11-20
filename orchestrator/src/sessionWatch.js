@@ -107,7 +107,8 @@ export async function pushUntilHeard(body, what, { send = push, waits = RETRY_MS
   for (let i = 0; ; i++) {
     const r = await send(body);
     if (r) {
-      if (i) console.error(`[sessionWatch] ${what} for ${body.session} reached the hub only on try ${i + 1}`);
+      // Healed by the retry, so an occurrence (counted, watched) rather than an incident; the give-up below is the error.
+      if (i) console.warn(`[sessionWatch] ${what} for ${body.session} reached the hub only on try ${i + 1}`);
       return r;
     }
     if (i >= waits.length) {
