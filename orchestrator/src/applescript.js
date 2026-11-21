@@ -256,6 +256,18 @@ export async function sendToTty(tty, text) {
   return line;
 }
 
+// Whether the console session's screen is locked: IOConsoleUsers carries CGSSessionScreenIsLocked
+// only while it is. null when ioreg cannot be read.
+async function screenLocked() {
+  try {
+    const { stdout } = await execFileP('ioreg', ['-n', 'Root', '-d1', '-a'], { timeout: 5000 });
+    return /<key>CGSSessionScreenIsLocked<\/key>\s*<true\/>/.test(stdout);
+  } catch (e) {
+    console.warn('[applescript] could not read the screen lock state (%s)', e.message.trim().split('\n').pop());
+    return null;
+  }
+}
+
 // Run a shell command in a new Terminal tab, falling back to a new window.
 //
 // Terminal.app has no scriptable "new tab" — the only way is a Cmd-T keystroke through System
@@ -286,6 +298,13 @@ async function runInNewTerminal(shellCmd) {
   if (running !== 'true') return newWindow();
   const windows = await osascript('tell application "Terminal" to count windows').catch(() => '0');
   if (parseInt(windows, 10) === 0) return newWindow();
+  // A locked screen drops synthetic keystrokes while Terminal still reports itself frontmost, so
+  // Cmd-T makes no tab and the checks below fail. The window path works locked, so go straight to it.
+  const locked = await screenLocked();
+  if (locked) {
+    console.log('[applescript] screen locked — opening a window, Cmd-T cannot reach Terminal');
+    return newWindow();
+  }
 
   // The keystroke is blind: it goes to whatever app is frontmost, and `do script … in front window`
   // runs in whatever tab is selected there. So a Cmd-T sent before Terminal is in front (activating
@@ -331,7 +350,8 @@ async function runInNewTerminal(shellCmd) {
       end tell`);
     return `newtab\t${String(tty).trim()}`;
   } catch (e) {
-    console.warn('[applescript] tab failed (%s) — opening a window instead', e.message.trim().split('\n').pop());
+    console.warn('[applescript] tab failed (%s) — opening a window instead', e.message.trim().split('\n').pop(),
+      `(screen locked: ${locked === null ? 'unknown' : locked})`);
     return newWindow();
   }
 }
