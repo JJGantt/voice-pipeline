@@ -118,4 +118,9 @@ stub only outside services (Supabase, Claude, Groq). From the repo root:
     .venv-test/bin/python -m pytest worker/tests server/tests
     (cd orchestrator && npm test)
 
+`server/requirements.txt` installs about 5 GB (plus about 3 GB of pip cache), which fills the Fly
+session machine's 10 GB volume and every session on it with it. There, for a worker-only change,
+install `worker/requirements-test.txt` and `worker/requirements.txt` with `--no-cache-dir` (about
+450 MB) and run `worker/tests` alone; CI runs the server suite.
+
 Run them before pushing; `.github/workflows/tests.yml` runs them again on every push to main.
