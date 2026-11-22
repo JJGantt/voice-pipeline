@@ -70,7 +70,10 @@ routed once it gets here is `../docs/ROUTING.md`.
    down and 120s while deferring. An idle cycle costs ONE read: `pending` is read
    first, and the defer check and the orphan-claim sweep run on their own 60s
    clocks instead of every cycle, because neither answers anything while there is
-   nothing to claim. Clean shutdown on SIGINT/SIGTERM.
+   nothing to claim. Every subscribe (the ~5-minute recycle included) and every
+   drop wakes the loop at once: a row that went `pending` while the socket was
+   down fired no event, so without that pass it waits out the 60s cadence.
+   Clean shutdown on SIGINT/SIGTERM.
 
 ## Environment variables
 

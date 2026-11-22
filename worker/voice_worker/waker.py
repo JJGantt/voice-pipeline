@@ -85,6 +85,7 @@ class RealtimeWaker:
             except Exception as e:  # noqa: BLE001
                 self._report(e)
             self.healthy = False   # disconnected (or never subscribed) → main loop tightens its poll
+            self.event.set()       # …now, not when its healthy-cadence wait (IDLE_POLL_S) runs out
             try:
                 if self._sock:
                     await self._sock.close()
@@ -161,6 +162,7 @@ class RealtimeWaker:
         if self.healthy:
             self._fail_since, self._fail_raised = 0.0, False
         if self.healthy:   # a fresh subscription missed whatever happened while it was down: reload
+            self.event.set()   # claim pass: a row that went pending during the gap fired no event here
             threading.Thread(target=live_load, name="live-load", daemon=True).start()
             threading.Thread(target=sweep_untranscribed, name="untranscribed-sweep", daemon=True).start()
         log(f"realtime subscription: {state}{(' err=' + str(err)) if err else ''}")
