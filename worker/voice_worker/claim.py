@@ -212,7 +212,7 @@ def failover_wait(db: Supabase, waited_s: float, target: str) -> float:
         left = BUSY_WAIT_S - (datetime.now(timezone.utc) - at).total_seconds()
         if left > 0:
             return left
-    log(f"pending {waited_s:.0f}s and {target} has not taken it — taking it")
+    log_error(f"pending {waited_s:.0f}s and {target} has not taken it — taking it")
     return 0.0
 
 

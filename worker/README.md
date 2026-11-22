@@ -45,7 +45,9 @@ routed once it gets here is `../docs/ROUTING.md`.
      exception is the worker it is left to being mid-run itself: a follow-up queues
      behind the run it follows, but for at most `BUSY_WAIT_S` (120s) of that run, so
      a hung run cannot hold every command behind it. Another worker's run is no
-     reason to wait. A standing-by worker sleeps to exactly its deadline.
+     reason to wait. A standing-by worker sleeps to exactly its deadline. Taking
+     one this way is reported as an error (`pending Ns and <worker> has not taken
+     it`), because it means the worker ahead missed a command it should have had.
    - **Desk hosts are not workers.** `desk` and `pi-desk` beat into the same
      `worker_presence` table; every "is another worker up" question counts only
      `WORKER_PRIORITY` members, and a presence with `info.stopping`,
