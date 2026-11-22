@@ -31,6 +31,7 @@ class RealtimeWaker:
         self._started = False
         self._fail_since = 0.0   # monotonic start of the current run of failed connects; 0 = none
         self._fail_raised = False
+        self._subs = 0            # SUBSCRIBEDs on the current client; a second one is an in-client rejoin
 
     def start(self) -> None:
         if self._started or not REALTIME_ENABLED:
@@ -72,15 +73,23 @@ class RealtimeWaker:
                                        schema="public", table="voice_requests")
                 for t in ("app_settings", "voice_focus", "voice_messages"):   # the live state's feeds
                     ch.on_postgres_changes("*", callback=self._on_live, schema="public", table=t)
+                self._subs = 0
                 await ch.subscribe(self._on_sub)
                 # Recycle the socket every ~5 min even while it still reports is_connected: a HALF-OPEN
                 # subscription stays "connected" but silently stops delivering INSERTs, stranding commands on
                 # the slow backstop poll (the ~60s pickup lag). Tear down + rebuild on a fixed cadence so
                 # events keep flowing — the same guard the Fly server, mac-listener, and litter watcher use.
                 started = time.monotonic()
-                while runstate._running and self._sock.is_connected and (time.monotonic() - started) < 300.0:
+                # An in-client rejoin (realtime-py's auto_reconnect after a server-side drop) reports
+                # SUBSCRIBED again but can deliver no voice_requests events until the client is rebuilt,
+                # leaving commands to the fallback worker. So a second SUBSCRIBED ends this client at once;
+                # the fresh client's first SUBSCRIBED runs a claim pass for anything that went pending.
+                while (runstate._running and self._sock.is_connected and self._subs < 2
+                       and (time.monotonic() - started) < 300.0):
                     await asyncio.sleep(1.0)
-                if runstate._running and self._sock.is_connected:
+                if runstate._running and self._subs >= 2:
+                    log_occurrence("realtime waker: channel rejoined inside the client — rebuilding it")
+                elif runstate._running and self._sock.is_connected:
                     log("realtime waker recycling socket (proactive half-open guard)")
             except Exception as e:  # noqa: BLE001
                 self._report(e)
@@ -161,6 +170,7 @@ class RealtimeWaker:
         self.healthy = "SUBSCRIBED" in str(state).upper()   # any other state (TIMED_OUT/CLOSED/ERROR) → degraded poll
         if self.healthy:
             self._fail_since, self._fail_raised = 0.0, False
+            self._subs += 1
         if self.healthy:   # a fresh subscription missed whatever happened while it was down: reload
             self.event.set()   # claim pass: a row that went pending during the gap fired no event here
             threading.Thread(target=live_load, name="live-load", daemon=True).start()
