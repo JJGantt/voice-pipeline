@@ -97,11 +97,14 @@ function report(err, extra = {}) {
   const fp = `${extra.service || ''}|${message.split('\n')[0].replace(/\d+/g, 'N').slice(0, 200)}`;
   const now = Date.now();
   const seen = recent.get(fp);
-  if (seen && now - seen.at < COALESCE_MS) { seen.count += 1; return Promise.resolve(true); }
+  if (seen && now - seen.at < COALESCE_MS) { seen.count += 1; seen.last = now; return Promise.resolve(true); }
+  // A tail is stamped with its latest repeat, not left for the responder to stamp on arrival: it can be
+  // sent, or re-sent from the spool, minutes after its repeats, and the responder decides from `at`
+  // whether they happened inside a network gap.
   if (seen && seen.count > 1) {
-    send('error', { machine: seen.machine, service: seen.service, message: `${seen.message} (x${seen.count - 1} more in ${Math.round((now - seen.at) / 1000)}s)`, count: seen.count - 1 });
+    send('error', { machine: seen.machine, service: seen.service, message: `${seen.message} (x${seen.count - 1} more in ${Math.round((now - seen.at) / 1000)}s)`, count: seen.count - 1, at: new Date(seen.last).toISOString() });
   }
-  recent.set(fp, { at: now, count: 1, message, machine: extra.machine || MACHINE, service: extra.service || SERVICE });
+  recent.set(fp, { at: now, last: now, count: 1, message, machine: extra.machine || MACHINE, service: extra.service || SERVICE });
   if (recent.size > 500) recent.delete(recent.keys().next().value);
   return send('error', { machine: extra.machine || MACHINE, service: extra.service || SERVICE, message, at: new Date(now).toISOString(),
     stack: err instanceof Error ? err.stack : extra.stack, context: extra.context });
@@ -113,11 +116,11 @@ function occurrence(msg, extra = {}) {
   const fp = `${extra.service || ''}|${message.split('\n')[0].replace(/\d+/g, 'N').slice(0, 200)}`;
   const now = Date.now();
   const seen = recentOcc.get(fp);
-  if (seen && now - seen.at < COALESCE_MS) { seen.count += 1; return Promise.resolve(true); }
+  if (seen && now - seen.at < COALESCE_MS) { seen.count += 1; seen.last = now; return Promise.resolve(true); }
   if (seen && seen.count > 1) {
-    send('occurrence', { machine: seen.machine, service: seen.service, message: seen.message, count: seen.count - 1 });
+    send('occurrence', { machine: seen.machine, service: seen.service, message: seen.message, count: seen.count - 1, at: new Date(seen.last).toISOString() });
   }
-  recentOcc.set(fp, { at: now, count: 1, message, machine: extra.machine || MACHINE, service: extra.service || SERVICE });
+  recentOcc.set(fp, { at: now, last: now, count: 1, message, machine: extra.machine || MACHINE, service: extra.service || SERVICE });
   if (recentOcc.size > 500) recentOcc.delete(recentOcc.keys().next().value);
   return send('occurrence', { machine: extra.machine || MACHINE, service: extra.service || SERVICE,
     message: message.slice(0, 2000), at: new Date(now).toISOString() });
