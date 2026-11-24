@@ -187,6 +187,14 @@ def read_again(text: str) -> bool:
 # from the transcript (status-hub /api/voice-command, voice_requests.alt_transcript). The two mishear
 # different words, so the model is told to reconcile them rather than trust either: large-v3 wrote
 # "pair putt" where turbo heard "haircut", and turbo wrote "to view" where large heard "a to-do".
+FAST_ROUTE_NOTE = (
+    "\n\n[This turn is on the FAST route: the watch's Hub Fast complication asked for it, so it runs in "
+    "Claude Code's fast mode, billed to the API key. Every other turn is the standard route on the "
+    "subscription. If he asks which path a command took, this is the answer; get_routing describes the "
+    "settings, not this request.]"
+)
+
+
 ALT_TRANSCRIPT_DIRECTIVE = (
     "\n\n[Speech-to-text ran twice on this recording, with two different models, and they disagree. The "
     "other reading was: \"{alt}\". Where they differ, one of them misheard him. Act on the reading that "

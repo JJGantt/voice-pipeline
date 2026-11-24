@@ -152,6 +152,9 @@ credits cover.
 - **The fast client is connected on its first turn** (a cold connect, several seconds) and dropped when
   the next standard turn answers, so a machine that never sees a fast request never holds a third
   Claude process. Its turns carry `"route": "fast"` in `voice_requests.timing`.
+- **A fast turn is told it is one** (`FAST_ROUTE_NOTE`, appended only to the fast run, so a turn that
+  falls back to the standard route does not carry it). Nothing else can tell the model: `get_routing`
+  reports settings, not the request in hand.
 
 ## Splitting it again
 

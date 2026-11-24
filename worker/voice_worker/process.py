@@ -19,7 +19,7 @@ from .live import get_focus, recent_context
 from .logs import _parse_ts, alert_failure, log, log_error, now_iso
 from .outbound import inject_to_terminal, ping_esp_led, push_activity
 from .presence import claude_unready, hand_off
-from .prompts import ADDRESSING_DIRECTIVE, ALT_TRANSCRIPT_DIRECTIVE, ATTACH_DIRECTIVE, DELIBERATE_DIRECTIVE, NO_PRESS_DIRECTIVE, NUTRITION_DIRECTIVE, READ_DIRECTIVE, SHARE_DIRECTIVE, TOOLS_DIRECTIVE, is_ignore, read_again, take_read_marker
+from .prompts import ADDRESSING_DIRECTIVE, ALT_TRANSCRIPT_DIRECTIVE, ATTACH_DIRECTIVE, DELIBERATE_DIRECTIVE, FAST_ROUTE_NOTE, NO_PRESS_DIRECTIVE, NUTRITION_DIRECTIVE, READ_DIRECTIVE, SHARE_DIRECTIVE, TOOLS_DIRECTIVE, is_ignore, read_again, take_read_marker
 from .runners import CODEX_TIMEOUT_S, SDK, SDK_CREDITS, SDK_FAST, codex_ready, limit_refused, run_codex, run_subscription, set_cmd_ts
 
 
@@ -378,7 +378,7 @@ def _run_fast(run_hub, *, manual: bool) -> "dict | None":
         log_error("a request asked for the fast route, but this worker has no ANTHROPIC_API_KEY; "
                   "running it on the standard route")
         return None
-    result = run_hub(SDK_FAST)
+    result = run_hub(SDK_FAST, FAST_ROUTE_NOTE)
     result.setdefault("timing", {})["route"] = "fast"
     if result.get("ok") or result.get("used_tools"):
         return result
@@ -389,8 +389,8 @@ def _run_fast(run_hub, *, manual: bool) -> "dict | None":
 
 def _run_turn(prompt: str, ctx: str, *, manual: bool, read_dir, on_event, hold, fast: bool = False) -> dict:
     """Run the turn on the route its provenance allows, and return the runner's result."""
-    # Dispatch — one route, the same on every worker (Pi, Mac, and Fly, which holds its own subscription
-    # token). Everything runs on the Claude SUBSCRIPTION; there is no paid path. A run that fails
+    # Dispatch — the same on every worker (Pi, Mac, and Fly, which holds its own subscription token). A turn
+    # runs on the Claude SUBSCRIPTION unless it asked for the fast route (`_run_fast`, on the key). A run that fails
     # transiently is retried (`run_subscription`), and one that still fails surfaces as an error. `ctx`
     # (the replayed hub conversation) rides on a FRESH conversation; there is no --resume for hub turns.
     # Every turn, photos and the watch's fallback included, → the warm SDK client. A failure that called no
@@ -402,7 +402,7 @@ def _run_turn(prompt: str, ctx: str, *, manual: bool, read_dir, on_event, hold, 
     else:
         # The warm SDK client, not a per-command `claude -p`: that spawn (CLI + four stdio MCP servers)
         # measured 3.6s on the Pi before the model saw a token; the warm client pays it once.
-        run_hub = lambda sdk: sdk.run(hub_prompt + NUTRITION_DIRECTIVE + TOOLS_DIRECTIVE, on_event=on_event,  # noqa: E731
+        run_hub = lambda sdk, note="": sdk.run(hub_prompt + note + NUTRITION_DIRECTIVE + TOOLS_DIRECTIVE, on_event=on_event,  # noqa: E731
                                       manual=manual, read_dir=read_dir, hold=hold)
         fast_result = _run_fast(run_hub, manual=manual) if fast else None
         result = fast_result or run_subscription(lambda: run_hub(SDK), "subscription hub")
