@@ -1,5 +1,5 @@
 // Voice route/mode tools backed by Supabase app_settings. Every conversational turn runs on Opus with the
-// full toolset (there are no model/thinking/runner knobs; the per-request fast route is told to its own turn), so this just reports that and toggles the two live voice modes
+// full toolset (there are no model/thinking/runner knobs), so this just reports that and toggles the two live voice modes
 // (always-on / wake-free and voice-inject) plus JaredBot. The single FAB button drives the one dynamic route.
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -40,7 +40,7 @@ export async function getRouting() {
     route: 'opus',
     route_label: 'Every turn runs on Opus at its default (adaptive) effort with the full toolset; no escalation. ' +
       "A command from the watch's Hub Fast complication runs the same turn on the fast route (Claude Code " +
-      'fast mode, billed to the API key), and its prompt says so. This tool cannot tell which route the ' +
+      'fast mode, billed to the API key). This tool cannot tell which route the ' +
       'current request took.',
     always_on: truthy(s.wakefree_enabled ?? '0'),   // hands-free, no-wake-word voice (aka 'AO' / 'wake-free')
     inject_mode: truthy(s.voice_inject_mode ?? '0'),   // voice-inject mode (transcripts injected into the conversation)
