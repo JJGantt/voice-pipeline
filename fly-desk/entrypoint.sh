@@ -57,4 +57,9 @@ process.stdout.write([
 JS
 chmod 600 "$CODEX_HOME/config.toml"
 
+# Claude Code: the newest version already on the volume now, before any session can launch, and the
+# newest release fetched behind it. Its own auto-updater is off (update-claude.sh says why).
+/app/update-claude.sh link
+/app/update-claude.sh fetch &
+
 cd /app/host/pi-desk && exec node index.js

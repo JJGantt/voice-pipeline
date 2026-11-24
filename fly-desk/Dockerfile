@@ -43,6 +43,6 @@ WORKDIR /app/host
 RUN cd /app/host && npm init -y >/dev/null && npm pkg set type=module \
     && npm install --no-audit --no-fund @supabase/supabase-js@2 ws@8
 COPY host/ /app/host/
-COPY entrypoint.sh /app/entrypoint.sh
+COPY entrypoint.sh update-claude.sh /app/
 
 CMD ["/app/entrypoint.sh"]

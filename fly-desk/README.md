@@ -50,6 +50,18 @@ made once, by hand, with the machine awake: wake it (`curl https://jared-desk-fl
 `fly ssh console -a jared-desk-fly -C 'codex login --device-auth'` and approve the code it prints. Until
 then its heartbeat-less dispatch refuses a Codex session with "Codex is not signed in on the Fly machine".
 
+## Claude Code version
+
+`deploy.sh` bakes the newest release into the image, and `update-claude.sh` keeps it current between
+deploys: at boot `link` switches to the newest version already on the volume (`/data/claude-code/<v>`),
+then `fetch` installs a newer release there in the background and moves `/usr/local/bin/claude` to it
+with one rename. A failed fetch is reported as a fly-desk error and the old version stays in use.
+
+Claude Code's own auto-updater is off (`DISABLE_AUTOUPDATER` in `fly.toml`), and must stay off. It
+rewrites the global npm package in place, `claude` does not exist while it does, and since every boot
+runs an image older than the newest release, the first session of a boot starts that rewrite: a second
+session launched in the same seconds exits before claude starts (`no claude came up in <session>`).
+
 ## Secrets
 
 `CLAUDE_CODE_OAUTH_TOKEN`, `SUPABASE_URL`, `SUPABASE_KEY`, `GH_TOKEN`, `GIT_USER_NAME` / `GIT_USER_EMAIL`
