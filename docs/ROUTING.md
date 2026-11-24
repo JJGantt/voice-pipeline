@@ -148,7 +148,8 @@ credits cover.
 - **Only a pressed command runs on it.** Anything a microphone heard by itself goes to the standard
   route, logged as an error, as does a request on a worker with no `ANTHROPIC_API_KEY`.
 - **A fast run that fails before calling a tool is re-run on the standard route**; one that called a
-  tool is surfaced, never repeated. The credits and Codex fallbacks do not apply to a fast turn.
+  tool is surfaced, never repeated. The credits and Codex fallbacks do not apply to a fast turn, and the sessions it dispatches
+  start on Claude: only the credits runner, which runs because the subscription refused, hands Codex on.
 - **The fast client is connected on its first turn** (a cold connect, several seconds) and dropped when
   the next standard turn answers, so a machine that never sees a fast request never holds a third
   Claude process. Its turns carry `"route": "fast"` in `voice_requests.timing`.

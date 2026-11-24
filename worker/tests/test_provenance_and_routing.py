@@ -161,6 +161,15 @@ def test_a_request_without_the_fast_route_never_touches_the_fast_client(load):
     assert h.fast.calls == [] and len(sdk.calls) == 1
 
 
+@pytest.mark.parametrize("kw,codex", [({}, False), ({"fast": True}, False), ({"credits": True}, True)])
+def test_only_the_usage_limit_runner_dispatches_sessions_on_codex(load, kw, codex):
+    h = load()
+    runner = h.w.SdkRunner(**kw)
+    assert runner.codex_sessions is codex
+    env = h.w.mcp_servers(codex_sessions=runner.codex_sessions)["data"]["env"]
+    assert (env.get("DATA_AGENT") == "codex") is codex
+
+
 def test_machine_clients_send_tokens_in_headers_never_the_url(load):
     h = load(LED_BASE_URL="http://led.test", LED_TOKEN="led-token", HUB_TOKEN="hub-token",
              HUB_URL="http://hub.test")

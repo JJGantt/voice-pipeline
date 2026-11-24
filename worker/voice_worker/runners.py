@@ -204,6 +204,10 @@ class SdkRunner:
         self.effort = effort
         self.credits = credits or fast
         self.fast = fast
+        # Sessions this runner dispatches start on Codex only when it runs because the subscription refused
+        # the turn (SDK_CREDITS): a Claude session would hit the same limit. The fast route bills the key by
+        # choice, with the subscription still answering, so its sessions stay on Claude.
+        self.codex_sessions = credits and not fast
         self.limit_hit = False   # the last turn's rate_limit_event said the subscription refused it
         self.tools = ALL_TOOLS + ["Read"]
         self._read_dir = None  # this turn's attachment directory, the only place Read may look
@@ -305,7 +309,7 @@ class SdkRunner:
             # this path on the same models as every other turn instead of drifting a release behind.
             cli_path=shutil.which(CLAUDE_BIN),
             # The credits runner is the usage-limit fallback, so the sessions it starts run on Codex.
-            mcp_servers=write_mcp_config(codex_sessions=self.credits),
+            mcp_servers=write_mcp_config(codex_sessions=self.codex_sessions),
             allowed_tools=list(self.tools),
             disallowed_tools=list(SESSION_TOOLS),   # session-only: out of sight entirely
             # The stable hub framing lives here so the prefix caches across turns; per-turn context
