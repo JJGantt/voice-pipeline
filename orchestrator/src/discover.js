@@ -74,6 +74,9 @@ export function sessionOf(pid) {
     shell: d.status === 'shell',
     // When this process started: anything a background agent left behind before it cannot be running in it.
     recordStartedAt: Number.isFinite(d.startedAt) ? d.startedAt : null,
+    // The process actually holding the conversation (a backgrounded job's, when it has one): its children
+    // are the shells.
+    recordPid: Number.isFinite(d.pid) ? d.pid : Number(pid),
   };
 }
 
@@ -102,14 +105,89 @@ export function backgroundAgents(transcriptPath, sinceMs) {
   return out.sort((a, b) => a.at - b.at).map((a) => a.label);
 }
 
+/** The command a Bash-tool shell runs: Claude Code wraps it as `… && eval '<command>' < /dev/null && …`. */
+export function shellCommand(args) {
+  const i = args.indexOf(" eval '");
+  if (i < 0) return null;
+  const end = args.lastIndexOf("' < /dev/null");
+  if (end <= i) return null;
+  return args.slice(i + 7, end).replace(/'"'"'/g, "'").replace(/'\\''/g, "'");
+}
+
+/** The commands of the Bash-tool shells running under process `pid`, from the process table. */
+async function shellsUnder(pid) {
+  let stdout;
+  try { ({ stdout } = await exec('ps', ['-Ao', 'pid=,ppid=,args='], { timeout: 10000, maxBuffer: 16 * 1024 * 1024 })); }
+  catch { return []; }
+  const kids = new Map(), args = new Map();
+  for (const l of stdout.split('\n')) {
+    const m = l.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
+    if (!m) continue;
+    args.set(+m[1], m[3]);
+    if (!kids.has(+m[2])) kids.set(+m[2], []);
+    kids.get(+m[2]).push(+m[1]);
+  }
+  // The topmost wrapper in each branch: a shell's own children are its command's, not another shell.
+  // A wrapper between claude and the shell (the Pi's CLAUDE_CODE_SHELL_PREFIX) is walked through.
+  const out = [];
+  const walk = (p) => {
+    for (const c of kids.get(p) || []) {
+      const cmd = shellCommand(args.get(c) || '');
+      if (cmd) out.push(cmd); else walk(c);
+    }
+  };
+  walk(pid);
+  return out;
+}
+
+// The description each command was launched with, read once per command from the transcripts that
+// could hold its Bash call — the conversation's own and its subagents' (an agent can leave a shell
+// running after it ends).
+const described = new Map();
+function describe(cmd, transcriptPath) {
+  const key = `${transcriptPath}\0${cmd}`;
+  if (described.has(key)) return described.get(key);
+  const needle = `"command":${JSON.stringify(cmd)}`;
+  let label = null;
+  const dir = path.join(transcriptPath.replace(/\.jsonl$/, ''), 'subagents');
+  let files = [transcriptPath];
+  try { files = files.concat(fs.readdirSync(dir).filter((f) => f.endsWith('.jsonl')).map((f) => path.join(dir, f))); } catch { /* none */ }
+  for (const f of files) {
+    let text;
+    try { text = fs.readFileSync(f, 'utf8'); } catch { continue; }
+    // Newest first: other records quote the command too (a task's notice, a progress line).
+    for (let at = text.lastIndexOf(needle); at >= 0 && !label; at = text.lastIndexOf(needle, at - 1)) {
+      const from = text.lastIndexOf('\n', at) + 1, to = text.indexOf('\n', at);
+      try {
+        const rec = JSON.parse(text.slice(from, to < 0 ? undefined : to));
+        const use = (rec.message?.content || []).find((x) => x.type === 'tool_use' && x.input?.command === cmd);
+        if (use?.input?.description) label = String(use.input.description);
+      } catch { /* a partial line */ }
+      if (at === 0) break;
+    }
+    if (label) break;
+  }
+  if (described.size > 500) described.clear();
+  described.set(key, label);
+  return label;
+}
+
 /**
  * The background work a live process `proc` (sessionOf) has going — what every host publishes as
- * `desk_sessions.bg_agents` / `bg_shell`. Nothing for a Codex session, whose rollout records none.
+ * `desk_sessions.bg_agents`, `bg_shell` and `bg_shells`. A shell is named by the description its Bash
+ * call gave it, else by its command's first line. Nothing for a Codex session, whose rollout records none.
  */
-export function backgroundOf(proc, transcriptPath) {
-  if (!proc || proc.shell == null) return { bg_agents: null, bg_shell: false };
+export async function backgroundOf(proc, transcriptPath) {
+  if (!proc || proc.shell == null) return { bg_agents: null, bg_shell: false, bg_shells: null };
   const agents = backgroundAgents(transcriptPath, proc.recordStartedAt);
-  return { bg_agents: agents.length ? agents : null, bg_shell: proc.shell === true };
+  let shells = null;
+  if (proc.shell === true && (proc.recordPid || proc.pid)) {
+    const cmds = await shellsUnder(proc.recordPid || proc.pid);
+    shells = cmds.map((c) => (transcriptPath && describe(c, transcriptPath))
+      || c.trim().split('\n')[0].slice(0, 120));
+    if (!shells.length) shells = null;
+  }
+  return { bg_agents: agents.length ? agents : null, bg_shell: proc.shell === true, bg_shells: shells };
 }
 
 /**

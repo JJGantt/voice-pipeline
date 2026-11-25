@@ -153,7 +153,7 @@ export async function reapIdle(row, proc, transcriptBytes) {
 
   if (proc.busy !== false || proc.waiting) return false;
   // A background agent or shell is still working for it; parking the session would kill that work.
-  const bg = backgroundOf(proc, row.transcript_path);
+  const bg = await backgroundOf(proc, row.transcript_path);
   if (bg.bg_shell || bg.bg_agents) return false;
   const idleFor = Date.now() - Date.parse(row.active_at || row.started);
   if (!(idleFor >= IDLE_PARK_MS)) return false;

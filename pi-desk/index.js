@@ -600,7 +600,7 @@ async function reconcileSessions() {
     // not been published yet, and the watcher would otherwise not start on it until the next tick.
     // What it still has running in the background once its turn is over: drawn as work in progress, and
     // never reaped or evicted, since parking the session would kill that work.
-    const bg = backgroundOf(s, tpath);
+    const bg = await backgroundOf(s, tpath);
     const background = bg.bg_shell || !!bg.bg_agents;
     residents.push({ name, working: busy, background, bytes: tail.bytes, lastActivity: tail.lastActivity, created, row, tpath });
 

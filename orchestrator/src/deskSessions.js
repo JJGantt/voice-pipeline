@@ -285,7 +285,7 @@ async function reconcile(row, proc, startup = false) {
   patch.working = alive && busy;
   // What it still has running in the background once its turn is over — an agent or a shell it started.
   // Every surface draws it the way it draws a turn in flight, so a reply is not read as the end of the work.
-  Object.assign(patch, alive ? backgroundOf(proc, row.transcript_path) : { bg_agents: null, bg_shell: false });
+  Object.assign(patch, alive ? await backgroundOf(proc, row.transcript_path) : { bg_agents: null, bg_shell: false, bg_shells: null });
   // The net under the watcher's relay, for a finished turn fs.watch dropped.
   if (alive && tail && !busy) relay(row.id, tail);
   // The same net for the reply's notification. A finished turn newer than the one this row records is

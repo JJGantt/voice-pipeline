@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { backgroundAgents, backgroundOf } from '../src/discover.js';
+import { backgroundAgents, backgroundOf, shellCommand } from '../src/discover.js';
 
 function conversation(agents) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bg-'));
@@ -42,11 +42,19 @@ test('no subagents directory, no transcript or no process start is nothing runni
   assert.deepEqual(backgroundAgents(conversation([{ meta: { requestShape: 'background' } }]), null), []);
 });
 
-test('backgroundOf: a shell is the process record saying so; no record (or Codex) is nothing', () => {
+test('backgroundOf: a shell is the process record saying so; no record (or Codex) is nothing', async () => {
   const t = conversation([{ meta: { description: 'A', requestShape: 'background' } }]);
   const since = Date.now() - 60000;
-  assert.deepEqual(backgroundOf({ shell: true, recordStartedAt: since }, t), { bg_agents: ['A'], bg_shell: true });
-  assert.deepEqual(backgroundOf({ shell: false, recordStartedAt: since }, conversation([])), { bg_agents: null, bg_shell: false });
-  assert.deepEqual(backgroundOf(null, t), { bg_agents: null, bg_shell: false });
-  assert.deepEqual(backgroundOf({ busy: false }, t), { bg_agents: null, bg_shell: false });
+  // A pid with no shells under it: the record still says one is running, with nothing to name it by.
+  assert.deepEqual(await backgroundOf({ shell: true, recordStartedAt: since, recordPid: 999999 }, t), { bg_agents: ['A'], bg_shell: true, bg_shells: null });
+  assert.deepEqual(await backgroundOf({ shell: false, recordStartedAt: since }, conversation([])), { bg_agents: null, bg_shell: false, bg_shells: null });
+  assert.deepEqual(await backgroundOf(null, t), { bg_agents: null, bg_shell: false, bg_shells: null });
+  assert.deepEqual(await backgroundOf({ busy: false }, t), { bg_agents: null, bg_shell: false, bg_shells: null });
+});
+
+test('shellCommand reads the command out of the wrapper Claude Code runs it in', () => {
+  const wrap = (c) => `/bin/zsh -c source /x.sh 2>/dev/null || true && eval '${c}' < /dev/null && pwd -P >| /tmp/claude-ab-cwd`;
+  assert.equal(shellCommand(wrap('fly deploy -a hub')), 'fly deploy -a hub');
+  assert.equal(shellCommand(wrap(`grep -q '"'"'a b'"'"' f`)), "grep -q 'a b' f");
+  assert.equal(shellCommand('node /x/mcp.js'), null);
 });
