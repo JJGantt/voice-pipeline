@@ -20,7 +20,7 @@ from .logs import _parse_ts, alert_failure, log, log_error, now_iso
 from .outbound import inject_to_terminal, ping_esp_led, push_activity
 from .presence import claude_unready, hand_off
 from .prompts import ADDRESSING_DIRECTIVE, ALT_TRANSCRIPT_DIRECTIVE, ATTACH_DIRECTIVE, DELIBERATE_DIRECTIVE, NO_PRESS_DIRECTIVE, NUTRITION_DIRECTIVE, READ_DIRECTIVE, SHARE_DIRECTIVE, TOOLS_DIRECTIVE, is_ignore, read_again, take_read_marker
-from .runners import CODEX_TIMEOUT_S, SDK, SDK_CREDITS, SDK_FAST, codex_ready, limit_refused, run_codex, run_subscription, set_cmd_ts
+from .runners import CODEX_TIMEOUT_S, SDK, SDK_CREDITS, SDK_FAST, codex_ready, limit_refused, run_codex, run_subscription, set_cmd_req, set_cmd_ts
 
 
 # PROVENANCE: was this command started by a deliberate act of the user's hand? Only such a command may reach
@@ -158,6 +158,7 @@ def process_request(db: Supabase, req: dict) -> None:
     # STARTED (not ~30s later at pipeline end), so a voice-logged set lands at the user's rest-clock moment.
     # Only for audio captures (typed/web commands have no capture_start → real wall clock).
     set_cmd_ts((req.get("capture_start") or "").strip() or None)
+    set_cmd_req(rid)   # which command save_recording takes its clip from
 
     # Manual context reset from the hub UI. The status-hub already stamped `voice_reset_at`, which bounds
     # the replayed conversation (recent_context), cleared the visible thread and pushed a live reset to every

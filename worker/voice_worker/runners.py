@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 
 import httpx
 
-from .config import ALL_TOOLS, JAREDBOT_TOOL, CLAUDE_BIN, CLAUDE_TIMEOUT_S, CREDITS_API_KEY, DATA_MCP_JS, GMAIL_MCP_PY, GMAIL_PY, GOVEE_MCP_PY, GOVEE_PY, HAS_MESSAGES, HTTP_TIMEOUT_S, HUB_EFFORT, HUB_MODEL, MESSAGES_HEADERS, MESSAGES_MCP_URL, PETLIBRO_MCP_PY, PETLIBRO_PY, SEND_TOOLS, SESSION_START_TOOLS, SESSION_TOOLS, STATE_DIR, SUPABASE_KEY, SUPABASE_URL, VOICE_MCP_JS, WORKER_ID
+from .config import ALL_TOOLS, JAREDBOT_TOOL, CLAUDE_BIN, CLAUDE_TIMEOUT_S, CREDITS_API_KEY, DATA_MCP_JS, GMAIL_MCP_PY, GMAIL_PY, GOVEE_MCP_PY, GOVEE_PY, HAS_MESSAGES, HTTP_TIMEOUT_S, HUB_EFFORT, HUB_MODEL, HUB_TOKEN, HUB_URL, MESSAGES_HEADERS, MESSAGES_MCP_URL, PETLIBRO_MCP_PY, PETLIBRO_PY, SEND_TOOLS, SESSION_START_TOOLS, SESSION_TOOLS, STATE_DIR, SUPABASE_KEY, SUPABASE_URL, VOICE_MCP_JS, WORKER_ID
 from .db import headers
 from .logs import classify_failure, log, log_error, now_iso
 from .outbound import push_activity
@@ -70,6 +70,20 @@ def run_subscription(run, label: str) -> dict:
 CMD_TS_FILE = STATE_DIR / "cmd_ts"
 
 
+# The in-flight command's voice_requests id, for the data MCP's save_recording (data-layer recordings.ts),
+# which asks the hub to keep that command's clip on a list item. A file for the same reason as CMD_TS_FILE.
+CMD_REQ_FILE = STATE_DIR / "cmd_req"
+
+
+def set_cmd_req(value: str | None) -> None:
+    """Publish (or clear) the in-flight command's request id for the data MCP."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        CMD_REQ_FILE.write_text(value or "")
+    except Exception as e:  # noqa: BLE001
+        log_error(f"cmd_req write failed: {e}")
+
+
 def set_cmd_ts(value: str | None) -> None:
     """Publish (or clear) the in-flight command's capture_start for the data MCP."""
     try:
@@ -88,7 +102,8 @@ def mcp_servers(codex_sessions: bool = False) -> dict:
     env = {"SUPABASE_URL": SUPABASE_URL, "SUPABASE_KEY": SUPABASE_KEY}
     # DATA_CALLER=hub marks sessions this worker dispatches, so their first reply is relayed back
     # into the hub thread (data-layer startSession → orchestrator/src/relay.js).
-    data_env = {**env, "DATA_TS_FILE": str(CMD_TS_FILE),
+    data_env = {**env, "DATA_TS_FILE": str(CMD_TS_FILE), "DATA_REQ_FILE": str(CMD_REQ_FILE),
+                "HUB_URL": HUB_URL, "HUB_TOKEN": HUB_TOKEN,
                 "DATA_CALLER": "hub", **({"DATA_AGENT": "codex"} if codex_sessions else {})}
     cfg = {
         "mcpServers": {
