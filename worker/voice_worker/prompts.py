@@ -1,5 +1,6 @@
 """What the model is told: the role framing and the directives appended to a hub turn."""
 
+import json
 import re
 
 
@@ -193,6 +194,69 @@ ALT_TRANSCRIPT_DIRECTIVE = (
     "makes sense, word by word, and never save a name or a value that appears in only one reading and "
     "makes no sense, as though he said it. If you cannot tell which he said, ask him.]"
 )
+
+
+
+# A command the hub RECOVERED from a recording that broke partway (status-hub routes/voice.js
+# lostRecording and recoverStream): the device stopped sending mid-recording and never sent the finished
+# clip, so the hub transcribed the audio it had and enqueued that, stamping `timing.cut_off`. Two things
+# make it unlike any other command. It may be only the first part of what he said, and acting on a
+# fragment ("delete the" ...) is a confident wrong action. And he usually notices the failure and says it
+# again another way (the phone, typing), so by the time it arrives it may already have been done; only
+# the conversation shows that, which is why the model judges it rather than code matching the words.
+_CUT_OFF_WHY = {
+    "lost": "its connection dropped while he was still talking",
+    "unmarked": "the app stopped while he was still talking",
+    "stalled": "it went silent while he was still talking, which is what the watch restarting or losing its network looks like",
+    "silent": "it went silent while he was still talking",
+}
+
+
+def _device(source: str) -> str:
+    s = (source or "").lower()
+    return "watch" if s.startswith("watch") else "phone" if "phone" in s or s.startswith("ios") else "device"
+
+
+def cut_off_directive(req: dict) -> str:
+    """The framing for a recovered command (timing.cut_off), or for the full clip of one that arrives after
+    its recovery (timing.supersedes). Empty for every other command."""
+    timing = req.get("timing") or {}
+    if isinstance(timing, str):
+        try:
+            timing = json.loads(timing)
+        except Exception:  # noqa: BLE001
+            timing = {}
+    out = ""
+    cut = timing.get("cut_off")
+    if isinstance(cut, dict):
+        device = _device(req.get("source") or "")
+        why = _CUT_OFF_WHY.get(str(cut.get("verdict") or ""), "it stopped sending partway through")
+        held = cut.get("held_s")
+        heard = f"the {held:g} seconds of audio it had received" if isinstance(held, (int, float)) else "the audio it had received"
+        out += (
+            f"\n\n[THIS COMMAND DID NOT ARRIVE THE NORMAL WAY. His {device} was recording it when {why}, and the "
+            f"finished recording never came, so the hub transcribed {heard} and sent you that, a few minutes "
+            "after he said it. Two things follow. FIRST, it may be cut off: the words above may be only the start "
+            "of what he said. SECOND, he may already have said it again another way (another device, or typed), "
+            "so read the conversation above before anything else. If he already repeated it and it was handled, "
+            "do NOT act on it again; reply in one short line that a failed recording from his "
+            f"{device} came through and was already taken care of. If he has not, and it is plainly a complete "
+            "request, do it, and say in your reply that it came from a "
+            f"{device} recording that failed. If it reads as cut off, or acting on part of it could do the wrong "
+            f"thing, do NOT act: tell him the {device} recording failed, quote what came through, and ask whether "
+            "there was more.")
+        if str(cut.get("view") or "") == "session":
+            out += (" It was said on the watch's session screen, so he meant it as a follow-up to one of his "
+                    "sessions, and which one is not known: ask him which before sending it anywhere.")
+        out += "]"
+    if timing.get("supersedes"):
+        out += (
+            "\n\n[This is the COMPLETE recording of a command whose stream broke earlier. The hub already sent you "
+            f"the part it had received as a separate, possibly cut-off command (request {timing['supersedes']}), "
+            "which is in the conversation above. This one is the whole of what he said. If you acted on the "
+            "partial one, do only what that left undone, never anything twice. If you asked him whether there "
+            "was more, this is the answer.]")
+    return out
 
 
 # Always-on mics hear the WHOLE room — the TV, Jared talking to his cats, other people talking to or

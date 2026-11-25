@@ -19,7 +19,7 @@ from .live import get_focus, recent_context
 from .logs import _parse_ts, alert_failure, log, log_error, now_iso
 from .outbound import inject_to_terminal, ping_esp_led, push_activity
 from .presence import claude_unready, hand_off
-from .prompts import ADDRESSING_DIRECTIVE, ALT_TRANSCRIPT_DIRECTIVE, ATTACH_DIRECTIVE, DELIBERATE_DIRECTIVE, NO_PRESS_DIRECTIVE, NUTRITION_DIRECTIVE, READ_DIRECTIVE, SHARE_DIRECTIVE, TOOLS_DIRECTIVE, is_ignore, read_again, take_read_marker
+from .prompts import ADDRESSING_DIRECTIVE, ALT_TRANSCRIPT_DIRECTIVE, ATTACH_DIRECTIVE, DELIBERATE_DIRECTIVE, cut_off_directive, NO_PRESS_DIRECTIVE, NUTRITION_DIRECTIVE, READ_DIRECTIVE, SHARE_DIRECTIVE, TOOLS_DIRECTIVE, is_ignore, read_again, take_read_marker
 from .runners import CODEX_TIMEOUT_S, SDK, SDK_CREDITS, SDK_FAST, codex_ready, limit_refused, run_codex, run_subscription, set_cmd_req, set_cmd_ts
 
 
@@ -364,6 +364,7 @@ def build_prompt(req: dict, transcript: str, *, ambient: bool, manual: bool) -> 
     alt = (req.get("alt_transcript") or "").strip()
     if alt:
         prompt += ALT_TRANSCRIPT_DIRECTIVE.format(alt=alt)
+    prompt += cut_off_directive(req)
     return prompt
 
 

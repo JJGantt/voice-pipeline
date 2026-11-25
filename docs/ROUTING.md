@@ -126,6 +126,18 @@ word and to ask when neither does. Neither model is the better transcriber: larg
 "pair putt" where turbo gets it, and turbo hears "a to-do" as "to view" where large gets it. The thread,
 the activity bar and dedupe all use `transcript` alone.
 
+## A command can arrive recovered from a broken recording
+
+When a device stops sending partway through a recording and never delivers the clip (a watch that
+restarts, a killed app, a dropped connection), the hub transcribes the audio its stream did receive and
+enqueues that, with `timing.cut_off` on the row (status-hub `docs/WATCH.md` § The wrist can drop
+mid-recording). `cut_off_directive` (`worker/voice_worker/prompts.py`) tells the model it may be only the
+start of what he said and that he may already have said it again another way, so it reads the
+conversation first, does nothing twice, acts only on a plainly complete request, and otherwise asks
+whether there was more. Deciding whether he repeated it is the model's job, from the conversation, and
+not a match on the words. A clip that arrives after its stream was recovered carries
+`timing.supersedes` and is framed as the whole of that command.
+
 ## Billing: the subscription, except where a turn is paid for on purpose
 
 A failed run is retried on the subscription and then surfaced as an error. An API-billed fallback for
