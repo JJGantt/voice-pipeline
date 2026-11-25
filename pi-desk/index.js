@@ -40,7 +40,7 @@ import { withAttachments, sweepStashedPrompts } from '../orchestrator/src/handof
 import { loginExpiresAt } from '../orchestrator/src/login.js';
 // Which conversation a process is in, from Claude Code's own record — shared with the Mac, which
 // reads the same files for the same reason.
-import { sessionOf } from '../orchestrator/src/discover.js';
+import { sessionOf, backgroundOf } from '../orchestrator/src/discover.js';
 // The same, for a Codex session (`agent = 'codex'`): its conversation is the rollout its process holds open.
 import { codexSessionOf, codexReady } from '../orchestrator/src/codex.js';
 import { sweepScratch } from './scratch.js';
@@ -61,6 +61,7 @@ import { wakeFly, presenceReady, nextMachine, handedVerdict, Reroute, mirroredPa
 const TS_COLUMNS = new Set(['reply_at', 'active_at', 'ended', 'mirror_at', 'last_seen']);
 const sameColumn = (col, next, current) => (TS_COLUMNS.has(col)
   ? (next ? Date.parse(next) : 0) === (current ? Date.parse(current) : 0)
+  : Array.isArray(next) || Array.isArray(current) ? JSON.stringify(next ?? null) === JSON.stringify(current ?? null)
   : (next ?? null) === (current ?? null));
 // `last_seen` is a clock reading, not news — the reasoning is on the same constant in the Mac's
 // orchestrator/src/deskSessions.js, and the two must not drift apart.
@@ -597,7 +598,11 @@ async function reconcileSessions() {
     // gone quiet from one that has not written its first transcript line yet.
     // `tpath` rather than row.transcript_path: a session that adopted its transcript on THIS pass has
     // not been published yet, and the watcher would otherwise not start on it until the next tick.
-    residents.push({ name, working: busy, bytes: tail.bytes, lastActivity: tail.lastActivity, created, row, tpath });
+    // What it still has running in the background once its turn is over: drawn as work in progress, and
+    // never reaped or evicted, since parking the session would kill that work.
+    const bg = backgroundOf(s, tpath);
+    const background = bg.bg_shell || !!bg.bg_agents;
+    residents.push({ name, working: busy, background, bytes: tail.bytes, lastActivity: tail.lastActivity, created, row, tpath });
 
     // Upsert, not patch-if-known: a session tmux is running that the table never saw must still
     // appear, or "tmux is the source of truth" is not true.
@@ -629,6 +634,7 @@ async function reconcileSessions() {
           // last_reply is the FINAL message of a turn; `working` is what says whether a newer one is
           // still being written. Without it a reader cannot tell an answer from a stale one.
           working: busy,
+          ...bg,
           reply_at: tail.replyAt || (rebound ? null : row?.reply_at) || null,
           // Both carried through for the same merge-duplicates reason as the label. `active_at` is the
           // last turn boundary, which orders and focuses sessions everywhere (turnBoundary).
@@ -712,7 +718,10 @@ async function reconcileSessions() {
           active_at: tail.turnAt || new Date().toISOString(),
           last_seen: new Date().toISOString(),
         }),
-      }).catch((e) => console.error('[pi-desk] turn-end patch:', e.message));
+      }).catch((e) => console.error('[pi-desk] turn-end patch:', e.message))
+        // A turn that ended handing work to the background is told apart from one that finished by the
+        // process's own record, which Claude Code rewrites a moment after the reply lands.
+        .finally(() => setTimeout(reconcileSoon, 1500));
     },
     (id, at) => {
       sb(`desk_sessions?id=eq.${encodeURIComponent(id)}`, {
@@ -736,7 +745,8 @@ async function reconcileSessions() {
  * not just the oldest, because the failure it exists to prevent is several of them accumulating.
  *
  * Two things are deliberately never reaped:
- *   · a `working` session — a turn is in flight, and cutting it can leave a repo half-edited.
+ *   · a `working` session — a turn is in flight, and cutting it can leave a repo half-edited. Nor one
+ *     with a background agent or shell still running, whose transcript goes quiet while that work goes on.
  *   · a session younger than the cutoff by tmux's clock — `lastActivity` is 0 until the transcript's
  *     first line lands, so a freshly launched session looks maximally idle and would be killed on
  *     the tick after it started.
@@ -748,7 +758,7 @@ async function reapIdleSessions(residents) {
   for (const r of residents) {
     const quiet = (r.lastActivity || 0) < cutoff;
     const old = (r.created || 0) < cutoff;             // never judge a session younger than the cutoff
-    if (r.working || !quiet || !old) { kept.push(r); continue; }
+    if (r.working || r.background || !quiet || !old) { kept.push(r); continue; }
     const idleMin = Math.round((Date.now() - (r.lastActivity || r.created || 0)) / 60000);
     console.log(`[pi-desk] reaping ${r.name}: idle ${idleMin}m (limit ${Math.round(IDLE_MAX_S / 60)}m)`);
     await park(r.name);

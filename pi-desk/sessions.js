@@ -164,12 +164,12 @@ async function exited(pid, ms = 10000) {
  * session that had said its work was deployed was protected, and the one the user was mid-conversation
  * with was killed, because it was 66KB smaller.
  *
- * Never a working one either — that check remains, but it is weak on its own: `working` means a turn
+ * Never a working one either, nor one with a background agent or shell running — that check remains, but it is weak on its own: `working` means a turn
  * is in flight, and between a reply and the next message a live conversation is indistinguishable
  * from an abandoned one. Recency is what actually separates them.
  */
 export function pickEviction(residents) {
-  const idle = residents.filter((r) => !r.working);
+  const idle = residents.filter((r) => !r.working && !r.background);
   if (!idle.length) return null;
   return idle.slice().sort((a, b) => (a.lastActivity || 0) - (b.lastActivity || 0))[0];
 }

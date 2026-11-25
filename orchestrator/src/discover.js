@@ -68,7 +68,48 @@ export function sessionOf(pid) {
     // What it is blocked on ('permission prompt'), or null. Typing into it then is not a message: the
     // keys go to the dialog, and a return there answers it.
     waiting: d.status === 'waiting' ? (d.waitingFor || 'input') : null,
+    // A background shell still running while no turn is (`run_in_background`, or a command moved to the
+    // background on its timeout). Claude Code writes `shell` in place of `idle` for exactly that and for
+    // nothing else; a background AGENT leaves it `idle`, which is what backgroundAgents() is for.
+    shell: d.status === 'shell',
+    // When this process started: anything a background agent left behind before it cannot be running in it.
+    recordStartedAt: Number.isFinite(d.startedAt) ? d.startedAt : null,
   };
+}
+
+/**
+ * The background agents still running in a conversation — each one's description, as its Agent call
+ * named it. Claude Code keeps a record beside each subagent's transcript
+ * (`<conversation>/subagents/agent-<id>.meta.json`), written at launch and rewritten with `finished`
+ * when the agent ends. A record without it is running — unless it predates this process (`sinceMs`),
+ * which is a process that was killed with the agent in flight and never wrote the end.
+ */
+export function backgroundAgents(transcriptPath, sinceMs) {
+  if (!transcriptPath || !sinceMs) return [];
+  const dir = path.join(transcriptPath.replace(/\.jsonl$/, ''), 'subagents');
+  let files;
+  try { files = fs.readdirSync(dir); } catch { return []; }
+  const out = [];
+  for (const f of files) {
+    if (!f.endsWith('.meta.json')) continue;
+    const file = path.join(dir, f);
+    let m, st;
+    try { st = fs.statSync(file); m = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { continue; }
+    if (m.requestShape !== 'background' || m.finished || m.stoppedByUser || m.sweptByStop) continue;
+    if (st.mtimeMs < sinceMs) continue;
+    out.push({ at: st.mtimeMs, label: String(m.description || m.agentType || 'agent').slice(0, 120) });
+  }
+  return out.sort((a, b) => a.at - b.at).map((a) => a.label);
+}
+
+/**
+ * The background work a live process `proc` (sessionOf) has going — what every host publishes as
+ * `desk_sessions.bg_agents` / `bg_shell`. Nothing for a Codex session, whose rollout records none.
+ */
+export function backgroundOf(proc, transcriptPath) {
+  if (!proc || proc.shell == null) return { bg_agents: null, bg_shell: false };
+  const agents = backgroundAgents(transcriptPath, proc.recordStartedAt);
+  return { bg_agents: agents.length ? agents : null, bg_shell: proc.shell === true };
 }
 
 /**

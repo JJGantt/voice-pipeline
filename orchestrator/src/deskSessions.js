@@ -30,7 +30,7 @@ import { syncSessionWatch, reportTurnEnd } from './sessionWatch.js';
 import { relayFirstReply } from './relay.js';
 import { reapIdle } from './idle.js';
 import { closeHuskForTty, closeTabForTty } from './applescript.js';
-import { sessionOf } from './discover.js';
+import { sessionOf, backgroundOf } from './discover.js';
 import { liveCodexSessions, codexSessionOf } from './codex.js';
 import fs from 'node:fs';
 import { streak } from './streak.js';
@@ -40,6 +40,8 @@ import { streak } from './streak.js';
 const LAUNCH_GRACE_S = 90;
 // A dispatched row is written as its tab opens, and claude can come up a moment either side of that.
 const START_SLACK_MS = 30000;
+// How long after a turn ends the tick re-reads the session for what it left running in the background.
+const BACKGROUND_SETTLE_MS = 1500;
 
 // Launches in flight (commands.js). Between a tab opening and its row being written, the new claude
 // looks exactly like a session nobody dispatched, and adopting it then would give one session two rows.
@@ -182,7 +184,9 @@ async function adopt(s, rows, elsewhere) {
 // are compared as instants and never as strings.
 const TS_FIELDS = new Set(['reply_at', 'active_at', 'ended', 'mirror_at', 'last_seen']);
 const unchanged = (field, next, current) =>
-  (TS_FIELDS.has(field) ? ms(next) === ms(current) : (next ?? null) === (current ?? null));
+  (TS_FIELDS.has(field) ? ms(next) === ms(current)
+    : Array.isArray(next) || Array.isArray(current) ? JSON.stringify(next ?? null) === JSON.stringify(current ?? null)
+    : (next ?? null) === (current ?? null));
 
 // `last_seen` is a clock reading, not news. Its only consumer is pi-desk's retention sweep over PARKED
 // rows, whose stamp freezes at eviction anyway, and every list surface orders by `active_at` and
@@ -279,6 +283,9 @@ async function reconcile(row, proc, startup = false) {
   // this catches one it missed, since fs.watch drops events.
   const busy = proc && proc.busy != null ? proc.busy : !!(tail && tail.working);
   patch.working = alive && busy;
+  // What it still has running in the background once its turn is over — an agent or a shell it started.
+  // Every surface draws it the way it draws a turn in flight, so a reply is not read as the end of the work.
+  Object.assign(patch, alive ? backgroundOf(proc, row.transcript_path) : { bg_agents: null, bg_shell: false });
   // The net under the watcher's relay, for a finished turn fs.watch dropped.
   if (alive && tail && !busy) relay(row.id, tail);
   // The same net for the reply's notification. A finished turn newer than the one this row records is
@@ -495,7 +502,10 @@ async function tick() {
         reply_at: tail.replyAt || null,
         active_at: tail.turnAt || new Date().toISOString(),
         last_seen: new Date().toISOString(),
-      }).catch((e) => console.error('[desk-sessions] turn-end patch:', e.message));
+      }).catch((e) => console.error('[desk-sessions] turn-end patch:', e.message))
+        // A turn that ended handing work to the background is told apart from one that finished by the
+        // process's own record, which Claude Code rewrites a moment after the reply lands.
+        .finally(() => setTimeout(tickSoon, BACKGROUND_SETTLE_MS));
     },
     (id, at) => {
       patchDeskSession(id, { working: true, active_at: at })

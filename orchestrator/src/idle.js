@@ -26,6 +26,7 @@ import { promisify } from 'node:util';
 import { patchDeskSession } from './supabase.js';
 import { closeTabForTty } from './applescript.js';
 import { codexPrompt } from './codex.js';
+import { backgroundOf } from './discover.js';
 
 const exec = promisify(execFile);
 
@@ -151,6 +152,9 @@ export async function reapIdle(row, proc, transcriptBytes) {
   }
 
   if (proc.busy !== false || proc.waiting) return false;
+  // A background agent or shell is still working for it; parking the session would kill that work.
+  const bg = backgroundOf(proc, row.transcript_path);
+  if (bg.bg_shell || bg.bg_agents) return false;
   const idleFor = Date.now() - Date.parse(row.active_at || row.started);
   if (!(idleFor >= IDLE_PARK_MS)) return false;
   // The mirror has to hold the whole conversation, or a resume on the other machine starts short.
