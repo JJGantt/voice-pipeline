@@ -13,6 +13,7 @@ on screen via the Hammerspoon overlay HUD (see hud()).
 
 import asyncio
 import json
+import logging
 import os
 import re
 import resource
@@ -28,7 +29,15 @@ from datetime import datetime, timezone
 import numpy as np
 import sounddevice as sd
 import httpx
+import ops_report as ops
 from openwakeword.model import Model
+
+# Errors go to the ops responder (health/responder): uncaught exceptions and `logging` at ERROR are
+# errors, `logging` at WARNING an occurrence (a failure a retry or a fallback already handles). See
+# log_error / log_warning below. The heartbeat comes from the wake loop in main().
+ops.install(machine="mac", service="mac-listener")
+_oplog = logging.getLogger("mac-listener")
+BEAT_S = 60
 
 # ---- config (env, with sane defaults) -------------------------------------
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://felyggqjjhltwokdfhop.supabase.co").rstrip("/")
@@ -93,11 +102,14 @@ def _self_reexec(reason: str) -> None:
     lid-closed wedge storm (~1,400 re-execs overnight on 2026-08-01) it recursed until the stack blew and
     Hammerspoon died with EXC_BREAKPOINT. Startup's hud("off") clears any frozen pill instead — the
     persisted HUD state means that clear still fires exactly once."""
-    log(f"self-heal: re-execing in place — {reason}")
+    log_warning(f"self-heal: re-execing in place — {reason}")
+    ops.flush(3)   # execv and os._exit both skip the sender thread and atexit
     run_sh = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run.sh")
     try:
         os.execv(run_sh, [run_sh])   # same PID, fresh process image — launchd never consulted
-    except OSError:
+    except OSError as e:
+        log_error(f"self-heal: execv {run_sh} failed ({e}); exiting 3")
+        ops.flush(3)
         os._exit(3)   # last resort; the worker's listener supervisor kickstarts the job
 
 
@@ -113,7 +125,7 @@ def _raise_fd_limit() -> None:
             resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
             log(f"raised fd soft limit {soft} → {target} (hard {hard})")
     except Exception as e:  # noqa: BLE001
-        log(f"could not raise fd limit: {e}")
+        log_error(f"could not raise fd limit: {e}")
 
 
 def _lid_closed() -> bool:
@@ -125,7 +137,8 @@ def _lid_closed() -> bool:
     try:
         out = subprocess.run(["/usr/sbin/ioreg", "-r", "-k", "AppleClamshellState", "-d", "4"],
                              capture_output=True, text=True, timeout=5).stdout
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        log_warning(f"lid state unreadable ({e!r}); treating the lid as open")
         return False
     return '"AppleClamshellState" = Yes' in out
 
@@ -147,9 +160,9 @@ def _builtin_mic():
         for i, d in enumerate(sd.query_devices()):
             if d["name"] == name and d["max_input_channels"] > 0:
                 return i
-        log(f"built-in mic {name!r} not in PortAudio's list — using the default input")
+        log_warning(f"built-in mic {name!r} not in PortAudio's list — using the default input")
     except Exception as exc:
-        log(f"no built-in mic found ({exc!r}) — using the default input")
+        log_warning(f"no built-in mic found ({exc!r}) — using the default input")
     return None
 
 
@@ -207,6 +220,9 @@ def _watchdog() -> None:
                 log("lid closed — audio hardware is down, not a wedged stream; holding until it opens")
                 lid_shut = True
             baseline = time.monotonic()     # re-arm, so the wedge test starts over when the lid opens
+            # The wake loop's beat stops with the frames. A closed lid is the one known reason for that,
+            # and this hold is what establishes it, so the hold beats instead.
+            ops.beat(BEAT_S, {"lid": "closed"})
             continue
         if lid_shut:
             log("lid open — audio hardware back; judging the stream from here")
@@ -227,8 +243,8 @@ def _alive_beacon() -> None:
                                     "Prefer": "resolution=merge-duplicates,return=minimal"},
                            json={"source": "mac-listener",
                                  "alive_at": datetime.now(timezone.utc).isoformat()}, timeout=5)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as e:  # noqa: BLE001 — the next beacon, 30s on, retries it
+                log_warning(f"mic-liveness beacon not sent: {e}")
         time.sleep(30)
 
 
@@ -246,9 +262,9 @@ def _ping_esp_capture(on: bool) -> None:
         httpx.get(f"{JARED_VOICE_URL}/capture-{'off' if on else 'on'}",
                   headers={"X-Token": LED_TOKEN}, timeout=3).raise_for_status()
     except httpx.HTTPStatusError as e:   # a refused token is a misconfiguration, not a network blip
-        log(f"ERROR esp capture bridge refused: {e.response.status_code}")
-    except Exception:  # noqa: BLE001 — redundant fast-path; the server also reads voice_muted itself
-        pass
+        log_error(f"esp capture bridge refused: {e.response.status_code}")
+    except Exception as e:  # noqa: BLE001 — redundant fast-path; the server also reads voice_muted itself
+        log_warning(f"esp capture bridge failed: {e}")
 
 
 def _ping_esp_wakefree(on: bool) -> None:
@@ -258,9 +274,9 @@ def _ping_esp_wakefree(on: bool) -> None:
         httpx.get(f"{JARED_VOICE_URL}/wakefree-{'on' if on else 'off'}",
                   headers={"X-Token": LED_TOKEN}, timeout=20).raise_for_status()
     except httpx.HTTPStatusError as e:
-        log(f"ERROR esp wakefree bridge refused: {e.response.status_code}")
-    except Exception:  # noqa: BLE001 — redundant fast-path; the server also reads wakefree_enabled itself
-        pass
+        log_error(f"esp wakefree bridge refused: {e.response.status_code}")
+    except Exception as e:  # noqa: BLE001 — redundant fast-path; the server also reads wakefree_enabled itself
+        log_warning(f"esp wakefree bridge failed: {e}")
 
 
 def _apply_mute(on: bool) -> None:
@@ -351,7 +367,7 @@ def _spawn_wakefree() -> None:
         wflog = open(os.path.expanduser("~/repos/voice-pipeline/voice-id/wakefree.out.log"), "a")
         _wf_proc = subprocess.Popen([WAKEFREE_RUN], stdout=wflog, stderr=wflog)  # logged so capture/speaker-ID/inject is visible
     except Exception as e:  # noqa: BLE001
-        log(f"failed to start wakefree: {e}")
+        log_error(f"failed to start wakefree: {e}")
         return
     finally:
         if wflog is not None:
@@ -362,7 +378,7 @@ def _spawn_wakefree() -> None:
         if not (_wakefree.is_set() and _mic_on.is_set() and proc is _wf_proc):
             return                      # deliberate stop (mode off / mic off) or a superseded child
         if rc == 2:
-            log("wakefree.py exited rc=2 (fatal config — missing key/exemplars); NOT respawning")
+            log_error("wakefree.py exited rc=2 (fatal config — missing key/exemplars); NOT respawning")
             return
         now = time.monotonic()
         lifetime = now - started
@@ -376,7 +392,7 @@ def _spawn_wakefree() -> None:
                 _self_reexec(f"wakefree crash-loop ({WF_STORM_N} deaths in <{WF_STORM_WINDOW_S}s) — audio stack wedged, not the child")
                 return                  # unreachable: execv replaced the image
             backoff = min(WF_BACKOFF_MAX_S, 2 ** len(_wf_deaths))
-        log(f"wakefree.py died rc={rc} after {lifetime:.0f}s while wake-free is on — respawning in {backoff}s")
+        log_warning(f"wakefree.py died rc={rc} after {lifetime:.0f}s while wake-free is on — respawning in {backoff}s")
         time.sleep(backoff)
         if _wakefree.is_set() and proc is _wf_proc:
             _spawn_wakefree()
@@ -445,7 +461,7 @@ def _spawn_sensor() -> None:
         _sensor_proc = subprocess.Popen([WAKEFREE_RUN], stdout=slog, stderr=slog,
                                         env={**os.environ, "WAKEFREE_SENSOR": "1"})
     except Exception as e:  # noqa: BLE001
-        log(f"failed to start voice sensor: {e}")
+        log_error(f"failed to start voice sensor: {e}")
         return
     finally:
         if slog is not None:
@@ -453,8 +469,12 @@ def _spawn_sensor() -> None:
 
     def _supervise(proc: subprocess.Popen) -> None:
         rc = proc.wait()
-        if not (_sensor.is_set() and _mic_on.is_set() and proc is _sensor_proc) or rc == 2:
-            return   # deliberate stop, superseded, or fatal config
+        if not (_sensor.is_set() and _mic_on.is_set() and proc is _sensor_proc):
+            return   # deliberate stop or superseded
+        if rc == 2:
+            log_error("voice sensor exited rc=2 (fatal config — missing key/exemplars); NOT respawning")
+            return
+        log_warning(f"voice sensor died rc={rc} — respawning")
         # Best-effort respawn with a flat backoff — no storm escalation like the real wakefree gets: a
         # sensor that keeps dying only makes re-arm happen EARLIER (absence of stamps reads as quiet).
         time.sleep(max(0.0, 10.0 - (time.monotonic() - started)))
@@ -480,16 +500,16 @@ def set_inject_mode(on: bool) -> None:
             set_wakefree(True)
         try:
             open(INJECT_FLAG, "w").close()
-        except OSError:
-            pass
+        except OSError as e:
+            log_error(f"inject flag not written ({INJECT_FLAG}): {e}")
         log("inject mode ON — Mac-mic → focused window; ESP gated off by the server (speech is a separate toggle)")
     else:
         try:
             os.remove(INJECT_FLAG)
         except FileNotFoundError:
             pass
-        except OSError:
-            pass
+        except OSError as e:
+            log_error(f"inject flag not removed ({INJECT_FLAG}): {e}")
         set_wakefree(_read_setting("wakefree_enabled"))   # inject forced wake-free on; restore its own toggle
         log("inject mode OFF — wake-free restored to its hub setting")
 
@@ -504,16 +524,16 @@ def set_speak_replies(on: bool) -> None:
     if on:
         try:
             open(SPEAK_FLAG, "w").close()
-        except OSError:
-            pass
+        except OSError as e:
+            log_error(f"speak flag not written ({SPEAK_FLAG}): {e}")
         log("speak replies ON — final reply read aloud")
     else:
         try:
             os.remove(SPEAK_FLAG)
         except FileNotFoundError:
             pass
-        except OSError:
-            pass
+        except OSError as e:
+            log_error(f"speak flag not removed ({SPEAK_FLAG}): {e}")
         log("speak replies OFF — replies stay silent")
 
 
@@ -524,11 +544,13 @@ def _read_setting(key: str, default: bool = False) -> bool:
         r = httpx.get(f"{SUPABASE_URL}/rest/v1/app_settings",
                       params={"key": f"eq.{key}", "select": "value"},
                       headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=8)
+        r.raise_for_status()
         rows = r.json()
         if not rows:
             return default
         return str(rows[0].get("value")) not in ("0", "false", "off", "no", "", "None")
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001 — falls back to the safe default; reconcile re-reads it
+        log_warning(f"setting {key} unreadable ({e}); using {default}")
         return default
 
 
@@ -546,9 +568,9 @@ def _write_setting(key: str, value: str) -> None:
                                 "Prefer": "resolution=merge-duplicates,return=minimal"},
                        json={"key": key, "value": value}, timeout=8)
         if r.status_code >= 300:
-            log(f"setting {key} not written: {r.status_code} {r.text[:120]}")
+            log_error(f"setting {key} not written: {r.status_code} {r.text[:120]}")
     except Exception as e:  # noqa: BLE001
-        log(f"setting {key} not written: {e}")
+        log_error(f"setting {key} not written: {e}")
 
 
 def _reconcile_settings() -> None:
@@ -565,11 +587,23 @@ def _reconcile_settings() -> None:
         set_wakefree(_read_setting("wakefree_enabled"))
         _apply_mute(_read_setting("voice_muted"))
     except Exception as e:  # noqa: BLE001
-        log(f"settings reconcile error: {e}")
+        log_error(f"settings reconcile error: {e}")
 
 
 def log(msg: str) -> None:
     print(f"{datetime.now(timezone.utc).isoformat()} [mac-listener] {msg}", flush=True)
+
+
+def log_error(msg: str) -> None:
+    """A failure: printed like every line, and logged at ERROR, which the ops reporter sends."""
+    log(f"ERROR {msg}")
+    _oplog.error(msg)
+
+
+def log_warning(msg: str) -> None:
+    """A failure a retry or a fallback already handles: an occurrence at the responder."""
+    log(f"WARNING {msg}")
+    _oplog.warning(msg)
 
 
 # ---- local feedback: a screen-level state HUD + Raspy's reply spoken aloud -----------------------
@@ -606,8 +640,8 @@ def hud(state: str) -> None:
                 fh.write(state)
             subprocess.Popen([HS_BIN, "-c", f'VoiceHUD("{state}")'],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        log_error(f"HUD {state!r} not sent: {e}")
 
 
 # ---- Central HUD state, driven off the SHARED voice state (voice_presence + voice_requests) -----------
@@ -655,8 +689,8 @@ def warm_tts() -> None:
     permanently. Idempotent + fire-and-forget (voice_daemon.sh no-ops if it's already running)."""
     try:
         subprocess.Popen([VOICE_DAEMON, "start"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        log_error(f"TTS warm-up not started: {e}")
 
 
 KOKORO_PIN = "/tmp/kokoro.pin"   # present = keep the TTS daemon warm (don't idle-exit); see kokoro_daemon.py
@@ -670,8 +704,8 @@ def _pin_tts(on: bool) -> None:
             open(KOKORO_PIN, "w").close()
         else:
             os.path.exists(KOKORO_PIN) and os.remove(KOKORO_PIN)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        log_error(f"TTS pin {'set' if on else 'clear'} failed: {e}")
 
 
 def _speak(text: str) -> None:
@@ -680,7 +714,7 @@ def _speak(text: str) -> None:
     try:
         subprocess.run([SPEAK_SH], input=text, text=True, capture_output=True, timeout=90)
     except Exception as e:  # noqa: BLE001
-        log(f"speak failed: {e}")
+        log_error(f"speak failed: {e}")
 
 
 # ---- universal feedback (event-driven) -----------------------------------------------------------
@@ -694,6 +728,15 @@ def _speak(text: str) -> None:
 # No polling, no fixed wait; both tables are in the supabase_realtime publication (00016 / 00021 /
 # 00024). The lib server-assigns a distinct id per binding and only invokes the matching callback,
 # so the two bindings never cross-fire. Mirrors the worker's RealtimeWaker (same AsyncRealtimeClient).
+def _record(payload):
+    """The changed row in a realtime payload, or None (logged) when the payload is not that shape."""
+    try:
+        return (payload.get("data") or {}).get("record") or {}
+    except AttributeError:
+        log_error(f"realtime payload without a record: {str(payload)[:200]}")
+        return None
+
+
 class RealtimeFeedback:
     def __init__(self):
         self._loop = None
@@ -713,7 +756,7 @@ class RealtimeFeedback:
         try:
             self._loop.run_until_complete(self._serve())
         except Exception as e:  # noqa: BLE001
-            log(f"realtime feedback loop exited: {e}")
+            log_error(f"realtime feedback loop exited: {e}")
 
     async def _serve(self) -> None:
         from realtime import AsyncRealtimeClient
@@ -748,7 +791,7 @@ class RealtimeFeedback:
                     await asyncio.sleep(1.0)
                 log("realtime feedback recycling socket (proactive half-open guard)")
             except Exception as e:  # noqa: BLE001
-                log(f"realtime feedback error: {e}; retrying in 5s")
+                log_warning(f"realtime feedback error: {e}; retrying in 5s")
             try:
                 if self._sock:
                     await self._sock.close()
@@ -760,9 +803,8 @@ class RealtimeFeedback:
         """voice_speech is now spoken by the Pi audio service (warm Kokoro → the TV) — the single audio
         owner — so the Mac no longer plays it (avoids a double-play). Kept subscribed only for visibility;
         the Mac-as-speaker option can return later as a hub-toggled output source."""
-        try:
-            rec = (payload.get("data") or {}).get("record") or {}
-        except AttributeError:
+        rec = _record(payload)
+        if rec is None:
             return
         text = (rec.get("text") or "").strip()
         if text:
@@ -770,9 +812,8 @@ class RealtimeFeedback:
 
     def _on_setting(self, payload) -> None:
         """A hub setting changed → react to the wake-free toggle and the global mute. Event-driven."""
-        try:
-            rec = (payload.get("data") or {}).get("record") or {}
-        except AttributeError:
+        rec = _record(payload)
+        if rec is None:
             return
         key = rec.get("key")
         truthy = str(rec.get("value")) not in ("0", "false", "off", "no", "", "None")
@@ -794,9 +835,8 @@ class RealtimeFeedback:
         Universal. (Warming lives here, not on a voice_requests INSERT binding, because realtime-py
         doesn't reliably support two bindings on the same table; 'claimed' is ~0.3s after INSERT, so
         the timing is unchanged. This Mac's OWN commands are warmed even earlier by the wake loop.)"""
-        try:
-            rec = (payload.get("data") or {}).get("record") or {}
-        except AttributeError:
+        rec = _record(payload)
+        if rec is None:
             return
         global _hud_working
         status = str(rec.get("status") or "")
@@ -813,14 +853,14 @@ class RealtimeFeedback:
 
     def _on_presence(self, payload) -> None:
         """Any mic confirmed the speaker (shared voice_presence) → HUD 'Hearing you'. Central, not just this Mac's mic."""
-        try:
-            rec = (payload.get("data") or {}).get("record") or {}
-        except AttributeError:
+        rec = _record(payload)
+        if rec is None:
             return
         hj = rec.get("heard_jared_at")
         try:
             fresh = bool(hj) and (datetime.now(timezone.utc) - datetime.fromisoformat(hj)).total_seconds() <= 1.5
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            log_error(f"voice_presence heard_jared_at unreadable ({hj!r}): {e}")
             fresh = False
         if fresh:
             _hud_hearing_on()
@@ -866,9 +906,9 @@ def _groq_transcribe(path: str):
             )
         if r.status_code == 200:
             return r.text.strip()
-        log(f"groq {r.status_code} — falling back to local whisper")
+        log_warning(f"groq {r.status_code} — falling back to local whisper")
     except Exception as e:  # noqa: BLE001
-        log(f"groq error ({e}) — falling back to local whisper")
+        log_warning(f"groq error ({e}) — falling back to local whisper")
     return None
 
 
@@ -903,7 +943,7 @@ def transcribe(pcm: np.ndarray) -> str:
         )
         return _heard(out.stdout.strip())
     except Exception as e:  # noqa: BLE001
-        log(f"transcribe failed: {e}")
+        log_error(f"transcribe failed: {e}")
         return ""
     finally:
         try:
@@ -917,9 +957,9 @@ def _esp_blink() -> None:
     working indicators start together instead of waiting for the worker's claim ping."""
     try:
         httpx.get(f"{JARED_VOICE_URL}/led-blink",
-                  headers={"X-Token": LED_TOKEN}, timeout=3)
-    except Exception:  # noqa: BLE001
-        pass
+                  headers={"X-Token": LED_TOKEN}, timeout=3).raise_for_status()
+    except Exception as e:  # noqa: BLE001
+        log_error(f"ESP blink failed: {e}")
 
 
 def open_request(cap_start: str, cap_end: str) -> str | None:
@@ -934,10 +974,11 @@ def open_request(cap_start: str, cap_end: str) -> str | None:
                                 "Content-Type": "application/json", "Prefer": "return=representation"},
                        json={"status": "transcribing", "source": "mac", "focus": "hub", "always_on": True,
                              "capture_start": cap_start, "capture_end": cap_end}, timeout=6)
+        r.raise_for_status()
         rows = r.json()
-        return rows[0]["id"] if isinstance(rows, list) and rows else None
-    except Exception as e:  # noqa: BLE001
-        log(f"open-request failed: {e}")
+        return rows[0]["id"]
+    except Exception as e:  # noqa: BLE001 — enqueue() inserts the finished transcript instead
+        log_warning(f"open-request failed: {e}")
         return None
 
 
@@ -954,13 +995,14 @@ def update_request_pending(rid: str, text: str) -> None:
                                   "updated_at": datetime.now(timezone.utc).isoformat()}, timeout=10)
             r.raise_for_status()
             if not r.json():
-                log(f"enqueue: row {rid} is no longer transcribing; transcript dropped")
+                log_error(f"enqueue: row {rid} is no longer transcribing; transcript dropped")
                 return
             return
         except Exception as e:  # noqa: BLE001
             if pause is None:
-                log(f"enqueue (update) failed: {e}")
+                log_error(f"enqueue (update) failed: {e}")
                 return
+            log_warning(f"enqueue (update) failed, retrying in {pause}s: {e}")
             time.sleep(pause)
 
 
@@ -971,9 +1013,9 @@ def close_request_error(rid: str, err: str) -> None:
                     headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
                              "Content-Type": "application/json", "Prefer": "return=minimal"},
                     json={"status": "error", "error": err,
-                          "updated_at": datetime.now(timezone.utc).isoformat()}, timeout=6)
-    except Exception:  # noqa: BLE001
-        pass
+                          "updated_at": datetime.now(timezone.utc).isoformat()}, timeout=6).raise_for_status()
+    except Exception as e:  # noqa: BLE001
+        log_error(f"request {rid} not closed as error: {e}")
 
 
 def enqueue(text: str, cap_start: str | None = None, cap_end: str | None = None):
@@ -1000,16 +1042,12 @@ def enqueue(text: str, cap_start: str | None = None, cap_end: str | None = None)
             json=payload,
             timeout=10.0,
         )
-        rid = None
-        try:
-            rows = r.json()
-            rid = rows[0]["id"] if isinstance(rows, list) and rows else None
-        except Exception:  # noqa: BLE001
-            pass
+        r.raise_for_status()
+        rid = r.json()[0]["id"]
         log(f"enqueued (id={rid}): {text[:80]!r}")
         return rid
     except Exception as e:  # noqa: BLE001
-        log(f"enqueue failed: {e}")
+        log_error(f"enqueue failed: {e}")
         return None
 
 
@@ -1062,11 +1100,11 @@ def capture_utterance(stream) -> np.ndarray:
 
 def main() -> int:
     if not SUPABASE_KEY:
-        print("FATAL: SUPABASE_KEY required (INSERT on voice_requests).", file=sys.stderr)
+        log_error("FATAL: SUPABASE_KEY required (INSERT on voice_requests).")
         return 2
     stt = f"groq:{GROQ_MODEL}" if GROQ_API_KEY else "whisper.cpp (local)"
     if not GROQ_API_KEY and (not os.path.exists(WHISPER_BIN) or not os.path.exists(WHISPER_MODEL)):
-        print(f"FATAL: no GROQ_API_KEY and whisper.cpp not found ({WHISPER_BIN}).", file=sys.stderr)
+        log_error(f"FATAL: no GROQ_API_KEY and whisper.cpp not found ({WHISPER_BIN}).")
         return 2
 
     _raise_fd_limit()   # headroom before we open models, sockets, and the wakefree supervisor
@@ -1100,6 +1138,7 @@ def main() -> int:
 
     global _last_frame
     yielded_logged = False
+    beat_at = 0.0
     with _open_input_stream() as stream:
         _last_frame = time.monotonic()
         threading.Thread(target=_watchdog, daemon=True).start()
@@ -1108,6 +1147,9 @@ def main() -> int:
         while True:
                 buf, _ = stream.read(FRAME)
                 _last_frame = time.monotonic()
+                if _last_frame - beat_at >= BEAT_S:
+                    ops.beat(BEAT_S)
+                    beat_at = _last_frame
                 if not _capture.is_set():
                     # Software mute: the stream stays hot (stopping it is the HAL deadlock); frames are
                     # read and dropped so nothing buffers while push-to-talk / wake-free holds the mic.

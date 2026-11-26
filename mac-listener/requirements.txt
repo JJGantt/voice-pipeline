@@ -3,3 +3,4 @@ sounddevice
 numpy
 scipy
 httpx
+ops-report @ https://github.com/JJGantt/ops-report/archive/refs/tags/v1.2.0.tar.gz
