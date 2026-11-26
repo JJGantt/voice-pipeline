@@ -29,7 +29,13 @@ from datetime import datetime, timezone
 import numpy as np
 import sounddevice as sd
 import httpx
-import ops_report as ops
+try:
+    import ops_report as ops
+except ImportError:  # a venv not yet reinstalled from requirements.txt: keep listening, say so
+    import types
+    print("[ops] ops_report not installed in this venv: mac-listener is not reporting", file=sys.stderr)
+    ops = types.SimpleNamespace(install=lambda **k: None, beat=lambda *a, **k: None,
+                                report=lambda *a, **k: None, occurrence=lambda *a, **k: None)
 from openwakeword.model import Model
 
 # Errors go to the ops responder (health/responder): uncaught exceptions and `logging` at ERROR are
