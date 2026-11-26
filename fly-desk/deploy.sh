@@ -10,7 +10,7 @@ GV=$(pick ~/repos/govee-mcp ~/mcp-govee)
 GM=$(pick ~/repos/gmail-mcp)
 VP=$(cd .. && pwd)
 mkdir -p data-layer govee-mcp gmail-mcp host/orchestrator
-cp $DL/package.json $DL/tsconfig.json data-layer/
+cp $DL/package.json $DL/tsconfig.json $DL/ops_report.cjs data-layer/   # mcp.ts loads ../ops_report.cjs
 cp -R $DL/src data-layer/src
 cp $GV/govee_mcp.py govee-mcp/
 cp $GM/gmail_mcp.py gmail-mcp/

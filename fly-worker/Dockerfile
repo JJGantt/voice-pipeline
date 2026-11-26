@@ -44,7 +44,8 @@ COPY govee-mcp /app/govee-mcp
 # run on. The credential is three Fly secrets (GOOGLE_CLIENT_ID / _SECRET / _REFRESH_TOKEN), passed to it
 # by write_mcp_config — the same refresh token the Mac and the Pi hold in gmail-mcp/.env.
 RUN python3 -m venv /opt/gmail-venv && /opt/gmail-venv/bin/pip install --no-cache-dir \
-      'mcp==2.1.1' google-api-python-client==2.200.0 google-auth==2.57.0 requests python-dotenv
+      'mcp==2.1.1' google-api-python-client==2.200.0 google-auth==2.57.0 requests python-dotenv \
+      'ops-report @ https://github.com/JJGantt/ops-report/archive/refs/tags/v1.2.0.tar.gz'
 COPY gmail-mcp /app/gmail-mcp
 
 WORKDIR /app

@@ -26,15 +26,18 @@ ARG CODEX_VERSION=latest
 RUN npm install -g @openai/codex@${CODEX_VERSION}
 
 # MCP servers: data (built), govee (mcp<2, see fly-worker/Dockerfile), gmail (its own venv, mcp 2.x).
-RUN pip3 install --no-cache-dir --break-system-packages httpx==0.27.2 'mcp<2' python-dotenv
+# ops-report is the error reporter govee and gmail load (health/responder); the pin is worker/requirements.txt's.
+RUN pip3 install --no-cache-dir --break-system-packages httpx==0.27.2 'mcp<2' python-dotenv \
+      'ops-report @ https://github.com/JJGantt/ops-report/archive/refs/tags/v1.2.0.tar.gz'
 WORKDIR /app/data-layer
-COPY data-layer/package.json data-layer/tsconfig.json ./
+COPY data-layer/package.json data-layer/tsconfig.json data-layer/ops_report.cjs ./
 RUN npm install --no-audit --no-fund
 COPY data-layer/src ./src
 RUN npm run build
 COPY govee-mcp /app/govee-mcp
 RUN python3 -m venv /opt/gmail-venv && /opt/gmail-venv/bin/pip install --no-cache-dir \
-      'mcp==2.1.1' google-api-python-client==2.200.0 google-auth==2.57.0 requests python-dotenv
+      'mcp==2.1.1' google-api-python-client==2.200.0 google-auth==2.57.0 requests python-dotenv \
+      'ops-report @ https://github.com/JJGantt/ops-report/archive/refs/tags/v1.2.0.tar.gz'
 COPY gmail-mcp /app/gmail-mcp
 
 # The session host: pi-desk and the orchestrator modules it shares, at the same relative layout. Only
