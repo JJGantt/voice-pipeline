@@ -27,7 +27,7 @@ RUN pip3 install --no-cache-dir --break-system-packages -r /app/requirements.txt
 
 # data MCP — build the TypeScript to dist/mcp.js
 WORKDIR /app/data-layer
-COPY data-layer/package.json data-layer/tsconfig.json ./
+COPY data-layer/package.json data-layer/tsconfig.json data-layer/ops_report.cjs ./
 RUN npm install --no-audit --no-fund
 COPY data-layer/src ./src
 RUN npm run build

@@ -13,7 +13,7 @@ GV=$(pick ~/repos/govee-mcp ~/mcp-govee)
 GM=$(pick ~/repos/gmail-mcp)
 VP=$(cd .. && pwd)
 mkdir -p data-layer mcp-voice govee-mcp gmail-mcp
-cp $DL/package.json $DL/tsconfig.json data-layer/
+cp $DL/package.json $DL/tsconfig.json $DL/ops_report.cjs data-layer/
 cp -R $DL/src data-layer/src
 cp $VP/mcp-voice/package.json $VP/mcp-voice/package-lock.json mcp-voice/ 2>/dev/null || true
 cp -R $VP/mcp-voice/src mcp-voice/src
