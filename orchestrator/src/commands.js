@@ -435,7 +435,7 @@ async function run(cmd) {
   // is a plain line: reporting it too opened a second incident for the same failed launch.
   if (tty) {
     (agent === 'codex' ? awaitCodexOn(tty, startedAt) : awaitSessionOn(tty, startedAt)).then((s) => {
-      if (!s) return console.log(`[commands] no ${agent} came up on ${tty} for ${sessionId} (checkLaunch reports it)`);
+      if (!s) return reportUnbound(agent, tty, sessionId);
       console.log(`[commands] ${sessionId} -> ${agent} session ${s.claudeId}`);
       noteStarted(tty);
       return patchDeskSession(sessionId, { pid: s.pid, claude_session_id: s.claudeId, transcript_path: s.transcriptPath })
@@ -444,6 +444,27 @@ async function run(cmd) {
   }
 
   return how;
+}
+
+/**
+ * A launch whose session never opened a conversation. When nothing is left on the tab, it never started
+ * or exited early, and checkLaunch (applescript.js) reports that, so this is a plain line. When the
+ * agent IS still on the tab, it is stuck before its first turn (a sign-in screen, a model or plan
+ * notice, a prompt waiting for a key) and nothing else reports it: the launch check sees it running,
+ * and the tick ends the row with no conversation, so the session drops off every list. That is an
+ * error, with the screen, which is the only record of why.
+ */
+async function reportUnbound(agent, tty, sessionId) {
+  const marker = agent === 'codex' ? 'codex' : 'claude';
+  let onTab = '';
+  try { onTab = (await exec('ps', ['-t', tty.replace(/^\/dev\//, ''), '-o', 'command='], { timeout: 10000 })).stdout; }
+  catch (e) { onTab = String(e.stdout || ''); }   // ps exits 1 when the tty has nothing on it
+  if (!onTab.includes(marker)) return console.log(`[commands] no ${agent} came up on ${tty} for ${sessionId} (checkLaunch reports it)`);
+  let screen = '';
+  try { screen = String(await screenOfTty(tty)); }
+  catch (e) { screen = `(screen unreadable: ${e.message})`; }
+  const tail = screen.split('\n').map((l) => l.trimEnd()).filter(Boolean).slice(-15).join('\n');
+  console.error(`[commands] ${sessionId}: ${agent} is running on ${tty} but never opened a conversation; its screen:\n${tail}`);
 }
 
 const followUpChains = new Map();
