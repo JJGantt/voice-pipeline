@@ -13,14 +13,19 @@ instructions. Sonnet, not Haiku: compared over forty real inbox rows, Haiku ran 
 lost the shape of the question where Sonnet held both. The prompt is kept word for word in step with
 orchestrator/src/label.js.
 
+When the subscription refuses the call for its usage limit, the label is made on the API key instead,
+the same fallback the turn it labels just took (process.py); without it every label in a limit window fails.
+
 The reply row is written first and labelled a few seconds later (`label_later`), so the answer never
 waits on the label; until it lands the inbox shows the question's own words.
 """
+import os
+import re
 import shutil
 import subprocess
 import threading
 
-from .config import CLAUDE_BIN
+from .config import CLAUDE_BIN, CREDITS_API_KEY
 from .db import Supabase
 from .logs import log, log_error
 
@@ -47,19 +52,32 @@ def make_label(question: str, earlier: list[str]) -> str | None:
     """The label for `question`, with his `earlier` words (oldest first) for context; None on failure."""
     body = (f"{PROMPT}\n\n<earlier>\n" + "\n".join(e.strip()[:600] for e in earlier)
             + f"\n</earlier>\n<last>\n{(question or '').strip()[:4000]}\n</last>")
-    try:
-        # No tools and no MCP servers: labelling needs nothing but the text.
-        out = subprocess.run([shutil.which(CLAUDE_BIN) or CLAUDE_BIN, "-p", "--model", "sonnet", "--tools", "",
-                              "--strict-mcp-config"], input=body, capture_output=True, text=True,
-                             timeout=LABEL_TIMEOUT_S)
-    except Exception as e:
-        log_error(f"inbox label: model call failed: {e}")
+    out = _call(body, credits=False)
+    if out is not None and out.returncode != 0 and CREDITS_API_KEY and \
+            re.search(r"hit your .{0,30}limit", ((out.stdout or "") + (out.stderr or "")).lower()):
+        out = _call(body, credits=True)
+    if out is None:
         return None
     line = " ".join((out.stdout or "").split()).strip().strip("\"'")
     if out.returncode != 0 or not line:
-        log_error(f"inbox label: model returned nothing (rc={out.returncode}): {(out.stderr or '')[:300]}")
+        # `claude -p` prints its own failure (a usage limit, an auth error) on stdout, not stderr.
+        why = " ".join(((out.stderr or "") + " " + (out.stdout or "")).split())
+        log_error(f"inbox label: model returned nothing (rc={out.returncode}): {why[:300]}")
         return None
     return line[:LABEL_MAX]
+
+
+def _call(body: str, *, credits: bool) -> "subprocess.CompletedProcess | None":
+    """One label call: on the subscription, or with `credits` on the API key. None when it could not run."""
+    env = {**os.environ, "ANTHROPIC_API_KEY": CREDITS_API_KEY, "CLAUDE_CODE_OAUTH_TOKEN": ""} if credits else None
+    try:
+        # No tools and no MCP servers: labelling needs nothing but the text.
+        return subprocess.run([shutil.which(CLAUDE_BIN) or CLAUDE_BIN, "-p", "--model", "sonnet", "--tools", "",
+                               "--strict-mcp-config"], input=body, capture_output=True, text=True,
+                              timeout=LABEL_TIMEOUT_S, env=env)
+    except Exception as e:
+        log_error(f"inbox label: model call failed{' on credits' if credits else ''}: {e}")
+        return None
 
 
 def earlier_questions(db: Supabase, request_id: str) -> list[str]:
