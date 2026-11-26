@@ -6,7 +6,17 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { createRequire } from 'node:module';
 import { getRouting, setAlwaysOn, setInjectMode, setJaredBot } from './routing.js';
+
+// Errors go to the ops responder (health/responder). ops_report.cjs is a copy of its reporter (edit
+// it there). This runs as a subprocess of every session and of the voice worker, not as a service, so
+// it reports but never beats. The reporter writes only to stderr; stdout is the MCP transport.
+const ops = createRequire(import.meta.url)('./ops_report.cjs');
+ops.install({
+  machine: process.env.OPS_MACHINE || (process.env.FLY_APP_NAME ? 'fly' : process.platform === 'darwin' ? 'mac' : 'pi'),
+  service: 'voice-mcp',
+});
 
 const server = new Server({ name: 'voice', version: '1.0.0' }, { capabilities: { tools: {} } });
 
@@ -72,9 +82,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (name === 'set_jaredbot') {
       return text(await setJaredBot(a.on));
     }
-    return text(`Unknown tool: ${name}`);
+    throw new Error(`Unknown tool: ${name}`);
   } catch (err) {
-    return text(`Error: ${err.message}`);
+    // A tool that threw, whatever the reason: reported, so the responder decides what it is worth.
+    console.error(`[voice-mcp] ${name} failed:`, err);
+    return { content: [{ type: 'text', text: `Error: ${err?.message || String(err)}` }], isError: true };
   }
 });
 
