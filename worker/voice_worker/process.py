@@ -16,7 +16,7 @@ from .db import Supabase
 from .labels import label_later
 from .governor import maybe_auto_disable_wakefree
 from .live import get_focus, recent_context
-from .logs import _parse_ts, alert_failure, log, log_error, now_iso
+from .logs import _parse_ts, alert_failure, log, log_error, log_occurrence, now_iso
 from .outbound import inject_to_terminal, ping_esp_led, push_activity
 from .presence import claude_unready, hand_off
 from .prompts import ADDRESSING_DIRECTIVE, ALT_TRANSCRIPT_DIRECTIVE, ATTACH_DIRECTIVE, DELIBERATE_DIRECTIVE, cut_off_directive, NO_PRESS_DIRECTIVE, NUTRITION_DIRECTIVE, READ_DIRECTIVE, SHARE_DIRECTIVE, TOOLS_DIRECTIVE, is_ignore, read_again, take_read_marker
@@ -129,7 +129,8 @@ def fallback_directive(db: Supabase, rid: str) -> str:
     since = (datetime.now(timezone.utc) - timedelta(seconds=FALLBACK_OUTAGE_S)).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
         earlier = db.get("voice_requests", f"source=eq.watch-fallback&id=neq.{rid}&created_at=gte.{since}&select=id&limit=1")
-    except Exception:  # noqa: BLE001 — unknown: investigate rather than stay quiet
+    except Exception as e:  # noqa: BLE001 — unknown: investigate rather than stay quiet
+        log_error(f"fallback_directive: earlier-fallback read failed: {e}")
         earlier = []
     note = ("\n\n[FALLBACK: this command reached you through the watch's FALLBACK path — the watch could not "
             "get an answer from the hub (Fly app jared-status-hub), so it sent the clip through a Supabase edge "
@@ -242,7 +243,8 @@ def process_request(db: Supabase, req: dict) -> None:
     if isinstance(attachments, str):
         try:
             attachments = json.loads(attachments)
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            log_error(f"attachments unreadable, running without them: {e}")
             attachments = []
     hub_route = f"hub {HUB_MODEL}@{HUB_EFFORT or 'default'}" + (" +photo" if attachments else "") + (" +fallback" if fallback else "")
     log(f"route={hub_route} src={source} manual={'y' if manual else 'n'}")
@@ -415,7 +417,7 @@ def _run_turn(prompt: str, ctx: str, *, manual: bool, read_dir, on_event, hold, 
             SDK_FAST.close()      # a standard turn: the fast client is not held warm between uses
         elif manual and limit_refused(result) and CREDITS_API_KEY:
             # Every worker shares the one account, so handing this on would only fail again elsewhere.
-            log(f"subscription limit hit ({result.get('raw_error')}) — running on API credits")
+            log_occurrence(f"subscription limit hit ({result.get('raw_error')}) — running on API credits")
             push_activity("On API credits")
             result = run_hub(SDK_CREDITS)
             result["_limit"] = True
@@ -514,16 +516,16 @@ def one_iteration(db: Supabase) -> bool:
     try:
         process_request(db, req)
     except Exception as e:  # noqa: BLE001 — a bug in processing must not kill the loop
-        log(f"process_request crashed: {e}")
+        log_error(f"process_request crashed: {e}")
         try:
             if not req.get("_acted") and hand_off(db, req, f"process_request crashed: {e}"):
                 return True
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e2:  # noqa: BLE001
+            log_error(f"hand_off after crash failed: {e2}")
         try:
             finish(db, req, {"status": "error", "error": str(e)})
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e2:  # noqa: BLE001
+            log_error(f"finish after crash failed: {e2}")
     finally:
         runstate._lease_deadline = 0.0   # nothing in flight: the heartbeat cannot call this worker stalled
         # /led-off must fire for EVERY command — the blink (ping_esp_led "blink") is universal, so the

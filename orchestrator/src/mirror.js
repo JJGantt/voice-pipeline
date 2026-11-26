@@ -115,7 +115,8 @@ export function mirrorUp(claudeId, transcriptPath, offset = 0) {
 
 async function uploadTail(claudeId, transcriptPath, offset) {
   let st;
-  try { st = fs.statSync(transcriptPath); } catch { return null; }
+  try { st = fs.statSync(transcriptPath); }
+  catch (e) { if (e.code !== 'ENOENT') console.warn('[mirror] stat of %s:', transcriptPath, e.message); return null; }
   if (!st.isFile()) return null;
   const asked = Number(offset) || 0;
   // The caller's offset comes from a row that may not have been written since this process last uploaded.
@@ -216,13 +217,15 @@ export async function mirrorReset(claudeId) {
   uploadedTo.delete(claudeId);
   partCount.delete(claudeId);
   let names;
-  try { names = await parts(claudeId); } catch { return; }
+  try { names = await parts(claudeId); }
+  catch (e) { console.error(`[mirror] listing ${claudeId}'s parts to reset them:`, e.message); return; }
   if (!names.length) return;
-  await fetch(`${SUPABASE_URL}/storage/v1/object/${BUCKET}`, {
+  const res = await fetch(`${SUPABASE_URL}/storage/v1/object/${BUCKET}`, {
     method: 'DELETE',
     headers: auth({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ prefixes: names.map((n) => `${claudeId}/${n}`) }),
   });
+  if (!res.ok) console.error(`[mirror] deleting ${claudeId}'s parts answered ${res.status}: ${(await res.text()).slice(0, 160)}`);
 }
 
 /**

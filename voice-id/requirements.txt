@@ -6,3 +6,4 @@ speechbrain==1.1.0
 numpy==1.26.4
 httpx==0.27.2
 sounddevice
+ops-report @ https://github.com/JJGantt/ops-report/archive/refs/tags/v1.2.0.tar.gz

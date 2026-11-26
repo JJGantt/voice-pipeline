@@ -146,7 +146,7 @@ function memAvailableMb() {
   try {
     const m = fs.readFileSync('/proc/meminfo', 'utf8').match(/^MemAvailable:\s+(\d+) kB/m);
     return m ? Math.round(Number(m[1]) / 1024) : Infinity;   // unreadable → never block on it
-  } catch { return Infinity; }
+  } catch (e) { console.error('[pi-desk] reading /proc/meminfo for MemAvailable (admission not gated on it):', e.message); return Infinity; }
 }
 // The SECOND memory bound, and the one MemAvailable cannot express.
 //
@@ -168,7 +168,7 @@ function swapUsedPct() {
     const total = Number(mi.match(/^SwapTotal:\s+(\d+) kB/m)?.[1] || 0);
     const free  = Number(mi.match(/^SwapFree:\s+(\d+) kB/m)?.[1] || 0);
     return total ? Math.round(((total - free) / total) * 100) : 0;
-  } catch { return 0; }
+  } catch (e) { console.error('[pi-desk] reading /proc/meminfo for swap (admission not gated on it):', e.message); return 0; }
 }
 
 /**
@@ -204,7 +204,10 @@ function shortfall(residents) {
 async function residentsNow() {
   const live = (await liveSessions()).filter((l) => l.alive);
   if (!live.length) return [];
-  const rows = await sb(`desk_sessions?worker=eq.${WORKER}&select=id,working,active_at`).catch(() => []);
+  const rows = await sb(`desk_sessions?worker=eq.${WORKER}&select=id,working,active_at`).catch((e) => {
+    console.warn('[pi-desk] reading resident rows (every session counts as working):', e.message);
+    return [];
+  });
   const byId = new Map((rows || []).map((r) => [r.id, r]));
   return live.map((l) => {
     const row = byId.get(l.name);
@@ -288,7 +291,8 @@ async function preferMac(residents) {
 /** Where the Mac keeps a project, from the list its orchestrator publishes; the Pi's layout differs. */
 async function macPath(name) {
   if (name === 'root') return '~';
-  const rows = await sb(`repos?name=eq.${encodeURIComponent(name)}&select=path`).catch(() => null);
+  const rows = await sb(`repos?name=eq.${encodeURIComponent(name)}&select=path`)
+    .catch((e) => { console.error(`[pi-desk] reading the Mac's path for ${name}:`, e.message); return null; });
   return rows?.[0]?.path || null;
 }
 
@@ -457,7 +461,10 @@ function hostStats(residentCount) {
     if (total) stats.mem_pct = Math.round(((total - kb('MemAvailable')) / total) * 100);
     const swapTotal = kb('SwapTotal');
     if (swapTotal) stats.swap_pct = Math.round(((swapTotal - kb('SwapFree')) / swapTotal) * 100);
-  } catch { /* a machine that cannot read /proc simply reports no numbers */ }
+  } catch (e) {
+    // The heartbeat goes out without the numbers.
+    console.error('[pi-desk] reading /proc/meminfo for the heartbeat:', e.message);
+  }
   if (Number.isFinite(residentCount)) stats.sessions = residentCount;
   return stats;
 }
@@ -811,7 +818,11 @@ async function macIsAwake(ifUnsure = true, agent = 'claude') {
   try {
     const rows = await sb('worker_presence?worker=eq.desk&select=last_seen,info');
     return presenceReady(rows?.[0], { staleS: MAC_STALE_S, agent });
-  } catch { return ifUnsure; }   // routing assumes the Mac has it rather than double-launch; a hand-off assumes not
+  } catch (e) {
+    // Routing assumes the Mac has it rather than double-launch; a hand-off assumes not.
+    console.warn(`[pi-desk] reading the Mac's presence (assuming ${ifUnsure ? 'awake' : 'not'}):`, e.message);
+    return ifUnsure;
+  }
 }
 
 // ---- the repo -------------------------------------------------------------
@@ -1363,7 +1374,8 @@ async function runCommand(cmd) {
 async function sendToFly(cmd, why, status) {
   const p = cmd.payload || {};
   const row = ['resume_session', 'follow_up'].includes(cmd.kind)
-    ? (await sb(`desk_sessions?id=eq.${encodeURIComponent(String(p.session || ''))}&select=*`).catch(() => null))?.[0]
+    ? (await sb(`desk_sessions?id=eq.${encodeURIComponent(String(p.session || ''))}&select=*`)
+        .catch((e) => { console.error(`[pi-desk] reading the row of ${p.session} to send ${cmd.id} to Fly:`, e.message); return null; }))?.[0]
     : null;
   const fly = flyCommandFor(cmd, row, MACHINE);
   if (!fly) {
@@ -1375,7 +1387,8 @@ async function sendToFly(cmd, why, status) {
     if (row && fly.kind === 'resume_mirrored') {
       // The conversation moves: the row is marked first, so the machine it was on closes its copy.
       if (row.worker === WORKER && row.transcript_path) {
-        await mirrorUp(row.claude_session_id, row.transcript_path, row.mirror_offset || 0).catch(() => null);
+        await mirrorUp(row.claude_session_id, row.transcript_path, row.mirror_offset || 0)
+          .catch((e) => console.error(`[pi-desk] mirroring ${row.id} up before moving it to Fly failed:`, e.message));
       }
       await sb(`desk_sessions?id=eq.${encodeURIComponent(row.id)}`, {
         method: 'PATCH', headers: { Prefer: 'return=minimal' },

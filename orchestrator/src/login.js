@@ -26,7 +26,12 @@ function read() {
     const o = JSON.parse(raw).claudeAiOauth || {};
     if (!o.refreshToken || !o.refreshTokenExpiresAt) return null;
     return new Date(o.refreshTokenExpiresAt).toISOString();
-  } catch { return null; }   // no login at all reads the same as an expired one: neither can run a session
+  } catch (e) {
+    // No login at all reads the same as an expired one: neither can run a session. `security` exits 44
+    // when the keychain has no such item, and the Pi has no file; anything else is the read failing.
+    if (!(MAC ? e.status === 44 : e.code === 'ENOENT')) console.error('[login] reading the Claude login failed:', e.message);
+    return null;
+  }
 }
 
 let current = read();

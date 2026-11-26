@@ -420,7 +420,8 @@ async function closeAfterTurn(id, tail) {
 export async function markTtyRead(tty) {
   if (!tty) return false;
   let rows;
-  try { rows = await deskSessionsFor('desk', 'resident'); } catch (_) { return false; }
+  try { rows = await deskSessionsFor('desk', 'resident'); }
+  catch (e) { console.error('[desk-sessions] reading resident rows to mark %s read:', tty, e.message); return false; }
   const row = (rows || []).find((r) => r.tty === tty);
   if (!row || !row.reply_at) return false;
   if (row.seen_at && Date.parse(row.seen_at) >= Date.parse(row.reply_at)) return false;
@@ -469,7 +470,8 @@ async function tick() {
       patchFailing.delete(row.id);
       if (row.status === 'resident' && proc) {
         let bytes = 0;
-        try { bytes = row.transcript_path ? fs.statSync(row.transcript_path).size : 0; } catch { /* not written yet */ }
+        try { bytes = row.transcript_path ? fs.statSync(row.transcript_path).size : 0; }
+        catch (e) { if (e.code !== 'ENOENT') console.warn(`[desk-sessions] stat of ${row.id}'s transcript:`, e.message); }
         try { await reapIdle(row, proc, bytes); }
         catch (e) { console.error(`[desk-sessions] idle reaper on ${row.id}:`, e.message); }
       }

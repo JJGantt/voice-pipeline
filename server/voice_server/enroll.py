@@ -75,8 +75,8 @@ async def sample(pcm_i16, floor_raw: float, ws) -> None:
             await ws.send("LED_ON")
             await asyncio.sleep(0.4)
             await led.render(ws, "enroll phrase accepted")
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001
+            log.warning("enroll: LED confirmation NOT sent: %s", e)
     if state.left > 0:
         log.info("enroll: %d phrase(s) to go", state.left)
         return
@@ -89,7 +89,7 @@ async def sample(pcm_i16, floor_raw: float, ws) -> None:
         log.info("enroll: DONE — bank now %s (was %s; +%d from this mic), uploaded to app_settings",
                  merged.shape, prev_shape, new.shape[0])
     else:
-        log.warning("enroll: upload FAILED — new exemplars kept in memory only for this process")
+        log.error("enroll: upload FAILED — new exemplars kept in memory only for this process")
     state.new = []
     if ws is not None:
         await led.render(ws, "enroll done")

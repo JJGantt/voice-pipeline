@@ -17,7 +17,7 @@ import httpx
 
 from .config import ALL_TOOLS, JAREDBOT_TOOL, CLAUDE_BIN, CLAUDE_TIMEOUT_S, CREDITS_API_KEY, DATA_MCP_JS, GMAIL_MCP_PY, GMAIL_PY, GOVEE_MCP_PY, GOVEE_PY, HAS_MESSAGES, HTTP_TIMEOUT_S, HUB_EFFORT, HUB_MODEL, HUB_TOKEN, HUB_URL, MESSAGES_HEADERS, MESSAGES_MCP_URL, PETLIBRO_MCP_PY, PETLIBRO_PY, SEND_TOOLS, SESSION_START_TOOLS, SESSION_TOOLS, STATE_DIR, SUPABASE_KEY, SUPABASE_URL, VOICE_MCP_JS, WORKER_ID
 from .db import headers
-from .logs import classify_failure, log, log_error, now_iso
+from .logs import classify_failure, log, log_error, log_occurrence, now_iso
 from .outbound import push_activity
 from .presence import claude_unready
 from .prompts import HUB_SYSTEM, SHARED_STATE_NOTE
@@ -48,7 +48,7 @@ def run_subscription(run, label: str) -> dict:
     for pause in SUBSCRIPTION_RETRY_S:
         if result.get("ok") or not transient_failure(result.get("raw_error") or ""):
             break
-        log(f"{label} failed ({result.get('raw_error')}) — retrying on the subscription in {pause}s")
+        log_occurrence(f"{label} failed ({result.get('raw_error')}) — retrying on the subscription in {pause}s")
         push_activity(f"Retrying ({classify_failure(result.get('raw_error') or '')})")
         time.sleep(pause)
         result = run()
@@ -258,7 +258,7 @@ class SdkRunner:
         try:
             asyncio.run_coroutine_threadsafe(self._ensure(), self._loop).result(timeout=120)
         except Exception as e:  # noqa: BLE001
-            log(f"sdk runner: warm-up failed ({e}); the next turn connects")
+            log_occurrence(f"sdk runner: warm-up failed ({e}); the next turn connects")
 
     def gate(self, name: str, tool_input: dict) -> tuple[str, "str | None"]:
         """The fence's decision (`_gate`), and for a tool it lets through, the lease: a worker whose claim
@@ -401,8 +401,8 @@ class SdkRunner:
                                 if said:
                                     on_event("text", {"text": said})
                                 on_event("tool", {"name": b.name, "input": b.input})
-                            except Exception:  # noqa: BLE001
-                                pass
+                            except Exception as e:  # noqa: BLE001
+                                log_error(f"sdk turn: event handler failed: {e}")
             elif isinstance(msg, RateLimitEvent):
                 self.limit_hit = msg.rate_limit_info.status == "rejected"
                 report_usage(msg.rate_limit_info.raw)
@@ -471,7 +471,7 @@ class SdkRunner:
             return result   # refused for usage: a retry is refused too, and only delays the credits run
         # Nothing was called, so re-running is side-effect free and keeps the turn on the subscription
         # instead of spending the caller's fallback. A genuinely refusable turn just fails twice, fast.
-        log(f"sdk turn failed ({result.get('raw_error')}) — recycled warm client, retrying once")
+        log_occurrence(f"sdk turn failed ({result.get('raw_error')}) — recycled warm client, retrying once")
         retry = self._held_attempt(transcript, on_event)
         if not retry.get("ok"):
             self._recycle()   # the cold client failed too; don't hand the next turn a used one

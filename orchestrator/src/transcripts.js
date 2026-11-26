@@ -191,7 +191,8 @@ function unstash(text) {
   if (path.dirname(file) !== STASH_DIR) return null;
   if (stashed.has(file)) return stashed.get(file);
   let body = null;
-  try { body = fs.readFileSync(file, 'utf8').trim() || null; } catch (_) { /* swept, or never written */ }
+  try { body = fs.readFileSync(file, 'utf8').trim() || null; }
+  catch (e) { if (e.code !== 'ENOENT') console.warn('[transcripts] reading stashed prompt %s:', file, e.message); }   // ENOENT: swept, or never written
   if (body) stashed.set(file, body);
   return body;
 }
@@ -210,7 +211,8 @@ function unstash(text) {
  */
 export function turnStartBefore(transcriptPath, end, { chunk = 1024 * 1024, maxBytes = 64 * 1024 * 1024 } = {}) {
   let fd;
-  try { fd = fs.openSync(transcriptPath, 'r'); } catch { return undefined; }
+  try { fd = fs.openSync(transcriptPath, 'r'); }
+  catch (e) { if (e.code !== 'ENOENT') console.warn('[transcripts] opening %s:', transcriptPath, e.message); return undefined; }
   try {
     let pos = end, carry = Buffer.alloc(0);   // carry: the head of a line whose start is further back
     while (pos > 0 && end - pos < maxBytes) {
@@ -240,7 +242,10 @@ export function turnStartBefore(transcriptPath, end, { chunk = 1024 * 1024, maxB
         if (start && !start.meta) return { ...start, offset: pos + lo, key: d.uuid || d.timestamp || null, at: d.timestamp || null };
       }
     }
-  } catch { /* unreadable: the same as not found */ } finally { fs.closeSync(fd); }
+  } catch (e) {
+    // Unreadable reads the same as not found.
+    console.warn('[transcripts] reading back through %s:', transcriptPath, e.message);
+  } finally { fs.closeSync(fd); }
   return undefined;
 }
 
@@ -273,7 +278,8 @@ export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
   // /dev/ttys007 BLOCKS THE PROCESS FOR EVER waiting for terminal input — the daemon stops beating,
   // stops draining commands, and steals the keystrokes of whoever is typing in that tab.
   let st;
-  try { st = fs.statSync(transcriptPath); } catch { return empty; }
+  try { st = fs.statSync(transcriptPath); }
+  catch (e) { if (e.code !== 'ENOENT') console.warn('[transcripts] stat of %s:', transcriptPath, e.message); return empty; }
   if (!st.isFile()) return empty;
   // Only the tail is read. These files reach tens of megabytes — one project directory here holds
   // 31MB — and every tick would otherwise read all of it to learn the last few lines. The leading
@@ -293,7 +299,7 @@ export function readTail(transcriptPath, { maxBytes = 512 * 1024 } = {}) {
       if (from > 0) windowStart = from + buf.indexOf(0x0a) + 1;
       lines = buf.toString('utf8').split('\n');
     } finally { fs.closeSync(fd); }
-  } catch { return empty; }
+  } catch (e) { console.warn('[transcripts] reading the tail of %s:', transcriptPath, e.message); return empty; }
   if (from > 0) lines.shift();
 
   let working = false, aiTitle = null, customTitle = null;

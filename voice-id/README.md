@@ -10,7 +10,7 @@ Everything runs on-device; no audio leaves the machine. Model: **ECAPA-TDNN**
 |---|---|
 | `enroll.py` | Build/extend your voiceprint from **separate command-shaped phrases** (each its own exemplar). `--append` adds more (e.g. a far-away pass) without replacing. |
 | `detect.py [thresh]` | Live readout — `● JARED / ○ not you / · silence` with the cosine score. Use it to probe your voice vs. the TV/others and tune the threshold. |
-| `wakefree.py` | The wake-free capture loop (run via `run-wakefree.sh`). Started/stopped by the Mac listener on the hub toggle — not launched by hand in normal use. |
+| `wakefree.py` | The wake-free capture loop (run via `run-wakefree.sh`). Started/stopped by the Mac listener on the hub toggle — not launched by hand in normal use. Its errors go to the ops responder as `mac-wakefree` (`mac-wakefree-sensor` when `WAKEFREE_SENSOR=1`); it sends no heartbeat, because it runs only while one of those modes is on. |
 | `exemplars.npy` | The voiceprint: an `(N, 192)` bank of per-phrase ECAPA embeddings. `reference.npy` is the averaged centroid (fallback). |
 | `.venv/`, `.model/` | Python env (torch + speechbrain + sounddevice) and the cached ECAPA weights. |
 

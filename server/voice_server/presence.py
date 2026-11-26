@@ -2,12 +2,15 @@
 stamp, and reading the other mics' stamps."""
 
 import asyncio
+import logging
 import time
 from datetime import datetime, timezone
 
 import httpx
 
 from . import db, esp
+
+log = logging.getLogger("voice")
 
 
 async def alive_beacon() -> None:
@@ -20,12 +23,13 @@ async def alive_beacon() -> None:
         if esp.link.last_frame and time.monotonic() - esp.link.last_frame < 10:
             try:
                 async with httpx.AsyncClient(timeout=5) as c:
-                    await c.post(db.url("/rest/v1/voice_presence?on_conflict=source"),
-                                 headers=db.headers("resolution=merge-duplicates,return=minimal"),
-                                 json={"source": "esp",
-                                       "alive_at": datetime.now(timezone.utc).isoformat()})
-            except Exception:  # noqa: BLE001 — best-effort; a missed beat reads as one late beacon
-                pass
+                    r = await c.post(db.url("/rest/v1/voice_presence?on_conflict=source"),
+                                     headers=db.headers("resolution=merge-duplicates,return=minimal"),
+                                     json={"source": "esp",
+                                           "alive_at": datetime.now(timezone.utc).isoformat()})
+                    r.raise_for_status()
+            except Exception as e:  # noqa: BLE001 — the next beat (30s) retries
+                log.warning("presence: alive beacon write failed: %s", e)
         await asyncio.sleep(30)
 
 
@@ -41,10 +45,11 @@ async def publish(jared: bool) -> None:
         body["heard_jared_at"] = now_iso
     try:
         async with httpx.AsyncClient(timeout=5) as c:
-            await c.post(db.url("/rest/v1/voice_presence?on_conflict=source"),
-                         headers=db.headers("resolution=merge-duplicates,return=minimal"), json=body)
-    except Exception:  # noqa: BLE001 — presence is best-effort
-        pass
+            r = await c.post(db.url("/rest/v1/voice_presence?on_conflict=source"),
+                             headers=db.headers("resolution=merge-duplicates,return=minimal"), json=body)
+            r.raise_for_status()
+    except Exception as e:  # noqa: BLE001 — the next confirmed check publishes again
+        log.warning("presence: publish failed: %s", e)
 
 
 async def other_heard_jared():
@@ -59,5 +64,6 @@ async def other_heard_jared():
                             params={"source": "neq.esp", "select": "heard_jared_at"}, headers=db.headers())
         stamps = [datetime.fromisoformat(row["heard_jared_at"]) for row in r.json() if row.get("heard_jared_at")]
         return max(stamps) if stamps else None
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001 — treated as no other mic: this capture is kept
+        log.warning("presence: other mics' stamps unreadable: %s", e)
         return None

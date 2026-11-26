@@ -93,7 +93,8 @@ function keyboardPromptAt(row) {
   let s = scanned.get(row.id);
   if (!s || s.path !== file) { s = { path: file, offset: 0 }; scanned.set(row.id, s); }
   let size;
-  try { size = fs.statSync(file).size; } catch { return null; }
+  try { size = fs.statSync(file).size; }
+  catch (e) { if (e.code !== 'ENOENT') console.warn('[idle] stat of %s:', file, e.message); return null; }
   if (size <= s.offset) return null;
   const fd = fs.openSync(file, 'r');
   let chunk;
@@ -129,7 +130,11 @@ async function runningCommand(pid) {
       const [ppid, comm] = l.trim().split(/\s+/, 2);
       return Number(ppid) === pid && /(^|\/)-?(zsh|bash|sh)$/.test(comm || '');
     });
-  } catch { return true; }   // unknown is treated as busy: never park on a guess
+  } catch (e) {
+    // Unknown is treated as busy: never park on a guess.
+    console.warn('[idle] ps for the shells under %s failed:', pid, e.message);
+    return true;
+  }
 }
 
 /**

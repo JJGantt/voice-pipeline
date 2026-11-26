@@ -59,7 +59,8 @@ function family(pid) {
     return out;
   }
   let table = '';
-  try { table = execFileSync('ps', ['-Ao', 'pid=,ppid='], { encoding: 'utf8', timeout: 10000 }); } catch { return out; }
+  try { table = execFileSync('ps', ['-Ao', 'pid=,ppid='], { encoding: 'utf8', timeout: 10000 }); }
+  catch (e) { console.warn('[codex] ps for the process tree failed:', e.message); return out; }
   const kids = new Map();
   for (const l of table.split('\n')) {
     const [p, pp] = l.trim().split(/\s+/).map(Number);
@@ -206,7 +207,10 @@ export function readCodexTail(file, { maxBytes = 512 * 1024 } = {}) {
   const empty = { working: false, lastReply: null, lastPrompt: null, replyAt: null, turnAt: null, title: null,
                   customTitle: null, bytes: 0, lastActivity: 0 };
   let st;
-  try { st = fs.statSync(file); } catch { return empty; }
+  try { st = fs.statSync(file); } catch (e) {
+    if (e.code !== 'ENOENT') console.warn('[codex] stat of rollout %s failed:', file, e.message);
+    return empty;
+  }
   if (!st.isFile()) return empty;
   const from = Math.max(0, st.size - maxBytes);
   let lines;
@@ -217,7 +221,7 @@ export function readCodexTail(file, { maxBytes = 512 * 1024 } = {}) {
       fs.readSync(fd, buf, 0, buf.length, from);
       lines = buf.toString('utf8').split('\n');
     } finally { fs.closeSync(fd); }
-  } catch { return empty; }
+  } catch (e) { console.warn('[codex] reading rollout %s failed:', file, e.message); return empty; }
   if (from > 0) lines.shift();
 
   let working = false, newest = 0, promptAt = null, replyAt = null;
@@ -257,7 +261,7 @@ export function liveCodexSessions() {
   let stdout;
   // `comm` LAST, for the reason given in discover.js.
   try { stdout = execFileSync('ps', ['-Ao', 'pid=,tty=,lstart=,comm='], { encoding: 'utf8', timeout: 10000 }); }
-  catch { return []; }
+  catch (e) { console.warn('[codex] ps for codex processes failed:', e.message); return []; }
   return stdout.split('\n').map((l) => l.trim()).filter(Boolean)
     .map((l) => {
       const m = l.match(/^(\d+)\s+(\S+)\s+(\w{3}\s+\w{3}\s+\d+\s+[\d:]+\s+\d{4})\s+(.+)$/);

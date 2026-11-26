@@ -7,7 +7,7 @@ import httpx
 
 from .config import SUPABASE_URL
 from .db import headers, report_failure
-from .logs import log, now_iso
+from .logs import log, log_occurrence, now_iso
 
 
 AO_IGNORE_STREAK_OFF = 3    # consecutive ignored turns that put the brakes on… (owner-chosen values)
@@ -112,7 +112,7 @@ def maybe_auto_reenable_wakefree() -> None:
                 try:
                     stamps.append(datetime.fromisoformat(str(v).replace("Z", "+00:00")))
                 except ValueError:
-                    pass
+                    log_occurrence(f"wakefree re-arm: unreadable heard_jared_at {v!r}, skipped")
         if stamps and (datetime.now(timezone.utc) - max(stamps)).total_seconds() < AO_REARM_QUIET_S:
             return   # the room is still talking — hold the brake
         _set("wakefree_enabled", "1")

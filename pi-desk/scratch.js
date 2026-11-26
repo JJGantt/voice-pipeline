@@ -34,7 +34,8 @@ function running(pid, procStart) {
 /** Conversation ids some live process is in; null when that cannot be read (then nothing is cleared). */
 function liveConversations() {
   let files;
-  try { files = fs.readdirSync(SESSIONS_DIR); } catch { return null; }
+  try { files = fs.readdirSync(SESSIONS_DIR); }
+  catch (e) { if (e.code !== 'ENOENT') console.error('[pi-desk] scratch: reading %s:', SESSIONS_DIR, e.message); return null; }
   const live = new Set();
   for (const f of files) {
     if (!f.endsWith('.json')) continue;
@@ -49,12 +50,14 @@ export function sweepScratch() {
   const live = liveConversations();
   if (!live) return;
   let projects;
-  try { projects = fs.readdirSync(SCRATCH_ROOT, { withFileTypes: true }); } catch { return; }
+  try { projects = fs.readdirSync(SCRATCH_ROOT, { withFileTypes: true }); }
+  catch (e) { if (e.code !== 'ENOENT') console.error('[pi-desk] scratch: reading %s:', SCRATCH_ROOT, e.message); return; }
   for (const p of projects) {
     if (!p.isDirectory()) continue;
     const dir = path.join(SCRATCH_ROOT, p.name);
     let entries;
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+    catch (e) { if (e.code !== 'ENOENT') console.error('[pi-desk] scratch: reading %s:', dir, e.message); continue; }
     for (const e of entries) {
       if (!e.isDirectory() || !CONVERSATION.test(e.name) || live.has(e.name)) continue;
       try {

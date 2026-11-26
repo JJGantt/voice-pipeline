@@ -28,7 +28,11 @@ export async function tmuxNameForTty(tty) {
   if (!tty) return null;
   let out;
   try { out = await tmux(['list-panes', '-a', '-F', '#{pane_tty}\t#{session_name}']); }
-  catch { return null; }
+  catch (e) {
+    // No server running is the normal case when no headless session is open.
+    if (!/no server running|error connecting/i.test(String(e.stderr || ''))) console.error('[tmux] list-panes failed:', e.message);
+    return null;
+  }
   const hit = out.split('\n').map((l) => l.split('\t')).find(([t]) => t === tty);
   return hit ? hit[1] : null;
 }
@@ -70,7 +74,8 @@ export const screenTmux = (name) => tmux(['capture-pane', '-p', '-t', `=${name}:
  * terminated if it ignored that, then the tmux session goes.
  */
 export async function closeTmux(name, tty, pidOnTty) {
-  await tmux(['send-keys', '-t', `=${name}:`, '/exit', 'Enter']).catch(() => {});
+  await tmux(['send-keys', '-t', `=${name}:`, '/exit', 'Enter'])
+    .catch((e) => console.warn('[tmux] /exit into %s failed, falling back to SIGTERM:', name, e.message));
   await new Promise((r) => setTimeout(r, 3000));
   const pid = await pidOnTty(tty);
   if (pid) {

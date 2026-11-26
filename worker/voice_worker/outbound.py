@@ -6,6 +6,7 @@ import httpx
 
 from . import runstate
 from .config import HUB_HEADERS, HUB_PUSH_URL, LED_BASE_URL, LED_TOKEN, ORCH_TOKEN, ORCH_URL
+from .logs import log_error, log_occurrence
 
 
 def push_activity(text: str, state: str = "tool") -> None:
@@ -14,9 +15,9 @@ def push_activity(text: str, state: str = "tool") -> None:
         return
     try:
         httpx.post(HUB_PUSH_URL, json={"text": text, "state": state, "focus": "hub"}, headers=HUB_HEADERS,
-                   timeout=2.0)
-    except Exception:  # noqa: BLE001
-        pass
+                   timeout=2.0).raise_for_status()
+    except Exception as e:  # noqa: BLE001
+        log_error(f"hub activity push failed: {e}")
 
 
 def ping_esp_led(state: str) -> None:
@@ -27,9 +28,9 @@ def ping_esp_led(state: str) -> None:
     def _go():
         try:
             httpx.get(f"{LED_BASE_URL}/led-{state}",
-                      headers={"X-Token": LED_TOKEN} if LED_TOKEN else None, timeout=3.0)
-        except Exception:  # noqa: BLE001
-            pass
+                      headers={"X-Token": LED_TOKEN} if LED_TOKEN else None, timeout=3.0).raise_for_status()
+        except Exception as e:  # noqa: BLE001 — the server's LED safety backstop and lifecycle row clear it
+            log_occurrence(f"ESP LED {state} ping failed: {e}")
     threading.Thread(target=_go, daemon=True).start()
 
 

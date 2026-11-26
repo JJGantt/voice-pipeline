@@ -46,7 +46,8 @@ export function typeable(text) {
  */
 export function sweepStashedPrompts(maxAgeMs = 30 * 86400000) {
   let names;
-  try { names = fs.readdirSync(PROMPT_DIR); } catch { return; }
+  try { names = fs.readdirSync(PROMPT_DIR); }
+  catch (e) { if (e.code !== 'ENOENT') console.error('[handoff] reading %s to sweep it:', PROMPT_DIR, e.message); return; }
   for (const n of names) {
     const f = path.join(PROMPT_DIR, n);
     try { if (Date.now() - fs.statSync(f).mtimeMs > maxAgeMs) fs.unlinkSync(f); } catch { /* gone already */ }
@@ -91,7 +92,8 @@ export async function withAttachments(prompt, payload) {
 
 /** Bytes in a transcript right now — where to start looking for what is typed next. 0 if not yet written. */
 export function transcriptSize(transcriptPath) {
-  try { return fs.statSync(transcriptPath).size; } catch { return 0; }
+  try { return fs.statSync(transcriptPath).size; }
+  catch (e) { if (e.code !== 'ENOENT') console.warn('[handoff] stat of %s:', transcriptPath, e.message); return 0; }
 }
 
 /**
@@ -112,7 +114,10 @@ export function awaitTranscript(transcriptPath, timeoutMs = 30000) {
     const base = path.basename(transcriptPath);
     try {
       watcher = fs.watch(path.dirname(transcriptPath), (_ev, f) => { if ((!f || f === base) && exists()) done(); });
-    } catch { /* no directory yet — the timeout's own check is all there is */ }
+    } catch (e) {
+      // No directory yet: the timeout's own check is all there is.
+      if (e.code !== 'ENOENT') console.warn('[handoff] watching for %s:', transcriptPath, e.message);
+    }
   });
 }
 
@@ -136,7 +141,10 @@ export function awaitSubmitted(transcriptPath, from, expect, timeoutMs = 8000) {
         fs.readSync(fd, buf, 0, buf.length, from);
         return buf.toString('utf8').includes(needle);
       } finally { fs.closeSync(fd); }
-    } catch { return false; }
+    } catch (e) {
+      if (e.code !== 'ENOENT') console.warn('[handoff] reading %s for the submitted prompt:', transcriptPath, e.message);
+      return false;
+    }
   };
   if (seen()) return Promise.resolve(true);
   return new Promise((resolve) => {
@@ -148,6 +156,9 @@ export function awaitSubmitted(transcriptPath, from, expect, timeoutMs = 8000) {
       watcher = fs.watch(path.dirname(transcriptPath), (_ev, f) => {
         if ((!f || f === base) && seen()) done(true);
       });
-    } catch { /* no directory yet — the timeout's own check is all there is */ }
+    } catch (e) {
+      // No directory yet: the timeout's own check is all there is.
+      if (e.code !== 'ENOENT') console.warn('[handoff] watching %s:', transcriptPath, e.message);
+    }
   });
 }

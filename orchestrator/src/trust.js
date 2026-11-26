@@ -45,6 +45,7 @@ export function ensureTrusted(dir) {
       mtimeBefore = fs.statSync(CONFIG).mtimeMs;
       cfg = JSON.parse(fs.readFileSync(CONFIG, 'utf8'));
     } catch (e) {
+      console.error('[trust] reading %s to trust %s failed:', CONFIG, dir, e.message);
       return `failed:read ${e.message}`;
     }
     if (!cfg.projects) cfg.projects = {};
@@ -60,8 +61,10 @@ export function ensureTrusted(dir) {
       fs.renameSync(tmp, CONFIG);   // atomic within the same filesystem
       return 'seeded';
     } catch (e) {
+      console.error('[trust] writing %s to trust %s failed:', CONFIG, dir, e.message);
       return `failed:write ${e.message}`;
     }
   }
+  console.error('[trust] %s changed under three writes in a row; %s was not trusted', CONFIG, dir);
   return 'failed:busy';   // three straight collisions — the prompt will just appear
 }

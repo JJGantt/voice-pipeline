@@ -40,7 +40,8 @@ function readRecord(file) {
  */
 function jobRecord(jobId) {
   let files;
-  try { files = fs.readdirSync(SESSIONS_DIR); } catch { return null; }
+  try { files = fs.readdirSync(SESSIONS_DIR); }
+  catch (e) { if (e.code !== 'ENOENT') console.warn('[discover] reading %s:', SESSIONS_DIR, e.message); return null; }
   for (const f of files) {
     if (!f.endsWith('.json')) continue;
     const d = readRecord(f);
@@ -91,7 +92,8 @@ export function backgroundAgents(transcriptPath, sinceMs) {
   if (!transcriptPath || !sinceMs) return [];
   const dir = path.join(transcriptPath.replace(/\.jsonl$/, ''), 'subagents');
   let files;
-  try { files = fs.readdirSync(dir); } catch { return []; }
+  try { files = fs.readdirSync(dir); }
+  catch (e) { if (e.code !== 'ENOENT') console.warn('[discover] reading %s:', dir, e.message); return []; }
   const out = [];
   for (const f of files) {
     if (!f.endsWith('.meta.json')) continue;
@@ -118,7 +120,7 @@ export function shellCommand(args) {
 async function shellsUnder(pid) {
   let stdout;
   try { ({ stdout } = await exec('ps', ['-Ao', 'pid=,ppid=,args='], { timeout: 10000, maxBuffer: 16 * 1024 * 1024 })); }
-  catch { return []; }
+  catch (e) { console.warn('[discover] ps for the shells under %s failed:', pid, e.message); return []; }
   const kids = new Map(), args = new Map();
   for (const l of stdout.split('\n')) {
     const m = l.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
@@ -151,10 +153,12 @@ function describe(cmd, transcriptPath) {
   let label = null;
   const dir = path.join(transcriptPath.replace(/\.jsonl$/, ''), 'subagents');
   let files = [transcriptPath];
-  try { files = files.concat(fs.readdirSync(dir).filter((f) => f.endsWith('.jsonl')).map((f) => path.join(dir, f))); } catch { /* none */ }
+  try { files = files.concat(fs.readdirSync(dir).filter((f) => f.endsWith('.jsonl')).map((f) => path.join(dir, f))); }
+  catch (e) { if (e.code !== 'ENOENT') console.warn('[discover] reading %s:', dir, e.message); }
   for (const f of files) {
     let text;
-    try { text = fs.readFileSync(f, 'utf8'); } catch { continue; }
+    try { text = fs.readFileSync(f, 'utf8'); }
+    catch (e) { if (e.code !== 'ENOENT') console.warn('[discover] reading %s:', f, e.message); continue; }
     // Newest first: other records quote the command too (a task's notice, a progress line).
     for (let at = text.lastIndexOf(needle); at >= 0 && !label; at = text.lastIndexOf(needle, at - 1)) {
       const from = text.lastIndexOf('\n', at) + 1, to = text.indexOf('\n', at);
@@ -203,7 +207,10 @@ export function awaitSession(pid, timeoutMs = 15000) {
     const timer = setTimeout(() => done(sessionOf(pid)), timeoutMs);
     try {
       watcher = fs.watch(SESSIONS_DIR, () => { const s = sessionOf(pid); if (s) done(s); });
-    } catch { /* no directory — the timeout's own check is all there is */ }
+    } catch (e) {
+      // No directory: the timeout's own check is all there is.
+      if (e.code !== 'ENOENT') console.warn('[discover] watching %s:', SESSIONS_DIR, e.message);
+    }
   });
 }
 
@@ -225,7 +232,10 @@ export function awaitNotWaiting(pid, timeoutMs) {
     }, timeoutMs);
     try {
       watcher = fs.watch(SESSIONS_DIR, () => { const r = clear(); if (r) finish(() => resolve(r.s)); });
-    } catch { /* no directory: the timeout's own check is all there is */ }
+    } catch (e) {
+      // No directory: the timeout's own check is all there is.
+      if (e.code !== 'ENOENT') console.warn('[discover] watching %s:', SESSIONS_DIR, e.message);
+    }
   });
 }
 
@@ -241,7 +251,7 @@ export async function liveClaudeSessions() {
   // `claude` launched by full path (/Users/jaredgantt/.local/bin/claude) into "/Users/jaredgant" and
   // made that session invisible.
   try { ({ stdout } = await exec('ps', ['-Ao', 'pid=,tty=,lstart=,comm='], { timeout: 10000 })); }
-  catch { return []; }
+  catch (e) { console.warn('[discover] ps for claude processes failed:', e.message); return []; }
   return stdout.split('\n').map((l) => l.trim()).filter(Boolean)
     .map((l) => {
       // lstart is five fields ("Wed Sep  9 16:02:54 2026"); comm is the rest of the line.

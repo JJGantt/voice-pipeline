@@ -90,9 +90,13 @@ async function push(body) {
     });
     // The hub answers an event with what it holds of that turn (`emit`); everything else is empty, and
     // a `summary` is a bare 204. Null means only that the hub did not take it.
-    if (!r.ok) return null;
+    if (!r.ok) { console.warn(`[sessionWatch] hub answered a ${body.state} push with ${r.status}`); return null; }
     return r.status === 204 ? {} : await r.json().catch(() => ({}));
-  } catch { return null; /* never let a dropped push break the watcher; pushUntilHeard retries the ones that matter */ }
+  } catch (e) {
+    // Never let a dropped push break the watcher; pushUntilHeard retries the ones that matter.
+    console.warn(`[sessionWatch] ${body.state} push to the hub failed:`, e.message);
+    return null;
+  }
 }
 
 // A turn's `done` that the hub never hears is lost for good: the row's last_reply is written straight to
@@ -230,7 +234,8 @@ export function step(st, d, out, live) {
     // One that the model does answer is picked up by the tick from the transcript.
     if (said && !said.meta) st.turn = newTurn(d);
     if (live && said && !said.meta && typeof d.timestamp === 'string') {
-      try { st.onActivity(st.id, d.timestamp); } catch { /* the tick writes it regardless */ }
+      try { st.onActivity(st.id, d.timestamp); }
+      catch (e) { console.warn('[sessionWatch] turn-start activity (the tick writes it regardless):', e.message); }
     }
     // THE USER'S WORDS, AT THE MOMENT THEY ARRIVE, as their own event in the list.
     // `turnStart` is the same rule readTail uses: tool results, injected context and compact
@@ -307,7 +312,8 @@ function codexStep(st, d, out, live) {
   if (turn !== null) {
     st.turn = newTurn({ uuid: turn, timestamp: d.timestamp });
     if (live && typeof d.timestamp === 'string') {
-      try { st.onActivity(st.id, d.timestamp); } catch { /* the tick writes it regardless */ }
+      try { st.onActivity(st.id, d.timestamp); }
+      catch (e) { console.warn('[sessionWatch] turn-start activity (the tick writes it regardless):', e.message); }
     }
     return false;
   }
@@ -348,7 +354,7 @@ function loadPrefix(st) {
       fs.readSync(fd, buf, 0, buf.length, start.offset);
       text = buf.toString('utf8');
     } finally { fs.closeSync(fd); }
-  } catch { return; }
+  } catch (e) { console.warn('[sessionWatch] reading the turn before attach in %s:', st.path, e.message); return; }
   const was = { id: st.id, said: null, queue: [], echo: null, turn: null };
   for (const line of text.split('\n')) {
     if (!line.trim()) continue;
@@ -364,7 +370,8 @@ function loadPrefix(st) {
 // — and `rest` holds the trailing partial line, because an append can land mid-record.
 function drain(st) {
   let size;
-  try { size = fs.statSync(st.path).size; } catch { return; }
+  try { size = fs.statSync(st.path).size; }
+  catch (e) { if (e.code !== 'ENOENT') console.warn('[sessionWatch] stat of %s:', st.path, e.message); return; }
   // Shrunk means compacted or replaced. Starting over would replay the whole conversation as live
   // activity, so take the new end and carry on from there.
   if (size < st.offset) { st.offset = size; st.rest = ''; return; }
@@ -378,7 +385,7 @@ function drain(st) {
       fs.readSync(fd, buf, 0, buf.length, st.offset);
       chunk = buf.toString('utf8');
     } finally { fs.closeSync(fd); }
-  } catch { return; }
+  } catch (e) { console.warn('[sessionWatch] reading new records in %s:', st.path, e.message); return; }
   st.offset = size;
   if (st.partial) loadPrefix(st);
 
@@ -417,7 +424,7 @@ function finish(st) {
   // out, and a write that never returned would hold back this reply and every step after it.
   st.chain = st.chain
     .then(() => Promise.race([st.onTurnEnd(st.id, tail), new Promise((r) => setTimeout(r, 10000))]))
-    .catch(() => { /* the tick will write it 30s from now regardless */ })
+    .catch((e) => console.warn('[sessionWatch] turn-end write (the tick writes it 30s from now regardless):', e.message))
     .then(() => reportTurnEnd(st.id, tail, mine))
     .then(() => st.onReported(st.id, tail))
     .catch((e) => console.error('[sessionWatch] after turn end:', e.message));
@@ -484,17 +491,21 @@ function summarise(reply) {
       // No tools and no MCP servers: the reply can quote anything a session read (an incident's log
       // lines, a web page), and summarising it needs nothing but the text.
       child = spawn('claude', ['-p', '--model', 'haiku', '--tools', '', '--strict-mcp-config'], { stdio: ['pipe', 'pipe', 'ignore'] });
-    } catch (_) { return finish(null); }
-    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch (_) {} finish(null); }, 45000);
+    } catch (e) { console.warn('[sessionWatch] summary: starting claude failed:', e.message); return finish(null); }
+    const timer = setTimeout(() => {
+      console.warn('[sessionWatch] summary: claude gave nothing in 45s');
+      try { child.kill('SIGKILL'); } catch (_) {}
+      finish(null);
+    }, 45000);
     child.stdout.on('data', (c) => { out += c; if (out.length > 4000) out = out.slice(0, 4000); });
-    child.on('error', () => { clearTimeout(timer); finish(null); });
+    child.on('error', (e) => { console.warn('[sessionWatch] summary: claude failed:', e.message); clearTimeout(timer); finish(null); });
     child.on('close', () => {
       clearTimeout(timer);
       const line = out.replace(/\s+/g, ' ').trim().replace(/^["']|["']$/g, '');
       finish(line ? line.slice(0, SUMMARY_MAX) : null);
     });
     try { child.stdin.end(`${SUMMARY_SYSTEM}\n\n---\n\n${body.slice(0, 12000)}`); }
-    catch (_) { clearTimeout(timer); finish(null); }
+    catch (e) { console.warn('[sessionWatch] summary: writing to claude failed:', e.message); clearTimeout(timer); finish(null); }
   });
 }
 
@@ -511,9 +522,10 @@ function attach(st) {
         }, MIRROR_EVERY_MS);
       }
     });
-    st.watcher.on('error', () => detach(st.id));
-  } catch {
+    st.watcher.on('error', (e) => { console.warn('[sessionWatch] watcher on %s failed (the next sync re-attaches):', st.path, e.message); detach(st.id); });
+  } catch (e) {
     // The transcript does not exist yet — a session opened a moment ago. The next sync retries.
+    if (e.code !== 'ENOENT') console.warn('[sessionWatch] watching %s:', st.path, e.message);
     watched.delete(st.id);
   }
 }
@@ -552,7 +564,8 @@ export function syncSessionWatch(rows, onTurnEnd, onActivity = () => {}, onRepor
     // Start at the CURRENT end of the file. Reading from zero would replay a whole conversation's
     // tool calls onto the wall as though they were happening now.
     let offset = 0;
-    try { offset = fs.statSync(r.transcript_path).size; } catch { continue; }
+    try { offset = fs.statSync(r.transcript_path).size; }
+    catch (e) { if (e.code !== 'ENOENT') console.warn('[sessionWatch] stat of %s:', r.transcript_path, e.message); continue; }
     const st = { id: r.id, path: r.transcript_path, offset, rest: '', watcher: null, timer: null, mirrorTimer: null,
                  onTurnEnd, onActivity, onReported, onAppend,
                  said: null, queue: [], chain: Promise.resolve(),

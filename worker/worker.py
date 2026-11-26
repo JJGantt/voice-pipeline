@@ -29,7 +29,7 @@ from voice_worker import runstate
 from voice_worker.config import HEARTBEAT_INTERVAL_S, HOLD_RETRY_S, HTTP_TIMEOUT_S, HUB_TOKEN, IDLE_POLL_DEGRADED_S, IDLE_POLL_S, STANDBY_HEARTBEAT_S, STANDBY_POLL_S, STATE_DIR, SUPABASE_KEY, WORKER_ID, WORKER_PRIORITY
 from voice_worker.db import Supabase
 from voice_worker.governor import maybe_auto_reenable_wakefree
-from voice_worker.logs import log, log_error
+from voice_worker.logs import log, log_error, log_occurrence
 from voice_worker.presence import heartbeat
 from voice_worker.process import one_iteration
 from voice_worker.runners import SDK
@@ -52,8 +52,8 @@ def _handle_signal(signum, frame):  # noqa: ARG001
     try:
         with httpx.Client(timeout=3) as c:
             heartbeat(Supabase(c))
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001 — the next worker fails over on this one's stale beat
+        log_occurrence(f"shutdown heartbeat failed: {e}")
     if _waker is not None:
         _waker.event.set()
 

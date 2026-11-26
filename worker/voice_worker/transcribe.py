@@ -11,7 +11,7 @@ from datetime import datetime, timezone, timedelta
 import httpx
 
 from .config import SUPABASE_KEY, SUPABASE_URL, UNTRANSCRIBED_MAX_S, WORKER_ID, _NOTHING_SAID
-from .logs import alert_failure, log, log_error, now_iso
+from .logs import alert_failure, log, log_error, log_occurrence, now_iso
 from .db import report_failure
 
 
@@ -66,8 +66,8 @@ def transcribe_local(rec: dict) -> None:
         try:
             httpx.patch(url + "&status=eq.transcribing", json={"status": "error", "error": f"local Whisper failed: {e}"[:300],
                         "updated_at": now_iso()}, headers={**hdr, "Content-Type": "application/json"}, timeout=10)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e2:  # noqa: BLE001 — the stuck-transcribing sweep closes the row
+            log_occurrence(f"local Whisper: marking {rid} as error failed: {e2}")
         alert_failure("transcription", f"local Whisper failed: {e}",
                       f"Request {rid}: Groq and OpenAI had both failed, and the Mac's local Whisper failed too.")
 

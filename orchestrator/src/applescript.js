@@ -71,7 +71,11 @@ export async function ttyForSession(id, cwd) {
   try {
     const { stdout } = await execFileP('pgrep', ['-f', 'claude']);
     pids = stdout.split('\n').map((s) => s.trim()).filter(Boolean);
-  } catch { return null; }
+  } catch (e) {
+    // pgrep exits 1 when nothing matches; anything else is pgrep itself failing.
+    if (e.code !== 1) console.error('[applescript] pgrep for claude processes failed:', e.message);
+    return null;
+  }
   const cwdMatches = [];
   for (const pid of pids) {
     const t = await ttyOf(pid);
@@ -153,7 +157,7 @@ export async function closeTabForTty(tty) {
          end repeat
        end repeat
      end tell`
-  ).catch(() => {});
+  ).catch((e) => console.warn('[applescript] /exit into %s failed, falling back to SIGTERM:', tty, e.message));
   await new Promise((r) => setTimeout(r, 3000));
 
   const pid = await claudePidOnTty(tty);
@@ -168,7 +172,7 @@ export async function closeTabForTty(tty) {
          if (count of tabs of w) is 1 and (tty of item 1 of tabs of w) is "${tty}" then close w
        end repeat
      end tell`
-  ).catch(() => {});
+  ).catch((e) => console.error('[applescript] closing the window of %s failed:', tty, e.message));
   return true;
 }
 
@@ -194,6 +198,7 @@ export async function closeHuskForTty(tty) {
   } catch (e) {
     // ps exits 1 when the tty has no processes, which is the case being looked for.
     if (String(e.stdout || '').trim()) return false;
+    if (e.code !== 1) console.error('[applescript] ps on %s failed:', tty, e.message);
   }
   const out = await osascript(
     `tell application "Terminal"
@@ -205,7 +210,7 @@ export async function closeHuskForTty(tty) {
        end repeat
        return ""
      end tell`
-  ).catch(() => '');
+  ).catch((e) => { console.error('[applescript] closing the husk window of %s failed:', tty, e.message); return ''; });
   return out === 'closed';
 }
 
@@ -329,9 +334,9 @@ async function runInNewTerminal(shellCmd) {
 
   // Nothing to make a tab in — one call, one window.
   const running = await osascript('tell application "System Events" to (exists process "Terminal")')
-    .catch(() => 'false');
+    .catch((e) => { console.warn('[applescript] could not ask whether Terminal is running, opening a window:', e.message); return 'false'; });
   if (running !== 'true') return newWindow();
-  const windows = await osascript('tell application "Terminal" to count windows').catch(() => '0');
+  const windows = await osascript('tell application "Terminal" to count windows').catch((e) => { console.warn('[applescript] could not count Terminal windows, opening a window:', e.message); return '0'; });
   if (parseInt(windows, 10) === 0) return newWindow();
   // A locked screen drops synthetic keystrokes while Terminal still reports itself frontmost, so
   // Cmd-T makes no tab and the checks below fail. The window path works locked, so go straight to it.

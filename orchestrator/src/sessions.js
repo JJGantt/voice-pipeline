@@ -43,7 +43,8 @@ export function findSessionFile(id) {
   let projects;
   try {
     projects = fs.readdirSync(root, { withFileTypes: true });
-  } catch {
+  } catch (e) {
+    if (e.code !== 'ENOENT') console.warn('[sessions] reading %s:', root, e.message);
     return null;
   }
   for (const ent of projects) {
@@ -62,7 +63,8 @@ export async function cwdFromSessionFile(id) {
   try {
     const text = await fsp.readFile(file, 'utf8');
     return extractMeta(text).cwd;
-  } catch {
+  } catch (e) {
+    if (e.code !== 'ENOENT') console.warn('[sessions] reading %s:', file, e.message);
     return null;
   }
 }
@@ -74,7 +76,8 @@ export async function scanRegistry(limit) {
   let projects;
   try {
     projects = await fsp.readdir(root, { withFileTypes: true });
-  } catch {
+  } catch (e) {
+    if (e.code !== 'ENOENT') console.warn('[sessions] reading %s:', root, e.message);
     return [];
   }
 
@@ -85,7 +88,8 @@ export async function scanRegistry(limit) {
     let entries;
     try {
       entries = await fsp.readdir(projDir, { withFileTypes: true });
-    } catch {
+    } catch (e) {
+      if (e.code !== 'ENOENT') console.warn('[sessions] reading %s:', projDir, e.message);
       continue;
     }
     for (const f of entries) {
@@ -94,7 +98,8 @@ export async function scanRegistry(limit) {
       let st;
       try {
         st = await fsp.stat(full);
-      } catch {
+      } catch (e) {
+        if (e.code !== 'ENOENT') console.warn('[sessions] stat of %s:', full, e.message);
         continue;
       }
       files.push({
@@ -114,8 +119,9 @@ export async function scanRegistry(limit) {
     let meta = { title: null, cwd: null };
     try {
       meta = extractMeta(await fsp.readFile(f.full, 'utf8'));
-    } catch {
-      // ignore unreadable file; still register with what we have.
+    } catch (e) {
+      // Still register it with what we have.
+      if (e.code !== 'ENOENT') console.warn('[sessions] reading %s:', f.full, e.message);
     }
     rows.push({
       id: f.id,

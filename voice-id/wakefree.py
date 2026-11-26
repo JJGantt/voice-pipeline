@@ -13,6 +13,7 @@ while wake-free mode is toggled on (the listener releases the mic and keeps doin
 
 Env: SUPABASE_URL, SUPABASE_KEY, GROQ_API_KEY (sourced from mac-listener/.env by run-wakefree.sh).
 """
+import logging
 import os
 import signal
 import subprocess
@@ -38,6 +39,14 @@ _resumed.set()
 # spends importing torch and loading ECAPA. Respawns logged as rc=-30 / rc=-31 were exactly that window.
 signal.signal(signal.SIGUSR1, lambda *_: _resumed.clear())
 signal.signal(signal.SIGUSR2, lambda *_: _resumed.set())
+
+# Errors go to the ops responder (health/responder): uncaught exceptions and `logging` at ERROR are errors,
+# `logging` at WARNING an occurrence (a failure a retry or a fallback already handles); see log_error /
+# log_warning. No heartbeat: this runs only while wake-free (or the governor's sensor) is on, so its silence
+# is normal; the listener supervises it and reports its deaths. Sensor mode is its own service.
+import ops_report as ops  # noqa: E402
+ops.install(machine="mac", service="mac-wakefree-sensor" if os.environ.get("WAKEFREE_SENSOR") == "1" else "mac-wakefree")
+_oplog = logging.getLogger("mac-wakefree")
 
 from collections import deque
 
@@ -106,7 +115,8 @@ def _lid_closed() -> bool:
     try:
         out = subprocess.run(["/usr/sbin/ioreg", "-r", "-k", "AppleClamshellState", "-d", "4"],
                              capture_output=True, text=True, timeout=5).stdout
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        log_warning(f"lid state unreadable, treating it as open: {e}")
         return False
     return '"AppleClamshellState" = Yes' in out
 
@@ -178,9 +188,9 @@ def _alive_beacon() -> None:
                                     "Content-Type": "application/json",
                                     "Prefer": "resolution=merge-duplicates,return=minimal"},
                            json={"source": "mac-wakefree",
-                                 "alive_at": datetime.now(timezone.utc).isoformat()}, timeout=5)
-            except Exception:  # noqa: BLE001
-                pass
+                                 "alive_at": datetime.now(timezone.utc).isoformat()}, timeout=5).raise_for_status()
+            except Exception as e:  # noqa: BLE001 — the next beacon (30s) retries
+                log_warning(f"alive beacon write failed: {e}")
         time.sleep(30)
 
 
@@ -192,6 +202,18 @@ SENSOR = os.environ.get("WAKEFREE_SENSOR") == "1"
 
 def log(msg: str) -> None:
     print(f"{datetime.now(timezone.utc).isoformat()} [{'wf-sensor' if SENSOR else 'wakefree'}] {msg}", flush=True)
+
+
+def log_error(msg: str) -> None:
+    """A failure: printed like every line, and logged at ERROR, which the ops reporter sends."""
+    log(f"ERROR {msg}")
+    _oplog.error(msg)
+
+
+def log_warning(msg: str) -> None:
+    """A failure a retry or a fallback already handles: an occurrence at the responder."""
+    log(f"WARNING {msg}")
+    _oplog.warning(msg)
 
 
 def hud(state: str) -> None:
@@ -211,15 +233,17 @@ def hud(state: str) -> None:
                 with open(HUD_STATE_FILE) as fh:
                     if fh.read().strip() == state:
                         return
-            except OSError:
+            except FileNotFoundError:
                 pass                                    # no record yet → send it
+            except OSError as e:
+                log_warning(f"HUD state file unreadable, sending {state!r} anyway: {e}")
             os.makedirs(os.path.dirname(HUD_STATE_FILE), exist_ok=True)
             with open(HUD_STATE_FILE, "w") as fh:
                 fh.write(state)
             subprocess.Popen([HS_BIN, "-c", f'VoiceHUD("{state}")'],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        log_error(f"HUD {state!r} not sent: {e}")
 
 
 def cue() -> None:
@@ -228,8 +252,8 @@ def cue() -> None:
     try:
         if os.path.exists(HEARD_WAV):
             subprocess.Popen(["afplay", HEARD_WAV], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        log_error(f"heard cue failed: {e}")
 
 
 def publish_presence(jared: bool) -> None:
@@ -246,9 +270,9 @@ def publish_presence(jared: bool) -> None:
                        headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
                                 "Content-Type": "application/json",
                                 "Prefer": "resolution=merge-duplicates,return=minimal"},
-                       json=body, timeout=5)
-        except Exception:  # noqa: BLE001
-            pass
+                       json=body, timeout=5).raise_for_status()
+        except Exception as e:  # noqa: BLE001 — the next confirmed check publishes again
+            log_warning(f"presence publish failed: {e}")
     threading.Thread(target=_post, daemon=True).start()
 
 
@@ -261,7 +285,8 @@ def other_heard_jared():
                       headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=4)
         stamps = [datetime.fromisoformat(row["heard_jared_at"]) for row in r.json() if row.get("heard_jared_at")]
         return max(stamps) if stamps else None
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001 — treated as no other mic: this capture is kept
+        log_warning(f"other mics' presence unreadable: {e}")
         return None
 
 
@@ -275,8 +300,8 @@ def warm_tts() -> None:
         return
     try:
         subprocess.Popen([VOICE_DAEMON, "start"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001 — the reply's own speak starts the daemon, only later
+        log_warning(f"TTS pre-warm failed: {e}")
 
 
 def _write_wav(pcm_f32: np.ndarray) -> str:
@@ -303,9 +328,12 @@ def transcribe(pcm_f32: np.ndarray) -> str:
                            # English, always: auto-detection guesses per clip and has produced Icelandic.
                            data={"model": GROQ_MODEL, "response_format": "text", "language": "en"},
                            timeout=30.0)
-        return r.text.strip() if r.status_code == 200 else ""
+        if r.status_code != 200:
+            log_error(f"transcribe failed: Groq HTTP {r.status_code}: {r.text[:200]}")
+            return ""
+        return r.text.strip()
     except Exception as e:  # noqa: BLE001
-        log(f"transcribe failed: {e}")
+        log_error(f"transcribe failed: {e}")
         return ""
     finally:
         try:
@@ -323,9 +351,9 @@ def _esp_working() -> None:
     copy as 'not the speaker', would briefly show idle before the worker's slower blink-ping lands."""
     try:
         httpx.get(f"{JARED_VOICE_URL}/led-blink",
-                  headers={"X-Token": LED_TOKEN} if LED_TOKEN else None, timeout=3)
-    except Exception:  # noqa: BLE001
-        pass
+                  headers={"X-Token": LED_TOKEN} if LED_TOKEN else None, timeout=3).raise_for_status()
+    except Exception as e:  # noqa: BLE001 — the worker's own blink ping follows
+        log_warning(f"ESP working blink failed: {e}")
 
 
 def open_request(cap_start: str, cap_end: str) -> str | None:
@@ -343,8 +371,8 @@ def open_request(cap_start: str, cap_end: str) -> str | None:
                              "capture_start": cap_start, "capture_end": cap_end}, timeout=6)
         rows = r.json()
         return rows[0]["id"] if isinstance(rows, list) and rows else None
-    except Exception as e:  # noqa: BLE001
-        log(f"open-request failed: {e}")
+    except Exception as e:  # noqa: BLE001 — the transcript is then inserted at enqueue instead
+        log_warning(f"open-request failed: {e}")
         return None
 
 
@@ -361,13 +389,13 @@ def update_request_pending(rid: str, text: str) -> None:
                                   "updated_at": datetime.now(timezone.utc).isoformat()}, timeout=10)
             r.raise_for_status()
             if not r.json():
-                log(f"enqueue: row {rid} is no longer transcribing; transcript dropped")
+                log_error(f"enqueue: row {rid} is no longer transcribing; transcript dropped")
                 return
             log(f"enqueued: {text[:80]!r}")
             return
         except Exception as e:  # noqa: BLE001
             if pause is None:
-                log(f"enqueue (update) failed: {e}")
+                log_error(f"enqueue (update) failed: {e}")
                 return
             time.sleep(pause)
 
@@ -379,9 +407,9 @@ def close_request_error(rid: str, err: str) -> None:
                     headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
                              "Content-Type": "application/json", "Prefer": "return=minimal"},
                     json={"status": "error", "error": err,
-                          "updated_at": datetime.now(timezone.utc).isoformat()}, timeout=6)
-    except Exception:  # noqa: BLE001
-        pass
+                          "updated_at": datetime.now(timezone.utc).isoformat()}, timeout=6).raise_for_status()
+    except Exception as e:  # noqa: BLE001 — the worker's stuck-transcribing sweep closes the row
+        log_warning(f"closing request {rid} as error failed: {e}")
 
 
 def enqueue(text: str, cap_start: str | None = None, cap_end: str | None = None) -> None:
@@ -396,11 +424,11 @@ def enqueue(text: str, cap_start: str | None = None, cap_end: str | None = None)
         httpx.post(f"{SUPABASE_URL}/rest/v1/voice_requests",
                    headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
                             "Content-Type": "application/json", "Prefer": "return=minimal"},
-                   json=payload, timeout=10.0)
+                   json=payload, timeout=10.0).raise_for_status()
         log(f"enqueued: {text[:80]!r}")
         threading.Thread(target=_esp_working, daemon=True).start()
     except Exception as e:  # noqa: BLE001
-        log(f"enqueue failed: {e}")
+        log_error(f"enqueue failed: {e}")
 
 
 def inject_mode() -> bool:
@@ -412,7 +440,8 @@ def inject_mode() -> bool:
                       headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=5)
         rows = r.json()
         return bool(rows) and str(rows[0].get("value")).strip().lower() not in ("0", "false", "off", "no", "", "none")
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001 — the command goes to the hub instead
+        log_warning(f"inject-mode read failed, sending to the hub: {e}")
         return False
 
 
@@ -424,7 +453,7 @@ def inject_text(text: str) -> None:
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         log(f"injected: {text[:80]!r}")
     except Exception as e:  # noqa: BLE001
-        log(f"inject failed: {e}")
+        log_error(f"inject failed: {e}")
 
 
 def get_setting(key: str, default: float) -> float:
@@ -437,8 +466,8 @@ def get_setting(key: str, default: float) -> float:
         rows = r.json()
         if rows and rows[0].get("value") not in (None, ""):
             return float(rows[0]["value"])
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        log_warning(f"setting {key} unreadable, using the default {default}: {e}")
     return default
 
 
@@ -490,7 +519,7 @@ def _load_bank():
             log(f"voiceprint: shared bank from app_settings {bank.shape}")
             return bank
     except Exception as e:  # noqa: BLE001
-        log(f"voiceprint: shared bank unavailable ({e}); trying local exemplars.npy")
+        log_warning(f"voiceprint: shared bank unavailable ({e}); trying local exemplars.npy")
     ref_bank = HERE / "exemplars.npy"
     if ref_bank.exists():
         bank = np.load(ref_bank)
@@ -605,7 +634,8 @@ def main() -> int:
                     if vad_future is not None and vad_future.done():
                         try:
                             sim = vad_future.result()
-                        except Exception:
+                        except Exception as e:  # noqa: BLE001
+                            log_error(f"speaker check failed: {e}")
                             sim = 0.0
                         vad_future = None
                         thr = THRESHOLD - (KEEPALIVE_MARGIN if jared_seen else 0.0)

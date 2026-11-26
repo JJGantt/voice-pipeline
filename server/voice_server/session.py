@@ -200,7 +200,8 @@ async def connection(ws):
                         if sense_task is not None and sense_task.done():
                             try:
                                 _sim, _ = sense_task.result()
-                            except Exception:  # noqa: BLE001
+                            except Exception as e:  # noqa: BLE001
+                                log.error("sensor speaker check failed: %s", e)
                                 _sim = 0.0
                             sense_task = None
                             if _sim >= vid.thresh:
@@ -265,7 +266,8 @@ async def connection(ws):
                     if check_task is not None and check_task.done():
                         try:
                             sim, _ = check_task.result()
-                        except Exception:
+                        except Exception as e:  # noqa: BLE001
+                            log.error("capture speaker check failed: %s", e)
                             sim = 0.0
                         check_task = None
                         thr = min(vid.thresh, VAD_KEEPALIVE_MIN) if jared_seen else vid.thresh

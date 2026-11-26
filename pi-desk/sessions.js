@@ -50,7 +50,11 @@ export async function liveSessions() {
     names = stdout.split('\n').map((l) => l.trim()).filter(Boolean)
       .map((l) => { const [n, c] = l.split(' '); return { n, created: Number(c) * 1000 || 0 }; })
       .filter((x) => x.n.startsWith('hub-'));
-  } catch { return []; }   // no server running is a valid state, not an error
+  } catch (e) {
+    // No server running is a valid state, not an error.
+    if (!/no server running|error connecting/i.test(String(e.stderr || ''))) console.error('[pi-desk] tmux list-sessions failed:', e.message);
+    return [];
+  }
 
   const out = [];
   for (const { n: name, created } of names) {
@@ -64,7 +68,13 @@ export async function liveSessions() {
       // binary, and the wrapper is what the launcher exec'd. codex.js finds the rollout under it.
       const hit = panes.split('\n').map((l) => l.trim().split(' ')).find(([c]) => AGENT_OF[c]);
       if (hit) { alive = true; pid = Number(hit[1]) || null; agent = AGENT_OF[hit[0]]; }
-    } catch { alive = false; }
+    } catch (e) {
+      // The session ending between the two calls is the normal way to get here.
+      if (!/can't find session|no server running|error connecting/i.test(String(e.stderr || ''))) {
+        console.warn('[pi-desk] tmux list-panes for %s failed:', name, e.message);
+      }
+      alive = false;
+    }
     out.push({ name, alive, created, pid, agent });
   }
   return out;
@@ -155,7 +165,12 @@ export async function evict(name) {
     await new Promise((r) => setTimeout(r, 800));
     await exec('tmux', ['send-keys', '-t', name, '/exit', 'Enter'], { timeout: 10000 });
     await new Promise((r) => setTimeout(r, 2500));
-  } catch { /* fall through to the backstop */ }
+  } catch (e) {
+    // Falls through to the kill below.
+    if (!/can't find session|no server running|error connecting/i.test(String(e.stderr || ''))) {
+      console.warn('[pi-desk] asking %s to exit failed, killing it:', name, e.message);
+    }
+  }
   try { await exec('tmux', ['kill-session', '-t', name], { timeout: 10000 }); } catch {}
   // Return only once claude has actually exited: the caller measures the memory this freed, or flushes
   // the transcript it was writing, and neither is true while the process is still winding down.

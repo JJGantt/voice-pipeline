@@ -41,7 +41,7 @@ class RealtimeWaker:
         try:
             import realtime  # noqa: F401 — probe availability before spawning the thread
         except Exception as e:  # noqa: BLE001 — missing lib must not break the worker; just poll
-            log(f"realtime listener unavailable ({e}); falling back to {IDLE_POLL_DEGRADED_S}s polling")
+            log_occurrence(f"realtime listener unavailable ({e}); falling back to {IDLE_POLL_DEGRADED_S}s polling")
             return
         self._started = True
         self._loop = asyncio.new_event_loop()
@@ -54,7 +54,7 @@ class RealtimeWaker:
         try:
             self._loop.run_until_complete(self._serve())
         except Exception as e:  # noqa: BLE001
-            log(f"realtime listener loop exited: {e}")
+            log_error(f"realtime listener loop exited: {e}")
 
     async def _serve(self) -> None:
         from realtime import AsyncRealtimeClient

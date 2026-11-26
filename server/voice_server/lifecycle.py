@@ -20,11 +20,12 @@ async def notify_transcribe_failure() -> None:
         return
     try:
         async with httpx.AsyncClient(timeout=6) as c:
-            await c.post(db.url("/rest/v1/voice_messages"), headers=db.headers("return=minimal"),
-                         json={"focus": "hub", "mode": "hub", "role": "assistant", "done": True,
-                               "text": "⚠️ Heard you, but speech-to-text failed twice — say that again?"})
-    except Exception:  # noqa: BLE001 — the log line above is the floor
-        pass
+            r = await c.post(db.url("/rest/v1/voice_messages"), headers=db.headers("return=minimal"),
+                             json={"focus": "hub", "mode": "hub", "role": "assistant", "done": True,
+                                   "text": "⚠️ Heard you, but speech-to-text failed twice — say that again?"})
+            r.raise_for_status()
+    except Exception as e:  # noqa: BLE001
+        log.error("transcribe-failure notice NOT posted to the hub: %s", e)
 
 
 async def open_request(cap_start: str | None = None, cap_end: str | None = None,

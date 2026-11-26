@@ -61,7 +61,7 @@ async function inspect(dir) {
     try { last_active = (await git(dir, ['log', '-1', '--format=%cI'])).trim() || null; }
     catch { /* no commits yet, or not a readable repo */ }
     try { dirty = (await git(dir, ['status', '--porcelain'])).trim().length > 0; }
-    catch { /* leave clean */ }
+    catch (e) { console.warn('[repos] git status in %s failed, publishing it clean:', dir, e.message); }
   }
   if (!last_active) {
     try { last_active = fs.statSync(dir).mtime.toISOString(); } catch { /* leave null */ }
@@ -77,7 +77,10 @@ function scanRoots() {
   for (const root of config.REPO_ROOTS) {
     let entries = [];
     try { entries = fs.readdirSync(root, { withFileTypes: true }); }
-    catch { continue; }  // root doesn't exist on this machine — fine
+    catch (e) {   // a root that doesn't exist on this machine is fine
+      if (e.code !== 'ENOENT') console.warn('[repos] reading %s:', root, e.message);
+      continue;
+    }
     for (const e of entries) {
       if (!e.isDirectory() || e.name.startsWith('.')) continue;
       found.push(path.join(root, e.name));

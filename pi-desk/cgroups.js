@@ -50,9 +50,15 @@ const write = (file, value) => fs.writeFileSync(file, String(value));
 const sessionDirs = () => fs.readdirSync(SESSIONS, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name);
 const procsOf = (dir) => {
   try { return fs.readFileSync(path.join(dir, 'cgroup.procs'), 'utf8').split('\n').filter(Boolean).map(Number); }
-  catch { return []; }
+  catch (e) { if (e.code !== 'ENOENT') console.warn(`[cgroups] reading ${dir}/cgroup.procs: ${e.message}`); return []; }
 };
-const move = (pid, dir) => { try { write(path.join(dir, 'cgroup.procs'), pid); return true; } catch { return false; } };
+const move = (pid, dir) => {
+  try { write(path.join(dir, 'cgroup.procs'), pid); return true; }
+  catch (e) {   // ESRCH: the process exited first
+    if (e.code !== 'ESRCH') console.error(`[cgroups] moving ${pid} into ${dir}: ${e.message}`);
+    return false;
+  }
+};
 
 /** pid → parent pid for every process, read once. */
 function parents() {
@@ -136,7 +142,11 @@ export async function setupCgroups(live) {
 /** Create a session's cgroup with its budget, before launch.sh moves into it. Returns its path. */
 export function limitSession(name) {
   const cg = sessionCgroup(name);
-  try { fs.mkdirSync(cg, { recursive: true }); } catch { return ''; }   // no cgroups: launch.sh skips the move
+  try { fs.mkdirSync(cg, { recursive: true }); }
+  catch (e) {   // no cgroups: launch.sh skips the move
+    console.warn(`[cgroups] creating ${cg} (${e.message}) — ${name} runs without a budget`);
+    return '';
+  }
   if (enabled) {
     try {
       write(path.join(cg, 'memory.max'), SESSION_MAX_MB * MB);
@@ -152,12 +162,14 @@ export function limitSession(name) {
  * still holds, so the rest of the Pi is protected either way.
  */
 export function liftBudget(name) {
-  try { write(path.join(sessionCgroup(name), 'memory.high'), 'max'); } catch {}
+  try { write(path.join(sessionCgroup(name), 'memory.high'), 'max'); }
+  catch (e) { if (enabled && e.code !== 'ENOENT') console.error(`[cgroups] lifting the budget of ${name}: ${e.message}`); }
 }
 
 /** Kill every process in a cgroup and wait until it is empty. */
 async function killCgroup(dir) {
-  try { write(path.join(dir, 'cgroup.kill'), 1); } catch { return; }
+  try { write(path.join(dir, 'cgroup.kill'), 1); }
+  catch (e) { if (e.code !== 'ENOENT') console.error(`[cgroups] killing ${dir}: ${e.message}`); return; }
   // cgroup.kill is asynchronous; `populated 0` in cgroup.events is the kernel saying it is done.
   for (let i = 0; i < 100; i++) {
     try { if (/^populated 0$/m.test(fs.readFileSync(path.join(dir, 'cgroup.events'), 'utf8'))) break; }
@@ -204,7 +216,7 @@ export function sessionUsage(name) {
       try { rssKb += Number(fs.readFileSync(`/proc/${pid}/status`, 'utf8').match(/^VmRSS:\s+(\d+)/m)?.[1] || 0); } catch {}
     }
     return { anonMb: Math.round(anon / MB), currentMb: Math.max(Math.round(current / MB), Math.round(rssKb / 1024)) };
-  } catch { return null; }
+  } catch (e) { if (e.code !== 'ENOENT') console.warn(`[cgroups] reading the usage of ${name}: ${e.message}`); return null; }
 }
 
 // ---- heavy-work events ----------------------------------------------------------------------
@@ -251,9 +263,10 @@ export function watchSession(name, onHeavy) {
       const next = u.currentMb + COMMAND_BUDGET_MB;
       console.log(`[cgroups] ${name} is at ${u.currentMb}MB, its commands ${cmdMb}MB — not heavy work; ` +
                   `memory.high raised to ${Math.min(next, SESSION_MAX_MB)}MB`);
-      try { write(path.join(sessionCgroup(name), 'memory.high'), next < SESSION_MAX_MB ? next * MB : 'max'); } catch {}
+      try { write(path.join(sessionCgroup(name), 'memory.high'), next < SESSION_MAX_MB ? next * MB : 'max'); }
+      catch (e) { if (e.code !== 'ENOENT') console.error(`[cgroups] raising memory.high of ${name}: ${e.message}`); }
     });
-    w.on('error', () => stopWatching(name));
+    w.on('error', (e) => { console.warn(`[cgroups] watcher on ${name} failed: ${e.message}`); stopWatching(name); });
     watchers.set(name, w);
   } catch (e) { console.error(`[cgroups] cannot watch ${name}: ${e.message}`); }
 }
@@ -264,5 +277,6 @@ export function stopWatching(name) {
 }
 
 function highCount(file) {
-  try { return Number(fs.readFileSync(file, 'utf8').match(/^high (\d+)$/m)?.[1] || 0); } catch { return 0; }
+  try { return Number(fs.readFileSync(file, 'utf8').match(/^high (\d+)$/m)?.[1] || 0); }
+  catch (e) { if (e.code !== 'ENOENT') console.warn(`[cgroups] reading ${file}: ${e.message}`); return 0; }
 }

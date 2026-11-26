@@ -89,8 +89,8 @@ async def _safety(ws):
         await render(ws, "safety timeout — no done arrived")
     except asyncio.CancelledError:
         pass
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as e:  # noqa: BLE001
+        log.error("LED safety backstop failed: %s", e)
 
 
 async def _clear_other_hearing_after(delay: float = 1.6) -> None:
@@ -116,7 +116,8 @@ def on_presence(payload) -> None:
     hj = rec.get("heard_jared_at")
     try:
         fresh = bool(hj) and (datetime.now(timezone.utc) - datetime.fromisoformat(hj)).total_seconds() <= PRESENCE_FRESH_S
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        log.warning("presence: unreadable heard_jared_at %r from %s: %s", hj, rec.get("source"), e)
         fresh = False
     if not fresh:
         return

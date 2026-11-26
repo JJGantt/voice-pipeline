@@ -3,6 +3,8 @@
 import json
 import re
 
+from .logs import log_error
+
 
 
 
@@ -231,7 +233,8 @@ def cut_off_directive(req: dict) -> str:
     if isinstance(timing, str):
         try:
             timing = json.loads(timing)
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            log_error(f"cut_off_directive: timing unreadable: {e}")
             timing = {}
     out = ""
     cut = timing.get("cut_off")

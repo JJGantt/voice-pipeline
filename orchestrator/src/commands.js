@@ -517,7 +517,8 @@ async function sendToFly(cmd, why, status) {
     if (row && fly.kind === 'resume_mirrored') {
       // The conversation moves: the row is marked first, so the machine it was on closes its copy.
       if (row.worker === 'desk' && row.transcript_path) {
-        await mirrorUp(row.claude_session_id, row.transcript_path, row.mirror_offset || 0).catch(() => null);
+        await mirrorUp(row.claude_session_id, row.transcript_path, row.mirror_offset || 0)
+          .catch((e) => console.error(`[commands] mirroring ${row.id} up before moving it to Fly failed:`, e.message));
       }
       await patchDeskSession(row.id, { status: 'transferred', ended: new Date().toISOString(), working: false });
     }
