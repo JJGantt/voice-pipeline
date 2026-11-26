@@ -59,6 +59,12 @@ export async function sendToTmux(name, line) {
   await tmux(['send-keys', '-t', `=${name}:`, 'Enter']);
 }
 
+/** Press `keys` (tmux key names: `Escape`, `C-c`) in the session's pane. */
+export const keysTmux = (name, ...keys) => tmux(['send-keys', '-t', `=${name}:`, ...keys]);
+
+/** The pane's visible screen as plain text. */
+export const screenTmux = (name) => tmux(['capture-pane', '-p', '-t', `=${name}:`]);
+
 /**
  * End the session: `/exit` first, which flushes the transcript, then `pidOnTty`'s process is
  * terminated if it ignored that, then the tmux session goes.

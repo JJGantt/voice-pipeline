@@ -12,10 +12,11 @@
 // last resort, taken only when a new session needs a slot.
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { awaitSession } from '../orchestrator/src/discover.js';
+import { awaitSession, sessionOf } from '../orchestrator/src/discover.js';
 import { awaitCodexSession } from '../orchestrator/src/codex.js';
 import { typeable, transcriptSize, awaitSubmitted, awaitTranscript } from '../orchestrator/src/handoff.js';
 import { expectPrompt } from '../orchestrator/src/sessionWatch.js';
+import { stopTurn } from '../orchestrator/src/interrupt.js';
 import { removeSessionCgroup } from './cgroups.js';
 
 const exec = promisify(execFile);
@@ -118,6 +119,25 @@ export async function typeInto(target, text, { expect = null, cmd = null } = {})
     return `sent ${text.length} chars to ${target} (on a second Enter)`;
   }
   throw new Error(`typed into ${target} but it never reached the transcript — likely sitting unsent in the composer`);
+}
+
+/**
+ * Stop the turn a session is running: the Esc key, which is what Esc at the keyboard does — what was
+ * queued behind it runs next, otherwise it waits (orchestrator interrupt.js, which also says why a
+ * composer left holding the interrupted prompt is cleared with Ctrl-C).
+ */
+export async function interruptPane(target) {
+  const pane = (await liveSessions()).find((l) => l.name === target && l.alive);
+  if (!pane?.pid) throw new Error(`${target} is not running`);
+  if (pane.agent === 'codex') throw new Error('stopping a turn works on Claude sessions only');
+  const keys = (k) => exec('tmux', ['send-keys', '-t', target, k], { timeout: 10000 });
+  return stopTurn(target, {
+    session: await awaitPaneSession(pane, 3000),
+    state: () => sessionOf(pane.pid),
+    press: () => keys('Escape'),
+    screen: async () => (await exec('tmux', ['capture-pane', '-p', '-t', target], { timeout: 10000 })).stdout,
+    clear: () => keys('C-c'),
+  });
 }
 
 /**

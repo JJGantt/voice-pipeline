@@ -21,7 +21,7 @@ import { config } from './config.js';
 import { findSessionFile } from './sessions.js';
 import { typeable } from './handoff.js';
 import { claudeBinFor, claudeBinForSession, isIncident } from './incident.js';
-import { tmuxNameForTty, runInTmux, sendToTmux, closeTmux, killTmux } from './tmux.js';
+import { tmuxNameForTty, runInTmux, sendToTmux, closeTmux, killTmux, keysTmux, screenTmux } from './tmux.js';
 
 const execFileP = promisify(execFile);
 
@@ -254,6 +254,41 @@ export async function sendToTty(tty, text) {
     end tell
     return "sent"`);
   return line;
+}
+
+/**
+ * Interrupt the turn in a session: Ctrl-C, for the reason in interrupt.js (`do script` appends a return,
+ * and ESC plus a return is read as Alt-Return). Also what clears a composer that holds text. A tmux pane
+ * takes the real Esc key instead.
+ */
+export async function interruptTty(tty, { clear = false } = {}) {
+  const headless = await tmuxNameForTty(tty);
+  if (headless) { await keysTmux(headless, clear ? 'C-c' : 'Escape'); return; }
+  await osascript(`tell application "Terminal"
+      repeat with w in windows
+        repeat with t in tabs of w
+          if tty of t is "${tty}" then
+            do script (character id 3) in t
+            return "sent"
+          end if
+        end repeat
+      end repeat
+      error "no tab with tty ${tty}"
+    end tell`);
+}
+
+/** What the session's terminal shows, as plain text. */
+export async function screenOfTty(tty) {
+  const headless = await tmuxNameForTty(tty);
+  if (headless) return screenTmux(headless);
+  return osascript(`tell application "Terminal"
+      repeat with w in windows
+        repeat with t in tabs of w
+          if tty of t is "${tty}" then return contents of t
+        end repeat
+      end repeat
+      error "no tab with tty ${tty}"
+    end tell`);
 }
 
 // Whether the console session's screen is locked: IOConsoleUsers carries CGSSessionScreenIsLocked

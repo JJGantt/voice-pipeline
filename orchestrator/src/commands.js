@@ -45,7 +45,9 @@ import { isKnownRepo } from './repos.js';
 const [MOVED_NOTE, MOVED_MID_TURN, MOVED_BETWEEN_TURNS] = fs.readFileSync(new URL('../moved-session.txt', import.meta.url), 'utf8')
   .split(/^---$/m).map((s) => s.trim());
 import { ensureTrusted } from './trust.js';
-import { openFreshTab, openCodexTab, sendToTty, closeTabForTty, noteStarted } from './applescript.js';
+import { openFreshTab, openCodexTab, sendToTty, closeTabForTty, noteStarted, interruptTty, screenOfTty } from './applescript.js';
+import { stopTurn } from './interrupt.js';
+import { tmuxNameForTty } from './tmux.js';
 import { isIncident } from './incident.js';
 import { withAttachments, transcriptSize, awaitSubmitted } from './handoff.js';
 import { expectPrompt } from './sessionWatch.js';
@@ -146,6 +148,29 @@ async function run(cmd) {
     if (row && row.status !== 'resident') throw new Error(`${session} has ended`);
     // The hub passes the sender's own message id as `msg` when it has one; the command id otherwise.
     return deliver(row, prompt, { cmd: (cmd.payload || {}).msg || cmd.id });
+  }
+
+  // Stop the turn a session is running, as Esc at the keyboard does (interrupt.js): what was queued
+  // behind it runs next, and with nothing queued it waits for the next message.
+  if (cmd.kind === 'interrupt_session') {
+    const id = String((cmd.payload || {}).session || '').trim();
+    const row = await deskSession(id);
+    if (!row) throw new Error(`no such session: ${id}`);
+    if (row.status !== 'resident') throw new Error(`${id} is not running`);
+    if (!row.tty) throw new Error(`no terminal recorded for ${id}`);
+    if (row.agent === 'codex') throw new Error('stopping a turn works on Claude sessions only');
+    const session = sessionFor(row);
+    // A Terminal tab is interrupted with Ctrl-C plus the return `do script` appends; on a permission
+    // dialog that return could answer it. tmux sends a bare Esc, which only dismisses the dialog.
+    if (session?.waiting && !(await tmuxNameForTty(row.tty))) {
+      throw new Error(`${id} is waiting on a ${session.waiting}; answer it at the Mac`);
+    }
+    return stopTurn(id, {
+      session, state: () => sessionFor(row),
+      press: () => interruptTty(row.tty),
+      screen: () => screenOfTty(row.tty),
+      clear: () => interruptTty(row.tty, { clear: true }),
+    });
   }
 
   // Name the session itself. `/rename` is the command the user types, so this is the same act rather than
@@ -504,6 +529,8 @@ async function execute(cmd) {
   } catch (e) {
     console.error('[commands] failed:', e.message);
     await finishCommand(cmd.id, 'error', e.message).catch((err) => console.error('[commands] finish:', err.message));
+    // A stop that failed is not work to keep for later: the moment it was for has passed.
+    if (cmd.kind === 'interrupt_session') return;
     await deadLetterCommand(cmd, e.message).catch((err) => console.error('[commands] dead letter:', err.message));
   }
 }
@@ -530,6 +557,14 @@ async function drain() {
       // which runs whatever reaches it; and not a follow-up for a session open here, which the Mac can
       // deliver now.
       const target0 = (cmd.payload || {}).target;
+      // A stop is for the turn running when it was pressed; late, it would stop whatever runs now.
+      if (cmd.kind === 'interrupt_session' && ageS > config.COMMAND_TTL_S && (!target0 || target0 === 'mac')) {
+        if (await claimCommand(cmd.id)) {
+          console.log(`[commands] ${cmd.id} (interrupt_session) expired unrun after ${Math.round(ageS)}s — dropped`);
+          await finishCommand(cmd.id, 'expired', `not run: ${Math.round(ageS)}s old`);
+        }
+        continue;
+      }
       if (ageS > config.COMMAND_TTL_S && target0 !== 'fly' && !(await deliverableHere(cmd))) {
         if (await claimCommand(cmd.id)) {
           await sendToFly(cmd, `expired unrun — queued ${Math.round(ageS)}s before this machine saw it`, 'expired');
@@ -543,6 +578,12 @@ async function drain() {
       const target = (cmd.payload || {}).target;
       if (target && target !== 'mac') continue;
       if (!(await claimCommand(cmd.id))) continue;   // someone else took it
+      // Not awaited and not chained behind the session's follow-ups: a stop that waited on a follow-up
+      // held on a dialog would arrive after the moment it was for.
+      if (cmd.kind === 'interrupt_session') {
+        execute(cmd).catch((e) => console.error(`[commands] interrupt ${cmd.id}: ${e.message}`));
+        continue;
+      }
       if (cmd.kind === 'follow_up') {
         // Not awaited: a follow-up can be held for minutes on a dialog (deliver), and that must not
         // stop other commands. Chained per session, so two follow-ups to one session keep their order.

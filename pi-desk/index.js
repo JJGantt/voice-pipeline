@@ -33,7 +33,7 @@ import { randomUUID } from 'node:crypto';
 // Shared with the Mac orchestrator rather than copied: it only writes ~/.claude.json and has nothing
 // platform-specific in it, and two copies of "which keys make a project entry complete" would drift.
 import { ensureTrusted } from '../orchestrator/src/trust.js';
-import { readTail, liveSessions, evict, pickEviction, typeInto } from './sessions.js';
+import { readTail, liveSessions, evict, pickEviction, typeInto, interruptPane } from './sessions.js';
 import { turnBoundary } from '../orchestrator/src/transcripts.js';
 // Pictures attached in the hub, fetched to this machine for the session to read — shared with the Mac.
 import { withAttachments, sweepStashedPrompts } from '../orchestrator/src/handoff.js';
@@ -1098,6 +1098,13 @@ async function run(cmd) {
     return typeInto(target, prompt, { cmd: (cmd.payload || {}).msg || cmd.id });
   }
 
+  // Stop the turn a session is running, as Esc at the keyboard does (sessions.js interruptPane).
+  if (cmd.kind === 'interrupt_session') {
+    const target = String((cmd.payload || {}).session || '').trim();
+    if (!/^hub-[A-Za-z0-9._-]+$/.test(target)) throw new Error(`unusable session name: ${target}`);
+    return interruptPane(target);
+  }
+
   // Name the session itself, with the command the user would type. Claude Code writes the `custom-title`
   // record, so the name comes back through the transcript rather than living only in our row.
   if (cmd.kind === 'rename_session') {
@@ -1417,6 +1424,14 @@ async function drain() {
       checkHeard(cmd);
       // Late. Fly runs whatever reaches it; elsewhere it goes to Fly — except a follow-up for a session
       // running here, which this machine can deliver now.
+      // A stop is for the turn running when it was pressed; late, it would stop whatever runs now.
+      if (cmd.kind === 'interrupt_session' && ageS > COMMAND_TTL_S) {
+        if (await claim(cmd.id)) {
+          console.log(`[pi-desk] ${cmd.id} (interrupt_session) expired unrun after ${Math.round(ageS)}s — dropped`);
+          await finish(cmd.id, 'expired', `not run: ${Math.round(ageS)}s old`);
+        }
+        continue;
+      }
       const late = !FLY && ageS > COMMAND_TTL_S
         && !(cmd.kind === 'follow_up' && await aliveHere(String((cmd.payload || {}).session || '')));
       if (late) {
@@ -1432,7 +1447,8 @@ async function drain() {
       } catch (e) {
         console.error('[pi-desk] failed:', e.message);
         await finish(cmd.id, 'error', e.message);
-        await deadLetter(cmd, e.message);
+        // A stop that failed is not work to keep for later: the moment it was for has passed.
+        if (cmd.kind !== 'interrupt_session') await deadLetter(cmd, e.message);
       }
     }
     drainStreak.ok();
