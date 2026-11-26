@@ -98,7 +98,11 @@ function needsWrite(rows) {
 // Is `p` one of the directories we published? The command runner re-checks every launch target
 // against this, so a bad or stale row in the queue can't turn into `cd` anywhere on the disk.
 export function isKnownRepo(p) {
-  return !!(lastWritten || []).find((r) => r.path === p);
+  // Before the first scan has finished (the seconds after this process starts, which is exactly when
+  // the restart recovery resumes sessions) the list is read straight from disk, the same set the scan
+  // publishes. An empty list there reroutes every project off the Mac as "not a known project".
+  if (!lastWritten) return scanRoots().includes(p);
+  return !!lastWritten.find((r) => r.path === p);
 }
 
 async function tick() {

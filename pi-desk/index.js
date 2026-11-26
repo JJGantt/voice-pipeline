@@ -1198,21 +1198,38 @@ async function run(cmd) {
     const midTurn = to === 'mac' && rec?.busy === true && !rec.waiting;
     // Woken before the session is closed: a Fly that will not answer leaves it running here.
     if (to === 'fly' && !FLY) await wakeFly();
-    await evict(id);
-    const at = await mirrorUp(row.claude_session_id, row.transcript_path, row.mirror_offset || 0);
-    const now = new Date().toISOString();
-    await sb(`desk_sessions?id=eq.${encodeURIComponent(id)}`, {
-      method: 'PATCH', headers: { Prefer: 'return=minimal' },
-      body: JSON.stringify({ status: 'transferred', ended: now, working: false,
-                             ...(at != null ? { mirror_offset: at, mirror_at: now } : {}) }),
+    // Marking the row transferred is the claim, conditional on it still being resident here: a second
+    // transfer of the same row (or one racing an evacuation) finds it already moved and stops, instead
+    // of asking the destination for a second copy of a conversation that is already running there.
+    const won = await sb(`desk_sessions?id=eq.${encodeURIComponent(id)}&status=eq.resident`, {
+      method: 'PATCH', headers: { Prefer: 'return=representation' },
+      body: JSON.stringify({ status: 'transferred', ended: new Date().toISOString(), working: false }),
     });
-    await sb('desk_commands', {
-      method: 'POST', headers: { Prefer: 'return=minimal' },
-      body: JSON.stringify({ id: randomUUID(), kind: 'resume_mirrored',
-                             payload: { target: to, claude_session_id: row.claude_session_id, repo: row.repo,
-                                        label: row.label, origin: row.origin || 'dispatched', from: MACHINE,
-                                        ...(midTurn ? { prompt: MOVED_MARKER, moved: 'it was transferred there while working, so it can use the Mac', mid_turn: true } : {}) } }),
-    });
+    if (!won?.length) throw new Error(`${id} is not resident here (${row.status}), so it is not handed over again`);
+    try {
+      await evict(id);
+      const at = await mirrorUp(row.claude_session_id, row.transcript_path, row.mirror_offset || 0);
+      const now = new Date().toISOString();
+      if (at != null) {
+        await sb(`desk_sessions?id=eq.${encodeURIComponent(id)}`, {
+          method: 'PATCH', headers: { Prefer: 'return=minimal' },
+          body: JSON.stringify({ mirror_offset: at, mirror_at: now }),
+        });
+      }
+      await sb('desk_commands', {
+        method: 'POST', headers: { Prefer: 'return=minimal' },
+        body: JSON.stringify({ id: randomUUID(), kind: 'resume_mirrored',
+                               payload: { target: to, claude_session_id: row.claude_session_id, repo: row.repo,
+                                          label: row.label, origin: row.origin || 'dispatched', from: MACHINE,
+                                          ...(midTurn ? { prompt: MOVED_MARKER, moved: 'it was transferred there while working, so it can use the Mac', mid_turn: true } : {}) } }),
+      });
+    } catch (e) {
+      // Nothing was asked to pick it up, so it is left parked and resumable rather than marked as moved.
+      await sb(`desk_sessions?id=eq.${encodeURIComponent(id)}&status=eq.transferred`, {
+        method: 'PATCH', headers: { Prefer: 'return=minimal' }, body: JSON.stringify({ status: 'evicted' }),
+      }).catch((e2) => console.error(`[pi-desk] parking ${id} after a failed transfer:`, e2.message));
+      throw e;
+    }
     return `handed ${id} to the ${{ mac: 'Mac', pi: 'Pi', fly: 'Fly machine' }[to]}`;
   }
 

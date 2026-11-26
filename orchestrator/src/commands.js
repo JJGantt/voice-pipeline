@@ -267,16 +267,28 @@ async function run(cmd) {
     if (row.agent === 'codex') throw new Error(`${id} is a Codex session, and Codex sessions do not move between machines`);
     // Woken before the tab is closed: a Fly that will not answer leaves the session running here.
     if (to === 'fly') await wakeFly();
-    if (row.tty) await closeTabForTty(row.tty);
-    await new Promise((r) => setTimeout(r, 2000));   // let claude exit and flush its last records
-    const at = await mirrorUp(row.claude_session_id, row.transcript_path, row.mirror_offset || 0);
-    const now = new Date().toISOString();
-    await patchDeskSession(id, { status: 'transferred', ended: now, working: false,
-                                 ...(at != null ? { mirror_offset: at, mirror_at: now } : {}) });
-    await insertCommand('resume_mirrored', {
-      target: to, claude_session_id: row.claude_session_id, repo: row.repo,
-      label: row.label, origin: row.origin || 'dispatched', from: 'mac',
-    });
+    // Marking the row transferred is the claim, conditional on it still being resident: a second
+    // transfer of the same row (or one racing an evacuation) finds it already moved and stops here,
+    // instead of asking the destination for a second copy of a conversation that is already going.
+    const won = await patchDeskSessionIf(id, 'resident',
+      { status: 'transferred', ended: new Date().toISOString(), working: false });
+    if (!won.length) throw new Error(`${id} is not resident here (${row.status}), so it is not handed over again`);
+    try {
+      if (row.tty) await closeTabForTty(row.tty);
+      await new Promise((r) => setTimeout(r, 2000));   // let claude exit and flush its last records
+      const at = await mirrorUp(row.claude_session_id, row.transcript_path, row.mirror_offset || 0);
+      const now = new Date().toISOString();
+      if (at != null) await patchDeskSession(id, { mirror_offset: at, mirror_at: now });
+      await insertCommand('resume_mirrored', {
+        target: to, claude_session_id: row.claude_session_id, repo: row.repo,
+        label: row.label, origin: row.origin || 'dispatched', from: 'mac',
+      });
+    } catch (e) {
+      // Nothing was asked to pick it up, so it is left parked and resumable rather than marked as moved.
+      await patchDeskSessionIf(id, 'transferred', { status: 'evicted' })
+        .catch((e2) => console.error(`[commands] parking ${id} after a failed transfer:`, e2.message));
+      throw e;
+    }
     return `handed ${id} to ${{ pi: 'the Pi', fly: 'Fly', mac: 'the Mac' }[to]}`;
   }
 

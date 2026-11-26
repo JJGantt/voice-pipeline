@@ -337,7 +337,9 @@ async function reconcile(row, proc, startup = false) {
     // On the first tick after this process starts, a session that was mid-turn did not end: it died
     // with the Mac (a restart), in the middle of work. It is parked and then resumed with a note
     // saying so, rather than left parked. Fenced first: a session another machine took over is not.
-    if (startup && before.working === true && row.claude_session_id) {
+    // Once per conversation: two rows can hold one conversation, and each resumed would start two copies.
+    if (startup && before.working === true && row.claude_session_id && !resumedAfterRestart.has(row.claude_session_id)) {
+      resumedAfterRestart.add(row.claude_session_id);
       console.error(`[desk-sessions] ${row.id} was mid-turn when this machine went down; resuming it`);
       resumeAfter = true;
     } else {
@@ -368,6 +370,8 @@ async function reconcile(row, proc, startup = false) {
 
 // Until the first tick has completed: see the restart case in reconcile.
 let startupTick = true;
+// Conversations the restart case has already resumed, so a second row holding one is only parked.
+const resumedAfterRestart = new Set();
 
 // Sessions being closed right now, so the watcher and the tick never both close one.
 const closing = new Set();
