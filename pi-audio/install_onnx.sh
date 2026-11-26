@@ -5,7 +5,8 @@ set -u
 LOG=~/voice/pi/onnx-install.log
 VENV=~/voice/pi/.venv-kokoro
 echo "=== ONNX install $(date) ===" > "$LOG"
-"$VENV"/bin/pip install kokoro-onnx soundfile httpx realtime >> "$LOG" 2>&1
+"$VENV"/bin/pip install kokoro-onnx soundfile httpx realtime \
+  "ops-report @ https://github.com/JJGantt/ops-report/archive/refs/tags/v1.2.0.tar.gz" >> "$LOG" 2>&1
 echo "--- pip rc=$?, fetching model files ---" >> "$LOG"
 cd ~/voice/pi || exit 1
 wget -q https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx -O kokoro-v1.0.onnx >> "$LOG" 2>&1

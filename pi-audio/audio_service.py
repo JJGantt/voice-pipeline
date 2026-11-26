@@ -16,8 +16,17 @@ suspends (no cold-clip). Output-only, so feedback is impossible. The service uni
 XDG_RUNTIME_DIR=/run/user/1000 to reach the user PipeWire.
 Env (see ~/voice/pi/.env-audio): SUPABASE_URL, SUPABASE_KEY, optional PW_SINK, KOKORO_VOICE.
 """
-import os, re, asyncio, threading, subprocess, time, collections, socket, json
+import os, re, asyncio, threading, subprocess, time, collections, socket, json, logging
 from datetime import datetime, timezone
+import ops_report as ops
+
+# Errors go to the ops responder (health/responder): uncaught exceptions and `logging` at ERROR are
+# errors, `logging` at WARNING an occurrence (a failure a retry already handles). Installed before
+# anything else can fail; the heartbeat comes from the realtime loop in serve().
+ops.install(machine="pi", service="pi-audio")
+_oplog = logging.getLogger("pi-audio")
+BEAT_S = 60
+
 import numpy as np
 import httpx
 from realtime import AsyncRealtimeClient
@@ -64,6 +73,18 @@ _lamp_event = threading.Event()
 
 
 def log(m): print(f"{time.strftime('%H:%M:%S')} [pi-audio] {m}", flush=True)
+
+
+def log_error(m):
+    """A failure: printed like every line, and logged at ERROR, which the ops reporter sends."""
+    log(f"ERROR {m}")
+    _oplog.error(m)
+
+
+def log_warning(m):
+    """A failure a retry already handles: an occurrence at the responder."""
+    log(f"WARNING {m}")
+    _oplog.warning(m)
 
 
 def strip_markdown(md: str) -> str:
@@ -114,7 +135,7 @@ def _stream_loop():
                 proc.stdin.write(chunk.tobytes() if chunk is not None else silence)
                 proc.stdin.flush()
         except Exception as e:  # noqa: BLE001
-            log(f"pw-cat stream error: {e}; reopening in 1s")
+            log_warning(f"pw-cat stream error: {e}; reopening in 1s")
             time.sleep(1)
 
 
@@ -143,7 +164,7 @@ def _lamp_scan(timeout: float = 1.2):
             except (socket.timeout, json.JSONDecodeError):
                 continue
     except Exception as e:  # noqa: BLE001
-        log(f"lamp scan failed: {e}")
+        log_error(f"lamp scan failed: {e}")
     finally:
         for s in (recv, send):
             try: s and s.close()
@@ -163,7 +184,7 @@ def _lamp_send(msg: dict) -> None:
         s.sendto(json.dumps(msg).encode(), (_lamp_ip, LAMP_CMD_PORT))
         s.close()
     except Exception as e:  # noqa: BLE001
-        log(f"lamp send failed: {e}")
+        log_error(f"lamp send failed: {e}")
 
 
 _lamp_saved = None   # the lamp's OWN state before the working overlay — captured on the idle→working
@@ -181,8 +202,8 @@ def _lamp_save_prior(st) -> None:
     try:
         with open(LAMP_SAVED_FILE, "w") as f:
             json.dump(st, f)
-    except OSError:
-        pass
+    except OSError as e:
+        log_error(f"lamp prior state not persisted ({LAMP_SAVED_FILE}): {e}")
 
 
 def _lamp_load_prior():
@@ -191,7 +212,10 @@ def _lamp_load_prior():
     try:
         with open(LAMP_SAVED_FILE) as f:
             return json.load(f)
-    except (OSError, ValueError):
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        log_error(f"lamp prior state unreadable ({LAMP_SAVED_FILE}): {e}")
         return None
 
 
@@ -218,6 +242,7 @@ def _lamp_status(timeout: float = 1.0):
             try:
                 data, _ = recv.recvfrom(2048)
             except socket.timeout:
+                log_warning(f"lamp at {_lamp_ip} did not answer devStatus within {timeout}s")
                 return None
             try:
                 m = json.loads(data.decode()).get("msg", {})
@@ -226,7 +251,7 @@ def _lamp_status(timeout: float = 1.0):
             if m.get("cmd") == "devStatus":
                 return m.get("data", {})
     except Exception as e:  # noqa: BLE001
-        log(f"lamp status query failed: {e}")
+        log_error(f"lamp status query failed: {e}")
     finally:
         for s in (recv, send):
             try: s and s.close()
@@ -265,7 +290,7 @@ def _lamp_apply(working: bool) -> None:
         if st is None:
             # Never guess and never go dark: with no known prior state, leaving the amber is the only
             # honest option (a blind 'off' kills a light the user may be using).
-            log("lamp: no saved prior state — leaving as-is")
+            log_error("lamp: no saved prior state — leaving the working amber on")
             return
         # Restore color/brightness FIRST (so the device's remembered state is right even when the
         # prior state was off), then the power state.
@@ -350,7 +375,7 @@ def _play_http_server():
                     log(f"/play: {len(i16) / STREAM_RATE:.2f}s pcm queued")
                 self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
             except Exception as e:  # noqa: BLE001
-                log(f"/play error: {e}")
+                log_error(f"/play error: {e}")
                 try:
                     self.send_response(500); self.end_headers()
                 except Exception:  # noqa: BLE001
@@ -408,14 +433,19 @@ def fetch_toggles() -> None:
         r = httpx.get(f"{SUPABASE_URL}/rest/v1/app_settings",
                       params={"key": "in.(audio_processing_sound,audio_spoken_reply)", "select": "key,value"},
                       headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, timeout=10)
+        r.raise_for_status()
         for row in r.json():
             _toggles[row["key"]] = str(row["value"]) not in ("0", "false", "off", "no", "", "None")
     except Exception as e:
-        log(f"toggle fetch failed: {e}")
+        log_error(f"toggle fetch failed: {e}; using {_toggles}")
 
 
 def _rec(payload):
-    return (payload.get("data") or {}).get("record") or {}
+    try:
+        return (payload.get("data") or {}).get("record") or {}
+    except AttributeError:
+        log_error(f"realtime payload without a record: {str(payload)[:200]}")
+        return {}
 
 
 async def _clear_hearing(delay: float = 1.3):
@@ -439,7 +469,8 @@ def on_presence(payload):
     hj = rec.get("heard_jared_at")
     try:
         fresh = bool(hj) and (datetime.now(timezone.utc) - datetime.fromisoformat(hj)).total_seconds() <= 1.5
-    except Exception:
+    except Exception as e:  # noqa: BLE001
+        log_error(f"voice_presence heard_jared_at unreadable ({hj!r}): {e}")
         fresh = False
     if not fresh:
         return
@@ -468,10 +499,13 @@ def _speaker_loop():
         held = time.monotonic() - t0   # tail part 2: hold (invisible until now) — reply waiting on you/mute
         if held > 0.15:
             log(f"reply HELD {held:.1f}s (you were talking / push-to-talk) before playing")
-        if kind == "pcm":
-            _play_pcm(payload)         # already synthesized (on the faster Mac) → just stream it
-        else:
-            speak(payload)             # synth on the Pi (fallback path); 'first audio Xs' = first clause
+        try:
+            if kind == "pcm":
+                _play_pcm(payload)         # already synthesized (on the faster Mac) → just stream it
+            else:
+                speak(payload)             # synth on the Pi (fallback path); 'first audio Xs' = first clause
+        except Exception as e:  # noqa: BLE001 — one failed reply must not end the speaker thread
+            log_error(f"reply not played ({kind}): {e!r}")
 
 
 def on_speech(payload):
@@ -483,8 +517,8 @@ def on_speech(payload):
         if ca:
             try:
                 lat = f" (delivery {(datetime.now(timezone.utc) - datetime.fromisoformat(ca)).total_seconds():.1f}s)"
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as e:  # noqa: BLE001
+                log_error(f"voice_speech created_at unreadable ({ca!r}): {e}")
         log(f"reply queued{lat} — {text[:40]!r}")
         with _speak_lock:
             _speak_queue.append(("text", text))   # FIFO — play in order, don't drop
@@ -533,10 +567,15 @@ async def serve():
             ch.on_postgres_changes("UPDATE", callback=on_setting, schema="public", table="app_settings")
             await ch.subscribe()
             log("subscribed (voice_presence → hearing, voice_requests lifecycle → lamp, voice_speech → TTS, app_settings → toggles)")
+            beat_at = 0.0
             while sock.is_connected:
+                if time.monotonic() - beat_at >= BEAT_S:   # beats only while the subscription is up
+                    ops.beat(BEAT_S)
+                    beat_at = time.monotonic()
                 await asyncio.sleep(1.0)
-        except Exception as e:
-            log(f"realtime error: {e}; retry 5s")
+            log_warning("realtime socket disconnected; reconnecting in 5s")
+        except Exception as e:  # noqa: BLE001
+            log_warning(f"realtime error: {e}; retry 5s")
         await asyncio.sleep(5)
 
 
@@ -547,8 +586,8 @@ def main():
     _kok = Kokoro(MODEL_ONNX, VOICES_BIN)
     try:                                   # warm the graph so the first real synth is fast
         _kok.create("ready", voice=VOICE, speed=1.0, lang="en-us")
-    except Exception as e:
-        log(f"warmup failed: {e}")
+    except Exception as e:  # noqa: BLE001
+        log_error(f"warmup failed: {e}")
     fetch_toggles()
     threading.Thread(target=_stream_loop, daemon=True).start()   # the always-open warm output (no cold clip)
     threading.Thread(target=_play_http_server, daemon=True).start()  # accept pre-synth'd PCM (synth-on-Mac)
