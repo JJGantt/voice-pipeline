@@ -45,9 +45,17 @@ const BACKGROUND_SETTLE_MS = 1500;
 
 // Launches in flight (commands.js). Between a tab opening and its row being written, the new claude
 // looks exactly like a session nobody dispatched, and adopting it then would give one session two rows.
+// A launch that ENDS while a tick is running is just as unsafe: the tick read its rows before the new
+// row existed, so the new process still looks unowned, and `adopt` revives the conversation's older
+// parked row onto it — two resident rows on one process. So every begin and end bumps a generation,
+// and a tick adopts only when no launch is in flight and none began or ended since it read its rows.
 let launching = 0;
-export function beginLaunch() { launching++; }
-export function endLaunch() { launching = Math.max(0, launching - 1); }
+let launchGen = 0;
+export function beginLaunch() { launching++; launchGen++; }
+export function endLaunch() { launching = Math.max(0, launching - 1); launchGen++; }
+/** Taken before a tick reads its rows; `mayAdopt` says whether they still cover every launch. */
+export function launchSnapshot() { return launchGen; }
+export function mayAdopt(snapshot) { return launching === 0 && launchGen === snapshot; }
 
 // Mirror upload failures per row: when the streak started and whether it has been raised yet.
 const mirrorFailing = new Map();
@@ -438,6 +446,7 @@ async function tick() {
   // Retention lives on the Pi (`sweepRetention` in pi-desk), which is always on — one rule in one
   // file, covering every kind of row rather than only the adopted ones this machine happens to make.
 
+  const launches = launchSnapshot();
   let rows;
   try { rows = await deskSessionsFor('desk'); }
   catch (e) { return listStreak.fail(e); }
@@ -487,7 +496,7 @@ async function tick() {
       }
     }
   }
-  if (!launching) {
+  if (mayAdopt(launches)) {
     for (const s of live) {
       if (claimed.has(s.pid) || s.agent === 'codex') continue;
       try { await adopt(s, rows, elsewhere); }
