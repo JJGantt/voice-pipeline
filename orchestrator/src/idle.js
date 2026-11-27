@@ -1,8 +1,7 @@
 // Parking the Mac's sessions that the Mac only HOSTED.
 //
-// A session dispatched from the watch, the phone or the ops responder opens a Terminal tab here and
-// is then driven entirely from elsewhere. Nobody at the Mac closes it, so without this they pile up
-// (27 windows on 2026-10-31). A session the user typed into at the Mac's own keyboard is the user's to close,
+// A session dispatched from the watch, the phone or the ops responder runs here (headless in tmux) and
+// is driven entirely from elsewhere. Nobody at the Mac closes it, so without this they pile up. A session the user typed into at the Mac's own keyboard is the user's to close,
 // and is never parked by this.
 //
 // TELLING THE TWO APART. The transcript records a prompt typed at the keyboard and one this

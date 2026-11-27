@@ -240,7 +240,7 @@ only spend its timeout. Status-hub `docs/WATCH.md` § When the hub does not answ
 
 ## Reading a session: two handles, two columns
 
-`desk_sessions.tty` reaches a Mac session (its Terminal tab); `transcript_path` reads what any session
+`desk_sessions.tty` reaches a Mac session (its tmux pane, or the Terminal tab of one opened by hand); `transcript_path` reads what any session
 said. A tty is not a transcript path; keep the two apart.
 
 ## A process's conversation is read from Claude Code's own record — never matched or guessed
@@ -373,36 +373,49 @@ its reply is written. data-layer stamps `close_after_turn` instead, and the host
 both machines) parks it once that turn's reply has been reported and the transcript mirrored.
 status-hub `docs/SESSIONS.md` has the details.
 
-Closing a session on the Mac is `/exit` typed into the tab, then SIGTERM if it is ignored. A Terminal
-TAB does not understand AppleScript's `close` (it answers -1708), so `closeTabForTty` closes the
-window only when that tab is the last one in it.
-A dispatched session's launch command ends in `exit 0`, so when the session ends by any route its
-shell goes too: with the Terminal profile's "When the shell exits: Close if the shell exited cleanly"
-(set on the Mac) the tab closes itself, and `closeHuskForTty` is the net when it does not.
+**Every session the Mac launches or resumes runs headless in tmux**, on a private server (`tmux -L
+desk`, config `orchestrator/tmux.conf`), the way the Pi and Fly run theirs (`orchestrator/src/tmux.js`).
+Nothing opens on the screen. The pane's tty is the row's `tty`, and `sendToTty`, `closeTabForTty`,
+`closeHuskForTty`, `interruptTty` and `screenOfTty` route a tty on that server to tmux. A session Jared
+opens by hand in Terminal (`origin = adopted`) stays in its own Terminal window and keeps the Terminal
+paths.
+
+**Showing one is attaching to it, not restarting it.** `show_session` (data-layer `session_window`, and
+`show` on `open_session`, `resume_session`, `resume_mirrored` and a transfer to the Mac) opens a Terminal
+window running `tmux attach` for that session; hiding it detaches every client, and the window closes
+itself because its shell runs `exit 0` after the attach. The session never notices either. A session
+in a Terminal window of its own from before this (not adopted) goes to the background by being parked
+and resumed headless, so it is refused mid-turn. The desk tmux server outlives an orchestrator restart
+(measured: a server started by a launchd job survives that job being stopped). Watch one from a shell
+with `tmux -L desk attach -t <mac-…>`. `tmux.conf` turns the mouse on because, attached, the wheel
+otherwise reaches Claude Code as arrow keys, which it reads as prompt history.
+
+Every tmux call runs with `-u` and a UTF-8 `LANG`: launchd gives the orchestrator no locale, and
+without one tmux prints a tab in a `-F` format as `_` (the pane lookup then misses and a follow-up
+falls through to Terminal) and mangles non-ASCII pasted text.
+
+**One process per conversation, checked on the conversation.** A conversation collects a parked row
+per resume, so `resume_session` looks for ANY resident row with the same `claude_session_id` and
+delivers to it, rather than checking only the row it was named by: two resumes naming two parked rows of
+one conversation each pass a per-row check, and the two processes then write one transcript.
+
+Closing a session in a Terminal window (adopted ones) is `/exit` typed into the tab, then SIGTERM if
+it is ignored. A Terminal TAB does not understand AppleScript's `close` (it answers -1708), so
+`closeTabForTty` closes the window only when that tab is the last one in it.
 
 **Terminal's AppleScript sees a macOS-native tab as a WINDOW with one tab.** With
 `AppleWindowTabbingMode always`, nine tabs in one window answer as nine one-tab windows, so `count of
 tabs` is always 1 and `close w` closes just that tab. Count tabs with System Events instead (`radio
 buttons of tab group 1` of the window), or a merged window reads as a pile of separate ones.
 
-Sessions open as WINDOWS, not tabs, until the orchestrator's `/usr/local/bin/node` holds the
-Accessibility grant: a tab needs a Cmd-T keystroke, and the plain `do script` fallback opens a window
-whatever `AppleWindowTabbingMode` says. The out log's `tab failed` lines are this.
-
-**A freshly launched incident session (label `Incident: …`) opens no tab: it runs headless in tmux**, on a private
-server (`tmux -L desk`), the way the Pi and Fly run every session (`orchestrator/src/tmux.js`). The
-pane's tty is the row's `tty` like any tab's, and `sendToTty`, `closeTabForTty` and `closeHuskForTty`
-route a tty that belongs to that server to tmux. Watch one with `tmux -L desk attach -t <mac-…>`.
-A resumed or moved one (`resume`, `resume_mirrored`) opens a Terminal tab like any session: moving a
-session to the Mac is asking to see it there, and a headless one there cannot be seen or typed into.
-Every tmux call runs with `-u` and a UTF-8 `LANG`: launchd gives the orchestrator no locale, and
-without one tmux prints a tab in a `-F` format as `_` (the pane lookup then misses and a follow-up
-falls through to Terminal) and mangles non-ASCII pasted text.
+`close_window` closes a Terminal window by tty only while nothing but a login shell is on it: it is how
+data-layer's handoff agent (which has no Automation grant for Terminal) has the window a `drive_screen`
+session opened closed when the drive ends.
 
 ## Typing into a running session: short text only, and "sent" means the transcript has it
 
-Both machines put a follow-up into a live session by typing it — the Mac into a Terminal tab's tty
-(`sendToTty`, or the tmux pane of a headless incident session), the Pi into a tmux pane (`typeInto` in `pi-desk/sessions.js`). What they type and how
+Both machines put a follow-up into a live session by typing it — the Mac into a session's tmux pane
+(`sendToTty`, or the Terminal tab of one opened by hand), the Pi into a tmux pane (`typeInto` in `pi-desk/sessions.js`). What they type and how
 they confirm it is one contract, in `orchestrator/src/handoff.js`:
 
 - **A message of any length is pasted as it is.** Past about 800 characters or 4 lines Claude Code wraps
@@ -472,7 +485,9 @@ phone, the responder) and never typed into at the keyboard — once it has been 
 into at the Mac, or opened there by hand (`origin = adopted`), is never parked; the user closes it. The
 transcript records a keyboard prompt and a pasted-in one identically, so the orchestrator
 fingerprints every prompt it sends (`remote_inputs`, written BEFORE sending) and a human prompt
-matching none of them stamps `touched_at`, which is never cleared and survives a resume. Remote
+matching none of them stamps `touched_at`, which is never cleared and survives a resume he asked to
+SEE (`show`). A resume in the background (a follow-up or a handoff's result arriving for a parked
+session) starts the new row without it, so the session parks again once idle. Remote
 Control input from the Claude app is indistinguishable from the keyboard and counts as it, which
 errs toward keeping a session. Ticks never overlap: parking takes seconds per session, and an
 overlapping tick acting on rows read before the first wrote anything would park a session the first

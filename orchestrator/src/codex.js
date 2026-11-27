@@ -250,7 +250,7 @@ export function readCodexTail(file, { maxBytes = 512 * 1024 } = {}) {
            replyAt, turnAt, title: null, customTitle: null, bytes: st.size, lastActivity: newest || st.mtimeMs };
 }
 
-// ---- the Mac: Codex sessions in Terminal tabs ----------------------------------------------------
+// ---- the Mac: Codex sessions in tmux panes -------------------------------------------------------
 
 /**
  * Every native `codex` process sitting in a terminal on this machine, with the conversation it is in
