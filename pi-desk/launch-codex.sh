@@ -22,6 +22,14 @@ export DATA_AGENT=codex
 
 cd "$DIR" || exit 1
 
+# Codex opens a git repo it has not been told to trust on "Trust this folder?" and waits there for a key
+# nobody is at the terminal to press. `-c projects."<dir>".trust_level=...` on the command line does not
+# suppress it (measured, v0.166); the entry has to be in config.toml, which is where answering the prompt
+# writes it. Appended, never rewritten, so nothing else in the file is touched.
+CODEX_CFG="${CODEX_HOME:-$HOME/.codex}/config.toml"
+grep -qF "[projects.\"$DIR\"]" "$CODEX_CFG" 2>/dev/null \
+  || printf '\n[projects."%s"]\ntrust_level = "trusted"\n' "$DIR" >> "$CODEX_CFG"
+
 # Neither Claude credential belongs to a Codex session, and the API key must not reach anything it runs.
 unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN
 

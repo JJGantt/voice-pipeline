@@ -253,7 +253,8 @@ export function readCodexTail(file, { maxBytes = 512 * 1024 } = {}) {
 // ---- the Mac: Codex sessions in Terminal tabs ----------------------------------------------------
 
 /**
- * Every native `codex` process sitting in a terminal on this machine, with the conversation it is in —
+ * Every native `codex` process sitting in a terminal on this machine, with the conversation it is in
+ * (`claudeId` null until it has one) —
  * discover.js `liveClaudeSessions` for Codex. The native binary, not the node wrapper that launched it:
  * the binary holds the rollout, and its `comm` is `codex`. Oldest first.
  */
@@ -270,8 +271,12 @@ export function liveCodexSessions() {
       if (tty === '??' || tty === '?' || comm.split('/').pop() !== 'codex') return null;
       const startedAt = new Date(lstart).getTime();
       if (!Number.isFinite(startedAt)) return null;
-      const s = codexSessionOf(Number(pid));
-      return s ? { pid: Number(pid), tty: `/dev/${tty}`, startedAt, ...s } : null;
+      // A process with no rollout yet is still a live session: Codex writes the rollout only when its
+      // first turn starts, so one waiting on a screen before that (or launched without a prompt) has
+      // none. Listed all the same, with no conversation, so its row is not ended while it runs.
+      const s = codexSessionOf(Number(pid))
+        || { claudeId: null, transcriptPath: null, busy: false, statusAt: null, waiting: null, agent: 'codex' };
+      return { pid: Number(pid), tty: `/dev/${tty}`, startedAt, ...s };
     })
     .filter(Boolean)
     .sort((a, b) => a.startedAt - b.startedAt);
@@ -280,7 +285,7 @@ export function liveCodexSessions() {
 /** The Codex session a launch just started on `tty`: the first there that began after `since`. */
 export async function awaitCodexOn(tty, since, { attempts = 90, delayMs = 1000 } = {}) {
   for (let i = 0; i < attempts; i++) {
-    const hit = liveCodexSessions().find((s) => s.tty === tty && s.startedAt >= since);
+    const hit = liveCodexSessions().find((s) => s.tty === tty && s.startedAt >= since && s.claudeId);
     if (hit) return hit;
     await new Promise((r) => setTimeout(r, delayMs));
   }

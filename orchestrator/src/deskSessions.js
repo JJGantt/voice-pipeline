@@ -225,7 +225,8 @@ async function reconcile(row, proc, startup = false) {
   if (proc) {
     if (row.pid !== proc.pid) patch.pid = proc.pid;
     // The conversation the process is in NOW — `/clear` starts a new one inside the same process.
-    if (proc.claudeId !== row.claude_session_id) {
+    // A Codex process before its first turn has no conversation yet: nothing to bind, and not a rebind.
+    if (proc.claudeId && proc.claudeId !== row.claude_session_id) {
       patch.claude_session_id = proc.claudeId;
       patch.transcript_path = proc.transcriptPath;
       // The mirror is keyed by conversation id, so a new one is a new upload from zero.
@@ -245,7 +246,7 @@ async function reconcile(row, proc, startup = false) {
       Object.assign(row, { claude_session_id: proc.claudeId, transcript_path: proc.transcriptPath, mirror_offset: 0,
                            last_reply: null, last_prompt: null, reply_at: null });
       console.log(`[desk-sessions] ${row.id} is in conversation ${proc.claudeId.slice(0, 8)} now`);
-    } else if (proc.transcriptPath !== row.transcript_path) {
+    } else if (proc.transcriptPath && proc.transcriptPath !== row.transcript_path) {
       // Same conversation, but the row names a file that is not where Claude Code writes it.
       patch.transcript_path = proc.transcriptPath;
       row.transcript_path = proc.transcriptPath;
