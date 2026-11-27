@@ -1232,6 +1232,8 @@ async function run(cmd) {
         body: JSON.stringify({ id: randomUUID(), kind: 'resume_mirrored',
                                payload: { target: to, claude_session_id: row.claude_session_id, repo: row.repo,
                                           label: row.label, origin: row.origin || 'dispatched', from: MACHINE,
+                                          // Moved to the Mac to be looked at: shown there in a window.
+                                          ...((cmd.payload || {}).show ? { show: true } : {}),
                                           ...(midTurn ? { prompt: MOVED_MARKER, moved: 'it was transferred there while working, so it can use the Mac', mid_turn: true } : {}) } }),
       });
     } catch (e) {

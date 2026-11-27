@@ -336,6 +336,7 @@ async function run(cmd) {
       await insertCommand('resume_mirrored', {
         target: to, claude_session_id: row.claude_session_id, repo: row.repo,
         label: row.label, origin: row.origin || 'dispatched', from: 'mac',
+        ...((cmd.payload || {}).show ? { show: true } : {}),
       });
     } catch (e) {
       // Nothing was asked to pick it up, so it is left parked and resumable rather than marked as moved.
