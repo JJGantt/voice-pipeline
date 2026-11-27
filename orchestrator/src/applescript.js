@@ -300,7 +300,7 @@ export async function screenOfTty(tty) {
 // only while it is. null when ioreg cannot be read.
 async function screenLocked() {
   try {
-    const { stdout } = await execFileP('ioreg', ['-n', 'Root', '-d1', '-a'], { timeout: 5000 });
+    const { stdout } = await execFileP('/usr/sbin/ioreg', ['-n', 'Root', '-d1', '-a'], { timeout: 5000 });
     return /<key>CGSSessionScreenIsLocked<\/key>\s*<true\/>/.test(stdout);
   } catch (e) {
     console.warn('[applescript] could not read the screen lock state (%s)', e.message.trim().split('\n').pop());
