@@ -238,7 +238,18 @@ def cut_off_directive(req: dict) -> str:
             timing = {}
     out = ""
     cut = timing.get("cut_off")
-    if isinstance(cut, dict):
+    if isinstance(cut, dict) and cut.get("verdict") == "stopped":
+        # The phone ended the recording itself (status-hub voiceagent.js broke()) and sent what it had, at
+        # once, as a normal command: it may be truncated, but it is not late and not a repeat.
+        held = cut.get("held_s")
+        cause = "the capture was dropping audio" if cut.get("why") == "damaged" else "the hub stopped acknowledging it"
+        after = f" after {held:g} seconds" if isinstance(held, (int, float)) else ""
+        out += (
+            f"\n\n[CUT OFF: his phone stopped this recording itself{after}, because {cause}; he did not end it. "
+            "The words above may be only the start of what he said, and a truncated request can read as a complete "
+            "one that means something else. If it is plainly complete and safe to act on, do it and mention that the "
+            "recording was cut off. Otherwise do NOT act: quote what came through and ask him to finish it.]")
+    elif isinstance(cut, dict):
         device = _device(req.get("source") or "")
         why = _CUT_OFF_WHY.get(str(cut.get("verdict") or ""), "it stopped sending partway through")
         held = cut.get("held_s")

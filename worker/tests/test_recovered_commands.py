@@ -41,6 +41,13 @@ def test_a_recovered_phone_command_names_the_phone(load):
     assert "His phone was recording it" in p
 
 
+def test_a_recording_the_phone_stopped_itself_is_framed_as_cut_off_not_late(load):
+    p = prompt_for(load, {"cut_off": {"verdict": "stopped", "why": "stream", "held_s": 7}}, source="phone-cmd")
+    assert "CUT OFF" in p and "after 7 seconds" in p and "the hub stopped acknowledging it" in p
+    assert "ask him to finish it" in p
+    assert "DID NOT ARRIVE THE NORMAL WAY" not in p and "may already have said it again" not in p
+
+
 def test_the_full_clip_after_a_recovery_supersedes_it(load):
     p = prompt_for(load, {"audio_via": "upload", "supersedes": "abc-123"})
     assert "COMPLETE recording" in p and "abc-123" in p and "never anything twice" in p
