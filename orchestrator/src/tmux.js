@@ -1,15 +1,17 @@
-// Headless sessions on the Mac: a tmux session instead of a Terminal tab, so nothing opens on the
-// screen. A freshly launched incident session runs this way (applescript.js openFreshTab); everything
-// else opens a tab, because those are sessions Jared may want in front of him. That includes an
-// incident session resumed or moved to the Mac: bringing a session here is asking to see it.
+// Every session the Mac launches runs headless, in a tmux session on a private server, the way the Pi
+// and Fly run theirs: nothing opens on the screen. Showing one (`show_session`, data-layer
+// `session_window`) opens a Terminal window ATTACHED to that tmux session, so the session itself never
+// restarts to come to the front or to go back: hiding it detaches the window, and the window closes
+// itself because its shell runs `exit 0` after the attach. A session Jared opens by hand in Terminal is
+// not one of these and is left as it is.
 //
 // A tmux pane has a tty of its own, and the tty is the handle the rest of the orchestrator keeps
 // (`desk_sessions.tty`, discover.js, checkLaunch). So a headless session is the same row as a tab
-// session, and only the three things done TO a tty differ: typing into it, closing it, clearing its
-// husk. Each of those in applescript.js asks `tmuxNameForTty` first.
+// session, and only the things done TO a tty differ: typing into it, closing it, clearing its husk,
+// reading its screen. Each of those in applescript.js asks `tmuxNameForTty` first.
 //
-// A private server (`-L desk`, no config file) keeps these apart from any tmux Jared runs by hand and
-// from his ~/.tmux.conf. To watch one: `tmux -L desk attach -t <mac-…>` (detach with C-b d).
+// A private server (`-L desk`) with its own config (../tmux.conf) keeps these apart from any tmux
+// Jared runs by hand and from his ~/.tmux.conf. From a shell: `tmux -L desk attach -t <mac-…>`.
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
@@ -20,7 +22,9 @@ export const SOCKET = 'desk';
 // `_` and mangles non-ASCII text pasted into a session. `-u` and LANG fix both; the server hands LANG
 // on to every pane, so claude there runs in UTF-8 as it does in a Terminal tab.
 const env = { ...process.env, LANG: process.env.LANG || 'en_US.UTF-8' };
-const tmux = (args) => execFileP('tmux', ['-u', '-L', SOCKET, '-f', '/dev/null', ...args], { timeout: 10000, env })
+const CONF = new URL('../tmux.conf', import.meta.url).pathname;
+const base = ['-u', '-L', SOCKET, '-f', CONF];
+const tmux = (args) => execFileP('tmux', [...base, ...args], { timeout: 10000, env })
   .then((r) => r.stdout.trim());
 
 /** The tmux session whose pane is on `tty`, or null (also when no server is running). */
@@ -84,5 +88,17 @@ export async function closeTmux(name, tty, pidOnTty) {
   }
   await killTmux(name);
 }
+
+/** The shell command a Terminal window runs to show session `name`: attach, and close once detached. */
+export const attachCommand = (name) => `tmux ${base.map((a) => `'${a}'`).join(' ')} attach -t '=${name}'; exit 0`;
+
+/** How many Terminal windows (tmux clients) are showing session `name`. */
+export async function clientsOf(name) {
+  const out = await tmux(['list-clients', '-t', `=${name}`, '-F', '#{client_tty}']).catch(() => '');
+  return out.split('\n').filter(Boolean).length;
+}
+
+/** Detach every window showing session `name`; the session keeps running. */
+export const detachAll = (name) => tmux(['detach-client', '-s', `=${name}`]);
 
 export const killTmux = (name) => tmux(['kill-session', '-t', `=${name}`]).catch(() => {});

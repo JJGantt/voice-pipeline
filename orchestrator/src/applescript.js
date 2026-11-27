@@ -7,9 +7,9 @@
 //      has one, otherwise launch Terminal and run there.
 //   3. openFreshTab(cwd, name): the same tab-opening, but starting a NEW
 //      remote-controlled session — what the hub's repo picker fires.
-//      A freshly launched incident session runs headless in tmux instead
-//      (tmux.js); a resumed one opens a tab like any other. The
-//      tty-addressed calls here route a tmux pane's tty there.
+//      Every session the orchestrator launches runs headless in tmux
+//      (tmux.js) and is shown in a window attached to it only on request.
+//      The tty-addressed calls here route a tmux pane's tty there.
 //
 // Read-only helpers (enumerateTtys, ttyForSession) are SAFE to call anytime.
 import { execFile } from 'node:child_process';
@@ -20,8 +20,8 @@ import path from 'node:path';
 import { config } from './config.js';
 import { findSessionFile } from './sessions.js';
 import { typeable } from './handoff.js';
-import { claudeBinFor, claudeBinForSession, isIncident } from './incident.js';
-import { tmuxNameForTty, runInTmux, sendToTmux, closeTmux, killTmux, keysTmux, screenTmux } from './tmux.js';
+import { claudeBinFor, claudeBinForSession } from './incident.js';
+import { tmuxNameForTty, runInTmux, sendToTmux, closeTmux, killTmux, keysTmux, screenTmux, attachCommand, clientsOf, detachAll } from './tmux.js';
 
 const execFileP = promisify(execFile);
 
@@ -447,7 +447,8 @@ export async function reopenDeskTab(cwd, id) {
 const DISPATCHED = fs.readFileSync(new URL('../dispatched-session.txt', import.meta.url), 'utf8').trim();
 
 // `label` is the session's dispatch label: an incident session starts through incident.js's launcher.
-export async function openFreshTab(cwd, name, prompt, sessionId = null, resumeId = null, note = null, label = null) {
+// `show` opens a Terminal window attached to the session as well (showTty); without it nothing appears.
+export async function openFreshTab(cwd, name, prompt, sessionId = null, resumeId = null, note = null, label = null, show = false) {
   const bin = claudeBinFor(label);
   // The Remote Control name is an IDENTITY in the Claude app, so it has to be unique per SESSION,
   // not per repo. Named after the repo alone, two sessions on status-hub both register as
@@ -472,30 +473,76 @@ export async function openFreshTab(cwd, name, prompt, sessionId = null, resumeId
   // the Pi mid-turn is told why and what was cut off (commands.js resume_mirrored).
   const sysText = [(pf && !resumeId) ? DISPATCHED : '', note || ''].filter(Boolean).join('\n\n');
   const sys = sysText ? ` --append-system-prompt ${shQuote(sysText)}` : '';
-  // `exit 0` after claude: a dispatched tab is the session's and nothing else's, so when the session
-  // ends, however it ends, the shell goes too. With the profile's "When the shell exits: Close if the
-  // shell exited cleanly" the tab then closes itself. Without that setting it is left as "[Process
-  // completed]", which closeHuskForTty clears.
-  const cmd = `cd ${shQuote(cwd)}; ${env}${shQuote(bin)}${model}${resume}${rc}${sys}${first}; exit 0`;
-  // A fresh incident session is nobody's to watch, so it runs headless instead of opening a tab
-  // (tmux.js). A resume is a session brought to the Mac on purpose, so it always opens a tab.
-  const raw = isIncident(label) && !resumeId
-    ? await runInTmux(sessionId || `desk-${Date.now().toString(36)}`, cmd)
-    : await runInNewTerminal(cmd);
+  // The tmux session ends when claude does, so nothing is left behind however the session ends.
+  const cmd = `cd ${shQuote(cwd)}; ${env}${shQuote(bin)}${model}${resume}${rc}${sys}${first}`;
+  const raw = await runInTmux(sessionId || `desk-${Date.now().toString(36)}`, cmd);
+  if (show) await showTty(String(raw).split('\t')[1]).catch((e) => console.error(`[applescript] showing ${sessionId}:`, e.message));
   // The Remote Control name is unique to this launch; without one, the resumed id; failing both, claude.
   return checkLaunch(raw, rcName || resumeId || bin, `session ${sessionId || rcName || cwd}`);
+}
+
+/**
+ * Show a headless session: a Terminal window attached to its tmux session. Returns what happened.
+ * A second window is not opened for a session one is already showing.
+ */
+export async function showTty(tty) {
+  const name = await tmuxNameForTty(tty);
+  if (!name) return 'it is already in a Terminal window of its own';
+  if (await clientsOf(name)) {
+    await osascript('tell application "Terminal" to activate').catch(() => {});
+    return 'already shown';
+  }
+  const [how] = String(await runInNewTerminal(attachCommand(name))).split('\t');
+  return `shown (${how})`;
+}
+
+/** Hide a shown session: detach its window, which then closes itself. The session keeps running. */
+export async function hideTty(tty) {
+  const name = await tmuxNameForTty(tty);
+  if (!name) return null;   // not a tmux session: the caller decides
+  if (!(await clientsOf(name))) return 'already in the background';
+  await detachAll(name);
+  return 'moved to the background';
+}
+
+/**
+ * Close a Terminal window that holds nothing but an idle shell: what a session working the screen
+ * (data-layer drive_screen) leaves when it opens Terminal. Left open when anything else runs on the tty,
+ * so a wrong tty closes nothing. Answers what it did.
+ */
+export async function closeShellWindow(tty) {
+  if (!/^\/dev\/ttys\d+$/.test(String(tty || ''))) throw new Error(`not a tty: ${tty}`);
+  let comms = '';
+  try { comms = (await execFileP('ps', ['-t', tty.replace('/dev/', ''), '-o', 'comm='], { timeout: 10000 })).stdout; }
+  catch (e) { comms = String(e.stdout || ''); }
+  const other = [...new Set(comms.split('\n').map((c) => c.trim().split('/').pop()).filter(Boolean)
+    .filter((c) => !['login', '-zsh', 'zsh', '-bash', 'bash'].includes(c)))];
+  if (other.length) return `left open: ${tty} is running ${other.join(', ')}`;
+  const out = await osascript(
+    `tell application "Terminal"
+       repeat with w in windows
+         if (count of tabs of w) is 1 and (tty of item 1 of tabs of w) is "${tty}" then
+           if busy of item 1 of tabs of w then return "busy"
+           close w
+           return "closed"
+         end if
+       end repeat
+       return ""
+     end tell`);
+  return { busy: `left open: ${tty} is busy`, closed: `closed the window on ${tty}` }[out] || `no window on ${tty}`;
 }
 
 // A Codex session is started by the same launcher the Pi uses (pi-desk/launch-codex.sh): the flags that
 // make an unattended Codex session work are one list, kept there. It reads and deletes the prompt file.
 const CODEX_LAUNCHER = new URL('../../pi-desk/launch-codex.sh', import.meta.url).pathname;
 
-/** openFreshTab for a Codex session: a new tab running `codex` in `cwd`, or `codex resume <id>`. */
-export async function openCodexTab(cwd, name, prompt, sessionId, resumeId = null) {
+/** openFreshTab for a Codex session: `codex` in `cwd`, or `codex resume <id>`. */
+export async function openCodexTab(cwd, name, prompt, sessionId, resumeId = null, show = false) {
   const pf = prompt ? promptFile(prompt) : '';
-  // `exit 0` after it, for the reason given in openFreshTab.
-  const raw = await runInNewTerminal(`cd ${shQuote(cwd)}; DESK_MACHINE=mac ${shQuote(CODEX_LAUNCHER)} ${shQuote(cwd)} `
-    + `${shQuote(name || 'root')} ${shQuote(pf)} ${shQuote(resumeId || '')} ${shQuote(sessionId || '')}; exit 0`);
+  const raw = await runInTmux(sessionId || `desk-${Date.now().toString(36)}`,
+    `cd ${shQuote(cwd)}; DESK_MACHINE=mac ${shQuote(CODEX_LAUNCHER)} ${shQuote(cwd)} `
+    + `${shQuote(name || 'root')} ${shQuote(pf)} ${shQuote(resumeId || '')} ${shQuote(sessionId || '')}`);
+  if (show) await showTty(String(raw).split('\t')[1]).catch((e) => console.error(`[applescript] showing ${sessionId}:`, e.message));
   return checkLaunch(raw, 'codex', `Codex session ${sessionId || cwd}`);
 }
 

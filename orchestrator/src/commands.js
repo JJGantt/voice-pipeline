@@ -45,7 +45,8 @@ import { isKnownRepo } from './repos.js';
 const [MOVED_NOTE, MOVED_MID_TURN, MOVED_BETWEEN_TURNS] = fs.readFileSync(new URL('../moved-session.txt', import.meta.url), 'utf8')
   .split(/^---$/m).map((s) => s.trim());
 import { ensureTrusted } from './trust.js';
-import { openFreshTab, openCodexTab, sendToTty, closeTabForTty, noteStarted, interruptTty, screenOfTty } from './applescript.js';
+import { openFreshTab, openCodexTab, sendToTty, closeTabForTty, noteStarted, interruptTty, screenOfTty,
+         showTty, hideTty, closeShellWindow } from './applescript.js';
 import { stopTurn } from './interrupt.js';
 import { tmuxNameForTty } from './tmux.js';
 import { isIncident } from './incident.js';
@@ -206,20 +207,71 @@ async function run(cmd) {
     return `${status === 'evicted' ? 'parked' : 'closed'} ${id}`;
   }
 
-  // Bring a parked session back, in a new tab, with its whole conversation. `claude --resume` replays
+  // Show a running session in a Terminal window, or put it back in the background (data-layer
+  // `session_window`). Showing attaches a window to its tmux session and hiding detaches it, so the
+  // session does not restart either way (tmux.js). A parked one asked to be shown is resumed, shown.
+  if (cmd.kind === 'show_session') {
+    const p = cmd.payload || {};
+    const id = String(p.session || '').trim();
+    const show = p.show !== false;
+    const row = await deskSession(id);
+    if (!row) throw new Error(`no such session: ${id}`);
+    if (row.worker !== 'desk') throw new Error(`${id} is not on the Mac`);
+    if (row.status !== 'resident') {
+      if (!show) return `${id} is not running, so it is not on the screen`;
+      return run({ ...cmd, kind: 'resume_session', payload: { ...p, show: true } });
+    }
+    if (!row.tty) throw new Error(`no terminal recorded for ${id}`);
+    if (show) return `${id}: ${await showTty(row.tty)}`;
+    const hidden = await hideTty(row.tty);
+    if (hidden) return `${id}: ${hidden}`;
+    // A session in a Terminal window of its own, from before sessions ran headless. It goes to the
+    // background by restarting it there with its whole conversation, which a turn in flight would lose.
+    if (row.origin === 'adopted') throw new Error(`${id} was opened by hand in Terminal, so its window is his to close`);
+    if (row.working) throw new Error(`${id} is in the middle of a turn; it can go to the background once the turn ends`);
+    if (!row.claude_session_id) throw new Error(`${id} has no conversation to restart in the background`);
+    await closeTabForTty(row.tty);
+    await patchDeskSession(id, { status: 'evicted', ended: new Date().toISOString(), working: false });
+    return run({ ...cmd, kind: 'resume_session', payload: { session: id } });
+  }
+
+  // Close a Terminal window that holds only an idle shell, by its tty: the window a session working the
+  // screen through Terminal opened (data-layer drive_screen), closed when it is done with it.
+  if (cmd.kind === 'close_window') {
+    const tty = String((cmd.payload || {}).tty || '').trim();
+    const done = await closeShellWindow(tty);
+    // Something still running there is the session's to deal with, not a failed command.
+    if (done.startsWith('left open')) console.warn(`[commands] close_window ${done}`);
+    return done;
+  }
+
+  // Bring a parked session back, with its whole conversation. `claude --resume` replays
   // the transcript, which is why the id is recorded the moment a session is launched or adopted.
   if (cmd.kind === 'resume_session') {
-    const id = String((cmd.payload || {}).session || '').trim();
+    const p = cmd.payload || {};
+    const id = String(p.session || '').trim();
     const row = await deskSession(id);
     if (!row) throw new Error(`no such session: ${id}`);
     // Already open: resuming it is just talking to it, the same as the Pi does. Refusing here threw
     // away every follow-up that named a running session.
     const prompt = await withAttachments((cmd.payload || {}).prompt, cmd.payload) || null;
     if (row.status === 'resident') {
-      if (!prompt) return `${id} was already running`;
-      return `${id} was already running — ${await deliver(row, prompt, { cmd: (cmd.payload || {}).msg || cmd.id })}`;
+      const shown = p.show ? ` (${await showTty(row.tty)})` : '';
+      if (!prompt) return `${id} was already running${shown}`;
+      return `${id} was already running${shown} — ${await deliver(row, prompt, { cmd: p.msg || cmd.id })}`;
     }
     if (!row.claude_session_id) throw new Error(`${id} has no transcript recorded — cannot resume`);
+    // ONE PROCESS PER CONVERSATION. A conversation can have several parked rows (every resume makes a
+    // new one), and two of them resumed seconds apart would start two processes writing one transcript.
+    // So the check is on the conversation, not on the row named: a copy already running takes the words.
+    const running = (await deskSessionsFor('desk', 'resident'))
+      .find((r) => r.claude_session_id === row.claude_session_id);
+    if (running) {
+      const shown = p.show ? ` (${await showTty(running.tty)})` : '';
+      if (!prompt) return `${id}'s conversation is already running as ${running.id}${shown}`;
+      return `${id}'s conversation is already running as ${running.id}${shown} — `
+        + await deliver(running, prompt, { cmd: p.msg || cmd.id });
+    }
     const dir = repoDir(row.repo);
     ensureTrusted(dir);
     if (row.repo !== 'root') await pull(dir);
@@ -232,8 +284,8 @@ async function run(cmd) {
     beginLaunch();   // until the row exists — see open_session below
     try {
       const raw = row.agent === 'codex'
-        ? await openCodexTab(dir, row.repo, prompt, sessionId, row.claude_session_id)
-        : await openFreshTab(dir, row.repo, prompt, sessionId, row.claude_session_id, null, row.label);
+        ? await openCodexTab(dir, row.repo, prompt, sessionId, row.claude_session_id, !!p.show)
+        : await openFreshTab(dir, row.repo, prompt, sessionId, row.claude_session_id, null, row.label, !!p.show);
       const [how, tty] = String(raw).split('\t');
       // A NEW row for the new tab, exactly as the Pi makes a new tmux session on resume. The old row
       // stays parked until retention drops it; it is where that stretch of the conversation happened.
@@ -243,9 +295,11 @@ async function run(cmd) {
         label: row.label || null, claude_session_id: row.claude_session_id,
         transcript_path: row.transcript_path, mirror_offset: row.mirror_offset || 0,
         remote_inputs: prompt ? [fingerprint(prompt)] : [],
-        // A session the user used at the Mac stays the user's through a resume: the new row's transcript scan
-        // starts at its own start, so it would otherwise read as hosted-only and be parked again.
-        touched_at: row.touched_at || null,
+        // A session the user used at the Mac stays the user's through a resume he asked to see (`show`):
+        // the new row's transcript scan starts at its own start, so it would otherwise read as hosted-only
+        // and be parked again. Resumed in the background (a follow-up or a handoff's result arriving for
+        // it), it is hosted again until he types into it, and parks when idle like any other.
+        touched_at: p.show ? row.touched_at || null : null,
         active_at: new Date().toISOString(),
       });
       return `resumed ${id} here (${how})`;
@@ -319,7 +373,7 @@ async function run(cmd) {
       const note = moved
         ? `${MOVED_NOTE.replace('{why}', String(moved))}\n\n${midTurn ? MOVED_MID_TURN : MOVED_BETWEEN_TURNS}` : null;
       const raw = await openFreshTab(dir, repo, prompt, sessionId, claudeId, note,
-                                     (cmd.payload || {}).label || null);
+                                     (cmd.payload || {}).label || null, (cmd.payload || {}).show === true);
       const [how, tty] = String(raw).split('\t');
       await upsertDeskSession({
         id: sessionId, worker: 'desk', repo, status: 'resident',
@@ -408,8 +462,9 @@ async function run(cmd) {
   let how, tty;
   try {
     const raw = agent === 'codex'
-      ? await openCodexTab(target, name, prompt, sessionId)
-      : await openFreshTab(target, name, prompt, sessionId, null, null, (cmd.payload || {}).label || null);
+      ? await openCodexTab(target, name, prompt, sessionId, null, (cmd.payload || {}).show === true)
+      : await openFreshTab(target, name, prompt, sessionId, null, null, (cmd.payload || {}).label || null,
+                           (cmd.payload || {}).show === true);
     // openFreshTab reports "<how>\t<tty>"; the tty is the handle a later follow-up addresses.
     [how, tty] = String(raw).split('\t');
     console.log(`[commands] opened session in ${target} (${how}${tty ? `, tty ${tty}` : ''}, trust: ${trust}`
