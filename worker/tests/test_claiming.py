@@ -109,6 +109,16 @@ def test_a_busy_primary_keeps_its_follow_ups_for_a_bounded_time(load):
     assert h.w.claim_one(h.db)["id"] == row["id"]   # a run that long is a hang: take it
 
 
+def test_a_primary_whose_run_just_ended_gets_its_chance_at_the_follow_up(load):
+    h = load(WORKER_ID="mac")
+    h.beat("fly")
+    pending(h, transcript="earlier", status="done", claimed_by="fly", claimed_at=ago(36), updated_at=ago(0.2))
+    row = pending(h, age=h.w.FAILOVER_S + 2)
+    assert h.w.claim_one(h.db) is None          # fly's next pass claims it
+    h.pg.rows("voice_requests")[0]["updated_at"] = ago(h.w.FAILOVER_S + 1)
+    assert h.w.claim_one(h.db)["id"] == row["id"]   # freed and still not claimed: take it
+
+
 def test_primary_that_is_stale_degraded_or_stopping_is_not_waited_for(load):
     for info, age in (({}, 200.0), ({"degraded": True}, 1.0), ({"stopping": True}, 1.0)):
         h = load(WORKER_ID="pi")

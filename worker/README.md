@@ -44,8 +44,10 @@ routed once it gets here is `../docs/ROUTING.md`.
      claims in about a second, so one that has not is not going to. The one
      exception is the worker it is left to being mid-run itself: a follow-up queues
      behind the run it follows, but for at most `BUSY_WAIT_S` (120s) of that run, so
-     a hung run cannot hold every command behind it. Another worker's run is no
-     reason to wait. A standing-by worker sleeps to exactly its deadline. Taking
+     a hung run cannot hold every command behind it. A run that has just ended
+     looks like an idle worker (no claimed row), so the worker it is left to also
+     gets `FAILOVER_S` from the moment its last run finished, which is when it
+     claims the follow-up. Another worker's run is no reason to wait. A standing-by worker sleeps to exactly its deadline. Taking
      one this way is reported as an error (`pending Ns and <worker> has not taken
      it`), because it means the worker ahead missed a command it should have had.
    - **Desk hosts are not workers.** `desk` and `pi-desk` beat into the same

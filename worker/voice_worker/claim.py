@@ -212,6 +212,18 @@ def failover_wait(db: Supabase, waited_s: float, target: str) -> float:
         left = BUSY_WAIT_S - (datetime.now(timezone.utc) - at).total_seconds()
         if left > 0:
             return left
+    else:
+        # A run that has JUST ended reads exactly like an idle worker that ignored the request: no claimed
+        # row. The target claims its queued follow-up on its next pass, about a second after finishing,
+        # so it gets FAILOVER_S from that moment, as an idle one gets FAILOVER_S from creation.
+        last = db.get("voice_requests",
+                      f"claimed_by=eq.{target}&status=in.(done,error)&select=updated_at"
+                      "&order=updated_at.desc&limit=1")
+        freed = _parse_ts((last or [{}])[0].get("updated_at") or "") if last else None
+        if freed:
+            left = FAILOVER_S - (datetime.now(timezone.utc) - freed).total_seconds()
+            if left > 0:
+                return left
     log_error(f"pending {waited_s:.0f}s and {target} has not taken it — taking it")
     return 0.0
 

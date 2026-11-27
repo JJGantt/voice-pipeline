@@ -9,6 +9,11 @@ import sys
 import httpx
 import pytest
 
+# ops_report reads its destination once, at import, and falls back to the host's ~/.config/ops/env, so on
+# a machine that has one the suite's simulated failures would reach the live responder as incidents.
+# Pinned here, before anything imports it; load() re-sets the same values per test.
+os.environ.update(OPS_URLS="http://127.0.0.1:9", OPS_TOKEN="")
+
 HERE = pathlib.Path(__file__).resolve().parent
 WORKER_DIR = HERE.parent
 sys.path.insert(0, str(HERE))
