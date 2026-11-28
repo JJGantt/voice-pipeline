@@ -27,7 +27,7 @@ import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { config } from './config.js';
-import { readTail, turnStart, turnStartBefore, resolvePrompt, gist, flatten, fromHim } from './transcripts.js';
+import { readTail, turnStart, turnStartBefore, resolvePrompt, gist, flatten, fromHim, TEXT_MAX } from './transcripts.js';
 import { codexPrompt, codexCommentary, codexToolLine, codexTurnStart, codexTurnEnd } from './codex.js';
 
 // fs.watch fires several times for one append, so coalesce. Long enough to batch a write, far short
@@ -445,8 +445,8 @@ export function reportTurnEnd(id, tail, turn = null) {
   // `text` is the 400-character line a wall draws; `reply` is the whole answer, and `prompt` what
   // began the turn, so the hub's event log holds the finished turn in full without a second read.
   return pushUntilHeard({ session: id, state: 'done', text: tail.lastReply.slice(0, 400),
-                   reply: tail.lastReply.slice(0, 20000),
-                   prompt: tail.lastPrompt ? tail.lastPrompt.slice(0, 20000) : null,
+                   reply: tail.lastReply.slice(0, TEXT_MAX),
+                   prompt: tail.lastPrompt ? tail.lastPrompt.slice(0, TEXT_MAX) : null,
                    at: tail.replyAt || null, summary_coming: true,
                    // The turn in order, as this machine read it: what the hub stores, and what fills
                    // in a hub that restarted and heard none of it. Absent from the tick's report of a

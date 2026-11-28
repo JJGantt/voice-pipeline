@@ -34,7 +34,7 @@ import { randomUUID } from 'node:crypto';
 // platform-specific in it, and two copies of "which keys make a project entry complete" would drift.
 import { ensureTrusted } from '../orchestrator/src/trust.js';
 import { readTail, liveSessions, evict, pickEviction, typeInto, interruptPane } from './sessions.js';
-import { turnBoundary } from '../orchestrator/src/transcripts.js';
+import { turnBoundary, TEXT_MAX } from '../orchestrator/src/transcripts.js';
 // Pictures attached in the hub, fetched to this machine for the session to read — shared with the Mac.
 import { withAttachments, sweepStashedPrompts } from '../orchestrator/src/handoff.js';
 import { loginExpiresAt } from '../orchestrator/src/login.js';
@@ -633,10 +633,10 @@ async function reconcileSessions() {
             // Separately, so a tab can show the repo unless the session was named by hand.
             custom_title: tail.customTitle ? tail.customTitle.slice(0, 60) : (row?.custom_title || null),
           } : {}),
-          last_reply: tail.lastReply ? tail.lastReply.slice(0, 20000) : (rebound ? null : row?.last_reply || null),
+          last_reply: tail.lastReply ? tail.lastReply.slice(0, TEXT_MAX) : (rebound ? null : row?.last_reply || null),
           // The prompt that reply answers, and carried by the same rule: it belongs to the reply, so it
           // is replaced only when the reply is.
-          last_prompt: tail.lastReply ? (tail.lastPrompt ? tail.lastPrompt.slice(0, 20000) : null)
+          last_prompt: tail.lastReply ? (tail.lastPrompt ? tail.lastPrompt.slice(0, TEXT_MAX) : null)
                                       : (rebound ? null : row?.last_prompt || null),
           // last_reply is the FINAL message of a turn; `working` is what says whether a newer one is
           // still being written. Without it a reader cannot tell an answer from a stale one.
@@ -719,8 +719,8 @@ async function reconcileSessions() {
         method: 'PATCH', headers: { Prefer: 'return=minimal' },
         body: JSON.stringify({
           working: false,
-          last_reply: tail.lastReply ? tail.lastReply.slice(0, 20000) : null,
-          last_prompt: tail.lastPrompt ? tail.lastPrompt.slice(0, 20000) : null,
+          last_reply: tail.lastReply ? tail.lastReply.slice(0, TEXT_MAX) : null,
+          last_prompt: tail.lastPrompt ? tail.lastPrompt.slice(0, TEXT_MAX) : null,
           reply_at: tail.replyAt || null,
           active_at: tail.turnAt || new Date().toISOString(),
           last_seen: new Date().toISOString(),

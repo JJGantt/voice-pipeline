@@ -11,6 +11,7 @@
 // host — can call this freely.
 import { config } from './config.js';
 import { makeLabel } from './label.js';
+import { TEXT_MAX } from './transcripts.js';
 
 // Sessions already relayed, or known not to be hub dispatches. Only a cache of lookups: after a restart
 // each running session costs one read again, and the unique column keeps a second insert harmless.
@@ -36,7 +37,7 @@ export async function relayFirstReply(sessionId, tail) {
     : [];
   if (!c?.payload?.relay) { settled.add(sessionId); return; }
   const label = s.custom_title || s.label || c.payload.label || null;
-  const text = tail.lastReply.slice(0, 20000);
+  const text = tail.lastReply.slice(0, TEXT_MAX);
   const rows = await rest('voice_messages?on_conflict=session_id', {
     method: 'POST',
     headers: { Prefer: 'resolution=ignore-duplicates,return=representation' },

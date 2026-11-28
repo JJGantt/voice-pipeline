@@ -17,6 +17,11 @@ const PROJECTS = process.env.CLAUDE_PROJECTS_DIR || path.join(os.homedir(), '.cl
  * Claude Code's directory for a working directory: every character that is not a letter or digit
  * becomes a dash, so `litter_robot_analyzer` is stored under `litter-robot-analyzer`.
  */
+// The most of one prompt or reply a host passes on (desk_sessions, the hub's session thread). An hour of
+// dictation is about 50,000 characters, so this guards against a runaway transcript line and nothing else.
+// The hub keeps its own copy of the same number (status-hub routes/conversation.js).
+export const TEXT_MAX = 200000;
+
 export function projectDir(cwd) {
   return path.join(PROJECTS, cwd.replace(/[^a-zA-Z0-9]/g, '-'));
 }
