@@ -37,16 +37,18 @@ test('leaves a transcript with no trailing interrupt untouched', () => {
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { mirrorUp, assemble, mirrorDown, mirrorCompact } from '../src/mirror.js';
+import { mirrorUp, assemble, mirrorDown, mirrorCompact, cuts } from '../src/mirror.js';
 
 function stubStorage() {
   const parts = new Map();   // offset -> bytes
+  const puts = [];           // offsets uploaded, in order
   const real = globalThis.fetch;
   globalThis.fetch = async (url, init = {}) => {
     const m = /\/(\d{12})\.part$/.exec(String(url));
     if (init.method === 'POST' && m) {
       await new Promise((r) => setTimeout(r, 5));   // an upload is not instant
       parts.set(Number(m[1]), Buffer.from(init.body));
+      puts.push(Number(m[1]));
       return new Response('{}', { status: 200 });
     }
     if (m) return new Response(parts.get(Number(m[1])), { status: 200 });   // a download
@@ -55,12 +57,12 @@ function stubStorage() {
       return new Response('[]', { status: 200 });
     }
     if (/\/object\/list\//.test(String(url))) {
-      const names = [...parts.keys()].map((o) => ({ name: `${String(o).padStart(12, '0')}.part` }));
+      const names = [...parts].map(([o, b]) => ({ name: `${String(o).padStart(12, '0')}.part`, metadata: { size: b.length } }));
       return new Response(JSON.stringify(names), { status: 200 });
     }
     return new Response('[]', { status: 200 });
   };
-  return { parts, restore: () => { globalThis.fetch = real; } };
+  return { parts, puts, restore: () => { globalThis.fetch = real; } };
 }
 const tmpFile = (text) => {
   const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'mirror-')), 't.jsonl');
@@ -143,4 +145,61 @@ test('mirrorCompact folds a stored mirror into one part without changing what it
     assert.deepEqual([...s.parts.keys()], [0]);
     assert.equal(s.parts.get(0).toString(), '{"a":1}\n{"b":2}\n{"c":3}\n');
   } finally { s.restore(); }
+});
+
+// ---- no part is larger than the storage file size limit ----
+
+test('cuts never exceeds the cap, ends each part after a newline when it can, and covers every byte', () => {
+  const buf = Buffer.from('aaa\nbb\ncccccccc\nd\n');
+  const c = cuts(buf, 6);
+  assert.deepEqual(c, [{ at: 0, len: 4 }, { at: 4, len: 3 }, { at: 7, len: 6 }, { at: 13, len: 5 }]);
+  assert.ok(c.every((x) => x.len <= 6));
+  assert.equal(c.reduce((n, x) => n + x.len, 0), buf.length);
+  // Cuts depend only on the bytes before them: growing the buffer keeps the earlier full parts.
+  assert.deepEqual(cuts(Buffer.from('aaa\nbb\ncccccccc\nd\neeee\n'), 6).slice(0, 3), c.slice(0, 3));
+});
+
+test('a tail and a compaction past the cap are split into parts no larger than it, and still assemble', async () => {
+  const s = stubStorage();
+  process.env.MIRROR_MAX_PART = '40';
+  try {
+    const f = tmpFile('');
+    const lines = [];
+    let at = 0;
+    // One big first upload (a fresh mirror of a long transcript) is split rather than sent whole.
+    for (let i = 0; i < 10; i++) { const l = `{"turn":${String(i).padStart(2, '0')}}\n`; lines.push(l); fs.appendFileSync(f, l); }
+    at = await mirrorUp('conv-big', f, 0);
+    assert.ok([...s.parts.values()].every((b) => b.length <= 40));
+    for (let i = 10; i < 40; i++) {
+      const l = `{"turn":${String(i).padStart(2, '0')}}\n`;
+      lines.push(l);
+      fs.appendFileSync(f, l);
+      at = await mirrorUp('conv-big', f, at);
+    }
+    assert.ok([...s.parts.values()].every((b) => b.length <= 40), 'no part over the cap');
+    assert.ok(s.parts.size < 20, `compacted to ${s.parts.size} parts`);
+    const whole = assemble([...s.parts].sort((x, y) => x[0] - y[0]).map(([o, buf]) => ({ at: o, buf })));
+    assert.equal(whole.toString(), lines.join(''));
+  } finally { delete process.env.MIRROR_MAX_PART; s.restore(); }
+});
+
+test('a compaction writes its parts last offset first and skips full parts already up', async () => {
+  const s = stubStorage();
+  process.env.MIRROR_MAX_PART = '16';
+  try {
+    // A stored mirror: two full 16-byte parts from an earlier compaction, then small tails.
+    const text = '{"a":"aaaaaaa"}\n{"b":"bbbbbbb"}\n{"c":1}\n{"d":2}\n{"e":3}\n';
+    s.parts.set(0, Buffer.from(text.slice(0, 16)));
+    s.parts.set(16, Buffer.from(text.slice(16, 32)));
+    s.parts.set(32, Buffer.from(text.slice(32, 40)));
+    s.parts.set(40, Buffer.from(text.slice(40, 48)));
+    s.parts.set(48, Buffer.from(text.slice(48)));
+    // Grow it so two new parts are written: the higher offset must land first.
+    s.parts.set(56, Buffer.from('{"f":"ffffffffff"}\n'));
+    assert.equal(await mirrorCompact('conv-skip'), 6);
+    assert.deepEqual(s.puts, [72, 56, 32], 'only parts that changed, highest offset first');
+    assert.deepEqual([...s.parts.keys()].sort((a, b) => a - b), [0, 16, 32, 48, 56, 72]);
+    const whole = assemble([...s.parts].sort((x, y) => x[0] - y[0]).map(([o, buf]) => ({ at: o, buf })));
+    assert.equal(whole.toString(), text + '{"f":"ffffffffff"}\n');
+  } finally { delete process.env.MIRROR_MAX_PART; s.restore(); }
 });

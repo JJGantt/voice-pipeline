@@ -9,7 +9,13 @@
 // ONLY THE TAIL IS UPLOADED. Transcripts here reach 16MB and a turn adds tens of KB, so each mirror
 // writes `<claude_session_id>/<offset>.part` and the destination concatenates the parts in offset
 // order. `desk_sessions.mirror_offset` is how much is already up. Every part costs the destination a
-// request, so once a conversation has COMPACT_AT parts they are folded back into one (compactFromFile).
+// request, so once a conversation has COMPACT_AT parts they are folded back into as few as fit
+// (compactFromFile).
+//
+// NO PART IS LARGER THAN MAX_PART. Storage refuses any object over the project's 50 MiB file size limit
+// (413 EntityTooLarge), and a week-long transcript passes that, so a tail and a compaction are both
+// cut into parts at most maxPart() long. One whole-file part per conversation would fail every compaction
+// from then on and re-send the whole file on every write.
 //
 // Both desk consumers use this — it is shared, not copied, because the two halves of a transfer have
 // to agree byte for byte on what a mirrored transcript is.
@@ -21,6 +27,9 @@ import { projectDir } from './transcripts.js';
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://felyggqjjhltwokdfhop.supabase.co';
 const BUCKET = 'transcripts';
 const MIRROR_FETCHES = 16;   // parallel part downloads in mirrorDown
+// Under the project's 50 MiB storage file size limit (Supabase dashboard > Storage > Settings), with room.
+// MIRROR_MAX_PART overrides it, for the tests.
+const maxPart = () => Number(process.env.MIRROR_MAX_PART) || 40 * 1024 * 1024;
 const key = () => process.env.SUPABASE_KEY || '';
 const auth = (extra = {}) => ({ apikey: key(), Authorization: `Bearer ${key()}`, ...extra });
 // Offsets are the sort key, and lexical order has to match numeric order.
@@ -95,6 +104,36 @@ const partCount = new Map();
 const COMPACT_AT = 20;
 
 /**
+ * Where to cut `buf` into parts of at most `cap` bytes: `[{ at, len }]`, `at` relative to the buffer.
+ * Each cut falls after a newline when one is in reach, so a part holds whole records where it can. The
+ * cuts depend only on the bytes before them, so as an append-only transcript grows its earlier full
+ * parts keep the same offsets and sizes, which is what lets a compaction skip the ones already up.
+ */
+export function cuts(buf, cap = maxPart()) {
+  const out = [];
+  let at = 0;
+  while (at < buf.length) {
+    let len = Math.min(cap, buf.length - at);
+    if (at + len < buf.length) {
+      const nl = buf.lastIndexOf(0x0a, at + len - 1);
+      if (nl >= at) len = nl + 1 - at;
+    }
+    out.push({ at, len });
+    at += len;
+  }
+  return out;
+}
+
+async function putPart(claudeId, offset, body, what) {
+  const res = await fetch(`${SUPABASE_URL}/storage/v1/object/${BUCKET}/${claudeId}/${partName(offset)}`, {
+    method: 'POST',
+    headers: auth({ 'Content-Type': 'application/x-ndjson', 'x-upsert': 'true' }),
+    body,
+  });
+  if (!res.ok) throw new Error(`${what} ${res.status}: ${(await res.text()).slice(0, 160)}`);
+}
+
+/**
  * Upload every whole line written since `offset`. Returns the offset the mirror now reaches, or null
  * when there was nothing to upload.
  *
@@ -135,29 +174,28 @@ async function uploadTail(claudeId, transcriptPath, offset) {
   if (cut < 0) return reached();   // nothing but a line still being written
   const body = buf.subarray(0, cut + 1);
 
-  const res = await fetch(`${SUPABASE_URL}/storage/v1/object/${BUCKET}/${claudeId}/${partName(from)}`, {
-    method: 'POST',
-    headers: auth({ 'Content-Type': 'application/x-ndjson', 'x-upsert': 'true' }),
-    body,
-  });
-  if (!res.ok) throw new Error(`mirrorUp ${res.status}: ${(await res.text()).slice(0, 160)}`);
-  const to = from + body.length;
-  uploadedTo.set(claudeId, to);
+  // In order, each counted as it lands, so a failure part-way leaves the mirror contiguous to there.
+  let to = from;
+  for (const c of cuts(body)) {
+    await putPart(claudeId, from + c.at, body.subarray(c.at, c.at + c.len), 'mirrorUp');
+    to = from + c.at + c.len;
+    uploadedTo.set(claudeId, to);
+    const n = partCount.get(claudeId);
+    partCount.set(claudeId, n == null ? (await parts(claudeId)).length : n + 1);
+  }
   // Every part is one request for whoever resumes it, ~0.4s each, so a week-long session that had
-  // left hundreds of parts took minutes to move. Past COMPACT_AT parts the whole file goes up again as
-  // the part at offset 0 and the rest are deleted, leaving one.
-  let n = partCount.get(claudeId);
-  if (n == null) n = (await parts(claudeId)).length;
-  else n += 1;
-  partCount.set(claudeId, n);
+  // left hundreds of parts took minutes to move. Past COMPACT_AT parts the file is folded back into
+  // as few parts as maxPart() allows.
+  const n = partCount.get(claudeId);
   if (n >= COMPACT_AT) await compactFromFile(claudeId, transcriptPath, to);
   return to;
 }
 
 /**
- * Replace a conversation's parts with one: the transcript's first `to` bytes, from the local file.
- * The whole part is written BEFORE anything is deleted, and `assemble` drops any later part it
- * already covers, so a reader listing in between gets the same transcript either way.
+ * Replace a conversation's parts with as few as fit: the transcript's first `to` bytes, from the local
+ * file. Every new part is written BEFORE anything is deleted, last offset first, so at each moment the
+ * parts in storage still cover the transcript without a gap; `assemble` drops what an overlapping part
+ * repeats, so a reader listing in between gets the same transcript either way.
  */
 async function compactFromFile(claudeId, transcriptPath, to) {
   const fd = fs.openSync(transcriptPath, 'r');
@@ -167,14 +205,16 @@ async function compactFromFile(claudeId, transcriptPath, to) {
 }
 
 async function replaceParts(claudeId, whole) {
-  const first = partName(0);
-  const res = await fetch(`${SUPABASE_URL}/storage/v1/object/${BUCKET}/${claudeId}/${first}`, {
-    method: 'POST',
-    headers: auth({ 'Content-Type': 'application/x-ndjson', 'x-upsert': 'true' }),
-    body: whole,
-  });
-  if (!res.ok) throw new Error(`mirror compact ${res.status}: ${(await res.text()).slice(0, 160)}`);
-  const stale = (await parts(claudeId)).filter((n) => n !== first);
+  const plan = cuts(whole);
+  const have = new Map((await listParts(claudeId)).map((o) => [o.name, o.size]));
+  // A full part already up from an earlier compaction has the same name and size: its bytes are the
+  // same, since the transcript only grows, so it is not sent again.
+  for (const c of [...plan].reverse()) {
+    if (have.get(partName(c.at)) === c.len) continue;
+    await putPart(claudeId, c.at, whole.subarray(c.at, c.at + c.len), 'mirror compact');
+  }
+  const keep = new Set(plan.map((c) => partName(c.at)));
+  const stale = [...have.keys()].filter((n) => !keep.has(n));
   if (stale.length) {
     const del = await fetch(`${SUPABASE_URL}/storage/v1/object/${BUCKET}`, {
       method: 'DELETE',
@@ -183,7 +223,7 @@ async function replaceParts(claudeId, whole) {
     });
     if (!del.ok) throw new Error(`mirror compact delete ${del.status}: ${(await del.text()).slice(0, 160)}`);
   }
-  partCount.set(claudeId, 1);
+  partCount.set(claudeId, plan.length);
 }
 
 /**
@@ -203,13 +243,21 @@ export async function mirrorHas(claudeId) {
 
 /** Every part uploaded for a session, in offset order. */
 async function parts(claudeId) {
+  return (await listParts(claudeId)).map((o) => o.name);
+}
+
+/** Every part with its size in bytes (null when storage did not say), in offset order. */
+async function listParts(claudeId) {
   const res = await fetch(`${SUPABASE_URL}/storage/v1/object/list/${BUCKET}`, {
     method: 'POST',
     headers: auth({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ prefix: claudeId, limit: 1000, sortBy: { column: 'name', order: 'asc' } }),
   });
   if (!res.ok) throw new Error(`mirror list ${res.status}: ${(await res.text()).slice(0, 160)}`);
-  return (await res.json()).map((o) => o.name).filter((n) => n.endsWith('.part')).sort();
+  return (await res.json())
+    .filter((o) => o.name.endsWith('.part'))
+    .map((o) => ({ name: o.name, size: Number.isFinite(Number(o.metadata?.size)) ? Number(o.metadata.size) : null }))
+    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 }
 
 /** Throw the mirror away — used when a transcript is rewritten under us. */
