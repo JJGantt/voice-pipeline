@@ -306,7 +306,8 @@ that cannot happen unless someone attaches to the tmux session and clears it.
 `sweepRetention` in `pi-desk` is the retention rule for this system, on the always-on machine: closed
 sessions (`ended`/`transferred`) go after 7 days, parked ones (`evicted`) after 14, the `desk_commands`
 log after 30, and `voice_requests` — the raw captures — after 7, together with the phone recordings
-behind them in the `voice-clips` bucket. All tunable by env. Photo attachments are the one exception:
+behind them in the `voice-clips` bucket. `voice_dictations` (speech the hub transcribed to be typed into
+a session, with its clip in the same bucket) goes after 7 as well. All tunable by env. Photo attachments are the one exception:
 the hub sweeps its own `voice-attachments` bucket after 7 days.
 
 Deleting a voice request does **not** delete the conversation: `voice_messages` has no cascade from

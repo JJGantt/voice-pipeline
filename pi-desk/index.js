@@ -1559,6 +1559,8 @@ async function sweepRetention() {
     // and a retried or dismissed one is a decision the user made, which is small and worth keeping.
     await sb(`desk_commands?created=lt.${ago(KEEP_COMMAND_DAYS)}`, { method: 'DELETE', headers: { Prefer: 'return=minimal' } });
     await sb(`voice_requests?created_at=lt.${ago(KEEP_REQUEST_DAYS)}`, { method: 'DELETE', headers: { Prefer: 'return=minimal' } });
+    // Dictations (speech typed into a session) are kept as long as commands, clips included.
+    await sb(`voice_dictations?at=lt.${ago(KEEP_REQUEST_DAYS)}`, { method: 'DELETE', headers: { Prefer: 'return=minimal' } });
     await sweepClips();
     // Messages handed to sessions by file, and the pictures fetched for them (handoff.js).
     sweepStashedPrompts();
